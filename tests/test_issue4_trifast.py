@@ -121,3 +121,62 @@ def test_over_31_buffer_args_refuses_clearly(tmp_path):
         mod.big_kernel[(1,)](out, *range(n_scalars))
     msg = str(ei.value).lower()
     assert "buffer" in msg and "31" in msg, f"refusal message not clear: {ei.value}"
+
+
+@triton.jit
+def _fa_shared_kv(
+    Q, KV, Out,
+    sqz, sqh, sqm, sqk,
+    skz, skh, skn, skk,
+    soz, soh, som, sok,
+    Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+):
+    """FA v2 forward where K and V are BOTH read through the ``KV`` pointer arg (K in
+    rows [0, N_CTX), V in rows [N_CTX, 2*N_CTX)) -- shared-KV attention. Routes to the
+    simdgroup FA template (HEAD_DIM=128), where Q/K/V/Out bind to distinct buffers."""
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + off_z * sqz + off_h * sqh + offs_m[:, None] * sqm + offs_d[None, :] * sqk)
+    q = q * (1.0 / tl.sqrt(float(HEAD_DIM)))
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    for start_n in range(0, N_CTX, BLOCK_N):
+        k = tl.load(KV + off_z * skz + off_h * skh + (start_n + offs_n)[:, None] * skn + offs_d[None, :] * skk)
+        qk = tl.dot(q, tl.trans(k).to(q.dtype))
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        v = tl.load(KV + off_z * skz + off_h * skh + (N_CTX + start_n + offs_n)[:, None] * skn + offs_d[None, :] * skk)
+        acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
+        m_i = m_new
+    acc = acc / l_i[:, None]
+    tl.store(Out + off_z * soz + off_h * soh + offs_m[:, None] * som + offs_d[None, :] * sok, acc)
+
+
+@requires
+def test_shared_kv_fa_refuses():
+    """#3: an FA kernel that reads V through the same pointer arg as K (shared-KV) must
+    refuse -- Q/K/V/Out bind to distinct buffers with independent strides and the template
+    cannot alias them, so lowering would be silently wrong."""
+    Z, H, N, HD = 1, 1, 64, 128
+    torch.manual_seed(0)
+    q = torch.randn(Z, H, N, HD, device="cpu", dtype=torch.float32)
+    k = torch.randn(Z, H, N, HD, device="cpu", dtype=torch.float32)
+    v = torch.randn(Z, H, N, HD, device="cpu", dtype=torch.float32)
+    kv = torch.cat([k, v], dim=2).contiguous()  # [Z,H,2N,HD]: K then V, one buffer
+    out = torch.empty(Z, H, N, HD, device="cpu", dtype=torch.float32)
+    with pytest.raises(MetalNonRecoverableError):
+        _fa_shared_kv[(N // 32, Z * H)](
+            q, kv, out, *q.stride(), *kv.stride(), *out.stride(), Z, H, N,
+            BLOCK_M=32, BLOCK_N=32, HEAD_DIM=HD,
+        )
