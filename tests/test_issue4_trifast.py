@@ -116,11 +116,19 @@ def test_over_31_buffer_args_refuses_clearly(tmp_path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
+    # Host path (cpu tensors) can't bind the packed signature -> clean refuse.
     out = torch.zeros(1, device="cpu", dtype=torch.int32)
     with pytest.raises(MetalNonRecoverableError) as ei:
         mod.big_kernel[(1,)](out, *range(n_scalars))
     msg = str(ei.value).lower()
-    assert "buffer" in msg and "31" in msg, f"refusal message not clear: {ei.value}"
+    assert "31" in msg, f"refusal message not clear: {ei.value}"
+
+    # MPS path packs the scalars into one argument buffer -> computes correctly (issue #4.7).
+    if torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader"):
+        out_m = torch.zeros(1, device="mps", dtype=torch.int32)
+        mod.big_kernel[(1,)](out_m, *range(n_scalars))
+        torch.mps.synchronize()
+        assert int(out_m.cpu()[0]) == sum(range(n_scalars)), "packed >31-arg kernel wrong on MPS"
 
 
 @triton.jit

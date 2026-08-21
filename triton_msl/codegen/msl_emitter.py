@@ -503,29 +503,51 @@ class MSLCodeGen:
         # "'buffer' attribute parameter is out of bounds" (one line per overflowing arg)
         # naming nothing. Refuse with a clear, actionable message instead of miscompiling
         # into that wall (GitHub issue #4.7).
+        # Metal binds kernel arguments to buffer slots 0..30 (31 total). When a kernel
+        # exceeds that, pack every runtime SCALAR into a single ``uint`` argument buffer
+        # (each pointer still needs its own slot) and unpack them as locals at the body top
+        # (GitHub issue #4.7). If even the pointers don't fit, or a scalar isn't 32-bit,
+        # that's a true hardware wall -> refuse.
         _MAX_METAL_BUFFERS = 31
         _args = self.builder.args
+        _pack_scalars = None  # list[Arg] packed into one buffer, or None
         if len(_args) > _MAX_METAL_BUFFERS:
             from triton_msl.errors import MetalNonRecoverableError
 
-            _n_ptr = sum(1 for a in _args if getattr(a, "is_ptr", False))
+            _ptr_args = [a for a in _args if getattr(a, "is_ptr", False)]
+            _scalar_args = [a for a in _args if not getattr(a, "is_ptr", False)]
             _kname = getattr(self.builder, "name", "kernel")
-            _overflow = ", ".join(a.name for a in _args[_MAX_METAL_BUFFERS:])
-            raise MetalNonRecoverableError(
-                f"kernel '{_kname}' needs {len(_args)} argument buffers ({_n_ptr} pointers "
-                f"+ {len(_args) - _n_ptr} runtime scalars), but Metal binds at most "
-                f"{_MAX_METAL_BUFFERS} (slots 0..{_MAX_METAL_BUFFERS - 1}). This is a "
-                "hardware limit, not a lowering gap. Reduce the argument count: make "
-                "sizes/strides `tl.constexpr` where they are compile-time constants, or "
-                "derive strides inside the kernel from a shape argument when the tensors "
-                f"are contiguous. Overflowing arguments: {_overflow}.",
-                op_name="kernel",
-            )
+            if len(_ptr_args) + 1 > _MAX_METAL_BUFFERS:
+                raise MetalNonRecoverableError(
+                    f"kernel '{_kname}' needs {len(_ptr_args)} pointer buffers, but Metal "
+                    f"binds at most {_MAX_METAL_BUFFERS} (slots 0..{_MAX_METAL_BUFFERS - 1}) "
+                    "and pointers cannot be packed into an argument buffer. Reduce the "
+                    "pointer count.",
+                    op_name="kernel",
+                )
+            for _a in _scalar_args:
+                if triton_type_to_msl(_a.dtype) not in ("int", "uint", "float", "bool"):
+                    raise MetalNonRecoverableError(
+                        f"kernel '{_kname}' exceeds Metal's {_MAX_METAL_BUFFERS} buffer slots "
+                        f"and scalar '{_a.name}' is not 32-bit ({triton_type_to_msl(_a.dtype)}); "
+                        "argument-buffer packing supports int/uint/float/bool scalars only. "
+                        "Make it `tl.constexpr` or reduce the argument count.",
+                        op_name="kernel",
+                    )
+            _pack_scalars = _scalar_args
 
         # Kernel signature
         params = []
-        for i, arg in enumerate(self.builder.args):
-            params.append(f"    {arg.msl_param(i)}")
+        if _pack_scalars is not None:
+            _pi = 0
+            for arg in _args:
+                if getattr(arg, "is_ptr", False):
+                    params.append(f"    {arg.msl_param(_pi)}")
+                    _pi += 1
+            params.append(f"    constant uint* _packed_scalars [[buffer({_pi})]]")
+        else:
+            for i, arg in enumerate(self.builder.args):
+                params.append(f"    {arg.msl_param(i)}")
 
         # Thread position qualifiers — Metal requires all position attrs same type
         used_axes = getattr(self.builder, "_used_pid_axes", {0})
@@ -553,6 +575,19 @@ class MSLCodeGen:
         lines.append(f"kernel void {self.builder.name}(")
         lines.append(",\n".join(params))
         lines.append(") {")
+
+        # Unpack packed scalars into locals so the body references them by name unchanged
+        # (issue #4.7). Each 32-bit slot is bitcast to the scalar's type; the launcher packs
+        # the values into ``_packed_scalars`` in this same (scalar-arg) order.
+        if _pack_scalars is not None:
+            for _j, _sa in enumerate(_pack_scalars):
+                _mt = triton_type_to_msl(_sa.dtype)
+                if _mt == "uint":
+                    lines.append(f"    uint {_sa.name} = _packed_scalars[{_j}];")
+                elif _mt == "bool":
+                    lines.append(f"    bool {_sa.name} = _packed_scalars[{_j}] != 0u;")
+                else:
+                    lines.append(f"    {_mt} {_sa.name} = as_type<{_mt}>(_packed_scalars[{_j}]);")
 
         # Decompose uint3 position attrs into scalar values
         if used_axes and max(used_axes) > 0:

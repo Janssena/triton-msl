@@ -411,6 +411,41 @@ def _compile_shader_scalars_ok(launcher, kargs) -> bool:
         return False  # any resolution failure -> conservative fall back
 
 
+_MAX_METAL_BUFFERS = 31
+
+
+def _pack_overflow_scalars(kargs):
+    """Argument-buffer packing (GitHub issue #4.7): a kernel with > 31 args has its runtime
+    SCALARS bundled by the emitter into one ``constant uint*`` buffer after the pointers.
+    Mirror that here for compile_shader dispatch: return ``[pointer tensors..., packed]``
+    where ``packed`` is one int32 tensor holding each scalar's 32-bit representation, in the
+    SAME (arg) order the emitter unpacks -- ints by value, floats by bit pattern (the kernel
+    ``as_type<>``-casts back). Pointers keep their own buffers."""
+    import struct
+
+    import torch
+
+    tensors = [a for a in kargs if hasattr(a, "data_ptr")]
+    scalars = [a for a in kargs if not hasattr(a, "data_ptr")]
+    bits = []
+    for s in scalars:
+        if isinstance(s, bool):
+            bits.append(1 if s else 0)
+        elif isinstance(s, float):
+            bits.append(struct.unpack("<i", struct.pack("<f", s))[0])  # float bits -> int32
+        else:
+            bits.append(int(s) & 0xFFFFFFFF if int(s) < 0 else int(s))
+    dev = tensors[0].device if tensors else "mps"
+    packed = torch.tensor([_i32(b) for b in bits], dtype=torch.int32, device=dev)
+    return tensors + [packed]
+
+
+def _i32(v):
+    """Wrap a Python int into signed 32-bit range so torch.int32 accepts the bit pattern."""
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
 class MetalLauncher:
     """Triton kernel launcher for Metal backend.
 
@@ -593,7 +628,10 @@ class MetalLauncher:
                             tg = min(self._msl_block_size or block_size, 1024)
                             threads, group_size = gridX * tg, tg
                             lib = _rt.get_library(self._msl)
-                            _rt.dispatch(lib, self.kernel_name, kargs, threads=threads, group_size=group_size)
+                            # >31 args -> the MSL packs scalars into one buffer; pack the
+                            # dispatch args to match (issue #4.7).
+                            _dk = _pack_overflow_scalars(kargs) if len(kargs) > _MAX_METAL_BUFFERS else kargs
+                            _rt.dispatch(lib, self.kernel_name, _dk, threads=threads, group_size=group_size)
                             if launch_exit_hook:
                                 launch_exit_hook(launch_metadata)
                             return
@@ -633,6 +671,22 @@ class MetalLauncher:
                 "MLA (nope/rope) attention runs only on MPS tensors via compile_shader "
                 "(the concatenated qk=head_dim kernel). This launch is non-MPS or has "
                 "compile_shader disabled/unavailable."
+            )
+
+        # A >31-arg kernel was lowered with argument-buffer packing (issue #4.7): the MSL
+        # has one packed scalar buffer, not one per scalar. The host round-trip path below
+        # binds one buffer per arg and cannot match that signature, so packed kernels run
+        # only via compile_shader (MPS tensors, 1-D grid). Refuse here rather than mis-bind.
+        _n_nonconstexpr = sum(1 for i in range(len(args)) if i not in self.constexpr_indices)
+        if _n_nonconstexpr > _MAX_METAL_BUFFERS:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"kernel with {_n_nonconstexpr} arguments (> {_MAX_METAL_BUFFERS}) uses "
+                "argument-buffer packing, which runs on MPS tensors via compile_shader "
+                "(1-D grid) only. This launch fell to the host path (non-MPS tensors or a "
+                "multi-dim grid). Use MPS tensors with a 1-D grid, or reduce the arg count.",
+                op_name="kernel",
             )
 
         # Pack arguments into Metal buffers.
