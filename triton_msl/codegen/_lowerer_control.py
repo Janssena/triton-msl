@@ -84,6 +84,10 @@ class _ControlFlowMixin:
         # loop). Maps index -> (n_elems, msl_type).
         mept_array_iter_indices = set()
         mept_array_iter_n = {}
+        # Pointer offset-carry iter-args (loop-carried pointer, GitHub issue #4.2): carry the
+        # OFFSET (uint), not a value -- base is loop-invariant. index -> base MSL expr.
+        ptr_offset_iter_indices = set()
+        ptr_offset_iter_base = {}
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
@@ -94,17 +98,31 @@ class _ControlFlowMixin:
             # error at others (GitHub issue #4.2). The matmul / FlashAttention templates use
             # this idiom too but rebuild addresses internally and never reach the generic
             # scf.for lowering. Refuse rather than emit silently-wrong output.
-            if self.env_is_ptr.get(init_id) is not None or init_id in getattr(
-                self, "env_ptr_array", {}
-            ):
+            _ptr = self.env_is_ptr.get(init_id)
+            if _ptr is not None:
+                # Scalar (1 element/thread) loop-carried pointer: carry the OFFSET. Declare
+                # ``uint off = <offset>`` and map the block-arg back to a pointer
+                # (base, off) so tt.load reads ``base[off]`` and ``p += X`` becomes
+                # ``off += X`` at the yield (base stays loop-invariant). Issue #4.2.
+                _base, _off = _ptr
+                _off_var = self._next_var("off")
+                self.kb.raw_line(f"    uint {_off_var} = (uint)({_off});")
+                iter_vars.append(_off_var)
+                iter_dtypes.append("i32")
+                ptr_offset_iter_indices.add(i)
+                ptr_offset_iter_base[i] = _base
+                continue
+            if init_id in getattr(self, "env_ptr_array", {}):
+                # Multi-element-per-thread pointer TENSOR (tile > threadgroup): the offset is
+                # a per-thread ARRAY; that carry is not implemented yet, so refuse rather
+                # than mis-lower (issue #4.2). Rebuild the address from a base each iteration.
                 from triton_msl.errors import MetalNonRecoverableError
 
                 raise MetalNonRecoverableError(
-                    "loop-carried pointer (a pointer advanced across an scf.for, e.g. "
-                    "`p += BLOCK * stride` at the end of the loop body) is not supported by "
-                    "the register-array lowering and would be silently wrong. Refusing. "
-                    "Rebuild the address from a base each iteration instead -- move the "
-                    "pointer computation inside the loop: `p = base + (k + offs) * stride`.",
+                    "loop-carried pointer tensor larger than the threadgroup (multi-element "
+                    "per thread) is not yet supported by the register-array lowering. "
+                    "Refusing. Rebuild the address from a base each iteration instead: move "
+                    "the pointer computation inside the loop (`p = base + (k + offs) * stride`).",
                     op_name="scf.for",
                 )
             init_val = self._lookup(init_id)
@@ -235,6 +253,10 @@ class _ControlFlowMixin:
                         n_arr, mt = mept_array_iter_n[i]
                         self.env_array[ba_id] = (var, n_arr, mt)
                         self.env_n_elems[ba_id] = n_arr
+                    # Pointer offset-carry iter-arg: block-arg is a pointer (base, off_var);
+                    # tt.load/addptr in the body consume env_is_ptr, the yield updates off_var.
+                    if i in ptr_offset_iter_indices:
+                        self.env_is_ptr[ba_id] = (ptr_offset_iter_base[i], var)
                     # Register shared-memory-backed iter_args
                     if i in smem_iter_indices:
                         init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
@@ -350,6 +372,20 @@ class _ControlFlowMixin:
                                         self.kb.raw_line(f"    }}")
                                         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                                     continue
+                                # Pointer offset-carry iter-arg: assign off_var from the
+                                # yielded (advanced) pointer's offset; base is loop-invariant.
+                                if i in ptr_offset_iter_indices:
+                                    _ny = self.env_is_ptr.get(yield_id)
+                                    if _ny is None:
+                                        from triton_msl.errors import MetalNonRecoverableError
+
+                                        raise MetalNonRecoverableError(
+                                            "loop-carried pointer yield is not a pointer; "
+                                            "refusing rather than mis-lower (issue #4.2).",
+                                            op_name="scf.for",
+                                        )
+                                    self.kb.raw_line(f"        {iter_vars[i]} = (uint)({_ny[1]});")
+                                    continue
                                 # MEPT register-array iter-arg: update v[e] per
                                 # element. The yielded value is itself an env_array
                                 # (the elementwise chain); copy element-wise. If it
@@ -396,6 +432,10 @@ class _ControlFlowMixin:
                     # Propagate shape from init value to result
                     if i < len(init_ids) and init_ids[i] in self.env_shapes:
                         self.env_shapes[rid] = self.env_shapes[init_ids[i]]
+                    # Pointer offset-carry iter-arg: expose the result as a pointer
+                    # (base, off_var) so a post-loop tt.load/addptr on the final pointer works.
+                    if i in ptr_offset_iter_indices:
+                        self.env_is_ptr[rid] = (ptr_offset_iter_base[i], var)
                     # MEPT register-array iter-arg: expose the result as an
                     # env_array so the post-loop store reads ``v[e]``.
                     if i in mept_array_iter_indices:

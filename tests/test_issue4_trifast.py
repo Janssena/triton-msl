@@ -147,7 +147,11 @@ def test_loop_carried_pointer_correct_or_refuse(nw):
     try:
         _loopcarry_ptr[(1,)](x, out, STEPS=STEPS, BLOCK=BLOCK, num_warps=nw)
     except MetalNonRecoverableError:
-        return  # refused loudly -- contract satisfied
+        # num_warps=8 is 1 element/thread (scalar pointer) -> offset-carry MUST work, not
+        # refuse; num_warps=4 is multi-element/thread (MEPT array offset) -> refuse is ok.
+        if nw == 8:
+            raise
+        return
     assert (out - x.reshape(STEPS, BLOCK).sum(0)).abs().max().item() < 1e-3
 
 
