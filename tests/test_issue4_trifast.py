@@ -124,6 +124,46 @@ def test_over_31_buffer_args_refuses_clearly(tmp_path):
 
 
 @triton.jit
+def _mm_square(a_ptr, b_ptr, c_ptr, N, K, sam, sak, sbk, sbn, scm, scn,
+               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """Square (N x N) matmul whose output mask bounds BOTH axes by the single extent
+    arg N -- the row axis is clipped by N (not by an arg named M)."""
+    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
+    offm = pid_m * BM + tl.arange(0, BM)
+    offn = pid_n * BN + tl.arange(0, BN)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, K, BK):
+        offk = k + tl.arange(0, BK)
+        a = a_ptr + (offm[:, None] * sam + offk[None, :] * sak)
+        b = b_ptr + (offk[:, None] * sbk + offn[None, :] * sbn)
+        acc += tl.dot(tl.load(a), tl.load(b))
+    mask = (offm[:, None] < N) & (offn[None, :] < N)
+    tl.store(c_ptr + (offm[:, None] * scm + offn[None, :] * scn), acc, mask=mask)
+
+
+@requires
+@pytest.mark.xfail(reason="#4.5 not yet fixed: square matmul with one extent arg for both "
+                          "axes is refused because the template resolves _M by the arg NAME "
+                          "'M' (absent) -> BLOCK_M, then the mask guard correctly refuses. "
+                          "Fix = resolve _M/_N structurally from the store mask, like #4.1's _K.",
+                   strict=True)
+def test_square_matmul_one_extent_arg_computes():
+    """#5: an N x N matmul that bounds both output axes by one extent arg should compute
+    correctly (currently refused, forcing PADDED workarounds)."""
+    NN = KK = 64
+    torch.manual_seed(0)
+    A = torch.randn(NN, KK, device="cpu", dtype=torch.float32)
+    B = torch.randn(KK, NN, device="cpu", dtype=torch.float32)
+    C = torch.empty(NN, NN, device="cpu", dtype=torch.float32)
+    _mm_square[(NN // 32, NN // 32)](
+        A, B, C, NN, KK,
+        A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+        BM=32, BN=32, BK=32,
+    )
+    assert (C - A @ B).abs().max().item() < 1e-3
+
+
+@triton.jit
 def _fa_shared_kv(
     Q, KV, Out,
     sqz, sqh, sqm, sqk,
