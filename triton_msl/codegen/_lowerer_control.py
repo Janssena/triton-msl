@@ -87,6 +87,26 @@ class _ControlFlowMixin:
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
+            # Loop-carried POINTER (e.g. ``ptrs += BLOCK * stride`` advanced across the
+            # scf.for) is not supported by the register-array lowering: the carried pointer
+            # is mis-lowered as a per-thread scalar VALUE (declared ``float`` and then
+            # subscripted), which is silently wrong at some tile sizes and a Metal compile
+            # error at others (GitHub issue #4.2). The matmul / FlashAttention templates use
+            # this idiom too but rebuild addresses internally and never reach the generic
+            # scf.for lowering. Refuse rather than emit silently-wrong output.
+            if self.env_is_ptr.get(init_id) is not None or init_id in getattr(
+                self, "env_ptr_array", {}
+            ):
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "loop-carried pointer (a pointer advanced across an scf.for, e.g. "
+                    "`p += BLOCK * stride` at the end of the loop body) is not supported by "
+                    "the register-array lowering and would be silently wrong. Refusing. "
+                    "Rebuild the address from a base each iteration instead -- move the "
+                    "pointer computation inside the loop: `p = base + (k + offs) * stride`.",
+                    op_name="scf.for",
+                )
             init_val = self._lookup(init_id)
             # Prefer result type, fall back to init value type
             init_type = self.env_types.get(init_id, "fp32")

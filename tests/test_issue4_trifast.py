@@ -124,6 +124,34 @@ def test_over_31_buffer_args_refuses_clearly(tmp_path):
 
 
 @triton.jit
+def _loopcarry_ptr(in_ptr, out_ptr, STEPS: tl.constexpr, BLOCK: tl.constexpr):
+    """A pointer advanced across the loop (`p += BLOCK`) -- the tutorial idiom."""
+    offs = tl.arange(0, BLOCK)
+    p = in_ptr + offs
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for _ in range(0, STEPS):
+        acc += tl.load(p)
+        p += BLOCK
+    tl.store(out_ptr + offs, acc)
+
+
+@requires
+@pytest.mark.parametrize("nw", [4, 8])
+def test_loop_carried_pointer_correct_or_refuse(nw):
+    """#2: a loop-carried pointer must compute correctly OR refuse -- it must not lower to
+    a per-thread scalar (silent-wrong at num_warps=4, compile error at num_warps=8)."""
+    BLOCK, STEPS = 256, 4
+    torch.manual_seed(0)
+    x = torch.randn(STEPS * BLOCK, device="cpu", dtype=torch.float32)
+    out = torch.empty(BLOCK, device="cpu", dtype=torch.float32)
+    try:
+        _loopcarry_ptr[(1,)](x, out, STEPS=STEPS, BLOCK=BLOCK, num_warps=nw)
+    except MetalNonRecoverableError:
+        return  # refused loudly -- contract satisfied
+    assert (out - x.reshape(STEPS, BLOCK).sum(0)).abs().max().item() < 1e-3
+
+
+@triton.jit
 def _mm_square(a_ptr, b_ptr, c_ptr, N, K, sam, sak, sbk, sbn, scm, scn,
                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """Square (N x N) matmul whose output mask bounds BOTH axes by the single extent
