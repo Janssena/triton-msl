@@ -127,6 +127,36 @@ class _TemplateMixin:
             return ("simdgroup", descriptors)
         return ("scalar", descriptors)
 
+    def _k_extent_line(self, info, BLOCK_K, has_K):
+        """MSL statement setting ``_K`` (the matmul reduction extent), resolved
+        STRUCTURALLY from the scf.for upper bound (``k_extent_arg``, works for any arg
+        name); the name-based ``has_K`` is kept only as a no-regression fallback. Refuses
+        when a runtime reduction extent can't be resolved, rather than silently reducing
+        over a single BLOCK_K tile (GitHub issue #4.1 -- renaming the reduction extent
+        ``K -> DIM`` dropped the K-loop and returned ``A[:, :BLOCK_K] @ B[:BLOCK_K, :]``
+        with no error). Single source of truth for every matmul template's ``_K``."""
+        k_extent_arg = info.get("k_extent_arg")
+        scf_iters = info.get("scf_iters")
+        has_k_loop = bool(info.get("has_k_loop"))
+        if k_extent_arg is not None:
+            return f"    uint _K = (uint){k_extent_arg};"
+        if has_K:  # legacy fallback: arg literally named K (structural trace missed it)
+            return "    uint _K = (uint)K;"
+        if has_k_loop and scf_iters is not None and scf_iters >= 1:
+            return f"    uint _K = {BLOCK_K * scf_iters}u;  // BLOCK_K * scf.for iters"
+        if not has_k_loop:
+            return f"    uint _K = {BLOCK_K}u;  // single, non-looped dot tile"
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(
+            "matmul K-loop reduction extent could not be resolved: it is neither a "
+            "compile-time constant nor traceable to a kernel argument, so reducing over "
+            "a single BLOCK_K tile would be silently wrong. Refusing. Pass the reduction "
+            "size as a scalar kernel argument used directly as the loop bound, e.g. "
+            "`for k in range(0, DIM, BK)`.",
+            op_name="tt.dot",
+        )
+
     def _refuse_if_pid_tiles_baked_output(self, has_M, has_N, what):
         """Single-source integrity guard for every matmul template that emits the
         whole baked output from a single threadgroup. If the kernel tiles the
@@ -246,14 +276,7 @@ class _TemplateMixin:
 
         lines.append(f"    uint _M = {'(uint)M' if has_M else f'{BLOCK_M}u'};")
         lines.append(f"    uint _N = {'(uint)N' if has_N else f'{BLOCK_N}u'};")
-        if has_K:
-            lines.append("    uint _K = (uint)K;")
-        else:
-            scf_iters = info.get("scf_iters")
-            if has_k_loop and scf_iters and scf_iters > 1:
-                lines.append(f"    uint _K = {BLOCK_K * scf_iters}u;")
-            else:
-                lines.append(f"    uint _K = {BLOCK_K}u;")
+        lines.append(self._k_extent_line(info, BLOCK_K, has_K))
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
         lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
         lines.append("")
@@ -676,17 +699,7 @@ class _TemplateMixin:
             lines.append(f"    uint _N = (uint)N;")
         else:
             lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")
-        scf_iters = info.get("scf_iters")
-        if has_K:
-            lines.append(f"    uint _K = (uint)K;")
-        elif scf_iters and scf_iters > 1:
-            # K is a constexpr / not a runtime scalar arg, but the
-            # ``scf.for`` body iterates ``scf_iters`` times across BLOCK_K
-            # chunks. Total K = BLOCK_K * scf_iters
-            # (``test_dot_mulbroadcasted`` baked K=160 in as constexpr).
-            lines.append(f"    uint _K = {BLOCK_K * scf_iters}u;  // BLOCK_K * scf.for iters")
-        else:
-            lines.append(f"    uint _K = {BLOCK_K}u;  // no K arg, single tile")
+        lines.append(self._k_extent_line(info, BLOCK_K, has_K))
 
         # Leading dims for the simdgroup loads/stores = each operand's ROW stride.
         # This path only handles contiguous-INNER operands (the stride-aware gate routed

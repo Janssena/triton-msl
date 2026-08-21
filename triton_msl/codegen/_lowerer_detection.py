@@ -1002,6 +1002,39 @@ class _DetectionMixin:
 
         scf_iters = _const_scf_iters(scf_for_ssa)
 
+        def _scf_upper_arg(scf_op):
+            """Trace the scf.for upper bound (the reduction extent) to a runtime scalar
+            kernel arg, through index/int casts. Returns the arg NAME, else None. This
+            resolves the reduction extent STRUCTURALLY (any arg name) rather than by
+            matching the name ``K`` -- renaming the reduction extent must not silently
+            drop the K-loop (GitHub issue #4.1)."""
+            if not scf_op or not scf_op.operand_ids or len(scf_op.operand_ids) < 2:
+                return None
+            arg_by_id = {a.id: a for a in self.graph.args}
+            op_by_id = {s.id: s for s in self.graph.ops}
+            _casts = {
+                "arith.index_cast",
+                "arith.index_castui",
+                "arith.extsi",
+                "arith.extui",
+                "arith.trunci",
+                "builtin.unrealized_conversion_cast",
+            }
+            cur, seen = scf_op.operand_ids[1], set()
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                a = arg_by_id.get(cur)
+                if a is not None:
+                    return a.name
+                o = op_by_id.get(cur)
+                if o is not None and o.op in _casts and o.operand_ids:
+                    cur = o.operand_ids[0]
+                    continue
+                break
+            return None
+
+        k_extent_arg = _scf_upper_arg(scf_for_ssa)
+
         if scf_for_ssa:
             # Check if the scf.for body contains tt.dot
             dot_in_loop = None
@@ -1096,6 +1129,10 @@ class _DetectionMixin:
                 "has_k_loop": True,
                 "scalar_args": scalar_arg_map,
                 "all_scalar_args": scalar_args,
+                # Reduction extent traced structurally from the scf.for upper bound
+                # (arg name, or None). Used by the template so K/DIM/depth/... all work
+                # and an unresolvable extent refuses instead of reducing one tile.
+                "k_extent_arg": k_extent_arg,
                 # When K is a constexpr (not a runtime scalar arg) the
                 # template can\'t read it from a buffer. Pre-compute the
                 # full ``_K = BLOCK_K * scf_iters`` from the scf.for
