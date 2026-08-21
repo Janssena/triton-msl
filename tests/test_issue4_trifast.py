@@ -144,14 +144,9 @@ def test_loop_carried_pointer_correct_or_refuse(nw):
     torch.manual_seed(0)
     x = torch.randn(STEPS * BLOCK, device="cpu", dtype=torch.float32)
     out = torch.empty(BLOCK, device="cpu", dtype=torch.float32)
-    try:
-        _loopcarry_ptr[(1,)](x, out, STEPS=STEPS, BLOCK=BLOCK, num_warps=nw)
-    except MetalNonRecoverableError:
-        # num_warps=8 is 1 element/thread (scalar pointer) -> offset-carry MUST work, not
-        # refuse; num_warps=4 is multi-element/thread (MEPT array offset) -> refuse is ok.
-        if nw == 8:
-            raise
-        return
+    # Offset-carry now handles BOTH the scalar (num_warps=8, 1 elem/thread) and the MEPT
+    # (num_warps=4, per-thread offset array) case -- the loop-carried pointer must compute.
+    _loopcarry_ptr[(1,)](x, out, STEPS=STEPS, BLOCK=BLOCK, num_warps=nw)
     assert (out - x.reshape(STEPS, BLOCK).sum(0)).abs().max().item() < 1e-3
 
 

@@ -88,6 +88,10 @@ class _ControlFlowMixin:
         # OFFSET (uint), not a value -- base is loop-invariant. index -> base MSL expr.
         ptr_offset_iter_indices = set()
         ptr_offset_iter_base = {}
+        # MEPT (tile > threadgroup) loop-carried pointer: carry a per-thread offset ARRAY
+        # ``uint off[n]``. index -> (base expr, n).
+        ptr_offset_arr_iter_indices = set()
+        ptr_offset_arr_iter = {}
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
@@ -112,19 +116,19 @@ class _ControlFlowMixin:
                 ptr_offset_iter_indices.add(i)
                 ptr_offset_iter_base[i] = _base
                 continue
-            if init_id in getattr(self, "env_ptr_array", {}):
-                # Multi-element-per-thread pointer TENSOR (tile > threadgroup): the offset is
-                # a per-thread ARRAY; that carry is not implemented yet, so refuse rather
-                # than mis-lower (issue #4.2). Rebuild the address from a base each iteration.
-                from triton_msl.errors import MetalNonRecoverableError
-
-                raise MetalNonRecoverableError(
-                    "loop-carried pointer tensor larger than the threadgroup (multi-element "
-                    "per thread) is not yet supported by the register-array lowering. "
-                    "Refusing. Rebuild the address from a base each iteration instead: move "
-                    "the pointer computation inside the loop (`p = base + (k + offs) * stride`).",
-                    op_name="scf.for",
-                )
+            _parr = getattr(self, "env_ptr_array", {}).get(init_id)
+            if _parr is not None:
+                # MEPT (tile > threadgroup) loop-carried pointer: the offset is a per-thread
+                # ARRAY. Carry ``uint off[n]`` (seeded from the init's offset array); map the
+                # block-arg to (base, off, n) so tt.load reads ``base[off[e]]`` and ``p += X``
+                # updates ``off[e]`` at the yield. Array analog of the scalar case (#4.2).
+                _base, _off_arr, _n = _parr
+                _off_var = self._var_array("off", [f"{_off_arr}[{e}]" for e in range(_n)], "uint")
+                iter_vars.append(_off_var)
+                iter_dtypes.append("i32")
+                ptr_offset_arr_iter_indices.add(i)
+                ptr_offset_arr_iter[i] = (_base, _n)
+                continue
             init_val = self._lookup(init_id)
             # Prefer result type, fall back to init value type
             init_type = self.env_types.get(init_id, "fp32")
@@ -257,6 +261,10 @@ class _ControlFlowMixin:
                     # tt.load/addptr in the body consume env_is_ptr, the yield updates off_var.
                     if i in ptr_offset_iter_indices:
                         self.env_is_ptr[ba_id] = (ptr_offset_iter_base[i], var)
+                    if i in ptr_offset_arr_iter_indices:
+                        _b, _n = ptr_offset_arr_iter[i]
+                        self.env_ptr_array[ba_id] = (_b, var, _n)
+                        self.env_n_elems[ba_id] = _n
                     # Register shared-memory-backed iter_args
                     if i in smem_iter_indices:
                         init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
@@ -386,6 +394,22 @@ class _ControlFlowMixin:
                                         )
                                     self.kb.raw_line(f"        {iter_vars[i]} = (uint)({_ny[1]});")
                                     continue
+                                # Pointer offset-ARRAY iter-arg (MEPT): copy the advanced
+                                # pointer's per-thread offset array element-wise into off[e].
+                                if i in ptr_offset_arr_iter_indices:
+                                    _nya = self.env_ptr_array.get(yield_id)
+                                    if _nya is None:
+                                        from triton_msl.errors import MetalNonRecoverableError
+
+                                        raise MetalNonRecoverableError(
+                                            "loop-carried pointer-array yield is not a pointer; "
+                                            "refusing rather than mis-lower (issue #4.2).",
+                                            op_name="scf.for",
+                                        )
+                                    _, _noff, _nn = _nya
+                                    for _e in range(_nn):
+                                        self.kb.raw_line(f"        {iter_vars[i]}[{_e}] = {_noff}[{_e}];")
+                                    continue
                                 # MEPT register-array iter-arg: update v[e] per
                                 # element. The yielded value is itself an env_array
                                 # (the elementwise chain); copy element-wise. If it
@@ -436,6 +460,9 @@ class _ControlFlowMixin:
                     # (base, off_var) so a post-loop tt.load/addptr on the final pointer works.
                     if i in ptr_offset_iter_indices:
                         self.env_is_ptr[rid] = (ptr_offset_iter_base[i], var)
+                    if i in ptr_offset_arr_iter_indices:
+                        _b, _n = ptr_offset_arr_iter[i]
+                        self.env_ptr_array[rid] = (_b, var, _n)
                     # MEPT register-array iter-arg: expose the result as an
                     # env_array so the post-loop store reads ``v[e]``.
                     if i in mept_array_iter_indices:
