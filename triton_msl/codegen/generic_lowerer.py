@@ -5571,6 +5571,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "resolved unambiguously; refusing rather than emit silently-wrong output."
             )
 
+        # The biased tiled template is 2-D-grid (z = zh/H, h = zh%H, per-(z,h)
+        # bias/mask). A 3-D grid — a THIRD program_id, as in trifast's
+        # pid_j/pid_i/pid_h triangle-attention — maps the batch axes differently
+        # (bias shared across the i-axis; mask indexed pid_h//H_heads), which this
+        # template does NOT model. Routing it would silently mis-compute, so REFUSE
+        # until the 3-D-grid path (B-step 2) lands. 2-D-grid biased FA is unaffected.
+        n_pid = len({s.id for s in allops if s.op == "tt.get_program_id"})
+        if n_pid > 2:
+            _refuse("a 2-D program grid (a 3-D grid / triangle-i axis is not yet supported)")
+
         q_res = resolve_2d(load_addr(dot_qk.operand_ids[0]))
         k_res = resolve_2d(load_addr(dot_qk.operand_ids[1]))
         v_res = resolve_2d(load_addr(dot_pv.operand_ids[1]))

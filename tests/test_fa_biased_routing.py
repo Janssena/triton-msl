@@ -32,7 +32,7 @@ def _biased_fa(
     mask_ptr, m_sz, m_sh, m_sn,
     sm_scale, neg_inf, Z, H, N,
     DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BAD_TEMP: tl.constexpr = False,
+    BAD_TEMP: tl.constexpr = False, I3D: tl.constexpr = False,
 ):
     inv_ln2: tl.constexpr = 1.4426950408889634
     ln2: tl.constexpr = 0.6931471824645996
@@ -40,6 +40,8 @@ def _biased_fa(
     pid_zh = tl.program_id(1)
     z = pid_zh // H
     h = pid_zh % H
+    if I3D:  # a 3rd program_id (trifast's triangle-i axis) -> detector must refuse
+        z = z + tl.program_id(2)
     start_m = pid_m * BLOCK_M
     m_idxs = start_m + tl.arange(0, BLOCK_M)
     n_idxs = tl.arange(0, BLOCK_N)
@@ -146,6 +148,61 @@ def test_biased_fa_bad_temperature_refuses():
         "temperature" in str(w.message) or "Refusing" in str(w.message) for w in wl
     )
     assert refused, "bad-temperature biased FA must be refused, not silently mis-routed"
+
+
+def _build_biased_lowerer(**constexpr_overrides):
+    """Compile _biased_fa to TTGIR and wrap in a GenericLowerer (no MSL emission)."""
+    from triton._C.libtriton import ir
+    from triton.compiler import ASTSource
+    from triton.backends.compiler import GPUTarget
+    from triton_msl.backend.compiler import MetalBackend
+    from triton_msl.codegen.mlir_walker import walk_ttgir
+    from triton_msl.codegen.generic_lowerer import GenericLowerer
+
+    target = GPUTarget("metal", "apple-m4", 32)
+    backend = MetalBackend(target)
+    options = backend.parse_options({})
+    ptr = "*fp32"
+    sig = {}
+    def add(names, ty):
+        for n in names.split():
+            sig[n] = ty
+    add("o_ptr", ptr); add("o_sz o_sh o_sm o_sk", "i32")
+    add("lse_ptr", ptr); add("lse_sz lse_sh lse_sm", "i32")
+    add("q_ptr", ptr); add("q_sz q_sh q_sm q_sk", "i32")
+    add("k_ptr", ptr); add("k_sz k_sh k_sn k_sk", "i32")
+    add("v_ptr", ptr); add("v_sz v_sh v_sn v_sk", "i32")
+    add("b_ptr", ptr); add("b_sz b_sh b_sm b_sn", "i32")
+    add("mask_ptr", "*i8"); add("m_sz m_sh m_sn", "i32")
+    add("sm_scale", "fp32"); add("neg_inf", "fp32"); add("Z H N", "i32")
+    constexprs = {"DIM": 32, "BLOCK_M": 32, "BLOCK_N": 32, "BAD_TEMP": False, "I3D": False}
+    constexprs.update(constexpr_overrides)
+    s = ASTSource(fn=_biased_fa, signature=sig, constexprs=constexprs)
+    ctx = ir.context(); ir.load_dialects(ctx)
+    mod = s.make_ir(target, options, backend.get_codegen_implementation(options),
+                    backend.get_module_map(), ctx)
+    md = {}
+    mod = backend.make_ttir(mod, md, options)
+    mod = backend.make_ttgir(mod, md, options)
+    return GenericLowerer(walk_ttgir(mod, options), options)
+
+
+def test_biased_fa_3d_grid_refuses():
+    """A 3-D-grid biased FA (a trifast-style triangle-i axis) must REFUSE — the
+    2-D-grid biased template would mis-map the batch axes (bias shared across i,
+    mask pid_h//H). Guards the silent-wrong the 2-D router would otherwise cause."""
+    from triton_msl.errors import MetalNonRecoverableError
+
+    low = _build_biased_lowerer(I3D=True)
+    with pytest.raises(MetalNonRecoverableError, match="grid|3-D|triangle"):
+        low._detect_biased_flash_attention()
+
+
+def test_biased_fa_2d_grid_detects():
+    """Sanity: the SAME kernel with a 2-D grid (I3D=False) IS detected (not refused)."""
+    low = _build_biased_lowerer(I3D=False)
+    info = low._detect_biased_flash_attention()
+    assert info is not None and info["biased"] is True
 
 
 def test_detector_returns_none_for_standard_fa():
