@@ -167,6 +167,11 @@ class _TemplateMixin:
         block size). De-duplicated from three copies after the re-audit
         (2026-06-27) found the fused matmul+softmax twin was the one copy MISSING
         this guard -> multi-block silent-wrong."""
+        # An axis whose extent resolves STRUCTURALLY from the output store mask (any arg
+        # name, issue #4.5) is recoverable, so don't refuse it as "baked constexpr".
+        m_ext, n_ext = self._matmul_output_extent_args()
+        has_M = has_M or m_ext is not None
+        has_N = has_N or n_ext is not None
         pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops if s.op == "tt.get_program_id"}
         if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
             from triton_msl.errors import MetalNonRecoverableError
@@ -274,8 +279,11 @@ class _TemplateMixin:
         for arg in all_scalar_args:
             lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
 
-        lines.append(f"    uint _M = {'(uint)M' if has_M else f'{BLOCK_M}u'};")
-        lines.append(f"    uint _N = {'(uint)N' if has_N else f'{BLOCK_N}u'};")
+        # Output extents resolved structurally from the store mask (issue #4.5): any arg
+        # name works, so a square N x N matmul clips both axes correctly instead of _M=BLOCK_M.
+        m_ext, n_ext = self._matmul_output_extent_args()
+        lines.append(f"    uint _M = {f'(uint){m_ext}' if m_ext else ('(uint)M' if has_M else f'{BLOCK_M}u')};")
+        lines.append(f"    uint _N = {f'(uint){n_ext}' if n_ext else ('(uint)N' if has_N else f'{BLOCK_N}u')};")
         lines.append(self._k_extent_line(info, BLOCK_K, has_K))
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
         lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
@@ -691,11 +699,16 @@ class _TemplateMixin:
         # emit wrong numbers. Shared guard (_refuse_if_pid_tiles_baked_output).
         self._refuse_if_pid_tiles_baked_output(has_M, has_N, "K-loop matmul")
 
-        if has_M:
+        m_ext, n_ext = self._matmul_output_extent_args()  # structural extents (issue #4.5)
+        if m_ext:
+            lines.append(f"    uint _M = (uint){m_ext};")
+        elif has_M:
             lines.append(f"    uint _M = (uint)M;")
         else:
             lines.append(f"    uint _M = {BLOCK_M}u;  // no M arg, single tile")
-        if has_N:
+        if n_ext:
+            lines.append(f"    uint _N = (uint){n_ext};")
+        elif has_N:
             lines.append(f"    uint _N = (uint)N;")
         else:
             lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")

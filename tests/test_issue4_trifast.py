@@ -170,11 +170,6 @@ def _mm_square(a_ptr, b_ptr, c_ptr, N, K, sam, sak, sbk, sbn, scm, scn,
 
 
 @requires
-@pytest.mark.xfail(reason="#4.5 not yet fixed: square matmul with one extent arg for both "
-                          "axes is refused because the template resolves _M by the arg NAME "
-                          "'M' (absent) -> BLOCK_M, then the mask guard correctly refuses. "
-                          "Fix = resolve _M/_N structurally from the store mask, like #4.1's _K.",
-                   strict=True)
 def test_square_matmul_one_extent_arg_computes():
     """#5: an N x N matmul that bounds both output axes by one extent arg should compute
     correctly (currently refused, forcing PADDED workarounds)."""

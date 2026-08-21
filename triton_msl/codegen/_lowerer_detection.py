@@ -592,6 +592,132 @@ class _DetectionMixin:
                     op_name="tt.dot",
                 )
 
+    # Wrappers a tile index can pass through on the way to its make_range. Kept in sync
+    # with the ``_IDX_WRAP`` closure inside ``_template_output_mask_nontrivial`` (the mask
+    # guard) -- ``_tile_index_info`` and that closure MUST agree, since the guard's
+    # acceptance and this resolver's ``_M``/``_N`` must pick the SAME arg (GitHub issue #4.5).
+    _MASK_IDX_WRAP = (
+        "arith.addi",
+        "arith.subi",
+        "arith.muli",
+        "tt.broadcast",
+        "ttg.convert_layout",
+        "tt.reshape",
+        "tt.splat",
+        "tt.expand_dims",
+    )
+
+    def _tile_index_info(self, start_id, by_id):
+        """Trace an SSA value to a ``tt.make_range`` tile index. Returns
+        ``(extent, axis, has_pid)`` -- axis = 1 for a ``[:, None]`` ROW index, 0 for a
+        ``[None, :]`` COL index, None if 1-D -- or None if no make_range is reachable (the
+        operand is a scalar bound, not a tile index). Mirrors the guard's ``_index_info``."""
+        seen, stack = set(), [start_id]
+        has_range = has_pid = False
+        extent = axis = None
+        while stack:
+            vid = stack.pop()
+            if vid in seen:
+                continue
+            seen.add(vid)
+            o = by_id.get(vid)
+            if o is None:
+                continue
+            if o.op == "tt.make_range":
+                has_range = True
+                try:
+                    extent = int(o.attrs.get("end")) - int(o.attrs.get("start"))
+                except (TypeError, ValueError):
+                    extent = None
+                continue
+            if o.op in ("tt.get_program_id", "tt.program_id", "tt.get_num_programs"):
+                has_pid = True
+                continue
+            if o.op == "tt.expand_dims":
+                try:
+                    axis = int(o.attrs.get("axis"))
+                except (TypeError, ValueError):
+                    pass
+                stack.extend(o.operand_ids or [])
+                continue
+            if o.op in self._MASK_IDX_WRAP:
+                stack.extend(o.operand_ids or [])
+                continue
+        return (extent, axis, has_pid) if has_range else None
+
+    def _trace_bound_arg(self, bound_id, by_id, arg_by_id):
+        """Trace a mask comparison's BOUND through layout-only wrappers to the kernel arg it
+        is; returns the arg (``.name``/``.index``) or None (a constant / expression). Same
+        wrapper set as the guard's ``_bound_ok`` trace -- they MUST agree."""
+        seen, cur = set(), bound_id
+        o = by_id.get(cur)
+        while (
+            o is not None
+            and o.id not in seen
+            and o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.reshape")
+            and o.operand_ids
+        ):
+            seen.add(o.id)
+            cur = o.operand_ids[0]
+            o = by_id.get(cur)
+        return arg_by_id.get(cur)
+
+    def _matmul_output_extent_args(self):
+        """Resolve the output row/col extent ARGS structurally from the matmul's output
+        ``tt.store`` mask (GitHub issue #4.5). A square ``N x N`` matmul that clips both axes
+        by one runtime arg then lowers with ``_M``/``_N`` = that arg, instead of the template
+        guessing ``_M = BLOCK_M`` off the missing name 'M' (which drops rows past the first
+        tile). Returns ``(m_extent_arg, n_extent_arg)`` -- the arg NAME bounding rows / cols,
+        or None. Only a clean single runtime-arg bound resolves; const bounds / value masks
+        return None so the mask guard keeps its refuse behavior for those."""
+
+        def _flat(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _flat(s.region_ops)
+                if s.else_ops:
+                    yield from _flat(s.else_ops)
+
+        allops = list(_flat(self.graph.ops))
+        by_id = {s.id: s for s in allops}
+        arg_by_id = {a.id: a for a in self.graph.args}
+        m_arg = n_arg = None
+        for st in allops:
+            if st.op != "tt.store" or len(st.operand_ids or []) < 3:
+                continue
+            stack, seen = [st.operand_ids[2]], set()
+            while stack:
+                mid = stack.pop()
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                o = by_id.get(mid)
+                if o is None:
+                    continue
+                if o.op in ("arith.andi", "tt.broadcast", "ttg.convert_layout", "tt.reshape", "tt.expand_dims"):
+                    stack.extend(o.operand_ids or [])
+                    continue
+                if o.op != "arith.cmpi" or len(o.operand_ids or []) < 2:
+                    continue
+                op0, op1 = o.operand_ids[0], o.operand_ids[1]
+                i0 = self._tile_index_info(op0, by_id)
+                i1 = self._tile_index_info(op1, by_id)
+                if i0 is not None and i1 is None:
+                    axis, bound_id = i0[1], op1
+                elif i1 is not None and i0 is None:
+                    axis, bound_id = i1[1], op0
+                else:
+                    continue
+                arg = self._trace_bound_arg(bound_id, by_id, arg_by_id)
+                if arg is None:
+                    continue
+                if axis == 0:  # [None, :] col index -> N
+                    n_arg = arg.name
+                else:  # [:, None] row index (axis 1) or 1-D -> M
+                    m_arg = arg.name
+        return m_arg, n_arg
+
     def _template_output_mask_nontrivial(self, is_fa):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
         RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
@@ -728,7 +854,11 @@ class _DetectionMixin:
                 o = by_id.get(cur)
             arg = arg_by_id.get(cur)
             if arg is not None:
-                return arg.name in ok_names
+                # A runtime-arg bound is trivially droppable for MATMUL: the template now
+                # clips _M/_N at exactly this arg (structural, _matmul_output_extent_args),
+                # so the mask is applied, not dropped -- for ANY arg name (issue #4.5). FA
+                # keeps the strict name match (its template clips by a fixed N_CTX boundary).
+                return True if not is_fa else (arg.name in ok_names)
             if o is not None and o.op == "arith.constant":
                 try:
                     val = int(o.attrs.get("value"))
