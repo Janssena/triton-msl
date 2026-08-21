@@ -863,6 +863,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "bf16 at any head_dim. Refusing to emit silently-wrong output. "
                     "Use fp16 or fp32 for Q/K/V in attention."
                 )
+            # BIASED / triangle attention (trifast): a bias tile as the QK dot's C
+            # operand + a loaded mask -> -inf + a per-row lse + a const result-scale
+            # (inv_ln2) with exp2. Route to the tiled template WITH bias/mask/lse
+            # fused into the online-softmax loop, BEFORE the dot-result-scale guard
+            # below (which would otherwise refuse the inv_ln2 scale). Returns None
+            # for a non-biased FA (the QK dot's C is a zero/loop-acc, not a load), so
+            # standard FA flows through unchanged; raises on any ambiguity.
+            _biased_info = self._detect_biased_flash_attention()
+            if _biased_info is not None:
+                return self._lower_biased_flash_attention_template(_biased_info)
             # FUSED-SCALE-ON-DOT-RESULT GATE (naming-independence follow-up): the generic
             # attention lowering silently mis-computes when a tt.dot RESULT feeds an
             # elementwise scale/bias before the softmax — e.g. the scores scaled INSIDE
@@ -5349,6 +5359,526 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "rope_dim": rope_dim,
             "mla_strides": {"q_rope": qr_strides, "k_rope": kr_strides} if is_mla else None,
         }
+
+    def _detect_biased_flash_attention(self):
+        """Recognize trifast-style BIASED / triangle FlashAttention and resolve it.
+
+        On top of standard FA (>=2 dots + exp + max) this pattern adds:
+          (a) an additive BIAS tile as the QK dot's C/accumulator operand
+              (``scores = tl.dot(q, kᵀ, bias)``) — the trigger; a standard FA's C
+              is a zero/loop-carried acc (no backing load), so a non-biased kernel
+              returns ``None`` here and flows to the normal path.
+          (b) a const result-scale ``c`` with exp base ``b`` (``scores*=c; exp_b``)
+              where ``c*ln(b) == 1`` — i.e. numerically identical to a natural-exp
+              softmax over ``(sm_scale*QK + bias)`` (trifast: c=1/ln2, exp2). A
+              mismatch (different temperature) is REFUSED.
+          (c) a loaded MASK tile applied ``-> -inf``.
+          (d) a per-query LSE store (a 1-D store distinct from the Out store).
+
+        Returns a fully-resolved dict (mapped to the tiled template's ABI
+        convention), ``None`` when the kernel is not this pattern, or raises
+        ``MetalNonRecoverableError`` on ANY ambiguity once the pattern is
+        confirmed (correct-or-refuse — a mis-read stride would silently mis-
+        compute). Handles loop-carried pointers (K/V/bias loaded inside the
+        K-loop address via scf.for block-args) and the direct-Kᵀ load
+        orientation (row=head_dim, col=kv) that trifast uses.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+        import math as _math
+
+        def _walk(ops):
+            for s in ops:
+                yield s
+                if getattr(s, "region_ops", None):
+                    yield from _walk(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    yield from _walk(s.else_ops)
+
+        allops = list(_walk(self.graph.ops))
+        dots = [s for s in allops if s.op == "tt.dot"]
+        has_exp = any(_op_is_exp(s.op) for s in allops)
+        has_max = any("max" in (s.op or "") for s in allops)
+        if not (len(dots) >= 2 and has_exp and has_max):
+            return None
+
+        op_by_id = {s.id: s for s in allops}
+        arg_by_id = {a.id: a for a in self.graph.args}
+        C1 = "c1"
+
+        # Loop-carried pointer: a load inside scf.for addresses via a block-arg;
+        # map each block-arg id -> its init value (the addptr chain before the loop).
+        blockarg_init = {}
+        for s in allops:
+            if s.op == "scf.for":
+                bids = (s.attrs or {}).get("block_arg_ids", [])
+                inits = list(s.operand_ids or [])[3:]
+                for i, init_id in enumerate(inits):
+                    if i + 1 < len(bids):
+                        blockarg_init[bids[i + 1]] = init_id
+
+        def skip_layout(sid):
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                if sid in blockarg_init:
+                    sid = blockarg_init[sid]
+                    continue
+                op = op_by_id.get(sid)
+                if op is not None and op.op == "ttg.convert_layout" and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                break
+            return sid
+
+        def stride_from_term(tid):
+            tid = skip_layout(tid)
+            op = op_by_id.get(tid)
+            if op is None:
+                return None
+            if op.op == "tt.broadcast" and op.operand_ids:
+                return stride_from_term(op.operand_ids[0])
+            if op.op != "arith.muli":
+                return C1
+            for oid in op.operand_ids:
+                sub = op_by_id.get(oid)
+                if sub is not None and sub.op == "tt.splat" and sub.operand_ids:
+                    a = arg_by_id.get(sub.operand_ids[0])
+                    if a is not None and not a.is_ptr:
+                        return a.index
+            return None
+
+        def scalar_stride_from_muli(mid):
+            op = op_by_id.get(mid)
+            if op is None or op.op != "arith.muli":
+                return None
+            for oid in op.operand_ids:
+                a = arg_by_id.get(oid)
+                if a is not None and not a.is_ptr:
+                    return a.index
+            return None
+
+        def _base_and_scalar(scal_id):
+            """scalar batch chain: addptr(addptr(PTR, muli(off_z,SZ)), muli(off_h,SH))
+            (2-level) OR addptr(PTR, muli(off_hz,SZ)) (1-level, h folded). Returns
+            (base_arg, z_stride, h_stride) or None."""
+            scal = op_by_id.get(scal_id)
+            if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                return None
+            outer = scalar_stride_from_muli(scal.operand_ids[1])
+            inner_arg = arg_by_id.get(scal.operand_ids[0])
+            inner = op_by_id.get(scal.operand_ids[0])
+            if inner_arg is not None and inner_arg.is_ptr:
+                return inner_arg, outer, C1
+            if inner is not None and inner.op == "tt.addptr" and len(inner.operand_ids) >= 2:
+                z = scalar_stride_from_muli(inner.operand_ids[1])
+                base = arg_by_id.get(inner.operand_ids[0])
+                if base is not None and base.is_ptr:
+                    return base, z, outer
+            return None
+
+        def resolve_2d(addr_id):
+            """addptr(broadcast(addptr(splat(base), row_term)), col_term) ->
+            (base_idx, [z, h, row_stride, col_stride]). Orientation-agnostic
+            (row_stride may be 1 for a direct-Kᵀ load)."""
+            if addr_id is None:
+                return None
+            addr_id = skip_layout(addr_id)
+            op = op_by_id.get(addr_id)
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
+            col = stride_from_term(op.operand_ids[1])
+            row_side = skip_layout(op.operand_ids[0])
+            rop = op_by_id.get(row_side)
+            if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
+                row_side = skip_layout(rop.operand_ids[0])
+                rop = op_by_id.get(row_side)
+            if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
+                return None
+            row = stride_from_term(rop.operand_ids[1])
+            sb = op_by_id.get(rop.operand_ids[0])
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            bs = _base_and_scalar(sb.operand_ids[0])
+            if bs is None:
+                return None
+            base, z, h = bs
+            s = [z, h, row, col]
+            return None if any(x is None for x in s) else (base.index, s)
+
+        def resolve_1d(addr_id):
+            """addptr(splat(base), idx_term) -> (base_idx, [z, h, col_stride])."""
+            if addr_id is None:
+                return None
+            addr_id = skip_layout(addr_id)
+            op = op_by_id.get(addr_id)
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
+            col = stride_from_term(op.operand_ids[1])
+            sb = op_by_id.get(skip_layout(op.operand_ids[0]))
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            bs = _base_and_scalar(sb.operand_ids[0])
+            if bs is None:
+                return None
+            base, z, h = bs
+            s = [z, h, col]
+            return None if any(x is None for x in s) else (base.index, s)
+
+        def load_addr(oid, depth=0):
+            if depth > 32:
+                return None
+            sid = oid
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                if sid in blockarg_init:
+                    sid = blockarg_init[sid]
+                    continue
+                op = op_by_id.get(sid)
+                if op is None:
+                    break
+                if op.op in (
+                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
+                ) and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                if op.op == "tt.load" and op.operand_ids:
+                    return op.operand_ids[0]
+                if op.op == "arith.mulf":
+                    for o in op.operand_ids:
+                        r = load_addr(o, depth + 1)
+                        if r is not None:
+                            return r
+                    return None
+                break
+            return None
+
+        order = {s.id: i for i, s in enumerate(allops)}
+        dot_qk, dot_pv = sorted(dots, key=lambda d: order[d.id])[:2]
+
+        # --- BIAS trigger: the QK dot's C operand must trace to a load. --------
+        if len(dot_qk.operand_ids) < 3:
+            return None
+        bias_addr = load_addr(dot_qk.operand_ids[2])
+        if bias_addr is None:
+            return None  # C is a zero/loop-acc (standard FA) -> not the biased pattern
+
+        # Past here the kernel IS biased-FA: any unresolved field is a hard refuse.
+        def _refuse(field):
+            raise MetalNonRecoverableError(
+                f"Biased/triangle FlashAttention recognized but {field} could not be "
+                "resolved unambiguously; refusing rather than emit silently-wrong output."
+            )
+
+        q_res = resolve_2d(load_addr(dot_qk.operand_ids[0]))
+        k_res = resolve_2d(load_addr(dot_qk.operand_ids[1]))
+        v_res = resolve_2d(load_addr(dot_pv.operand_ids[1]))
+        b_res = resolve_2d(bias_addr)
+        if q_res is None:
+            _refuse("the Q pointer/strides")
+        if k_res is None:
+            _refuse("the K pointer/strides")
+        if v_res is None:
+            _refuse("the V pointer/strides")
+        if b_res is None:
+            _refuse("the bias pointer/strides")
+
+        # Out + lse: exactly two tt.store — a 2-D Out store and a 1-D lse store.
+        stores = [s for s in allops if s.op == "tt.store"]
+        o_res = lse_res = None
+        for st_ in stores:
+            if not st_.operand_ids:
+                continue
+            r2 = resolve_2d(st_.operand_ids[0])
+            r1 = resolve_1d(st_.operand_ids[0])
+            if r2 is not None and o_res is None:
+                o_res = r2
+            elif r1 is not None and lse_res is None:
+                lse_res = r1
+        if o_res is None:
+            _refuse("the Out store pointer/strides")
+        if lse_res is None:
+            _refuse("the lse store pointer/strides")
+
+        # Mask: exactly one tt.load of an i1/i8 (bool) tensor.
+        mask_loads = [
+            s for s in allops
+            if s.op == "tt.load" and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))
+        ]
+        if len(mask_loads) != 1:
+            _refuse("a single boolean mask load")
+        m_res = resolve_1d(mask_loads[0].operand_ids[0])
+        if m_res is None:
+            _refuse("the mask pointer/strides")
+
+        # Runtime Q-scale: mulf(load(Q), splat(scale_arg)).
+        scale_arg = None
+        for s in allops:
+            if s.op == "arith.mulf" and s.operand_ids:
+                has_load = any(load_addr(o) is not None for o in s.operand_ids)
+                if not has_load:
+                    continue
+                for o in s.operand_ids:
+                    sp = op_by_id.get(skip_layout(o))
+                    if sp is not None and sp.op == "tt.splat" and sp.operand_ids:
+                        a = arg_by_id.get(sp.operand_ids[0])
+                        if a is not None and not a.is_ptr and not str(a.elem_type).startswith("i"):
+                            scale_arg = a.index
+                            break
+            if scale_arg is not None:
+                break
+        if scale_arg is None:
+            _refuse("the runtime softmax scale (q * scale)")
+
+        # Result-scale const + exp base: verify c*ln(base) == 1 (== natural softmax
+        # over (sm_scale*QK + bias)). No result-scale + natural exp is also valid.
+        result_const = None
+        for s in allops:
+            if s.op in ("arith.mulf",) and dot_qk.id in (s.operand_ids or []):
+                for o in s.operand_ids:
+                    if o == dot_qk.id:
+                        continue
+                    cop = op_by_id.get(skip_layout(o))
+                    if cop is not None and cop.op == "tt.splat" and cop.operand_ids:
+                        cc = op_by_id.get(cop.operand_ids[0])
+                        if cc is not None and cc.op == "arith.constant":
+                            result_const = cc.attrs.get("value")
+                    elif cop is not None and cop.op == "arith.constant":
+                        result_const = cop.attrs.get("value")
+        if any(s.op == "math.exp2" for s in allops):
+            exp_base = 2.0
+        elif any(s.op in ("math.exp", "tt.exp") for s in allops):
+            exp_base = _math.e
+        else:
+            _refuse("the softmax exp op")
+        c_eff = float(result_const) if result_const is not None else 1.0
+        if abs(c_eff * _math.log(exp_base) - 1.0) > 1e-4:
+            _refuse(
+                f"a softmax temperature of 1 (result-scale {c_eff} with exp base "
+                f"{exp_base:.4f} gives c*ln(base)={c_eff * _math.log(exp_base):.5f}, "
+                "not 1 — the biased template computes natural softmax over sm_scale*QK+bias)"
+            )
+
+        # --- tile dims from the dot shapes -----------------------------------
+        a_shape = _extract_shape(self._find_op_type_str(dot_qk.operand_ids[0]))
+        qk_out = _extract_shape(dot_qk.type_str or "")
+        pv_out = _extract_shape(dot_pv.type_str or "")
+        k_shape = _extract_shape(self._find_op_type_str(dot_qk.operand_ids[1]))
+        if not (a_shape and len(a_shape) == 2 and qk_out and len(qk_out) == 2
+                and pv_out and len(pv_out) == 2 and k_shape and len(k_shape) == 2):
+            _refuse("the dot tile shapes")
+        block_m, head_dim = a_shape
+        block_n = qk_out[1]
+        v_head_dim = pv_out[1]
+        if qk_out[0] != block_m or pv_out[0] != block_m:
+            _refuse("a consistent block_m across the two dots")
+        if v_head_dim != head_dim:
+            _refuse("a symmetric head_dim (v_head_dim must equal qk head_dim)")
+        # Direct-Kᵀ orientation check: the K operand is [head_dim, block_n].
+        if k_shape[0] != head_dim or k_shape[1] != block_n:
+            _refuse(
+                f"the direct-Kᵀ orientation (K operand shape {k_shape} != "
+                f"[head_dim={head_dim}, block_n={block_n}] — a transposed/canonical K "
+                "load is not handled by the biased path)"
+            )
+
+        # --- N_CTX (the K-loop upper bound) + H (zh // H decomposition) -------
+        def _arg_through_casts(sid):
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                a = arg_by_id.get(sid)
+                if a is not None:
+                    return a.index if not a.is_ptr else None
+                op = op_by_id.get(sid)
+                if op is not None and op.op in ("arith.extsi", "arith.trunci", "arith.index_cast") and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                break
+            return None
+
+        n_ctx_arg = None
+        for s in allops:
+            if s.op == "scf.for" and len(s.operand_ids or []) >= 2:
+                n_ctx_arg = _arg_through_casts(s.operand_ids[1])
+                if n_ctx_arg is not None:
+                    break
+        if n_ctx_arg is None:
+            _refuse("the N_CTX loop bound")
+
+        h_arg = None
+        h_div_exists = False
+        for s in allops:
+            if s.op in ("arith.divui", "arith.remui", "arith.divsi", "arith.remsi") and s.operand_ids:
+                pid_side = any(
+                    (op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id")
+                    for o in s.operand_ids
+                )
+                if not pid_side:
+                    continue
+                h_div_exists = True
+                for o in s.operand_ids:
+                    a = arg_by_id.get(o)
+                    if a is not None and not a.is_ptr:
+                        h_arg = a.index
+                        break
+            if h_arg is not None:
+                break
+        if h_arg is None:
+            if h_div_exists:
+                # A pid decomposition exists but its divisor isn't a resolvable arg.
+                _refuse("the H (heads) decomposition arg (zh // H)")
+            # No pid division at all -> H was equal_to_1-specialized (single head):
+            # z = pid_zh, h = 0. Bind H = 1u (the template computes h = zh % 1 = 0).
+            h_arg = C1
+
+        # DISTINCT pointer roles (7): Q, K, V, Out, bias, mask, lse.
+        roles = [q_res[0], k_res[0], v_res[0], o_res[0], b_res[0], m_res[0], lse_res[0]]
+        if len(set(roles)) != 7:
+            _refuse("seven distinct pointer roles (q,k,v,out,bias,mask,lse)")
+
+        out_dtype = "f16" if str(self.graph.args[o_res[0]].elem_type) in ("fp16", "f16") else "f32"
+
+        return {
+            "biased": True,
+            "q": q_res[0], "k": k_res[0], "v": v_res[0], "out": o_res[0],
+            "bias": b_res[0], "mask": m_res[0], "lse": lse_res[0],
+            # strides in resolver order; the template mapping handles the Kᵀ swap.
+            "q_strides": q_res[1], "k_strides": k_res[1], "v_strides": v_res[1],
+            "o_strides": o_res[1], "b_strides": b_res[1],
+            "m_strides": m_res[1], "lse_strides": lse_res[1],
+            "scale_arg": scale_arg,
+            "N_CTX": n_ctx_arg, "H": h_arg,
+            "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
+            "out_dtype": out_dtype, "causal": False,
+        }
+
+    def _lower_biased_flash_attention_template(self, info: dict) -> str:
+        """Emit the biased/triangle-attention tiled FA MSL for a detected biased-FA
+        kernel (``info`` from ``_detect_biased_flash_attention``) + set the
+        compile_shader dispatch descriptor.
+
+        ABI: pointers (Q,K,V,Out,Bias,Mask,Lse) keep individual buffers in their
+        kernel-arg order; when the kernel has > 31 runtime args, ALL scalars pack
+        into ONE ``constant uint*`` buffer AFTER the pointers, matching
+        ``driver._pack_overflow_scalars`` (scalars in arg order; ints by value,
+        the float scale by bit pattern -> ``as_type<float>``). The Kᵀ stride swap
+        (template k_sk=head-dim row, k_sn=kv col) is applied from the detector's
+        resolver-order strides.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+        from triton_msl.codegen.msl_types import triton_type_to_msl
+        from triton_msl.codegen._msl_templates import make_flash_attention_kernel_tiled
+
+        MAX_BUFFERS = 31  # mirrors driver._MAX_METAL_BUFFERS
+        C1 = "c1"
+        args = self.graph.args
+        for i, a in enumerate(args):
+            if i != a.index:
+                raise MetalNonRecoverableError(
+                    "biased FlashAttention arg list is not densely indexed; refusing "
+                    "rather than risk a mis-bound buffer."
+                )
+
+        head_dim = info["head_dim"]
+        block_m, block_n = info["block_m"], info["block_n"]
+        role_name = {
+            info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
+            info["bias"]: "Bias", info["mask"]: "Mask", info["lse"]: "Lse",
+        }
+
+        # Partition args into pointers + scalars, matching the launcher's binding.
+        #  - <= 31 args: NO packing; the launcher binds kargs[i] -> buffer(i)
+        #    POSITIONALLY, so every arg (pointer or scalar) declares buffer(a.index).
+        #  - > 31 args: driver._pack_overflow_scalars returns [pointers..., packed],
+        #    so pointers take buffers 0..n_ptr-1 in arg order, the packed scalar
+        #    buffer is n_ptr, and packed[j] is the j-th scalar in arg order.
+        n_args = len(args)
+        n_ptr = sum(1 for a in args if a.is_ptr)
+        packed = n_args > MAX_BUFFERS
+        arg_decls = []
+        scalar_pos = {}  # scalar arg index -> j (packed slot); identity-ish when unpacked
+
+        def _ptr_decl(a, buf):
+            role = role_name.get(a.index)
+            if role is None:
+                raise MetalNonRecoverableError(
+                    "biased FlashAttention has a pointer arg with no resolved role; refusing."
+                )
+            if role == "Mask":
+                return f"    device const uchar* Mask [[buffer({buf})]]"
+            if role == "Lse":
+                return f"    device float* Lse [[buffer({buf})]]"
+            m = triton_type_to_msl(a.elem_type)
+            qual = "device" if role == "Out" else "device const"
+            return f"    {qual} {m}* {role} [[buffer({buf})]]"
+
+        if packed:
+            ptr_ord = 0
+            j = 0
+            for a in args:
+                if a.is_ptr:
+                    arg_decls.append(_ptr_decl(a, ptr_ord))
+                    ptr_ord += 1
+                else:
+                    scalar_pos[a.index] = j
+                    j += 1
+            arg_decls.append(f"    constant uint* _bpk [[buffer({n_ptr})]]")
+        else:
+            for a in args:
+                if a.is_ptr:
+                    arg_decls.append(_ptr_decl(a, a.index))
+                else:
+                    arg_decls.append(f"    constant uint& bsc_{a.index} [[buffer({a.index})]]")
+                    scalar_pos[a.index] = a.index
+
+        def _uint_expr(entry):
+            """A stride/dim entry -> MSL uint expression (packed slot / individual
+            buffer / baked 1u)."""
+            if entry == C1:
+                return "1u"
+            if isinstance(entry, int) and entry in scalar_pos:
+                return f"_bpk[{scalar_pos[entry]}]" if packed else f"bsc_{entry}"
+            raise MetalNonRecoverableError(
+                "biased FlashAttention stride/dim could not be mapped to a kernel arg; refusing."
+            )
+
+        def _scale_expr(entry):
+            """The runtime scale is a FLOAT scalar -> reinterpret the packed bits."""
+            if isinstance(entry, int) and entry in scalar_pos:
+                return f"as_type<float>(_bpk[{scalar_pos[entry]}])" if packed else f"as_type<float>(bsc_{entry})"
+            raise MetalNonRecoverableError("biased FlashAttention runtime scale arg unmapped; refusing.")
+
+        qs, ks, vs = info["q_strides"], info["k_strides"], info["v_strides"]
+        os_, bs, ms, ls = info["o_strides"], info["b_strides"], info["m_strides"], info["lse_strides"]
+        bindings = {
+            "q_sz": _uint_expr(qs[0]), "q_sh": _uint_expr(qs[1]), "q_sm": _uint_expr(qs[2]), "q_sk": _uint_expr(qs[3]),
+            # Kᵀ: resolver row (ks[2]) = head-dim stride -> k_sk; col (ks[3]) = kv stride -> k_sn.
+            "k_sz": _uint_expr(ks[0]), "k_sh": _uint_expr(ks[1]), "k_sn": _uint_expr(ks[3]), "k_sk": _uint_expr(ks[2]),
+            "v_sz": _uint_expr(vs[0]), "v_sh": _uint_expr(vs[1]), "v_sn": _uint_expr(vs[2]), "v_sk": _uint_expr(vs[3]),
+            "o_sz": _uint_expr(os_[0]), "o_sh": _uint_expr(os_[1]), "o_sm": _uint_expr(os_[2]), "o_sk": _uint_expr(os_[3]),
+            "b_sz": _uint_expr(bs[0]), "b_sh": _uint_expr(bs[1]), "b_sm": _uint_expr(bs[2]), "b_sn": _uint_expr(bs[3]),
+            "mask_sz": _uint_expr(ms[0]), "mask_sh": _uint_expr(ms[1]), "mask_sn": _uint_expr(ms[2]),
+            "lse_sz": _uint_expr(ls[0]), "lse_sh": _uint_expr(ls[1]), "lse_sm": _uint_expr(ls[2]),
+            "Z": "1u",  # unused in the tiled template body (z = zh / H computed locally)
+            "H": _uint_expr(info["H"]), "N_CTX": _uint_expr(info["N_CTX"]),
+            "scale": _scale_expr(info["scale_arg"]),
+        }
+
+        Dc = head_dim if head_dim <= 64 else 64
+        msl = make_flash_attention_kernel_tiled(
+            head_dim, block_m, block_n, Dc=Dc,
+            causal=info["causal"], out_dtype=info["out_dtype"],
+            arg_decls=arg_decls, bindings=bindings,
+            kernel_name=_sanitize_msl_name(self.graph.func_name),
+            bias=True, mask=True, lse=True, runtime_scale=True,
+        )
+        self.effective_block_size = block_m * block_n
+        self._flash_attention = ("flash_attention", msl, block_m * block_n)
+        self._used_pid_axes = {0, 1}
+        self._prescan_stores()
+        return msl
 
     def _lower_mla_attention_template(self, info: dict) -> str:
         """Emit the qk=head_dim / v=v_head_dim simd FA kernel for a detected MLA
