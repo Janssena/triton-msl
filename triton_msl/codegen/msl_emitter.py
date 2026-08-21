@@ -497,6 +497,31 @@ class MSLCodeGen:
             lines.append(dev_fn)
             lines.append("")
 
+        # Metal binds kernel arguments to buffer slots 0..30 (31 total). Every pointer
+        # and every runtime scalar takes one, so a kernel passing ~20 strides overflows
+        # well before it looks large; the Metal frontend then emits a wall of cryptic
+        # "'buffer' attribute parameter is out of bounds" (one line per overflowing arg)
+        # naming nothing. Refuse with a clear, actionable message instead of miscompiling
+        # into that wall (GitHub issue #4.7).
+        _MAX_METAL_BUFFERS = 31
+        _args = self.builder.args
+        if len(_args) > _MAX_METAL_BUFFERS:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            _n_ptr = sum(1 for a in _args if getattr(a, "is_ptr", False))
+            _kname = getattr(self.builder, "name", "kernel")
+            _overflow = ", ".join(a.name for a in _args[_MAX_METAL_BUFFERS:])
+            raise MetalNonRecoverableError(
+                f"kernel '{_kname}' needs {len(_args)} argument buffers ({_n_ptr} pointers "
+                f"+ {len(_args) - _n_ptr} runtime scalars), but Metal binds at most "
+                f"{_MAX_METAL_BUFFERS} (slots 0..{_MAX_METAL_BUFFERS - 1}). This is a "
+                "hardware limit, not a lowering gap. Reduce the argument count: make "
+                "sizes/strides `tl.constexpr` where they are compile-time constants, or "
+                "derive strides inside the kernel from a shape argument when the tensors "
+                f"are contiguous. Overflowing arguments: {_overflow}.",
+                op_name="kernel",
+            )
+
         # Kernel signature
         params = []
         for i, arg in enumerate(self.builder.args):

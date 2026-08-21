@@ -92,3 +92,32 @@ def test_reduction_extent_correct_or_refuse(kernel):
         f"wrong result (err={err:.3f}); err vs first-tile-only={first_tile_err:.3f} "
         f"({'SILENT-WRONG: dropped the K-loop' if first_tile_err < 1e-3 else 'wrong'})"
     )
+
+
+@requires
+def test_over_31_buffer_args_refuses_clearly(tmp_path):
+    """#7: a kernel with more arguments than Metal's 31 buffer slots must refuse with a
+    clear, actionable message -- not the wall of cryptic "'buffer' attribute parameter is
+    out of bounds" the Metal frontend emits (one line per overflowing arg, naming nothing).
+    """
+    import importlib.util
+
+    n_scalars = 33  # 1 pointer + 33 scalars = 34 args, over the 31-slot limit
+    names = [f"s{i}" for i in range(n_scalars)]
+    body = " + ".join(names)
+    src = (
+        "import triton\nimport triton.language as tl\n\n"
+        f"@triton.jit\ndef big_kernel(out_ptr, {', '.join(names)}):\n"
+        f"    tl.store(out_ptr + tl.program_id(0), {body})\n"
+    )
+    modfile = tmp_path / "bigk.py"
+    modfile.write_text(src)
+    spec = importlib.util.spec_from_file_location("bigk", modfile)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    out = torch.zeros(1, device="cpu", dtype=torch.int32)
+    with pytest.raises(MetalNonRecoverableError) as ei:
+        mod.big_kernel[(1,)](out, *range(n_scalars))
+    msg = str(ei.value).lower()
+    assert "buffer" in msg and "31" in msg, f"refusal message not clear: {ei.value}"
