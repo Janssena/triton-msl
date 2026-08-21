@@ -2212,6 +2212,10 @@ def make_flash_attention_kernel_tiled(
     bindings=None,
     kernel_name="flash_attention",
     scale=None,
+    bias=False,
+    mask=False,
+    lse=False,
+    runtime_scale=False,
 ):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
@@ -2336,6 +2340,21 @@ def make_flash_attention_kernel_tiled(
     # correctly.  When None, fall back to the canonical 1/sqrt(head_dim).
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(head_dim))
 
+    # --- Biased/triangle-attention extensions (bias/mask/lse/runtime_scale). ---
+    # All are no-ops when their flag is off, so a plain-FA emission is byte-for-byte
+    # identical to the pre-extension template (guarded interpolations below). This
+    # lets trifast-style attention — additive bias into the scores, a loaded mask →
+    # −inf, a per-row log-sum-exp output, and a *runtime* softmax scale — reuse the
+    # validated online-softmax loop instead of the generic op-by-op path (which
+    # cannot express a dot-result epilogue). See generic_lowerer _dot_result_scaled.
+    _bias_uint = []
+    if bias:
+        _bias_uint += ["b_sz", "b_sh", "b_sm", "b_sn"]
+    if mask:
+        _bias_uint += ["mask_sz", "mask_sh", "mask_sn"]
+    if lse:
+        _bias_uint += ["lse_sz", "lse_sh", "lse_sm"]
+
     _LOGICAL = [
         "q_sz",
         "q_sh",
@@ -2356,10 +2375,10 @@ def make_flash_attention_kernel_tiled(
         "Z",
         "H",
         "N_CTX",
-    ]
+    ] + _bias_uint
     if arg_decls is None:
-        # Canonical full ABI: Q,K,V,Out (0..3), 16 strides (4..19), Z,H,N_CTX
-        # (20..22). Each logical name is its own buffer arg of the same name.
+        # Canonical full ABI: Q,K,V,Out (0..3), then the uint strides/dims (4..),
+        # then (when enabled) the optional runtime scale + Bias/Mask/Lse pointers.
         _ptr_decls = [
             f"    device const {elem_t}* Q [[buffer(0)]]",
             f"    device const {elem_t}* K [[buffer(1)]]",
@@ -2370,14 +2389,91 @@ def make_flash_attention_kernel_tiled(
         for i, name in enumerate(_LOGICAL):
             arg_decls.append(f"    constant uint& arg_{name} [[buffer({4 + i})]]")
         bindings = {name: f"arg_{name}" for name in _LOGICAL}
+        _next = 4 + len(_LOGICAL)
+        if runtime_scale:
+            arg_decls.append(f"    constant float& arg_scale [[buffer({_next})]]")
+            bindings["scale"] = "arg_scale"
+            _next += 1
+        if bias:
+            arg_decls.append(f"    device const {elem_t}* Bias [[buffer({_next})]]")
+            _next += 1
+        if mask:
+            arg_decls.append(f"    device const uchar* Mask [[buffer({_next})]]")
+            _next += 1
+        if lse:
+            arg_decls.append(f"    device float* Lse [[buffer({_next})]]")
+            _next += 1
 
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
         raise ValueError(f"make_flash_attention_kernel_tiled: bindings missing {missing}")
+    if runtime_scale and "scale" not in bindings:
+        raise ValueError("make_flash_attention_kernel_tiled: runtime_scale requires bindings['scale']")
     sig = ",\n".join(arg_decls)
     # Local aliases so the body references uniform names regardless of which
     # strides/dims are real buffer args vs baked constants.
     bind_lines = "\n".join(f"    const uint {name} = {bindings[name]};" for name in _LOGICAL)
+
+    # Scale: baked compile-time constant, or a runtime buffer arg (trifast passes
+    # sm_scale at runtime and folds it into Q; we apply it to the QK score instead).
+    scale_decl = (
+        f"const float scale = {bindings['scale']};" if runtime_scale else f"const float scale = {SCALE!r}f;"
+    )
+    # Per-(z,h) base offsets for the optional bias/mask/lse tensors (z,h in scope
+    # in the body). Shared-across-an-axis layouts (e.g. trifast's bias, which does
+    # not depend on the triangle-i axis) are expressed by a 0 stride from the detector.
+    _bb = []
+    if bias:
+        _bb.append("    uint bias_base = z * b_sz + h * b_sh;")
+    if mask:
+        _bb.append("    uint mask_base = z * mask_sz + h * mask_sh;")
+    if lse:
+        _bb.append("    uint lse_base = z * lse_sz + h * lse_sh;")
+    biased_base_lines = "\n".join(_bb)
+
+    # Score-cell compute: plain FA emits the original ternary (byte-identical); the
+    # biased path adds `+ Bias[...]` and a `Mask[...] -> -inf` inside the valid branch.
+    # These strings are interpolated as VALUES into the outer f-string, so they use
+    # single braces (real MSL), not f-string-doubled braces.
+    if bias or mask:
+        _bias_add = (
+            "\n                    s += float(Bias[bias_base + q_row * b_sm + kv_row * b_sn]);" if bias else ""
+        )
+        _mask_apply = (
+            "\n                    if (Mask[mask_base + kv_row * mask_sn] != 0) s = -INFINITY;" if mask else ""
+        )
+        score_compute_block = (
+            "float s;\n"
+            "                if (" + score_guard + ") {\n"
+            "                    s = tg_S[r * BN + cj] * scale;"
+            + _bias_add + _mask_apply + "\n"
+            "                } else {\n"
+            "                    s = -INFINITY;\n"
+            "                }"
+        )
+    else:
+        score_compute_block = (
+            "float s = " + score_guard + " ? (tg_S[r * BN + cj] * scale)\n"
+            "                                           : -INFINITY;"
+        )
+
+    # Log-sum-exp per query row (natural log): lse = running_max + log(running_sum).
+    if lse:
+        lse_store_block = (
+            "\n    // ---- Log-sum-exp per query row (lse = m + log(l), natural log) ----\n"
+            "    if (lid < BM) {\n"
+            "        uint r = lid;\n"
+            "        uint q_row = q_start + r;\n"
+            "        if (q_row < N_CTX) {\n"
+            "            float l_val = tg_l[r];\n"
+            "            // Fully-masked row (l==0): logsumexp of an empty set is -inf,\n"
+            "            // not nan (alpha = exp(-inf - -inf) = nan). Mirror the Out guard.\n"
+            "            Lse[lse_base + q_row * lse_sm] = (l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY;\n"
+            "        }\n"
+            "    }"
+        )
+    else:
+        lse_store_block = ""
 
     return f"""#include <metal_stdlib>
 using namespace metal;
@@ -2396,7 +2492,7 @@ kernel void {kernel_name}(
     const uint D  = {head_dim}u;
     const uint DC = {Dc}u;
     const uint TPG = {TPG}u;
-    const float scale = {SCALE!r}f;
+    {scale_decl}
 
     // Logical stride / dim aliases (buffer arg or baked constant).
 {bind_lines}
@@ -2414,6 +2510,7 @@ kernel void {kernel_name}(
     uint k_base = z * k_sz + h * k_sh;
     uint v_base = z * v_sz + h * v_sh;
     uint o_base = z * o_sz + h * o_sh;
+{biased_base_lines}
 
     // Threadgroup memory.
     threadgroup float tg_S[{BLOCK_M} * {BLOCK_N}];   // BM x BN scores / probs
@@ -2484,8 +2581,7 @@ kernel void {kernel_name}(
                 float m_new = m_prev;
                 for (uint cj = 0u; cj < BN; cj++) {{
                     uint kv_row = kv_start + cj;
-                    float s = {score_guard} ? (tg_S[r * BN + cj] * scale)
-                                               : -INFINITY;
+                    {score_compute_block}
                     tg_S[r * BN + cj] = s;   // store scaled score in place
                     m_new = max(m_new, s);
                 }}
@@ -2554,6 +2650,7 @@ kernel void {kernel_name}(
             Out[o_base + q_row * o_sm + c * o_sk] = {store_cast("o")};
         }}
     }}
+{lse_store_block}
 }}
 """
 
