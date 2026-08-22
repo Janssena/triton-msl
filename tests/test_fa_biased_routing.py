@@ -220,37 +220,43 @@ def _biased_tri_fa(
 
 
 @requires_mps
-@pytest.mark.parametrize("DIM", [32, 64])
-def test_biased_tri_fa_3d_computes(DIM):
+@pytest.mark.parametrize("DIM,dtype,o_tol", [
+    (32, torch.float32, 1e-3),   # small-head simd-MMA path
+    (64, torch.float32, 1e-3),   # simd-MMA path
+    (32, torch.bfloat16, 6e-2),  # bf16 in/out, fp32 compute -> tiled path
+])
+def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
     """trifast's 3-D triangle attention (bias shared across i, mask pid_h//H,
     >31 args -> packed ABI) computes correctly on Metal via the biased template.
-    DIM=32 routes to the scalar tiled template; DIM=64 to the simd-MMA fast path."""
+    fp32 DIM=32/64 route to simd-MMA; bf16 routes to the scalar tiled template
+    (bf16 in/out, fp32 interior compute)."""
     torch.manual_seed(0)
     dev = "mps"
     Hc, Hh, I, N = 4, 2, 3, 64   # H_combined=4, H_heads=2 => batch=2
     batch = Hc // Hh
     sm = 1.0 / math.sqrt(DIM)
-    q = torch.randn(Hc, I, N, DIM, device=dev)
-    k = torch.randn(Hc, I, N, DIM, device=dev)
-    v = torch.randn(Hc, I, N, DIM, device=dev)
-    bias = torch.randn(Hc, N, N, device=dev)
+    q = torch.randn(Hc, I, N, DIM, device=dev, dtype=dtype)
+    k = torch.randn(Hc, I, N, DIM, device=dev, dtype=dtype)
+    v = torch.randn(Hc, I, N, DIM, device=dev, dtype=dtype)
+    bias = torch.randn(Hc, N, N, device=dev, dtype=dtype)
     mask = (torch.rand(batch, I, N, device=dev) < 0.25).to(torch.uint8)
-    o = torch.zeros(Hc, I, N, DIM, device=dev)
-    lse = torch.zeros(Hc, I, N, device=dev)
+    o = torch.zeros(Hc, I, N, DIM, device=dev, dtype=dtype)
+    lse = torch.zeros(Hc, I, N, device=dev, dtype=torch.float32)
     st = lambda t: tuple(t.stride())
     grid = (triton.cdiv(N, 32), I, Hc)
     _biased_tri_fa[grid](
         o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v),
         bias, *st(bias), mask, *st(mask), sm, -1e9, N, Hh, DIM, 32, 32)
     torch.mps.synchronize()
-    qk = torch.einsum("hijd,hikd->hijk", q, k) * sm
-    raw = qk + bias[:, None, :, :]
+    qf, kf, vf, bf = q.float(), k.float(), v.float(), bias.float()
+    qk = torch.einsum("hijd,hikd->hijk", qf, kf) * sm
+    raw = qk + bf[:, None, :, :]
     mh = mask[torch.arange(Hc, device=dev) // Hh]
     raw = raw.masked_fill(mh[:, :, None, :].bool(), float("-inf"))
     p = torch.softmax(raw, dim=-1)
-    o_ref = torch.einsum("hijk,hikd->hijd", torch.nan_to_num(p, nan=0.0), v)
+    o_ref = torch.einsum("hijk,hikd->hijd", torch.nan_to_num(p, nan=0.0), vf)
     lse_ref = torch.logsumexp(raw, dim=-1)
-    assert (o - o_ref).abs().max().item() < 1e-3
+    assert (o.float() - o_ref).abs().max().item() < o_tol
     fin = torch.isfinite(lse_ref)
     assert (lse[fin] - lse_ref[fin]).abs().max().item() < 1e-3
 

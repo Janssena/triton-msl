@@ -2399,9 +2399,14 @@ def make_flash_attention_kernel_tiled(
     elif out_dtype in ("fp16", "f16"):
         elem_t = "half"
         store_cast = lambda expr: f"half({expr})"  # noqa: E731  (float -> half)
+    elif out_dtype in ("bf16", "bfloat16"):
+        # bf16 in/out, fp32 interior compute (loads promote bfloat->float implicitly,
+        # the store casts float->bfloat). Same accuracy contract as the fp16 path.
+        elem_t = "bfloat"
+        store_cast = lambda expr: f"bfloat({expr})"  # noqa: E731  (float -> bfloat)
     else:
         raise ValueError(
-            f"make_flash_attention_kernel_tiled: out_dtype must be one of fp32/f32/fp16/f16 (got {out_dtype!r})"
+            f"make_flash_attention_kernel_tiled: out_dtype must be fp32/f32/fp16/f16/bf16 (got {out_dtype!r})"
         )
     # Causal mask expression: emitted into the online-softmax row loop.
     # When causal=True the mask excludes kv positions *after* the query position

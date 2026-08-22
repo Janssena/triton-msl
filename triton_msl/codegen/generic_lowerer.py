@@ -842,6 +842,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         if _dims:
                             _fa_maxdim = max([_fa_maxdim] + _dims)
                             _fa_mindim = min([_fa_mindim] + _dims)
+            # BIASED / triangle attention (trifast): a bias tile as the QK dot's C
+            # operand + a loaded mask -> -inf + a per-row lse + a const result-scale
+            # (inv_ln2) with exp2. Route to the tiled/simd template WITH bias/mask/lse
+            # fused into the online-softmax loop, BEFORE the dot-result-scale guard
+            # below (which would otherwise refuse the inv_ln2 scale) AND before the
+            # bf16 gate — the biased path SUPPORTS bf16 via the scalar tiled template
+            # (loads promote bfloat->fp32; simd stays fp16/fp32). Returns None for a
+            # non-biased FA (the QK dot's C is a zero/loop-acc, not a load), so
+            # standard FA flows through to the gates below unchanged.
+            _biased_info = self._detect_biased_flash_attention()
+            if _biased_info is not None:
+                return self._lower_biased_flash_attention_template(_biased_info)
             # DTYPE GATE (2026-06-21 audit): the attention lowering — generic,
             # C++, and the tiled/simdgroup templates — is validated only for
             # fp32/fp16 dot operands. bf16 dot operands SILENTLY mis-compute
@@ -849,7 +861,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # head_dim>64 guard never fired, no dtype guard existed). Refuse them
             # LOUDLY here, before any head_dim routing, rather than emit garbage.
             # Covers bf16 introduced via explicit .to(tl.bfloat16) on Q/K/V or the
-            # scores (any dot operand). FA stays fp16/fp32 only.
+            # scores (any dot operand). NON-biased FA stays fp16/fp32 only.
             _fa_has_bf16 = any(
                 (self._find_op_type_str(_oid) or "")
                 and ("bf16" in (self._find_op_type_str(_oid) or "") or "bfloat" in (self._find_op_type_str(_oid) or ""))
@@ -863,16 +875,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "bf16 at any head_dim. Refusing to emit silently-wrong output. "
                     "Use fp16 or fp32 for Q/K/V in attention."
                 )
-            # BIASED / triangle attention (trifast): a bias tile as the QK dot's C
-            # operand + a loaded mask -> -inf + a per-row lse + a const result-scale
-            # (inv_ln2) with exp2. Route to the tiled template WITH bias/mask/lse
-            # fused into the online-softmax loop, BEFORE the dot-result-scale guard
-            # below (which would otherwise refuse the inv_ln2 scale). Returns None
-            # for a non-biased FA (the QK dot's C is a zero/loop-acc, not a load), so
-            # standard FA flows through unchanged; raises on any ambiguity.
-            _biased_info = self._detect_biased_flash_attention()
-            if _biased_info is not None:
-                return self._lower_biased_flash_attention_template(_biased_info)
             # FUSED-SCALE-ON-DOT-RESULT GATE (naming-independence follow-up): the generic
             # attention lowering silently mis-computes when a tt.dot RESULT feeds an
             # elementwise scale/bias before the softmax — e.g. the scores scaled INSIDE
@@ -5670,20 +5672,41 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         mask_div = _mask_batch_divisor(mask_loads[0].operand_ids[0])
 
-        # Runtime Q-scale: mulf(load(Q), splat(scale_arg)).
+        # Runtime Q-scale: mulf(load(Q), splat(scale_arg)). For fp16/bf16 inputs the
+        # scale is cast to the input dtype first (tl.full([1], sm_scale, dtype=q.dtype)
+        # -> truncf(splat(sm_scale))), so trace THROUGH dtype casts to the splat.
+        def _splat_scale_arg(oid):
+            # Walk through splat + dtype casts (in ANY order: splat(truncf(arg)) for
+            # bf16/fp16, truncf(splat(arg)), or splat(arg) for fp32) to the scalar arg.
+            sid = skip_layout(oid)
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                a = arg_by_id.get(sid)
+                if a is not None:  # reached a kernel arg
+                    return a.index if (not a.is_ptr and not str(a.elem_type).startswith("i")) else None
+                op = op_by_id.get(sid)
+                if op is None:
+                    return None
+                if op.op in (
+                    "tt.splat", "arith.truncf", "arith.extf", "arith.fptrunc", "arith.fpext",
+                    "arith.sitofp", "arith.uitofp", "tt.bitcast", "ttg.convert_layout",
+                ) and op.operand_ids:
+                    sid = skip_layout(op.operand_ids[0])
+                    continue
+                return None
+            return None
+
         scale_arg = None
         for s in allops:
             if s.op == "arith.mulf" and s.operand_ids:
-                has_load = any(load_addr(o) is not None for o in s.operand_ids)
-                if not has_load:
+                if not any(load_addr(o) is not None for o in s.operand_ids):
                     continue
                 for o in s.operand_ids:
-                    sp = op_by_id.get(skip_layout(o))
-                    if sp is not None and sp.op == "tt.splat" and sp.operand_ids:
-                        a = arg_by_id.get(sp.operand_ids[0])
-                        if a is not None and not a.is_ptr and not str(a.elem_type).startswith("i"):
-                            scale_arg = a.index
-                            break
+                    idx = _splat_scale_arg(o)
+                    if idx is not None:
+                        scale_arg = idx
+                        break
             if scale_arg is not None:
                 break
         if scale_arg is None:
@@ -5796,7 +5819,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if len(set(roles)) != 7:
             _refuse("seven distinct pointer roles (q,k,v,out,bias,mask,lse)")
 
-        out_dtype = "f16" if str(self.graph.args[o_res[0]].elem_type) in ("fp16", "f16") else "f32"
+        _o_elem = str(self.graph.args[o_res[0]].elem_type)
+        if _o_elem in ("fp16", "f16"):
+            out_dtype = "f16"
+        elif _o_elem in ("bf16", "bfloat16"):
+            out_dtype = "bf16"
+        else:
+            out_dtype = "f32"
 
         # 3-D grid (trifast): a tensor whose batch chain is 1-level has NO
         # dependence on the second batch axis (the triangle-i axis, h = pid3.y).
@@ -5962,6 +5991,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Valid v_head_dim tilings: <=64 (guarded surplus groups) OR the exact
             # multiples 128/192. 72..120 (non-64-multiple >64) mis-tile -> tiled path.
             and (8 <= head_dim <= 64 or head_dim in (128, 192))
+            and info["out_dtype"] != "bf16"  # simd MMA fragments are fp16/fp32; bf16 -> tiled
             and block_m == 32
             and qs2[3] == C1        # Q head-dim (col) contiguous
             and ks2[2] == C1        # K head-dim (Kᵀ row) contiguous
