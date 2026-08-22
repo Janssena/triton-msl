@@ -6056,12 +6056,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             kind = "b"
         else:
             return None
-        if kind != "kv":
-            return None  # q/b not yet routed -> fall through to the fail-closed path
+        if kind == "b":
+            return None  # dbias not yet routed -> fall through to the fail-closed path
 
         def _refuse(field):
             raise MetalNonRecoverableError(
-                f"Biased-FA backward (dK/dV) recognized but {field} could not be resolved; "
+                f"Biased-FA backward ({kind}) recognized but {field} could not be resolved; "
                 "refusing rather than emit silently-wrong gradients."
             )
 
@@ -6115,6 +6115,160 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if m_res is None:
             _refuse("the mask pointer")
 
+        # ----- N_CTX (loop bound) + H (mask cross-head divisor): shared by q/kv -----
+        def _arg_through_casts(sid):
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                a = arg_by_id.get(sid)
+                if a is not None:
+                    return a.index if not a.is_ptr else None
+                op = op_by_id.get(sid)
+                if op is not None and op.op in ("arith.extsi", "arith.trunci", "arith.index_cast") and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                break
+            return None
+
+        def _resolve_n_ctx():
+            for s in allops:
+                if s.op == "scf.for" and len(s.operand_ids or []) >= 2:
+                    r = _arg_through_casts(s.operand_ids[1])
+                    if r is not None:
+                        return r
+            return None
+
+        def _resolve_h_div():
+            h = C1
+            for s in allops:
+                if s.op in ("arith.divui", "arith.divsi") and s.operand_ids and any(
+                    op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+                ):
+                    for o in s.operand_ids:
+                        a = arg_by_id.get(o)
+                        if a is not None and not a.is_ptr:
+                            h = a.index
+                            break
+            return h
+
+        # ====================== _bwd_q (dQ + delta) ==========================
+        if kind == "q":
+            # delta = rowsum(O * dO): the reduce input is mulf(O_load, dO_load).
+            reduce_op = next((s for s in allops if s.op == "tt.reduce"), None)
+            mul = op_by_id.get(skip_layout(reduce_op.operand_ids[0])) if (reduce_op and reduce_op.operand_ids) else None
+            if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids or []) < 2:
+                _refuse("the delta reduce (O * dO)")
+            od_cands = []
+            for o in mul.operand_ids:
+                la = load_addr(o)
+                r = resolve_2d(la) if la is not None else None
+                if r is not None:
+                    od_cands.append((la, r))
+            if len(od_cands) != 2:
+                _refuse("the O and dO loads")
+
+            # dP dot = dot(dO, Vᵀ): the dot (not scores) whose op0 load is one of
+            # {O,dO} -> that's dO; op1 -> V. (tl.dot without an explicit acc still
+            # emits a 3-operand tt.dot with a zero C, so match on op0/op1, not count.)
+            do_addr = v_res = None
+            for d in dots:
+                if d.id == scores_dot.id or len(d.operand_ids or []) < 2:
+                    continue
+                a0 = load_addr(d.operand_ids[0])
+                a1 = load_addr(d.operand_ids[1])
+                if a0 is not None and a1 is not None and a0 in [c[0] for c in od_cands]:
+                    do_addr = a0
+                    v_res = resolve_2d(a1)
+                    break
+            if do_addr is None or v_res is None:
+                _refuse("the dO / V pointers (dP = dO @ Vᵀ)")
+            do_res = next(r for la, r in od_cands if la == do_addr)
+            o_res = next(r for la, r in od_cands if la != do_addr)
+
+            # delta OUTPUT store (value traces to the reduce) + dQ store (the other).
+            def _traces_to_reduce(vid):
+                sid = skip_layout(vid)
+                seen = set()
+                while sid not in seen:
+                    seen.add(sid)
+                    op = op_by_id.get(sid)
+                    if op is None:
+                        return False
+                    if op.op == "tt.reduce":
+                        return True
+                    if op.op in ("arith.truncf", "arith.extf", "ttg.convert_layout",
+                                 "tt.reshape", "ttg.local_load", "ttg.local_alloc") and op.operand_ids:
+                        sid = op.operand_ids[0]
+                        continue
+                    return False
+                return False
+
+            dlt_res = dq_res = None
+            for st_ in stores:
+                if len(st_.operand_ids) > 1 and _traces_to_reduce(st_.operand_ids[1]):
+                    dlt_res = resolve_1d(st_.operand_ids[0])
+                else:
+                    dq_res = resolve_2d(st_.operand_ids[0])
+            if dlt_res is None:
+                _refuse("the delta output store")
+            if dq_res is None:
+                _refuse("the dQ output store")
+
+            # scale: sm_scale is folded into K (mulf with a splat of a float arg).
+            scale_arg = None
+            for s in allops:
+                if s.op != "arith.mulf":
+                    continue
+                for o in s.operand_ids:
+                    node = op_by_id.get(skip_layout(o))
+                    if node is not None and node.op == "tt.splat" and node.operand_ids:
+                        inner = node.operand_ids[0]
+                        w = op_by_id.get(inner)
+                        while w is not None and w.op in ("arith.truncf", "arith.extf") and w.operand_ids:
+                            inner = w.operand_ids[0]
+                            w = op_by_id.get(inner)
+                        a = arg_by_id.get(inner)
+                        if a is not None and not a.is_ptr and not str(a.elem_type).startswith("i"):
+                            scale_arg = a.index
+                if scale_arg is not None:
+                    break
+            if scale_arg is None:
+                _refuse("the sm_scale argument")
+
+            n_ctx_arg = _resolve_n_ctx()
+            if n_ctx_arg is None:
+                _refuse("the N_CTX loop bound")
+            h_arg = _resolve_h_div()
+
+            # shared-across-i pointers (bias) -> h-slot 0 on the 3-D grid.
+            if grid_3d:
+                for _res in (q_res, k_res, v_res, b_res, do_res, o_res, dq_res):
+                    if _res[1][1] == C1:
+                        _res[1][1] = "c0"
+
+            a_shape = _extract_shape(self._find_op_type_str(scores_dot.operand_ids[0]))
+            if not a_shape or len(a_shape) != 2:
+                _refuse("the QK dot A shape")
+            block_j, head_dim = a_shape
+            qk_out = _extract_shape(scores_dot.type_str or "")
+            block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
+            out_dtype = "f16" if str(self.graph.args[dq_res[0]].elem_type) in ("fp16", "f16") else (
+                "bf16" if str(self.graph.args[dq_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+
+            roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
+                     dlt_res[0], do_res[0], o_res[0], dq_res[0]]
+            if len(set(roles)) != 10:
+                _refuse("ten distinct pointer roles")
+
+            return {
+                "bwd_kind": "q", "grid_3d": grid_3d,
+                "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
+                "lse": lse_res, "delta": dlt_res, "do": do_res, "o": o_res, "dq": dq_res,
+                "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
+                "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+            }
+
+        # ========================= _bwd_kv (dK/dV) ===========================
         def _traces_to_exp2(oid):
             sid = skip_layout(oid)
             seen = set()
@@ -6272,15 +6426,23 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """Emit the biased-FA backward MSL for a detected backward kernel + set the
         compile_shader dispatch descriptor. Mirrors the forward biased lowering's
         #7-packed ABI (pointers individual, scalars in one packed buffer when >31
-        args). Currently only bwd_kind == 'kv' (dK/dV). K and V are loaded
-        TRANSPOSED (row=head_dim, col=kv), so the template's k_sn/v_sn (kv) come
-        from the resolver COL and k_sk/v_sk (head_dim) from the resolver ROW."""
+        args). Routes bwd_kind 'kv' (dK/dV) and 'q' (dQ + delta).
+
+        Orientation notes (resolver strides are [z, h, row, col] from the ADDRESS):
+          - kv: K and V are loaded TRANSPOSED [d,k] -> template k_sn/v_sn (kv) come
+            from the resolver COL and k_sk/v_sk (head_dim) from the resolver ROW.
+          - q:  K is loaded UNtransposed [k,d] -> k_sn/k_sk map DIRECT (row/col);
+            V is still transposed [d,k] -> v_sn/v_sk SWAP. Delta here is an OUTPUT
+            (rowsum(O*dO)); sm_scale is folded into K, not a final store-scale.
+        """
         from triton_msl.errors import MetalNonRecoverableError
         from triton_msl.codegen.msl_types import triton_type_to_msl
-        from triton_msl.codegen._msl_templates import make_flash_attention_bwd_kv_kernel
+        from triton_msl.codegen._msl_templates import (
+            make_flash_attention_bwd_kv_kernel, make_flash_attention_bwd_q_kernel)
 
-        if info.get("bwd_kind") != "kv":
-            raise MetalNonRecoverableError("only biased-FA backward dK/dV is routed so far")
+        kind = info.get("bwd_kind")
+        if kind not in ("kv", "q"):
+            raise MetalNonRecoverableError("only biased-FA backward dK/dV and dQ are routed so far")
         MAX_BUFFERS = 31
         C1 = "c1"
         args = self.graph.args
@@ -6288,11 +6450,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if i != a.index:
                 raise MetalNonRecoverableError("biased-FA backward arg list not densely indexed; refusing.")
 
-        role_name = {
-            info["dk"][0]: "DK", info["dv"][0]: "DV", info["q"][0]: "Q", info["k"][0]: "K",
-            info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
-            info["lse"][0]: "Lse", info["delta"][0]: "Delta", info["do"][0]: "dO",
-        }
+        if kind == "kv":
+            role_name = {
+                info["dk"][0]: "DK", info["dv"][0]: "DV", info["q"][0]: "Q", info["k"][0]: "K",
+                info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
+                info["lse"][0]: "Lse", info["delta"][0]: "Delta", info["do"][0]: "dO",
+            }
+            write_roles = ("DK", "DV")
+        else:  # q
+            role_name = {
+                info["dq"][0]: "DQ", info["delta"][0]: "Delta", info["q"][0]: "Q", info["k"][0]: "K",
+                info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
+                info["lse"][0]: "Lse", info["o"][0]: "O", info["do"][0]: "dO",
+            }
+            write_roles = ("DQ", "Delta")
         n_args = len(args)
         n_ptr = sum(1 for a in args if a.is_ptr)
         packed = n_args > MAX_BUFFERS
@@ -6304,7 +6475,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if role == "Mask":
                 return f"    device const uchar* Mask [[buffer({buf})]]"
             m = triton_type_to_msl(a.elem_type)
-            qual = "device" if role in ("DK", "DV") else "device const"
+            qual = "device" if role in write_roles else "device const"
             return f"    {qual} {m}* {role} [[buffer({buf})]]"
 
         if packed:
@@ -6339,30 +6510,50 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         qs, ks, vs = info["q"][1], info["k"][1], info["v"][1]
         os_, bs, ms, ls = info["do"][1], info["bias"][1], info["mask"][1], info["lse"][1]
-        ds, dks, dvs = info["delta"][1], info["dk"][1], info["dv"][1]
-        bindings = {
+        ds = info["delta"][1]
+        grid_3d = bool(info.get("grid_3d"))
+        mask_batch_div = _u(info["H"]) if (grid_3d and info["H"] != C1) else None
+        head_dim, block_j, block_k = info["head_dim"], info["block_j"], info["block_k"]
+        common = {
             "q_sz": _u(qs[0]), "q_sh": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
-            # K/V loaded transposed (row=head-dim, col=kv) -> swap for the template.
-            "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[3]), "k_sk": _u(ks[2]),
-            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(vs[3]), "v_sk": _u(vs[2]),
+            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(vs[3]), "v_sk": _u(vs[2]),  # Vᵀ swap
             "b_sz": _u(bs[0]), "b_sh": _u(bs[1]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
             "mask_sz": _u(ms[0]), "mask_sh": _u(ms[1]), "mask_sn": _u(ms[2]),
             "lse_sz": _u(ls[0]), "lse_sh": _u(ls[1]), "lse_sm": _u(ls[2]),
             "dlt_sz": _u(ds[0]), "dlt_sh": _u(ds[1]), "dlt_sm": _u(ds[2]),
             "do_sz": _u(os_[0]), "do_sh": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
-            "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
-            "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
             "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
         }
-        grid_3d = bool(info.get("grid_3d"))
-        mask_batch_div = _u(info["H"]) if (grid_3d and info["H"] != C1) else None
-        head_dim, block_j, block_k = info["head_dim"], info["block_j"], info["block_k"]
-        msl = make_flash_attention_bwd_kv_kernel(
-            head_dim, block_j, block_k, out_dtype=info["out_dtype"],
-            arg_decls=arg_decls, bindings=bindings,
-            kernel_name=_sanitize_msl_name(self.graph.func_name),
-            grid_3d=grid_3d, mask_batch_div=mask_batch_div)
-        self.effective_block_size = block_k * head_dim
+        if kind == "kv":
+            dks, dvs = info["dk"][1], info["dv"][1]
+            bindings = dict(common)
+            bindings.update({
+                # K loaded transposed [d,k] -> swap.
+                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[3]), "k_sk": _u(ks[2]),
+                "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
+                "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
+            })
+            msl = make_flash_attention_bwd_kv_kernel(
+                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div)
+            self.effective_block_size = block_k * head_dim
+        else:  # q
+            oo, dqs = info["o"][1], info["dq"][1]
+            bindings = dict(common)
+            bindings.update({
+                # K loaded UNtransposed [k,d] -> direct.
+                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[2]), "k_sk": _u(ks[3]),
+                "o_sz": _u(oo[0]), "o_sh": _u(oo[1]), "o_sm": _u(oo[2]), "o_sk": _u(oo[3]),
+                "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
+            })
+            msl = make_flash_attention_bwd_q_kernel(
+                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div)
+            self.effective_block_size = block_j * head_dim
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
         self._prescan_stores()
