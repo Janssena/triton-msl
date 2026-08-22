@@ -6633,7 +6633,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         from triton_msl.codegen.msl_types import triton_type_to_msl
         from triton_msl.codegen._msl_templates import (
             make_flash_attention_bwd_kv_kernel, make_flash_attention_bwd_q_kernel,
-            make_flash_attention_bwd_b_kernel)
+            make_flash_attention_bwd_b_kernel, make_flash_attention_bwd_kv_kernel_simd,
+            make_flash_attention_bwd_q_kernel_simd)
 
         kind = info.get("bwd_kind")
         if kind not in ("kv", "q", "b"):
@@ -6726,6 +6727,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "do_sz": _u(os_[0]), "do_sh": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
             "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
         }
+        # simdgroup-MMA fast path (dK/dV, dQ): ~2-2.5x the scalar template at the tile
+        # sizes it supports. dbias stays scalar (memory-bound i-loop; MMA lost).
+        simd_ok = (head_dim % 8 == 0 and block_j % 8 == 0 and block_k % 8 == 0
+                   and head_dim <= 32 and block_j <= 32 and block_k <= 32)
         if kind == "kv":
             dks, dvs = info["dk"][1], info["dv"][1]
             bindings = dict(common)
@@ -6735,12 +6740,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
                 "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
             })
-            msl = make_flash_attention_bwd_kv_kernel(
+            kv_maker = make_flash_attention_bwd_kv_kernel_simd if simd_ok else make_flash_attention_bwd_kv_kernel
+            msl = kv_maker(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
-            self.effective_block_size = block_k * head_dim
+            self.effective_block_size = 128 if simd_ok else block_k * head_dim
         elif kind == "q":
             oo, dqs = info["o"][1], info["dq"][1]
             bindings = dict(common)
@@ -6750,12 +6756,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "o_sz": _u(oo[0]), "o_sh": _u(oo[1]), "o_sm": _u(oo[2]), "o_sk": _u(oo[3]),
                 "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
             })
-            msl = make_flash_attention_bwd_q_kernel(
+            q_maker = make_flash_attention_bwd_q_kernel_simd if simd_ok else make_flash_attention_bwd_q_kernel
+            msl = q_maker(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
-            self.effective_block_size = block_j * head_dim
+            self.effective_block_size = 128 if simd_ok else block_j * head_dim
         else:  # b — triangle-i is a loop; slot [1] of each stride list is the i-stride.
             dbs = info["db"][1]
             bindings = {
