@@ -95,9 +95,14 @@ def dispatch_flash_attention(
             return False
 
         lib = rt.get_library(msl)
+        # >31 args -> the emitted MSL packs its overflow SCALARS into one buffer after
+        # the pointers (issue #4.7); pack the dispatch args to match (the biased 3-D
+        # backward kernels have ~40 args). <=31 -> positional, unchanged.
+        from triton_msl.backend.driver import _pack_overflow_scalars, _MAX_METAL_BUFFERS
+        _dk = _pack_overflow_scalars(kargs) if len(kargs) > _MAX_METAL_BUFFERS else kargs
         # Native 2-D/3-D grid: gx*gy*gz threadgroups, tg threads each (in x).
         # threadgroup_position_in_grid -> (q_block, zh, 0); thread_index -> 0..tg-1.
-        rt.dispatch(lib, kernel_name, kargs, threads=(gx * tg, gy, gz), group_size=(tg, 1, 1))
+        rt.dispatch(lib, kernel_name, _dk, threads=(gx * tg, gy, gz), group_size=(tg, 1, 1))
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True

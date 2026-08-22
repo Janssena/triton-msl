@@ -830,6 +830,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # pull a non-FA >=2-dot + max + expand_dims kernel into FA handling.
         _fa_has_exp = any(_op_is_exp(s.op) for s in _fa_ops)
         _fa_has_max = any("max" in (s.op or "") for s in _fa_ops)
+        # Biased-FA BACKWARD (trifast _bwd_kv/_bwd_q/_bwd_b): FA-shaped (>=2 dots +
+        # exp2) but NO stability-max (P is recomputed from the saved lse), so it does
+        # NOT enter the forward FA block below. Route it to the backward templates
+        # here. Returns None for non-backward kernels (falls through unchanged);
+        # raises on ambiguity (never silently-wrong gradients).
+        if len(_fa_dots) >= 2 and _fa_has_exp and not _fa_has_max:
+            _bwd_info = self._detect_biased_fa_backward()
+            if _bwd_info is not None:
+                return self._lower_biased_fa_backward(_bwd_info)
         if len(_fa_dots) >= 2 and _fa_has_exp and _fa_has_max:
             _fa_maxdim = 0
             _fa_mindim = 1 << 30
@@ -5854,6 +5863,510 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
             "out_dtype": out_dtype, "causal": False,
         }
+
+    def _detect_biased_fa_backward(self):
+        """Recognize trifast's biased-FA BACKWARD kernels and resolve them
+        exact-or-refuse. Distinct from the forward: NO ``max`` op (P is recomputed
+        from the saved lse). Classifies by outputs: a delta-reduce + 2 stores =>
+        _bwd_q (dQ+delta); 2 stores, no reduce => _bwd_kv (dK/dV); 1 store => _bwd_b
+        (dbias). Returns a dict with ``bwd_kind`` + resolved pointers/strides, ``None``
+        when not a backward pattern, or raises on ambiguity. Only ``kv`` is fully
+        resolved so far; ``q``/``b`` return None (fall through -> fail-closed).
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        def _walk(ops):
+            for s in ops:
+                yield s
+                if getattr(s, "region_ops", None):
+                    yield from _walk(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    yield from _walk(s.else_ops)
+
+        allops = list(_walk(self.graph.ops))
+        dots = [s for s in allops if s.op == "tt.dot"]
+        has_exp2 = any(s.op == "math.exp2" or _op_is_exp(s.op) for s in allops)
+        has_max = any("max" in (s.op or "") for s in allops)
+        # Backward = FA-shaped (>=2 dots + exp) but NO stability-max (lse is loaded).
+        if not (len(dots) >= 2 and has_exp2) or has_max:
+            return None
+
+        op_by_id = {s.id: s for s in allops}
+        arg_by_id = {a.id: a for a in self.graph.args}
+        C1 = "c1"
+        blockarg_init = {}
+        for s in allops:
+            if s.op == "scf.for":
+                bids = (s.attrs or {}).get("block_arg_ids", [])
+                inits = list(s.operand_ids or [])[3:]
+                for i, init_id in enumerate(inits):
+                    if i + 1 < len(bids):
+                        blockarg_init[bids[i + 1]] = init_id
+
+        def skip_layout(sid):
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                if sid in blockarg_init:
+                    sid = blockarg_init[sid]
+                    continue
+                op = op_by_id.get(sid)
+                if op is not None and op.op == "ttg.convert_layout" and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                break
+            return sid
+
+        def stride_from_term(tid):
+            tid = skip_layout(tid)
+            op = op_by_id.get(tid)
+            if op is None:
+                return None
+            if op.op == "tt.broadcast" and op.operand_ids:
+                return stride_from_term(op.operand_ids[0])
+            if op.op != "arith.muli":
+                return C1
+            for oid in op.operand_ids:
+                sub = op_by_id.get(oid)
+                if sub is not None and sub.op == "tt.splat" and sub.operand_ids:
+                    a = arg_by_id.get(sub.operand_ids[0])
+                    if a is not None and not a.is_ptr:
+                        return a.index
+            return None
+
+        def scalar_stride_from_muli(mid):
+            op = op_by_id.get(mid)
+            if op is None or op.op != "arith.muli":
+                return None
+            for oid in op.operand_ids:
+                a = arg_by_id.get(oid)
+                if a is not None and not a.is_ptr:
+                    return a.index
+            return None
+
+        def _base_and_scalar(scal_id):
+            scal = op_by_id.get(scal_id)
+            if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                return None
+            outer = scalar_stride_from_muli(scal.operand_ids[1])
+            inner_arg = arg_by_id.get(scal.operand_ids[0])
+            inner = op_by_id.get(scal.operand_ids[0])
+            if inner_arg is not None and inner_arg.is_ptr:
+                return inner_arg, outer, C1
+            if inner is not None and inner.op == "tt.addptr" and len(inner.operand_ids) >= 2:
+                z = scalar_stride_from_muli(inner.operand_ids[1])
+                base = arg_by_id.get(inner.operand_ids[0])
+                if base is not None and base.is_ptr:
+                    return base, z, outer
+            return None
+
+        def resolve_2d(addr_id):
+            if addr_id is None:
+                return None
+            addr_id = skip_layout(addr_id)
+            op = op_by_id.get(addr_id)
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
+            col = stride_from_term(op.operand_ids[1])
+            row_side = skip_layout(op.operand_ids[0])
+            rop = op_by_id.get(row_side)
+            if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
+                row_side = skip_layout(rop.operand_ids[0])
+                rop = op_by_id.get(row_side)
+            if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
+                return None
+            row = stride_from_term(rop.operand_ids[1])
+            sb = op_by_id.get(rop.operand_ids[0])
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            bs = _base_and_scalar(sb.operand_ids[0])
+            if bs is None:
+                return None
+            base, z, h = bs
+            s = [z, h, row, col]
+            return None if any(x is None for x in s) else (base.index, s)
+
+        def resolve_1d(addr_id):
+            if addr_id is None:
+                return None
+            addr_id = skip_layout(addr_id)
+            op = op_by_id.get(addr_id)
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
+            col = stride_from_term(op.operand_ids[1])
+            sb = op_by_id.get(skip_layout(op.operand_ids[0]))
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            bs = _base_and_scalar(sb.operand_ids[0])
+            if bs is None:
+                return None
+            base, z, h = bs
+            s = [z, h, col]
+            return None if any(x is None for x in s) else (base.index, s)
+
+        def load_addr(oid, depth=0):
+            if depth > 32:
+                return None
+            sid = oid
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                if sid in blockarg_init:
+                    sid = blockarg_init[sid]
+                    continue
+                op = op_by_id.get(sid)
+                if op is None:
+                    break
+                if op.op in (
+                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
+                    # backward also loads lse/delta as [j] then broadcasts to [j,k]:
+                    "tt.broadcast", "tt.expand_dims",
+                ) and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                if op.op == "tt.load" and op.operand_ids:
+                    return op.operand_ids[0]
+                if op.op == "arith.mulf":
+                    for o in op.operand_ids:
+                        r = load_addr(o, depth + 1)
+                        if r is not None:
+                            return r
+                    return None
+                break
+            return None
+
+        # --- the QK "scores" dot: C operand traces to a LOAD (the bias). Other dots'
+        # C is a loop-acc/zeros. Absent -> not a biased backward.
+        scores_dot = None
+        for d in dots:
+            if len(d.operand_ids) >= 3 and load_addr(d.operand_ids[2]) is not None:
+                scores_dot = d
+                break
+        if scores_dot is None:
+            return None
+
+        stores = [s for s in allops if s.op == "tt.store"]
+        has_reduce = any(s.op == "tt.reduce" for s in allops)
+        if has_reduce:
+            kind = "q"
+        elif len(stores) == 2:
+            kind = "kv"
+        elif len(stores) == 1:
+            kind = "b"
+        else:
+            return None
+        if kind != "kv":
+            return None  # q/b not yet routed -> fall through to the fail-closed path
+
+        def _refuse(field):
+            raise MetalNonRecoverableError(
+                f"Biased-FA backward (dK/dV) recognized but {field} could not be resolved; "
+                "refusing rather than emit silently-wrong gradients."
+            )
+
+        # 3-D grid + mask divisor + block dims (shared with the forward semantics).
+        n_pid = len({s.id for s in allops if s.op == "tt.get_program_id"})
+        if n_pid > 3 or n_pid < 2:
+            _refuse(f"a 2-D/3-D grid (got {n_pid} program_ids)")
+        grid_3d = n_pid == 3
+
+        # Q, K, bias from the scores dot.
+        q_res = resolve_2d(load_addr(scores_dot.operand_ids[0]))
+        k_res = resolve_2d(load_addr(scores_dot.operand_ids[1]))
+        b_res = resolve_2d(load_addr(scores_dot.operand_ids[2]))
+        if not (q_res and k_res and b_res):
+            _refuse("Q/K/bias")
+
+        # lse: the exp2 input is mulf(subf(scores, splat(lse)), inv_ln2). Find the
+        # subf feeding an exp2 whose non-dot operand traces to a load.
+        def _find_sub_operands(target_op):
+            for s in allops:
+                if s.op in ("arith.subf",):
+                    yield s
+
+        lse_res = None
+        exp2_ops = [s for s in allops if s.op == "math.exp2"]
+        for e in exp2_ops:
+            inp = op_by_id.get(skip_layout(e.operand_ids[0])) if e.operand_ids else None
+            # inp = mulf(subf(...), inv_ln2)  OR  subf(...) directly
+            cands = []
+            if inp is not None and inp.op == "arith.mulf":
+                cands = list(inp.operand_ids or [])
+            elif inp is not None and inp.op == "arith.subf":
+                cands = [inp.id]
+            for c in cands:
+                cop = op_by_id.get(skip_layout(c))
+                if cop is not None and cop.op == "arith.subf":
+                    for o in cop.operand_ids:
+                        la = load_addr(o)
+                        r = resolve_1d(la) if la is not None else None
+                        if r is not None:
+                            lse_res = r
+        if lse_res is None:
+            _refuse("the lse (row_max) pointer")
+
+        # mask: the single i1/i8 load.
+        mask_loads = [s for s in allops if s.op == "tt.load"
+                      and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))]
+        if len(mask_loads) != 1:
+            _refuse("a single boolean mask load")
+        m_res = resolve_1d(mask_loads[0].operand_ids[0])
+        if m_res is None:
+            _refuse("the mask pointer")
+
+        def _traces_to_exp2(oid):
+            sid = skip_layout(oid)
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                op = op_by_id.get(sid)
+                if op is None:
+                    return False
+                if op.op == "math.exp2" or _op_is_exp(op.op):
+                    return True
+                if op.op in (
+                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
+                ) and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                return False
+            return False
+
+        # dV dot = dot(Pᵀ, dO): its FIRST operand traces to the exp2 (P). dO = 2nd.
+        do_addr = None
+        for d in dots:
+            if len(d.operand_ids or []) >= 2 and _traces_to_exp2(d.operand_ids[0]):
+                do_addr = load_addr(d.operand_ids[1])
+                break
+        do_res = resolve_2d(do_addr) if do_addr is not None else None
+        if do_res is None:
+            _refuse("the dO pointer (dV = Pᵀ @ dO)")
+
+        # dP dot = dot(dO, Vᵀ): its FIRST operand's load == dO. V = 2nd operand's load.
+        v_res = None
+        for d in dots:
+            if len(d.operand_ids or []) >= 2 and load_addr(d.operand_ids[0]) == do_addr:
+                cand = resolve_2d(load_addr(d.operand_ids[1]))
+                if cand is not None and cand[0] not in (q_res[0], k_res[0], b_res[0], do_res[0]):
+                    v_res = cand
+                    break
+        if v_res is None:
+            _refuse("the V pointer (dP = dO @ Vᵀ)")
+
+        # delta: dscores = P * (dP - delta). Find subf(dot_result, load) -> the load.
+        dlt_res = None
+        for s in allops:
+            if s.op == "arith.subf" and s.operand_ids:
+                for o in s.operand_ids:
+                    la = load_addr(o)
+                    r = resolve_1d(la) if la is not None else None
+                    if r is not None and r[0] not in (lse_res[0], m_res[0]):
+                        # the OTHER operand must be a dot result (dP), not a load
+                        others = [x for x in s.operand_ids if x != o]
+                        if others and load_addr(others[0]) is None:
+                            dlt_res = r
+        if dlt_res is None:
+            _refuse("the delta pointer (dP - delta)")
+
+        # dK / dV stores: dK's value traces through mulf(_, splat(sm_scale)); dV doesn't.
+        def _traces_scale_mul(vid):
+            sid = skip_layout(vid)
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                op = op_by_id.get(sid)
+                if op is None:
+                    return None
+                if op.op in ("arith.truncf", "arith.extf", "ttg.convert_layout") and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                if op.op == "arith.mulf":
+                    for o in op.operand_ids:
+                        sp = op_by_id.get(skip_layout(o))
+                        if sp is not None and sp.op == "tt.splat" and sp.operand_ids:
+                            a = arg_by_id.get(sp.operand_ids[0])
+                            if a is not None and not a.is_ptr and not str(a.elem_type).startswith("i"):
+                                return a.index
+                return None
+            return None
+
+        dk_res = dv_res = scale_from_dk = None
+        for st_ in stores:
+            addr_r = resolve_2d(st_.operand_ids[0])
+            if addr_r is None:
+                continue
+            sc = _traces_scale_mul(st_.operand_ids[1]) if len(st_.operand_ids) > 1 else None
+            if sc is not None and dk_res is None:
+                dk_res, scale_from_dk = addr_r, sc
+            else:
+                dv_res = addr_r
+        if dk_res is None or dv_res is None or scale_from_dk is None:
+            _refuse("the dK (scaled) / dV store pointers")
+
+        # N_CTX = the j-loop bound; H = the pid divisor (mask cross-head).
+        def _arg_through_casts(sid):
+            seen = set()
+            while sid not in seen:
+                seen.add(sid)
+                a = arg_by_id.get(sid)
+                if a is not None:
+                    return a.index if not a.is_ptr else None
+                op = op_by_id.get(sid)
+                if op is not None and op.op in ("arith.extsi", "arith.trunci", "arith.index_cast") and op.operand_ids:
+                    sid = op.operand_ids[0]
+                    continue
+                break
+            return None
+
+        n_ctx_arg = None
+        for s in allops:
+            if s.op == "scf.for" and len(s.operand_ids or []) >= 2:
+                n_ctx_arg = _arg_through_casts(s.operand_ids[1])
+                if n_ctx_arg is not None:
+                    break
+        if n_ctx_arg is None:
+            _refuse("the N_CTX loop bound")
+
+        h_arg = C1
+        for s in allops:
+            if s.op in ("arith.divui", "arith.divsi") and s.operand_ids and any(
+                op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+            ):
+                for o in s.operand_ids:
+                    a = arg_by_id.get(o)
+                    if a is not None and not a.is_ptr:
+                        h_arg = a.index
+                        break
+
+        # shared-across-i bias/pointers: 3-D 1-level chain -> h-slot 0.
+        if grid_3d:
+            for _res in (q_res, k_res, v_res, b_res, do_res, dk_res, dv_res):
+                if _res[1][1] == C1:
+                    _res[1][1] = "c0"
+
+        a_shape = _extract_shape(self._find_op_type_str(scores_dot.operand_ids[0]))
+        if not a_shape or len(a_shape) != 2:
+            _refuse("the QK dot A shape")
+        block_j, head_dim = a_shape
+        qk_out = _extract_shape(scores_dot.type_str or "")
+        block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
+        out_dtype = "f16" if str(self.graph.args[dk_res[0]].elem_type) in ("fp16", "f16") else (
+            "bf16" if str(self.graph.args[dk_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+
+        roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
+                 dlt_res[0], do_res[0], dk_res[0], dv_res[0]]
+        if len(set(roles)) != 10:
+            _refuse("ten distinct pointer roles")
+
+        return {
+            "bwd_kind": "kv", "grid_3d": grid_3d,
+            "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
+            "lse": lse_res, "delta": dlt_res, "do": do_res, "dk": dk_res, "dv": dv_res,
+            "scale_arg": scale_from_dk, "N_CTX": n_ctx_arg, "H": h_arg,
+            "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+        }
+
+    def _lower_biased_fa_backward(self, info: dict) -> str:
+        """Emit the biased-FA backward MSL for a detected backward kernel + set the
+        compile_shader dispatch descriptor. Mirrors the forward biased lowering's
+        #7-packed ABI (pointers individual, scalars in one packed buffer when >31
+        args). Currently only bwd_kind == 'kv' (dK/dV). K and V are loaded
+        TRANSPOSED (row=head_dim, col=kv), so the template's k_sn/v_sn (kv) come
+        from the resolver COL and k_sk/v_sk (head_dim) from the resolver ROW."""
+        from triton_msl.errors import MetalNonRecoverableError
+        from triton_msl.codegen.msl_types import triton_type_to_msl
+        from triton_msl.codegen._msl_templates import make_flash_attention_bwd_kv_kernel
+
+        if info.get("bwd_kind") != "kv":
+            raise MetalNonRecoverableError("only biased-FA backward dK/dV is routed so far")
+        MAX_BUFFERS = 31
+        C1 = "c1"
+        args = self.graph.args
+        for i, a in enumerate(args):
+            if i != a.index:
+                raise MetalNonRecoverableError("biased-FA backward arg list not densely indexed; refusing.")
+
+        role_name = {
+            info["dk"][0]: "DK", info["dv"][0]: "DV", info["q"][0]: "Q", info["k"][0]: "K",
+            info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
+            info["lse"][0]: "Lse", info["delta"][0]: "Delta", info["do"][0]: "dO",
+        }
+        n_args = len(args)
+        n_ptr = sum(1 for a in args if a.is_ptr)
+        packed = n_args > MAX_BUFFERS
+        arg_decls = []
+        scalar_pos = {}
+
+        def _ptr_decl(a, buf):
+            role = role_name[a.index]
+            if role == "Mask":
+                return f"    device const uchar* Mask [[buffer({buf})]]"
+            m = triton_type_to_msl(a.elem_type)
+            qual = "device" if role in ("DK", "DV") else "device const"
+            return f"    {qual} {m}* {role} [[buffer({buf})]]"
+
+        if packed:
+            ptr_ord = j = 0
+            for a in args:
+                if a.is_ptr:
+                    arg_decls.append(_ptr_decl(a, ptr_ord)); ptr_ord += 1
+                else:
+                    scalar_pos[a.index] = j; j += 1
+            arg_decls.append(f"    constant uint* _bpk [[buffer({n_ptr})]]")
+        else:
+            for a in args:
+                if a.is_ptr:
+                    arg_decls.append(_ptr_decl(a, a.index))
+                else:
+                    arg_decls.append(f"    constant uint& bsc_{a.index} [[buffer({a.index})]]")
+                    scalar_pos[a.index] = a.index
+
+        def _u(entry):
+            if entry == C1:
+                return "1u"
+            if entry == "c0":
+                return "0u"
+            if isinstance(entry, int) and entry in scalar_pos:
+                return f"_bpk[{scalar_pos[entry]}]" if packed else f"bsc_{entry}"
+            raise MetalNonRecoverableError("biased-FA backward stride unmapped; refusing.")
+
+        def _scale(entry):
+            if isinstance(entry, int) and entry in scalar_pos:
+                return f"as_type<float>(_bpk[{scalar_pos[entry]}])" if packed else f"as_type<float>(bsc_{entry})"
+            raise MetalNonRecoverableError("biased-FA backward scale unmapped; refusing.")
+
+        qs, ks, vs = info["q"][1], info["k"][1], info["v"][1]
+        os_, bs, ms, ls = info["do"][1], info["bias"][1], info["mask"][1], info["lse"][1]
+        ds, dks, dvs = info["delta"][1], info["dk"][1], info["dv"][1]
+        bindings = {
+            "q_sz": _u(qs[0]), "q_sh": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
+            # K/V loaded transposed (row=head-dim, col=kv) -> swap for the template.
+            "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[3]), "k_sk": _u(ks[2]),
+            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(vs[3]), "v_sk": _u(vs[2]),
+            "b_sz": _u(bs[0]), "b_sh": _u(bs[1]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
+            "mask_sz": _u(ms[0]), "mask_sh": _u(ms[1]), "mask_sn": _u(ms[2]),
+            "lse_sz": _u(ls[0]), "lse_sh": _u(ls[1]), "lse_sm": _u(ls[2]),
+            "dlt_sz": _u(ds[0]), "dlt_sh": _u(ds[1]), "dlt_sm": _u(ds[2]),
+            "do_sz": _u(os_[0]), "do_sh": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
+            "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
+            "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
+            "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
+        }
+        grid_3d = bool(info.get("grid_3d"))
+        mask_batch_div = _u(info["H"]) if (grid_3d and info["H"] != C1) else None
+        head_dim, block_j, block_k = info["head_dim"], info["block_j"], info["block_k"]
+        msl = make_flash_attention_bwd_kv_kernel(
+            head_dim, block_j, block_k, out_dtype=info["out_dtype"],
+            arg_decls=arg_decls, bindings=bindings,
+            kernel_name=_sanitize_msl_name(self.graph.func_name),
+            grid_3d=grid_3d, mask_batch_div=mask_batch_div)
+        self.effective_block_size = block_k * head_dim
+        self._flash_attention = ("flash_attention", msl, self.effective_block_size)
+        self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
+        self._prescan_stores()
+        return msl
 
     def _lower_biased_flash_attention_template(self, info: dict) -> str:
         """Emit the biased/triangle-attention tiled FA MSL for a detected biased-FA
