@@ -2288,6 +2288,24 @@ kernel void {kernel_name}(
     return head
 
 
+def _bwd_kv_subtile_size(head_dim, block_j, block_k):
+    """Largest power-of-two divisor KS of block_k such that the scalar bwd_kv kernel
+    fits Metal's limits: TPG = KS*head_dim <= 1024 threads AND the threadgroup footprint
+    (4*KS*D staged K/V/dK/dV + BJ*D staged Q + 2*BJ*KS scores/dS, fp32) < 32 KB. Returns
+    KS, or None if even KS=1 does not fit. KS == block_k for head_dim<=32 (single pass)."""
+    D, BJ = head_dim, block_j
+
+    def _fits(ks):
+        tpg = ks * D
+        mem = (4 * ks * D + BJ * D + 2 * BJ * ks) * 4 + (2 * BJ + ks + 16) * 4
+        return tpg <= 1024 and mem <= 32768
+
+    ks = block_k
+    while ks > 1 and not _fits(ks):
+        ks //= 2
+    return ks if _fits(ks) else None
+
+
 def make_flash_attention_bwd_kv_kernel(
     head_dim=32,
     BLOCK_J=32,
@@ -2325,7 +2343,16 @@ def make_flash_attention_bwd_kv_kernel(
         raise ValueError("make_flash_attention_bwd_kv_kernel is route-only (needs arg_decls/bindings)")
 
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
-    TPG = BK * D
+    # K-SUB-TILE so a large head_dim fits Metal's limits: TPG = KS*D <= 1024 threads
+    # and the threadgroup footprint < 32 KB (see _bwd_kv_subtile_size). KS == BK for the
+    # validated head_dim<=32 case (a SINGLE subtile) -> emitted kernel semantically
+    # identical to the pre-subtile template; the j-loop re-runs per k-subtile otherwise.
+    KS = _bwd_kv_subtile_size(D, BJ, BK)
+    if KS is None:
+        raise ValueError(
+            f"bwd_kv: head_dim={D} too large to tile within 32 KB / 1024 threads "
+            f"(BLOCK_J={BJ}, BLOCK_K={BK})")
+    TPG = KS * D
     _LOGICAL = [
         "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
         "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
@@ -2357,7 +2384,7 @@ kernel void {kernel_name}(
     uint3 pid3 [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]]
 ) {{
-    const uint BJ = {BJ}u, BK = {BK}u, D = {D}u, TPG = {TPG}u;
+    const uint BJ = {BJ}u, BK = {BK}u, KS = {KS}u, D = {D}u, TPG = {TPG}u;
     const float inv_ln2 = 1.4426950408889634f;
     {scale_decl}
 {bind_lines}
@@ -2375,30 +2402,34 @@ kernel void {kernel_name}(
     uint bias_base = z*b_sz + h*b_sh;
     uint mask_base = {_mz}*mask_sz + h*mask_sh;
 
-    threadgroup float tg_K[{BK} * {D}];
-    threadgroup float tg_V[{BK} * {D}];
-    threadgroup float dk_acc[{BK} * {D}];
-    threadgroup float dv_acc[{BK} * {D}];
+    threadgroup float tg_K[{KS} * {D}];
+    threadgroup float tg_V[{KS} * {D}];
+    threadgroup float dk_acc[{KS} * {D}];
+    threadgroup float dv_acc[{KS} * {D}];
     threadgroup float tg_Q[{BJ} * {D}];
-    threadgroup float tg_P[{BJ} * {BK}];
-    threadgroup float tg_dS[{BJ} * {BK}];
+    threadgroup float tg_P[{BJ} * {KS}];
+    threadgroup float tg_dS[{BJ} * {KS}];
     threadgroup float tg_lse[{BJ}];
     threadgroup float tg_delta[{BJ}];
-    threadgroup uchar tg_mask[{BK}];
+    threadgroup uchar tg_mask[{KS}];
 
-    for (uint i = lid; i < BK*D; i += TPG) {{ dk_acc[i] = 0.0f; dv_acc[i] = 0.0f; }}
-    for (uint i = lid; i < BK*D; i += TPG) {{
-        uint kk = i / D, dd = i % D; uint krow = k_start + kk;
+    uint n_j = (N_CTX + BJ - 1u) / BJ;
+    // Process the BK k-rows in KS-sized subtiles (KS == BK -> single pass for
+    // head_dim<=32). Each subtile stages its own K/V, re-runs the j-loop, stores DK/DV.
+    for (uint ksub = 0u; ksub < BK; ksub += KS) {{
+    uint ks_start = k_start + ksub;
+    for (uint i = lid; i < KS*D; i += TPG) {{ dk_acc[i] = 0.0f; dv_acc[i] = 0.0f; }}
+    for (uint i = lid; i < KS*D; i += TPG) {{
+        uint kk = i / D, dd = i % D; uint krow = ks_start + kk;
         tg_K[i] = (krow < N_CTX) ? float(K[k_base + krow*k_sn + dd*k_sk]) : 0.0f;
         tg_V[i] = (krow < N_CTX) ? float(V[v_base + krow*v_sn + dd*v_sk]) : 0.0f;
     }}
-    for (uint i = lid; i < BK; i += TPG) {{
-        uint krow = k_start + i;
+    for (uint i = lid; i < KS; i += TPG) {{
+        uint krow = ks_start + i;
         tg_mask[i] = (krow < N_CTX) ? Mask[mask_base + krow*mask_sn] : (uchar)1;
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint n_j = (N_CTX + BJ - 1u) / BJ;
     for (uint jb = 0u; jb < n_j; jb++) {{
         uint j_start = jb * BJ;
         for (uint i = lid; i < BJ*D; i += TPG) {{
@@ -2413,8 +2444,8 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // scores -> P[j,k] = exp2((scale*Q@Kᵀ + bias - lse) * inv_ln2)
-        for (uint i = lid; i < BJ*BK; i += TPG) {{
-            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
+        for (uint i = lid; i < BJ*KS; i += TPG) {{
+            uint jj = i / KS, kk = i % KS; uint jrow = j_start + jj, krow = ks_start + kk;
             if (jrow < N_CTX && krow < N_CTX && tg_mask[kk] == 0) {{
                 float s = 0.0f;
                 for (uint d = 0u; d < D; d++) s += tg_Q[jj*D + d] * tg_K[kk*D + d];
@@ -2427,20 +2458,20 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // dV[k,d] += sum_j P[j,k] * dO[j,d]   (dO read from device)
-        for (uint i = lid; i < BK*D; i += TPG) {{
+        for (uint i = lid; i < KS*D; i += TPG) {{
             uint kk = i / D, dd = i % D;
             float acc = 0.0f;
             for (uint jj = 0u; jj < BJ; jj++) {{
                 uint jrow = j_start + jj;
-                if (jrow < N_CTX) acc += tg_P[jj*BK + kk] * float(dO[do_base + jrow*do_sm + dd*do_sk]);
+                if (jrow < N_CTX) acc += tg_P[jj*KS + kk] * float(dO[do_base + jrow*do_sm + dd*do_sk]);
             }}
             dv_acc[i] += acc;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // dP[j,k] = sum_d dO[j,d]*V[k,d];  dS = P*(dP - delta[j])
-        for (uint i = lid; i < BJ*BK; i += TPG) {{
-            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj;
+        for (uint i = lid; i < BJ*KS; i += TPG) {{
+            uint jj = i / KS, kk = i % KS; uint jrow = j_start + jj;
             if (tg_P[i] != 0.0f) {{
                 float dp = 0.0f;
                 for (uint d = 0u; d < D; d++) dp += float(dO[do_base + jrow*do_sm + d*do_sk]) * tg_V[kk*D + d];
@@ -2452,21 +2483,23 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // dK[k,d] += sum_j dS[j,k] * Q[j,d]
-        for (uint i = lid; i < BK*D; i += TPG) {{
+        for (uint i = lid; i < KS*D; i += TPG) {{
             uint kk = i / D, dd = i % D;
             float acc = 0.0f;
-            for (uint jj = 0u; jj < BJ; jj++) acc += tg_dS[jj*BK + kk] * tg_Q[jj*D + dd];
+            for (uint jj = 0u; jj < BJ; jj++) acc += tg_dS[jj*KS + kk] * tg_Q[jj*D + dd];
             dk_acc[i] += acc;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    for (uint i = lid; i < BK*D; i += TPG) {{
-        uint kk = i / D, dd = i % D; uint krow = k_start + kk;
+    for (uint i = lid; i < KS*D; i += TPG) {{
+        uint kk = i / D, dd = i % D; uint krow = ks_start + kk;
         if (krow < N_CTX) {{
             DK[dk_base + krow*dk_sn + dd*dk_sk] = {store_cast("dk_acc[i] * scale")};
             DV[dv_base + krow*dv_sn + dd*dv_sk] = {store_cast("dv_acc[i]")};
         }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 }}
 """
@@ -2702,6 +2735,27 @@ kernel void {kernel_name}(
 """
 
 
+def _bwd_q_subtile_size(head_dim, block_j, block_k):
+    """Largest power-of-two divisor JS of block_j such that the scalar bwd_q kernel fits
+    Metal's limits: TPG = JS*head_dim <= 1024 threads AND the threadgroup footprint
+    (2*JS*D staged Q/dQ + 2*BK*D staged K/V + 2*JS*BK scores/dS, fp32) < 32 KB. Note the
+    K/V staging (2*BK*D) is J-INDEPENDENT, so head_dim large enough that 2*BK*D alone
+    exceeds the budget (e.g. head_dim>=128 at BLOCK_K=32) does NOT fit at any JS -> None
+    (dQ refuses; dK/dV still lower via the K-subtiled bwd_kv). JS == block_j for
+    head_dim<=32 (single pass)."""
+    D, BK = head_dim, block_k
+
+    def _fits(js):
+        tpg = js * D
+        mem = (2 * js * D + 2 * BK * D + 2 * js * BK) * 4 + (2 * js + BK + 16) * 4
+        return tpg <= 1024 and mem <= 32768
+
+    js = block_j
+    while js > 1 and not _fits(js):
+        js //= 2
+    return js if _fits(js) else None
+
+
 def make_flash_attention_bwd_q_kernel(
     head_dim=32,
     BLOCK_J=32,
@@ -2735,7 +2789,17 @@ def make_flash_attention_bwd_q_kernel(
         raise ValueError("make_flash_attention_bwd_q_kernel is route-only (needs arg_decls/bindings)")
 
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
-    TPG = BJ * D
+    # J-SUB-TILE so a large head_dim fits: TPG = JS*D <= 1024 threads and the threadgroup
+    # footprint < 32 KB (see _bwd_q_subtile_size). JS == BJ for head_dim<=32 (single
+    # subtile) -> emitted kernel semantically identical to the pre-subtile template; the
+    # k-loop re-runs per j-subtile otherwise.
+    JS = _bwd_q_subtile_size(D, BJ, BK)
+    if JS is None:
+        raise ValueError(
+            f"bwd_q: head_dim={D} too large to tile within 32 KB / 1024 threads "
+            f"(BLOCK_J={BJ}, BLOCK_K={BK}); the J-independent K/V staging (2*BK*D) exceeds "
+            f"the budget — dK/dV still lower via the K-subtiled bwd_kv.")
+    TPG = JS * D
     _LOGICAL = [
         "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
         "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
@@ -2765,12 +2829,12 @@ kernel void {kernel_name}(
     uint3 pid3 [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]]
 ) {{
-    const uint BJ = {BJ}u, BK = {BK}u, D = {D}u, TPG = {TPG}u;
+    const uint BJ = {BJ}u, BK = {BK}u, JS = {JS}u, D = {D}u, TPG = {TPG}u;
     const float inv_ln2 = 1.4426950408889634f;
     {scale_decl}
 {bind_lines}
     uint j_block = pid3.x; {grid_decode}
-    uint j_start = j_block * BJ;
+    uint j_block_start = j_block * BJ;
 
     uint q_base   = z*q_sz  + h*q_sh;
     uint k_base   = z*k_sz  + h*k_sh;
@@ -2783,23 +2847,28 @@ kernel void {kernel_name}(
     uint bias_base = z*b_sz + h*b_sh;
     uint mask_base = {_mz}*mask_sz + h*mask_sh;
 
-    threadgroup float tg_Q[{BJ} * {D}];
-    threadgroup float dq_acc[{BJ} * {D}];
+    threadgroup float tg_Q[{JS} * {D}];
+    threadgroup float dq_acc[{JS} * {D}];
     threadgroup float tg_K[{BK} * {D}];
     threadgroup float tg_V[{BK} * {D}];
-    threadgroup float tg_P[{BJ} * {BK}];
-    threadgroup float tg_dS[{BJ} * {BK}];
-    threadgroup float tg_lse[{BJ}];
-    threadgroup float tg_delta[{BJ}];
+    threadgroup float tg_P[{JS} * {BK}];
+    threadgroup float tg_dS[{JS} * {BK}];
+    threadgroup float tg_lse[{JS}];
+    threadgroup float tg_delta[{JS}];
     threadgroup uchar tg_mask[{BK}];
 
-    for (uint i = lid; i < BJ*D; i += TPG) {{
+    uint n_k = (N_CTX + BK - 1u) / BK;
+    // Process the BJ j-rows in JS-sized subtiles (JS == BJ -> single pass for
+    // head_dim<=32). Each subtile stages its own Q/delta, re-runs the k-loop, stores dQ.
+    for (uint jsub = 0u; jsub < BJ; jsub += JS) {{
+    uint j_start = j_block_start + jsub;
+    for (uint i = lid; i < JS*D; i += TPG) {{
         uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
         tg_Q[i] = (jrow < N_CTX) ? float(Q[q_base + jrow*q_sm + dd*q_sk]) : 0.0f;
         dq_acc[i] = 0.0f;
     }}
     // delta[j] = rowsum(O[j]*dO[j]); store it; load lse
-    for (uint i = lid; i < BJ; i += TPG) {{
+    for (uint i = lid; i < JS; i += TPG) {{
         uint jrow = j_start + i;
         float dl = 0.0f;
         if (jrow < N_CTX) {{
@@ -2812,7 +2881,6 @@ kernel void {kernel_name}(
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint n_k = (N_CTX + BK - 1u) / BK;
     for (uint kb = 0u; kb < n_k; kb++) {{
         uint k_start = kb * BK;
         for (uint i = lid; i < BK*D; i += TPG) {{
@@ -2827,7 +2895,7 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // P[j,k]
-        for (uint i = lid; i < BJ*BK; i += TPG) {{
+        for (uint i = lid; i < JS*BK; i += TPG) {{
             uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
             if (jrow < N_CTX && krow < N_CTX && tg_mask[kk] == 0) {{
                 float s = 0.0f;
@@ -2841,7 +2909,7 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // dP -> dS
-        for (uint i = lid; i < BJ*BK; i += TPG) {{
+        for (uint i = lid; i < JS*BK; i += TPG) {{
             uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj;
             if (tg_P[i] != 0.0f) {{
                 float dp = 0.0f;
@@ -2854,7 +2922,7 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // dQ[j,d] += sum_k dS[j,k] * K[k,d]
-        for (uint i = lid; i < BJ*D; i += TPG) {{
+        for (uint i = lid; i < JS*D; i += TPG) {{
             uint jj = i / D, dd = i % D;
             float acc = 0.0f;
             for (uint kk = 0u; kk < BK; kk++) acc += tg_dS[jj*BK + kk] * tg_K[kk*D + dd];
@@ -2863,9 +2931,11 @@ kernel void {kernel_name}(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    for (uint i = lid; i < BJ*D; i += TPG) {{
+    for (uint i = lid; i < JS*D; i += TPG) {{
         uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
         if (jrow < N_CTX) DQ[dq_base + jrow*dq_sm + dd*dq_sk] = {store_cast("dq_acc[i] * scale")};
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 }}
 """
@@ -3085,6 +3155,25 @@ kernel void {kernel_name}(
 """
 
 
+def _bwd_b_config(head_dim, block_j, block_k):
+    """(stage_q, fits) for the scalar bwd_b (dbias) kernel. TPG = BJ*BK is D-independent
+    (fits 1024), but the staged Q/K/V (=(BJ+2*BK)*D) scale with head_dim. tg_Q is used
+    only in the score dot and is reused across k, so for a head_dim where full staging
+    overflows 32 KB we DE-STAGE Q (read from device) — that alone fits head_dim=64.
+    head_dim large enough that the J-independent K/V staging (2*BK*D) + the BJ*BK*3
+    score/bias/db scratch already exceed 32 KB (e.g. head_dim>=128 at BLOCK_K=32) does
+    NOT fit -> (False, False) -> refuse. stage_q True (head_dim<=32) -> byte-identical."""
+    D, BJ, BK = head_dim, block_j, block_k
+    common = (3 * BJ * BK + 2 * BJ) * 4 + BK  # db_acc+tg_bias+tg_P + lse+delta + mask
+    kv = 2 * BK * D * 4
+    q = BJ * D * 4
+    if common + kv + q <= 32768:
+        return True, True
+    if common + kv <= 32768:
+        return False, True
+    return False, False
+
+
 def make_flash_attention_bwd_b_kernel(
     head_dim=32,
     BLOCK_J=32,
@@ -3117,6 +3206,13 @@ def make_flash_attention_bwd_b_kernel(
 
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
     TPG = BJ * BK
+    # For a large head_dim, DE-STAGE Q (read from device in the score dot) so the
+    # threadgroup footprint fits 32 KB; stage_q True for head_dim<=32 (byte-identical).
+    stage_q, _fits = _bwd_b_config(D, BJ, BK)
+    if not _fits:
+        raise ValueError(
+            f"bwd_b: head_dim={D} too large to fit dbias scratch within 32 KB "
+            f"(BLOCK_J={BJ}, BLOCK_K={BK}); the J-independent K/V staging exceeds the budget")
     _LOGICAL = [
         "q_sh", "q_si", "q_sm", "q_sk", "k_sh", "k_si", "k_sn", "k_sk",
         "v_sh", "v_si", "v_sn", "v_sk", "b_sh", "b_sm", "b_sn",
@@ -3131,6 +3227,22 @@ def make_flash_attention_bwd_b_kernel(
     bind_lines = "\n".join(f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale")
     scale_decl = f"const float scale = {bindings['scale']};"
     _mz = f"(z / {mask_batch_div})" if mask_batch_div is not None else "z"
+
+    # Conditional Q staging (de-staged for large head_dim). These fragments carry SINGLE
+    # braces (interpolated into the f-string verbatim, not re-escaped).
+    if stage_q:
+        tg_q_decl = f"    threadgroup float tg_Q[{BJ} * {D}];"
+        tg_q_load = (
+            "        for (uint i = lid; i < BJ*D; i += TPG) {\n"
+            "            uint jj = i / D, dd = i % D; uint jrow = j_start + jj;\n"
+            "            tg_Q[i] = (jrow < N_CTX) ? float(Q[q_hbase + ii*q_si + jrow*q_sm + dd*q_sk]) : 0.0f;\n"
+            "        }"
+        )
+        q_score = "tg_Q[jj*D + d]"
+    else:
+        tg_q_decl = "    // tg_Q de-staged (read from device) to fit the threadgroup budget"
+        tg_q_load = "        // Q read from device in the score dot (de-staged)"
+        q_score = "float(Q[q_hbase + ii*q_si + jrow*q_sm + d*q_sk])"
 
     return f"""#include <metal_stdlib>
 using namespace metal;
@@ -3160,7 +3272,7 @@ kernel void {kernel_name}(
 
     threadgroup float db_acc[{BJ} * {BK}];
     threadgroup float tg_bias[{BJ} * {BK}];
-    threadgroup float tg_Q[{BJ} * {D}];
+{tg_q_decl}
     threadgroup float tg_K[{BK} * {D}];
     threadgroup float tg_V[{BK} * {D}];
     threadgroup float tg_P[{BJ} * {BK}];
@@ -3177,10 +3289,7 @@ kernel void {kernel_name}(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint ii = 0u; ii < N_CTX; ii++) {{
-        for (uint i = lid; i < BJ*D; i += TPG) {{
-            uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
-            tg_Q[i] = (jrow < N_CTX) ? float(Q[q_hbase + ii*q_si + jrow*q_sm + dd*q_sk]) : 0.0f;
-        }}
+{tg_q_load}
         for (uint i = lid; i < BK*D; i += TPG) {{
             uint kk = i / D, dd = i % D; uint krow = k_start + kk;
             tg_K[i] = (krow < N_CTX) ? float(K[k_hbase + ii*k_si + krow*k_sn + dd*k_sk]) : 0.0f;
@@ -3202,7 +3311,7 @@ kernel void {kernel_name}(
             uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
             if (jrow < N_CTX && krow < N_CTX && tg_mask[kk] == 0) {{
                 float s = 0.0f;
-                for (uint d = 0u; d < D; d++) s += tg_Q[jj*D + d] * tg_K[kk*D + d];
+                for (uint d = 0u; d < D; d++) s += {q_score} * tg_K[kk*D + d];
                 s = s*scale + tg_bias[i];
                 tg_P[i] = exp2((s - tg_lse[jj]) * inv_ln2);
             }} else {{

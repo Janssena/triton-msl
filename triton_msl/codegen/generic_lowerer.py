@@ -6881,7 +6881,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
-            self.effective_block_size = 128 if simd_ok else block_k * head_dim
+            # scalar path k-subtiles so a large head_dim fits: TPG = KS*head_dim (KS==block_k
+            # for head_dim<=32 -> unchanged block_k*head_dim). Must match the template's KS.
+            if simd_ok:
+                self.effective_block_size = 128
+            else:
+                from triton_msl.codegen._msl_templates import _bwd_kv_subtile_size
+                _ks = _bwd_kv_subtile_size(head_dim, block_j, block_k)
+                self.effective_block_size = (_ks * head_dim) if _ks is not None else block_k * head_dim
         elif kind == "q":
             oo, dqs = info["o"][1], info["dq"][1]
             bindings = dict(common)
@@ -6892,12 +6899,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
             })
             q_maker = make_flash_attention_bwd_q_kernel_simd if simd_ok else make_flash_attention_bwd_q_kernel
+            # scalar path j-subtiles so a large head_dim fits: TPG = JS*head_dim (JS==block_j
+            # for head_dim<=32 -> unchanged). The J-independent K/V staging (2*BK*D) can make
+            # dQ unfittable at head_dim>=128 (JS is None) -> refuse LOUDLY (dK/dV still lower).
+            if simd_ok:
+                self.effective_block_size = 128
+            else:
+                from triton_msl.codegen._msl_templates import _bwd_q_subtile_size
+                _js = _bwd_q_subtile_size(head_dim, block_j, block_k)
+                if _js is None:
+                    raise MetalNonRecoverableError(
+                        f"Refusing to emit silently-wrong output: backward dQ head_dim={head_dim} "
+                        f"(BLOCK_J={block_j}, BLOCK_K={block_k}) — the J-independent K/V threadgroup "
+                        f"staging (2*BLOCK_K*head_dim) exceeds 32 KB at any j-subtile, so dQ has no "
+                        f"correct lowering here (dK/dV still lower via the K-subtiled bwd_kv).")
+                self.effective_block_size = _js * head_dim
             msl = q_maker(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
-            self.effective_block_size = 128 if simd_ok else block_j * head_dim
         else:  # b — triangle-i is a loop; slot [1] of each stride list is the i-stride.
             dbs = info["db"][1]
             bindings = {
@@ -6913,6 +6934,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "db_sh": _u(dbs[0]), "db_sm": _u(dbs[2]), "db_sn": _u(dbs[3]),
                 "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
             }
+            # dbias de-stages Q for a large head_dim; if even that overflows 32 KB
+            # (head_dim>=128 at BLOCK_K=32) it has no correct lowering here -> refuse LOUDLY.
+            from triton_msl.codegen._msl_templates import _bwd_b_config
+            _bfits = _bwd_b_config(head_dim, block_j, block_k)[1]
+            if not _bfits:
+                raise MetalNonRecoverableError(
+                    f"Refusing to emit silently-wrong output: backward dbias head_dim={head_dim} "
+                    f"(BLOCK_J={block_j}, BLOCK_K={block_k}) — the J-independent K/V threadgroup "
+                    f"staging exceeds 32 KB even with Q de-staged, so dbias has no correct lowering.")
             msl = make_flash_attention_bwd_b_kernel(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
