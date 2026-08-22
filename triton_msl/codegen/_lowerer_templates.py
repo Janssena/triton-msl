@@ -3061,6 +3061,44 @@ class _TemplateMixin:
         if _trace_to_arg(scale_bc) != 3 or _trace_to_arg(zero_bc) != 4:
             return None
 
+        # --- PER-N vs PER-GROUP: the fast kernel indexes scale/zero as length-N (per
+        #     output channel). A GPTQ PER-GROUP kernel loads scale/zero INSIDE the K-loop
+        #     at k//G, so the load is loop-VARIANT and stays in the scf.for body; routing
+        #     it to the per-N kernel silently drops the group boundary (wrong numbers, no
+        #     error). Refuse when either scale/zero load lives inside a loop region. A
+        #     genuinely per-N load (or a single-group load, k//G folded to 0) is hoisted
+        #     out -> not in the loop set -> still routes. ---
+        _loop_op_ids = set()
+
+        def _collect_loop_ops(ops, in_loop):
+            for s in ops:
+                if in_loop:
+                    _loop_op_ids.add(s.id)
+                child = in_loop or (s.op == "scf.for")
+                if getattr(s, "region_ops", None):
+                    _collect_loop_ops(s.region_ops, child)
+                if getattr(s, "else_ops", None):
+                    _collect_loop_ops(s.else_ops, child)
+
+        _collect_loop_ops(self.graph.ops, False)
+
+        def _find_load(oid, d=0):
+            if d > 32:
+                return None
+            o = op_by_id.get(oid)
+            if o is None:
+                return None
+            if o.op == "tt.load":
+                return o
+            if not o.operand_ids:
+                return None
+            return _find_load(o.operand_ids[0], d + 1)
+
+        for _bc in (scale_bc, zero_bc):
+            _ld = _find_load(_bc)
+            if _ld is not None and _ld.id in _loop_op_ids:
+                return None  # per-group (loop-variant) scale/zero -> refuse
+
         # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
         try:
             sd = self.infer_dot_strides()
