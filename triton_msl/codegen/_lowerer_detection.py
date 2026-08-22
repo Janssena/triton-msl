@@ -769,7 +769,7 @@ class _DetectionMixin:
                     m_arg = arg.name
         return m_arg, n_arg
 
-    def _template_output_mask_nontrivial(self, is_fa):
+    def _template_output_mask_nontrivial(self, is_fa, fa_ctx_index=None):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
         RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
         matmul / FlashAttention TEMPLATES would SILENTLY DROP. They gate writes only on
@@ -907,9 +907,16 @@ class _DetectionMixin:
             if arg is not None:
                 # A runtime-arg bound is trivially droppable for MATMUL: the template now
                 # clips _M/_N at exactly this arg (structural, _matmul_output_extent_args),
-                # so the mask is applied, not dropped -- for ANY arg name (issue #4.5). FA
-                # keeps the strict name match (its template clips by a fixed N_CTX boundary).
-                return True if not is_fa else (arg.name in ok_names)
+                # so the mask is applied, not dropped -- for ANY arg name (issue #4.5). FA's
+                # template clips output ROWS at exactly its resolved N_CTX arg, so the mask is
+                # honored (not dropped) when the store bound IS that same arg -- matched by
+                # NAME ("N_CTX") or, when the seq-len was resolved STRUCTURALLY from a renamed
+                # arg (seqlen, L, ...), by that arg's INDEX (fa_ctx_index).
+                if not is_fa:
+                    return True
+                return arg.name in ok_names or (
+                    fa_ctx_index is not None and getattr(arg, "index", None) == fa_ctx_index
+                )
             if o is not None and o.op == "arith.constant":
                 try:
                     val = int(o.attrs.get("value"))

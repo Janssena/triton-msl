@@ -5285,7 +5285,77 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         z_arg = scalar_by_name.get("Z")
         h_arg = scalar_by_name.get("H")
         n_ctx_arg = scalar_by_name.get("N_CTX")
-        if n_ctx_arg is None:
+        n_ctx_index = n_ctx_arg.index if n_ctx_arg is not None else None
+        if n_ctx_index is None:
+            # STRUCTURAL fallback (independent of the arg NAME, the trifast-#1
+            # name-heuristic class): the bounds masks compare a make_range-derived
+            # tile index to the sequence length (offs < N_CTX) in BOTH causal and
+            # non-causal kernels — unlike the KV-loop upper bound, which is
+            # (start_m+1)*BLOCK_M under causal and would resolve the WRONG arg. So
+            # a kernel that names its seq-len anything but "N_CTX" (seqlen, L, ...)
+            # still routes. Collect the distinct non-ptr scalar args that appear as
+            # the (splat) operand of a less-than cmpi whose OTHER operand is a tile
+            # index; require EXACTLY one -> that is N_CTX (2+ distinct -> ambiguous
+            # -> refuse, never guess).
+            _passthru = (
+                "tt.splat", "tt.broadcast", "arith.extsi", "arith.extui",
+                "arith.index_cast", "arith.index_castui", "ttg.convert_layout",
+            )
+
+            def _is_lt(_s):
+                _pn = _s.attrs.get("predicate_name")
+                if _pn is not None:
+                    return _pn in ("slt", "sle", "ult", "ule")
+                return _s.attrs.get("predicate") in (2, 3, 6, 7)
+
+            def _cone_has_range(_start):
+                # True if the SSA cone reaches a tt.make_range, unwrapping the
+                # shape ops (_trace_to_make_range stops at expand_dims/broadcast,
+                # but the mask operand is offs[:, None] = expand_dims(range)). The
+                # splat-of-scalar-arg side bottoms out at a block arg -> False.
+                _seen, _stack = set(), [_start]
+                while _stack:
+                    _c = _stack.pop()
+                    if _c in _seen:
+                        continue
+                    _seen.add(_c)
+                    _o = op_by_id.get(_c)
+                    if _o is None:
+                        continue
+                    if _o.op == "tt.make_range":
+                        return True
+                    if _o.op in (
+                        "tt.expand_dims", "tt.broadcast", "tt.reshape", "tt.splat",
+                        "ttg.convert_layout", "arith.extsi", "arith.extui",
+                        "arith.trunci", "arith.index_cast", "arith.index_castui",
+                        "arith.muli", "arith.addi",
+                    ) and _o.operand_ids:
+                        _stack.extend(_o.operand_ids)
+                return False
+
+            _nctx_cands = set()
+            for _s in all_ops:
+                if _s.op != "arith.cmpi" or len(_s.operand_ids or []) != 2 or not _is_lt(_s):
+                    continue
+                _x, _y = _s.operand_ids
+                _x_mr = _cone_has_range(_x)
+                _y_mr = _cone_has_range(_y)
+                if _x_mr == _y_mr:
+                    continue  # need exactly one tile-index side (excludes causal range-vs-range)
+                _arg_side = _y if _x_mr else _x
+                _root = _arg_side
+                while True:
+                    _o = op_by_id.get(_root)
+                    if _o is not None and _o.op in _passthru and _o.operand_ids:
+                        _root = _o.operand_ids[0]
+                        continue
+                    break
+                _a = arg_by_id.get(_root)
+                if _a is not None and not _a.is_ptr:
+                    _nctx_cands.add(_a.index)
+            if len(_nctx_cands) == 1:
+                n_ctx_index = next(iter(_nctx_cands))
+        if n_ctx_index is None:
             _refuse("the N_CTX scalar arg")
         z_val = z_arg.index if z_arg is not None else C1
         # H (heads) is baked into the template as the head divisor (z = zh / H,
@@ -5373,7 +5443,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             },
             "Z": z_val,
             "H": h_val,
-            "N_CTX": n_ctx_arg.index,
+            "N_CTX": n_ctx_index,
             "block_m": block_m,
             "block_n": block_n,
             "head_dim": head_dim,
@@ -7127,7 +7197,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # rows. So the mask-dropping templates refuse such a mask THEMSELVES here, using
         # the SAME shared triviality check as the chokepoint (so the two cannot diverge).
         # A trivially-true tile-boundary mask (om < N_CTX) / the no-mask case pass through.
-        if self._template_output_mask_nontrivial(is_fa=True):
+        if self._template_output_mask_nontrivial(is_fa=True, fa_ctx_index=info.get("N_CTX")):
             raise MetalNonRecoverableError(
                 "FlashAttention (head_dim=128) with a non-tile-boundary output store "
                 "mask is not supported: the simdgroup / tiled FA templates compute the "
