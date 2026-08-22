@@ -5646,16 +5646,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if lse_res is None:
             _refuse("the lse store pointer/strides")
 
-        # Mask: exactly one tt.load of an i1/i8 (bool) tensor.
+        # Mask: OPTIONAL — a boolean tt.load of an i1/i8 tensor. Zero mask loads =>
+        # ALiBi/T5-style additive bias with NO masking (the template's mask is a no-op).
+        # Exactly one => resolve it (trifast). More than one => REFUSE, never return None
+        # (a bias-in-dot kernel routed to standard FA would silently DROP the bias).
         mask_loads = [
             s for s in allops
             if s.op == "tt.load" and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))
         ]
-        if len(mask_loads) != 1:
-            _refuse("a single boolean mask load")
-        m_res = resolve_1d(mask_loads[0].operand_ids[0])
-        if m_res is None:
-            _refuse("the mask pointer/strides")
+        if len(mask_loads) > 1:
+            _refuse("at most one boolean mask load (ambiguous biased attention)")
+        has_mask = len(mask_loads) == 1
+        m_res = None
+        if has_mask:
+            m_res = resolve_1d(mask_loads[0].operand_ids[0])
+            if m_res is None:
+                _refuse("the mask pointer/strides")
 
         def _mask_batch_divisor(mask_addr):
             """The mask's batch (z) offset. Returns the divisor arg index iff it is
@@ -5702,7 +5708,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return ar.index
             return None
 
-        mask_div = _mask_batch_divisor(mask_loads[0].operand_ids[0])
+        mask_div = _mask_batch_divisor(mask_loads[0].operand_ids[0]) if has_mask else None
 
         # Runtime Q-scale: mulf(load(Q), splat(scale_arg)). For fp16/bf16 inputs the
         # scale is cast to the input dtype first (tl.full([1], sm_scale, dtype=q.dtype)
@@ -5846,10 +5852,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # z = pid_zh, h = 0. Bind H = 1u (the template computes h = zh % 1 = 0).
             h_arg = C1
 
-        # DISTINCT pointer roles (7): Q, K, V, Out, bias, mask, lse.
-        roles = [q_res[0], k_res[0], v_res[0], o_res[0], b_res[0], m_res[0], lse_res[0]]
-        if len(set(roles)) != 7:
-            _refuse("seven distinct pointer roles (q,k,v,out,bias,mask,lse)")
+        # DISTINCT pointer roles: Q, K, V, Out, bias, lse (+ mask when present).
+        roles = [q_res[0], k_res[0], v_res[0], o_res[0], b_res[0], lse_res[0]]
+        if has_mask:
+            roles.append(m_res[0])
+        if len(set(roles)) != len(roles):
+            _refuse("distinct pointer roles (q,k,v,out,bias,lse[,mask])")
 
         _o_elem = str(self.graph.args[o_res[0]].elem_type)
         if _o_elem in ("fp16", "f16"):
@@ -5874,11 +5882,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "biased": True,
             "grid_3d": grid_3d,
             "q": q_res[0], "k": k_res[0], "v": v_res[0], "out": o_res[0],
-            "bias": b_res[0], "mask": m_res[0], "lse": lse_res[0],
+            "bias": b_res[0], "mask": (m_res[0] if has_mask else None), "lse": lse_res[0],
+            "has_mask": has_mask,
             # strides in resolver order; the template mapping handles the Kᵀ swap.
             "q_strides": q_res[1], "k_strides": k_res[1], "v_strides": v_res[1],
             "o_strides": o_res[1], "b_strides": b_res[1],
-            "m_strides": m_res[1], "lse_strides": lse_res[1],
+            "m_strides": (m_res[1] if has_mask else None), "lse_strides": lse_res[1],
             "scale_arg": scale_arg,
             # In 2-D, H drives z=zh/H. In 3-D, the same resolved divui(pid_h, H) IS
             # the mask cross-head divisor (mask_start_h = pid_h // H_heads).
@@ -6874,10 +6883,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         head_dim = info["head_dim"]
         block_m, block_n = info["block_m"], info["block_n"]
+        has_mask = bool(info.get("has_mask", info.get("mask") is not None))
         role_name = {
             info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
-            info["bias"]: "Bias", info["mask"]: "Mask", info["lse"]: "Lse",
+            info["bias"]: "Bias", info["lse"]: "Lse",
         }
+        if has_mask:
+            role_name[info["mask"]] = "Mask"
 
         # Partition args into pointers + scalars, matching the launcher's binding.
         #  - <= 31 args: NO packing; the launcher binds kargs[i] -> buffer(i)
@@ -6944,7 +6956,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             raise MetalNonRecoverableError("biased FlashAttention runtime scale arg unmapped; refusing.")
 
         qs, ks, vs = info["q_strides"], info["k_strides"], info["v_strides"]
-        os_, bs, ms, ls = info["o_strides"], info["b_strides"], info["m_strides"], info["lse_strides"]
+        os_, bs, ls = info["o_strides"], info["b_strides"], info["lse_strides"]
+        # mask strides only exist when a mask is present; 0u placeholders otherwise (the
+        # template's mask code is gated off, so they are never read).
+        ms = info["m_strides"] if has_mask else None
+        _msk = (lambda i: _uint_expr(ms[i])) if has_mask else (lambda i: "0u")
         bindings = {
             "q_sz": _uint_expr(qs[0]), "q_sh": _uint_expr(qs[1]), "q_sm": _uint_expr(qs[2]), "q_sk": _uint_expr(qs[3]),
             # Kᵀ: resolver row (ks[2]) = head-dim stride -> k_sk; col (ks[3]) = kv stride -> k_sn.
@@ -6952,7 +6968,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "v_sz": _uint_expr(vs[0]), "v_sh": _uint_expr(vs[1]), "v_sn": _uint_expr(vs[2]), "v_sk": _uint_expr(vs[3]),
             "o_sz": _uint_expr(os_[0]), "o_sh": _uint_expr(os_[1]), "o_sm": _uint_expr(os_[2]), "o_sk": _uint_expr(os_[3]),
             "b_sz": _uint_expr(bs[0]), "b_sh": _uint_expr(bs[1]), "b_sm": _uint_expr(bs[2]), "b_sn": _uint_expr(bs[3]),
-            "mask_sz": _uint_expr(ms[0]), "mask_sh": _uint_expr(ms[1]), "mask_sn": _uint_expr(ms[2]),
+            "mask_sz": _msk(0), "mask_sh": _msk(1), "mask_sn": _msk(2),
             "lse_sz": _uint_expr(ls[0]), "lse_sh": _uint_expr(ls[1]), "lse_sm": _uint_expr(ls[2]),
             "Z": "1u",  # unused in the tiled template body (z = zh / H computed locally)
             "H": _uint_expr(info["H"]), "N_CTX": _uint_expr(info["N_CTX"]),
@@ -6996,7 +7012,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 causal=info["causal"], out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                bias=True, mask=True, lse=True, runtime_scale=True,
+                bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
             )
             self.effective_block_size = 256
@@ -7007,7 +7023,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 causal=info["causal"], out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                bias=True, mask=True, lse=True, runtime_scale=True,
+                bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
             )
             self.effective_block_size = block_m * block_n
