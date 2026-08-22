@@ -6056,9 +6056,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             kind = "b"
         else:
             return None
-        if kind == "b":
-            return None  # dbias not yet routed -> fall through to the fail-closed path
-
         def _refuse(field):
             raise MetalNonRecoverableError(
                 f"Biased-FA backward ({kind}) recognized but {field} could not be resolved; "
@@ -6085,7 +6082,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if s.op in ("arith.subf",):
                     yield s
 
-        lse_res = None
+        lse_res = lse_addr = None
         exp2_ops = [s for s in allops if s.op == "math.exp2"]
         for e in exp2_ops:
             inp = op_by_id.get(skip_layout(e.operand_ids[0])) if e.operand_ids else None
@@ -6103,6 +6100,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         r = resolve_1d(la) if la is not None else None
                         if r is not None:
                             lse_res = r
+                            lse_addr = la
         if lse_res is None:
             _refuse("the lse (row_max) pointer")
 
@@ -6111,7 +6109,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                       and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))]
         if len(mask_loads) != 1:
             _refuse("a single boolean mask load")
-        m_res = resolve_1d(mask_loads[0].operand_ids[0])
+        mask_addr = mask_loads[0].operand_ids[0]
+        m_res = resolve_1d(mask_addr)
         if m_res is None:
             _refuse("the mask pointer")
 
@@ -6264,6 +6263,198 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "bwd_kind": "q", "grid_3d": grid_3d,
                 "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
                 "lse": lse_res, "delta": dlt_res, "do": do_res, "o": o_res, "dq": dq_res,
+                "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
+                "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+            }
+
+        # ======================= _bwd_b (dbias) ==============================
+        # Here the triangle-i axis is a LOOP (grid = (pid_j, pid_k, pid_h)); Q/K/V/dO/
+        # lse/delta/mask advance by their i-stride each iteration -> that stride lives
+        # in the loop-body addptr, not the initial pointer. bias/db do not depend on i.
+        if kind == "b":
+            # per-iteration advance stride of a loop-carried pointer (its i-stride).
+            def _off_arg(oid):
+                seen = set()
+                while oid not in seen:
+                    seen.add(oid)
+                    oid2 = skip_layout(oid)
+                    op = op_by_id.get(oid2)
+                    if op is not None and op.op in ("tt.splat", "tt.broadcast") and op.operand_ids:
+                        oid = op.operand_ids[0]
+                        continue
+                    if op is not None and op.op == "arith.muli":
+                        for o in op.operand_ids:
+                            sub = op_by_id.get(skip_layout(o))
+                            if sub is not None and sub.op in ("tt.splat", "tt.broadcast") and sub.operand_ids:
+                                a = arg_by_id.get(sub.operand_ids[0])
+                                if a is not None and not a.is_ptr:
+                                    return a.index
+                            a = arg_by_id.get(skip_layout(o))
+                            if a is not None and not a.is_ptr:
+                                return a.index
+                        return None
+                    a = arg_by_id.get(oid2)
+                    return a.index if (a is not None and not a.is_ptr) else None
+                return None
+
+            def _advance_stride(ba_id):
+                for s in allops:
+                    if s.op == "tt.addptr" and len(s.operand_ids or []) >= 2 and s.operand_ids[0] == ba_id:
+                        r = _off_arg(s.operand_ids[1])
+                        if r is not None:
+                            return r
+                return None
+
+            # Q/K/bias from the scores dot; capture raw (block-arg) addrs for advances.
+            q_addr = load_addr(scores_dot.operand_ids[0])
+            k_addr = load_addr(scores_dot.operand_ids[1])
+            q_res = resolve_2d(q_addr)
+            k_res = resolve_2d(k_addr)
+            b_res = resolve_2d(load_addr(scores_dot.operand_ids[2]))
+            if not (q_res and k_res and b_res):
+                _refuse("Q/K/bias")
+
+            # dP dot = the one non-scores dot: dot(dO, Vᵀ) -> op0=dO, op1=V.
+            dp_dot = next((d for d in dots if d.id != scores_dot.id), None)
+            if dp_dot is None or len(dp_dot.operand_ids or []) < 2:
+                _refuse("the dP dot (dO @ Vᵀ)")
+            do_addr = load_addr(dp_dot.operand_ids[0])
+            v_addr = load_addr(dp_dot.operand_ids[1])
+            do_res = resolve_2d(do_addr)
+            v_res = resolve_2d(v_addr)
+            if do_res is None or v_res is None:
+                _refuse("the dO / V pointers (dP = dO @ Vᵀ)")
+
+            # delta LOADED: subf(dP_result, delta_load) -> the load.
+            dlt_res = dlt_addr = None
+            for s in allops:
+                if s.op == "arith.subf" and s.operand_ids:
+                    for o in s.operand_ids:
+                        la = load_addr(o)
+                        r = resolve_1d(la) if la is not None else None
+                        if r is not None and r[0] not in (lse_res[0], m_res[0]):
+                            others = [x for x in s.operand_ids if x != o]
+                            if others and load_addr(others[0]) is None:
+                                dlt_res, dlt_addr = r, la
+            if dlt_res is None:
+                _refuse("the delta pointer (dP - delta)")
+
+            # db store: addptr(splat(base), addi(j*sm_row, k*sn_col)) -- a SINGLE addptr
+            # with a FUSED offset (unlike q/k/v's chained addptrs), so resolve_2d's
+            # chained form doesn't match. Resolve the fused offset directly, tagging
+            # each addi term as row (broadcast input [BJ,1]) or col ([1,BK]).
+            def _range_axis(tid):
+                sid = skip_layout(tid)
+                seen = set()
+                while sid not in seen:
+                    seen.add(sid)
+                    op = op_by_id.get(sid)
+                    if op is None:
+                        return None
+                    if op.op == "tt.broadcast" and op.operand_ids:
+                        insh = _extract_shape(self._find_op_type_str(op.operand_ids[0]))
+                        if insh and len(insh) == 2:
+                            if insh[1] == 1:
+                                return 0
+                            if insh[0] == 1:
+                                return 1
+                        return None
+                    nxt = None
+                    for o in (op.operand_ids or []):
+                        sub = op_by_id.get(skip_layout(o))
+                        if sub is not None and sub.op != "tt.splat":
+                            nxt = o
+                            break
+                    if nxt is None:
+                        return None
+                    sid = skip_layout(nxt)
+                return None
+
+            def _resolve_db(addr_id):
+                aid = skip_layout(addr_id)
+                op = op_by_id.get(aid)
+                if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                    return None
+                sp = op_by_id.get(skip_layout(op.operand_ids[0]))
+                if sp is None or sp.op != "tt.splat" or not sp.operand_ids:
+                    return None
+                bs = _base_and_scalar(sp.operand_ids[0])
+                if bs is None:
+                    return None
+                base, z, h = bs
+                off = op_by_id.get(skip_layout(op.operand_ids[1]))
+                if off is None or off.op != "arith.addi" or len(off.operand_ids) < 2:
+                    return None
+                row = col = None
+                for term in off.operand_ids:
+                    ax = _range_axis(term)
+                    if ax == 0:
+                        row = stride_from_term(term)
+                    elif ax == 1:
+                        col = stride_from_term(term)
+                s = [z, h, row, col]
+                return None if any(x is None for x in s) else (base.index, s)
+
+            if len(stores) != 1:
+                _refuse("a single dbias store")
+            db_res = _resolve_db(stores[0].operand_ids[0])
+            if db_res is None:
+                _refuse("the dbias store pointer")
+
+            # scale: sm_scale folded into Q (mulf with a splat of a float arg).
+            scale_arg = None
+            for s in allops:
+                if s.op != "arith.mulf":
+                    continue
+                for o in s.operand_ids:
+                    node = op_by_id.get(skip_layout(o))
+                    if node is not None and node.op == "tt.splat" and node.operand_ids:
+                        inner = node.operand_ids[0]
+                        w = op_by_id.get(inner)
+                        while w is not None and w.op in ("arith.truncf", "arith.extf") and w.operand_ids:
+                            inner = w.operand_ids[0]
+                            w = op_by_id.get(inner)
+                        a = arg_by_id.get(inner)
+                        if a is not None and not a.is_ptr and not str(a.elem_type).startswith("i"):
+                            scale_arg = a.index
+                if scale_arg is not None:
+                    break
+            if scale_arg is None:
+                _refuse("the sm_scale argument")
+
+            # i-advance strides -> baked into stride-slot [1] (the "i" slot) of each
+            # loop-advanced pointer (bias/db keep C1; they don't depend on i).
+            for _res, _addr in ((q_res, q_addr), (k_res, k_addr), (v_res, v_addr),
+                                (do_res, do_addr), (lse_res, lse_addr),
+                                (m_res, mask_addr), (dlt_res, dlt_addr)):
+                adv = _advance_stride(_addr)
+                if adv is None:
+                    _refuse("an i-loop advance stride")
+                _res[1][1] = adv
+
+            n_ctx_arg = _resolve_n_ctx()
+            if n_ctx_arg is None:
+                _refuse("the N_CTX loop bound")
+            h_arg = _resolve_h_div()
+
+            a_shape = _extract_shape(self._find_op_type_str(scores_dot.operand_ids[0]))
+            if not a_shape or len(a_shape) != 2:
+                _refuse("the QK dot A shape")
+            block_j, head_dim = a_shape
+            qk_out = _extract_shape(scores_dot.type_str or "")
+            block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
+            out_dtype = "f16" if str(self.graph.args[db_res[0]].elem_type) in ("fp16", "f16") else (
+                "bf16" if str(self.graph.args[db_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+
+            roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
+                     dlt_res[0], do_res[0], db_res[0]]
+            if len(set(roles)) != 9:
+                _refuse("nine distinct pointer roles")
+
+            return {
+                "bwd_kind": "b", "grid_3d": True,
+                "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
+                "lse": lse_res, "delta": dlt_res, "do": do_res, "db": db_res,
                 "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
                 "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
             }
@@ -6434,15 +6625,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
           - q:  K is loaded UNtransposed [k,d] -> k_sn/k_sk map DIRECT (row/col);
             V is still transposed [d,k] -> v_sn/v_sk SWAP. Delta here is an OUTPUT
             (rowsum(O*dO)); sm_scale is folded into K, not a final store-scale.
+          - b:  triangle-i is a LOOP (grid = j,k,h); K and V both UNtransposed ->
+            direct. Each stride list's slot [1] is the i-loop ADVANCE stride (baked
+            by the detector), which the template consumes as q_si/k_si/v_si/....
         """
         from triton_msl.errors import MetalNonRecoverableError
         from triton_msl.codegen.msl_types import triton_type_to_msl
         from triton_msl.codegen._msl_templates import (
-            make_flash_attention_bwd_kv_kernel, make_flash_attention_bwd_q_kernel)
+            make_flash_attention_bwd_kv_kernel, make_flash_attention_bwd_q_kernel,
+            make_flash_attention_bwd_b_kernel)
 
         kind = info.get("bwd_kind")
-        if kind not in ("kv", "q"):
-            raise MetalNonRecoverableError("only biased-FA backward dK/dV and dQ are routed so far")
+        if kind not in ("kv", "q", "b"):
+            raise MetalNonRecoverableError("only biased-FA backward dK/dV, dQ, dbias are routed so far")
         MAX_BUFFERS = 31
         C1 = "c1"
         args = self.graph.args
@@ -6457,13 +6652,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 info["lse"][0]: "Lse", info["delta"][0]: "Delta", info["do"][0]: "dO",
             }
             write_roles = ("DK", "DV")
-        else:  # q
+        elif kind == "q":
             role_name = {
                 info["dq"][0]: "DQ", info["delta"][0]: "Delta", info["q"][0]: "Q", info["k"][0]: "K",
                 info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
                 info["lse"][0]: "Lse", info["o"][0]: "O", info["do"][0]: "dO",
             }
             write_roles = ("DQ", "Delta")
+        else:  # b
+            role_name = {
+                info["db"][0]: "DB", info["q"][0]: "Q", info["k"][0]: "K", info["v"][0]: "V",
+                info["bias"][0]: "Bias", info["mask"][0]: "Mask", info["lse"][0]: "Lse",
+                info["delta"][0]: "Delta", info["do"][0]: "dO",
+            }
+            write_roles = ("DB",)
         n_args = len(args)
         n_ptr = sum(1 for a in args if a.is_ptr)
         packed = n_args > MAX_BUFFERS
@@ -6539,7 +6741,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
             self.effective_block_size = block_k * head_dim
-        else:  # q
+        elif kind == "q":
             oo, dqs = info["o"][1], info["dq"][1]
             bindings = dict(common)
             bindings.update({
@@ -6554,6 +6756,27 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div)
             self.effective_block_size = block_j * head_dim
+        else:  # b — triangle-i is a loop; slot [1] of each stride list is the i-stride.
+            dbs = info["db"][1]
+            bindings = {
+                "q_sh": _u(qs[0]), "q_si": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
+                # K and V both UNtransposed [k,d] -> direct (no swap).
+                "k_sh": _u(ks[0]), "k_si": _u(ks[1]), "k_sn": _u(ks[2]), "k_sk": _u(ks[3]),
+                "v_sh": _u(vs[0]), "v_si": _u(vs[1]), "v_sn": _u(vs[2]), "v_sk": _u(vs[3]),
+                "b_sh": _u(bs[0]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
+                "mask_sz": _u(ms[0]), "mask_si": _u(ms[1]), "mask_sn": _u(ms[2]),
+                "lse_sh": _u(ls[0]), "lse_si": _u(ls[1]), "lse_sm": _u(ls[2]),
+                "dlt_sh": _u(ds[0]), "dlt_si": _u(ds[1]), "dlt_sm": _u(ds[2]),
+                "do_sh": _u(os_[0]), "do_si": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
+                "db_sh": _u(dbs[0]), "db_sm": _u(dbs[2]), "db_sn": _u(dbs[3]),
+                "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
+            }
+            msl = make_flash_attention_bwd_b_kernel(
+                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                mask_batch_div=mask_batch_div)
+            self.effective_block_size = block_j * block_k
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
         self._prescan_stores()

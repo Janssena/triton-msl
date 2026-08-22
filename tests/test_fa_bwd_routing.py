@@ -354,3 +354,147 @@ def test_bwd_q_routes_and_computes(Hc, Hh, I, N, DIM):
     dlt_err = (delta - delta_ref).abs().max().item()
     assert dq_err < 3e-3, f"dQ wrong: {dq_err:.3e} (ref scale {dq_ref.abs().max():.2f})"
     assert dlt_err < 3e-3, f"delta wrong: {dlt_err:.3e}"
+
+
+# fmt: off
+@triton.jit
+def _bwd_b(
+    d_ptr, stride_dh, stride_dm, stride_dn,
+    q_ptr, stride_qh, stride_qm, stride_qn, stride_qd,
+    k_ptr, stride_kh, stride_km, stride_kn, stride_kd,
+    v_ptr, stride_vh, stride_vm, stride_vn, stride_vd,
+    b_ptr, stride_bh, stride_bm, stride_bn,
+    l_ptr, stride_lh, stride_lm, stride_ln,
+    m_ptr, stride_mh, stride_mm, stride_mn,
+    do_ptr, stride_doh, stride_dom, stride_don, stride_dod,
+    db_ptr, stride_dbh, stride_dbm, stride_dbn,
+    sm_scale,
+    neg_inf,
+    H, N, DIM: tl.constexpr,
+    CLOSEST_N: tl.constexpr,
+    BLOCK_J: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    input_dtype = q_ptr.dtype.element_ty
+    BLOCK_I: tl.constexpr = 1
+    pid_j = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    inv_ln2: tl.constexpr = 1.4426950408889634
+
+    mask_start_h = pid_h // H
+    start_h = pid_h
+    start_i = 0
+    start_j = pid_j * BLOCK_J
+    start_k = pid_k * BLOCK_K
+
+    k_idxs = tl.arange(0, BLOCK_K) + start_k
+    j_idxs = tl.arange(0, BLOCK_J) + start_j
+    d_idxs = tl.arange(0, DIM)
+
+    base_q_ptr = q_ptr + (start_h * stride_qh)
+    q_ptrs = base_q_ptr + (j_idxs[:, None] * stride_qn) + (d_idxs[None, :] * stride_qd)
+
+    base_k_ptr = k_ptr + (start_h * stride_kh)
+    k_ptrs = base_k_ptr + (k_idxs[:, None] * stride_kn) + (d_idxs[None, :]) * stride_kd
+
+    base_b_ptr = b_ptr + (start_h * stride_bh)
+    b_ptrs = base_b_ptr + (j_idxs[:, None] * stride_bm) + (k_idxs[None, :] * stride_bn)
+
+    base_v_ptr = v_ptr + (start_h * stride_vh)
+    v_ptrs = base_v_ptr + (k_idxs[:, None] * stride_vn) + (d_idxs[None, :] * stride_vd)
+
+    base_l_ptr = l_ptr + (start_h * stride_lh)
+    l_ptrs = base_l_ptr + (j_idxs * stride_ln)
+
+    base_mask_ptr = m_ptr + (mask_start_h * stride_mh)
+    mask_ptrs = base_mask_ptr + (k_idxs * stride_mn)
+
+    base_do_ptr = do_ptr + (start_h * stride_doh)
+    do_ptrs = base_do_ptr + (j_idxs[:, None] * stride_don) + (d_idxs[None, :] * stride_dod)
+
+    base_db_ptr = db_ptr + (pid_h * stride_dbh)
+    db_ptrs = base_db_ptr + (j_idxs[:, None] * stride_dbm + k_idxs[None, :] * stride_dbn)
+
+    base_d_ptr = d_ptr + (start_h * stride_dh)
+    d_ptrs = base_d_ptr + (j_idxs * stride_dn)
+
+    mask_k = k_idxs < N
+    mask_j = j_idxs < N
+
+    db_block = tl.zeros([BLOCK_J, BLOCK_K], dtype=tl.float32)
+
+    for start_i in range(0, N, BLOCK_I):
+        start_i = tl.multiple_of(start_i, BLOCK_I)
+        q_block = tl.load(q_ptrs, mask_j[:, None], cache_modifier=".cg")
+        q_block *= tl.full([1], value=sm_scale, dtype=input_dtype)
+        k_block = tl.load(k_ptrs, mask_k[:, None], cache_modifier=".cg")
+
+        b_block = tl.load(b_ptrs, mask_j[:, None] & mask_k[None, :], cache_modifier=".cg").to(tl.float32)
+        m_block = tl.load(mask_ptrs, mask_k, cache_modifier=".cg")
+
+        scores = tl.dot(q_block, tl.trans(k_block), b_block, input_precision="ieee")
+        scores = tl.where(mask_j[:, None] & mask_k[None, :], scores, neg_inf)
+        scores = tl.where(m_block[None, :], neg_inf, scores)
+
+        sm_denom = tl.load(l_ptrs, mask=mask_j, cache_modifier=".cg")
+        sm_score = tl.math.exp2((scores - sm_denom[:, None]) * inv_ln2)
+
+        do = tl.load(do_ptrs, mask_j[:, None], cache_modifier=".cg")
+        delta = tl.load(d_ptrs, mask_j, cache_modifier=".cg")
+
+        v_block = tl.load(v_ptrs, mask_k[:, None], cache_modifier=".cg")
+        dsm_value = tl.dot(do, tl.trans(v_block), input_precision="ieee")
+
+        dscores = sm_score * (dsm_value - delta[:, None])
+
+        db_block += dscores
+
+        q_ptrs += stride_qm * BLOCK_I
+        k_ptrs += stride_km * BLOCK_I
+        v_ptrs += stride_vm * BLOCK_I
+        l_ptrs += stride_lm * BLOCK_I
+        mask_ptrs += stride_mm * BLOCK_I
+        d_ptrs += stride_dm * BLOCK_I
+        do_ptrs += stride_dom * BLOCK_I
+
+    tl.store(db_ptrs, db_block.to(input_dtype), mask=mask_j[:, None] & mask_k[None, :])
+# fmt: on
+
+
+@requires_mps
+@pytest.mark.parametrize("Hc,Hh,N,DIM", [(4, 2, 32, 32), (2, 1, 32, 32), (1, 1, 48, 32)])
+def test_bwd_b_routes_and_computes(Hc, Hh, N, DIM):
+    """trifast's UNMODIFIED _bwd_b routes to the dbias template and computes correct
+    db = sum_i dS vs autograd. The triangle-i axis is a LOOP (I == N)."""
+    dev = "mps"
+    I = N  # _bwd_b loops i over N
+    BJ = BK = 32
+    NEG = -1e9
+    torch.manual_seed(0)
+    sm = 1.0 / math.sqrt(DIM)
+    q = torch.randn(Hc, I, N, DIM, device=dev, requires_grad=True)
+    k = torch.randn(Hc, I, N, DIM, device=dev, requires_grad=True)
+    v = torch.randn(Hc, I, N, DIM, device=dev, requires_grad=True)
+    bias = torch.randn(Hc, N, N, device=dev, requires_grad=True)
+    mask = (torch.rand(Hc // Hh, I, N, device=dev) < 0.15).to(torch.uint8)
+    do = torch.randn(Hc, I, N, DIM, device=dev)
+    qk = torch.einsum("hijd,hikd->hijk", q, k) * sm
+    mh = mask[torch.arange(Hc, device=dev) // Hh]
+    raw = (qk + bias[:, None, :, :]).masked_fill(mh[:, :, None, :].bool(), float("-inf"))
+    p = torch.softmax(raw, dim=-1)
+    o = torch.einsum("hijk,hikd->hijd", p, v)
+    o.retain_grad(); o.backward(do)
+    db_ref = bias.grad.detach()
+    lse = torch.logsumexp(raw, dim=-1).detach()
+    delta = (o.detach() * do).sum(-1).contiguous()
+
+    st = lambda t: tuple(t.stride())
+    qd, kd, vd, bd = q.detach(), k.detach(), v.detach(), bias.detach()
+    db = torch.zeros(Hc, N, N, device=dev)
+    _bwd_b[(triton.cdiv(N, BJ), triton.cdiv(N, BK), Hc)](
+        delta, *st(delta), qd, *st(qd), kd, *st(kd), vd, *st(vd), bd, *st(bd),
+        lse, *st(lse), mask, *st(mask), do, *st(do), db, *st(db),
+        sm, NEG, Hh, N, DIM, N, BJ, BK)
+    torch.mps.synchronize()
+    db_err = (db - db_ref).abs().max().item()
+    assert db_err < 5e-3, f"dbias wrong: {db_err:.3e} (ref scale {db_ref.abs().max():.2f})"
