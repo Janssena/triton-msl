@@ -3286,6 +3286,158 @@ class _TemplateMixin:
         fast_msl = make_int8_matmul_fast(rr=rr, rc=rc, bk=32, layout=layout)
         return (fast_msl, 5, 6, 7, 8 * rr, 8 * rc, tuple(stride_checks))
 
+    def _maybe_quant_matmul_symmetric_descriptor(self):
+        """SYMMETRIC weight-only int8 GEMM: out = a @ (w_i8.to(float) * scale), NO
+        zero-point — 4 ptrs (input, weight, output, scale), M/N/K at 4/5/6, per-N float
+        scale, fp32 in/out, int8 weight. Routes to the stride-generic per-group scalar
+        template (make_int8_matmul_pergroup) with a SYNTHESIZED all-zero zeros buffer +
+        ssg=0 (so g*ssg=0 -> per-N regardless of the baked group size). Correct-or-refuse.
+        """
+        import os
+
+        if os.environ.get("TRITON_MSL_QUANT_MATMUL", "1") == "0":
+            return None
+
+        def _all(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _all(s.region_ops)
+                if s.else_ops:
+                    yield from _all(s.else_ops)
+
+        op_by_id = {o.id: o for o in _all(self.graph.ops)}
+        dots = [o for o in op_by_id.values() if o.op == "tt.dot"]
+        if len(dots) != 1 or len(dots[0].operand_ids) < 2:
+            return None
+        dot = dots[0]
+        args = self.graph.args
+        if sum(1 for a in args if a.is_ptr) != 4 or not all(args[i].is_ptr for i in range(4)):
+            return None
+        if len(args) < 7 or args[4].is_ptr or args[5].is_ptr or args[6].is_ptr:
+            return None
+        arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+
+        def _peel(oid):
+            o = op_by_id.get(oid)
+            while o is not None and o.operand_ids and o.op in (
+                "ttg.local_load", "ttg.local_alloc", "ttg.convert_layout", "tt.trans", "ttg.memdesc_trans",
+            ):
+                o = op_by_id.get(o.operand_ids[0])
+            return o
+
+        mul = _peel(dot.operand_ids[1])
+        if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids) != 2:
+            return None
+
+        def _has_i2f_no_sub(oid, seen=None, d=0):
+            if seen is None:
+                seen = set()
+            if oid in seen or d > 24:
+                return False
+            seen.add(oid)
+            o = op_by_id.get(oid)
+            if o is None:
+                return False
+            if o.op == "arith.subf":  # a subf -> ASYMMETRIC, not this path
+                return False
+            if o.op in ("arith.sitofp", "arith.uitofp"):
+                return True
+            return any(_has_i2f_no_sub(x, seen, d + 1) for x in (o.operand_ids or []))
+
+        # weight side = the mul operand that reaches sitofp with NO subf; scale = the other.
+        w_side = scale_bc = None
+        for cw, cs in ((mul.operand_ids[0], mul.operand_ids[1]), (mul.operand_ids[1], mul.operand_ids[0])):
+            _sub = op_by_id.get(cw)
+            if _sub is not None and _sub.op == "arith.subf":
+                return None  # asymmetric dequant present -> the canonical descriptor handles it
+            if _has_i2f_no_sub(cw):
+                w_side, scale_bc = cw, cs
+                break
+        if w_side is None:
+            return None
+
+        def _trace_to_arg(oid, d=0):
+            if d > 32:
+                return None
+            if oid in arg_id_to_idx:
+                return arg_id_to_idx[oid]
+            o = op_by_id.get(oid)
+            if o is None or not o.operand_ids:
+                return None
+            return _trace_to_arg(o.operand_ids[0], d + 1)
+
+        if _trace_to_arg(scale_bc) != 3:
+            return None
+        if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+            return None
+
+        try:
+            sd = self.infer_dot_strides()
+        except Exception:  # noqa: BLE001
+            return None
+        if not sd or not all(sd.get(x) for x in ("A", "B", "C")):
+            return None
+        _nti = {a.name: i for i, a in enumerate(args)}
+
+        def _sidx(nm):
+            return -1 if nm == "1" else _nti.get(nm)
+
+        # per-N scale: addr = addptr(splat(scale_ptr), offs_n * ssn); ssn arg or -1 (folded).
+        def _find_load(oid, d=0):
+            o = op_by_id.get(oid)
+            if o is None:
+                return None
+            if o.op == "tt.load":
+                return o
+            if not o.operand_ids:
+                return None
+            return _find_load(o.operand_ids[0], d + 1)
+
+        def _vec_stride(tid):
+            o = op_by_id.get(tid)
+            if o is None:
+                return None
+            if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.expand_dims") and o.operand_ids:
+                return _vec_stride(o.operand_ids[0])
+            if o.op == "arith.muli":
+                for oid in o.operand_ids:
+                    sub = op_by_id.get(oid)
+                    if sub is not None and sub.op in ("tt.splat", "tt.broadcast") and sub.operand_ids:
+                        ai = arg_id_to_idx.get(sub.operand_ids[0])
+                        if ai is not None:
+                            return ai
+                    ai = arg_id_to_idx.get(oid)
+                    if ai is not None:
+                        return ai
+                return None
+            return -1  # no stride multiply -> stride 1
+
+        sld = _find_load(scale_bc)
+        if sld is None or not sld.operand_ids:
+            return None
+        saddr = op_by_id.get(sld.operand_ids[0])
+        if saddr is None or saddr.op != "tt.addptr" or len(saddr.operand_ids) < 2:
+            return None
+        if _trace_to_arg(saddr.operand_ids[0]) != 3:
+            return None  # base must be scale_ptr (per-N: no inner g-addptr)
+        ssn = _vec_stride(saddr.operand_ids[1])
+
+        idxs = [
+            _sidx(sd["A"][0]), _sidx(sd["A"][1]),   # isr, isc
+            _sidx(sd["B"][0]), _sidx(sd["B"][1]),   # wsk, wsn
+            _sidx(sd["C"][0]), _sidx(sd["C"][1]),   # osr, osc
+            ssn,                                    # scale n-stride
+        ]
+        if any(i is None for i in idxs):
+            return None
+        from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
+        return ("sym_int8", make_int8_matmul_pergroup(32), 4, 5, 6, tuple(idxs))
+
     def _maybe_fast_matmul_descriptor(self):
         """Build the runtime fast-matmul dispatch descriptor, or None.
 

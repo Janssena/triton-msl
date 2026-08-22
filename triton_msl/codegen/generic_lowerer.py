@@ -1086,7 +1086,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # CANONICAL case to the dedicated fast dequant kernel (make_int8_matmul_fast,
         # layout kn) via the quant_matmul dispatch descriptor; refuse anything else.
         if self._detect_quantized_dot():
-            _qdesc = self._maybe_quant_matmul_descriptor()
+            _qdesc = self._maybe_quant_matmul_descriptor() or self._maybe_quant_matmul_symmetric_descriptor()
             if _qdesc is None:
                 raise MetalNonRecoverableError(
                     "quantized matmul (a tt.dot whose B operand is an integer weight "

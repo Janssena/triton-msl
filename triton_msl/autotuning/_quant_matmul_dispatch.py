@@ -57,6 +57,10 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
             return _dispatch_pergroup_int8(
                 rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
+        if descriptor[0] == "sym_int8":
+            return _dispatch_sym_int8(
+                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+            )
 
     try:
         fast_msl = descriptor[0]
@@ -147,6 +151,47 @@ def _dispatch_int4_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_
             rt.mark_unsupported(int4_msl)
         except Exception:
             pass
+        return False
+
+
+def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+    """Dispatch a SYMMETRIC int8 GEMM (no zero-point) via make_int8_matmul_pergroup.
+
+    descriptor = ("sym_int8", pg_msl, m_idx, n_idx, k_idx,
+                  (isr, isc, wsk, wsn, osr, osc, ssn)).
+    kargs = [input, weight, output, scale, M, N, K, ...strides] (4 ptrs, NO zeros).
+    Synthesize an all-zero zeros buffer and set ssg=0/zsg=0/zsn=0 so the per-group
+    template reads scale[col*ssn] and subtracts 0 -> w = weight*scale (per-N symmetric).
+    """
+    try:
+        pg_msl = descriptor[1]
+        m_idx, n_idx, k_idx = descriptor[2], descriptor[3], descriptor[4]
+        isr, isc, wsk, wsn, osr, osc, ssn_idx = descriptor[5]
+    except (TypeError, ValueError, IndexError):
+        return False
+    if pg_msl is None or rt.is_unsupported(pg_msl):
+        return False
+    try:
+        import torch as _torch
+
+        M, N, K = int(kargs[m_idx]), int(kargs[n_idx]), int(kargs[k_idx])
+        if not (M > 0 and N > 0 and K > 0):
+            return False
+        _s = lambda i: (int(kargs[i]) if i >= 0 else 1)
+        scale = kargs[3]
+        zeros = _torch.zeros(1, dtype=getattr(scale, "dtype", None), device=getattr(scale, "device", None))
+        # input(0), weight(1), output(2), scale(3), zeros(synth,4), M,N,K, strides...
+        buffers = list(kargs[0:4]) + [zeros, M, N, K,
+                                      _s(isr), _s(isc), _s(wsk), _s(wsn), _s(osr), _s(osc),
+                                      0, _s(ssn_idx), 0, 0]  # ssg=0, ssn, zsg=0, zsn=0
+        lib = rt.get_library(pg_msl)
+        _grp = 256
+        threads = _math.ceil((M * N) / _grp) * _grp
+        rt.dispatch(lib, "int8_matmul_pergroup", buffers, threads=threads, group_size=_grp)
+        if launch_exit_hook:
+            launch_exit_hook(launch_metadata)
+        return True
+    except Exception:  # noqa: BLE001
         return False
 
 
