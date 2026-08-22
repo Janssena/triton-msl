@@ -2472,6 +2472,323 @@ kernel void {kernel_name}(
 """
 
 
+def make_flash_attention_bwd_q_kernel(
+    head_dim=32,
+    BLOCK_J=32,
+    BLOCK_K=32,
+    out_dtype="fp32",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="flash_attention_bwd_q",
+    grid_3d=False,
+    mask_batch_div=None,
+):
+    """Tiled FA-2 BACKWARD dQ + delta for biased/triangle attention (route-only ABI).
+
+    Per (j-block, i, batch*heads): delta[j] = rowsum(O[j]*dO[j]) (stored for _bwd_kv),
+    then recompute P and accumulate over k-blocks
+        dP[j,k] = sum_d dO[j,d]*V[k,d];  dS[j,k] = P[j,k]*(dP[j,k] - delta[j])
+        dQ[j,d] += sum_k dS[j,k]*K[k,d]      (dQ *= sm_scale at store)
+    O and dO read from device (cached); the threadgroup budget is tg_Q + dq_acc +
+    tg_K + tg_V + tg_P + tg_dS = 6 fp32 [BLOCK*head_dim] buffers ~24 KB. Grid:
+    (n_j_blocks, I, Z*H); bias shared across i + cross-head mask as in the forward.
+    """
+    if out_dtype in ("fp32", "f32"):
+        elem, store_cast = "float", lambda e: e
+    elif out_dtype in ("fp16", "f16"):
+        elem, store_cast = "half", lambda e: f"half({e})"
+    elif out_dtype in ("bf16", "bfloat16"):
+        elem, store_cast = "bfloat", lambda e: f"bfloat({e})"
+    else:
+        raise ValueError(f"bwd_q out_dtype must be fp32/fp16/bf16 (got {out_dtype!r})")
+    if arg_decls is None or bindings is None:
+        raise ValueError("make_flash_attention_bwd_q_kernel is route-only (needs arg_decls/bindings)")
+
+    D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
+    TPG = BJ * D
+    _LOGICAL = [
+        "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
+        "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
+        "mask_sz", "mask_sh", "mask_sn", "lse_sz", "lse_sh", "lse_sm",
+        "o_sz", "o_sh", "o_sm", "o_sk", "do_sz", "do_sh", "do_sm", "do_sk",
+        "dq_sz", "dq_sh", "dq_sm", "dq_sk", "dlt_sz", "dlt_sh", "dlt_sm",
+        "H", "N_CTX", "scale",
+    ]
+    missing = [n for n in _LOGICAL if n not in bindings]
+    if missing:
+        raise ValueError(f"bwd_q bindings missing {missing}")
+    sig = ",\n".join(arg_decls)
+    bind_lines = "\n".join(f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale")
+    scale_decl = f"const float scale = {bindings['scale']};"
+    if grid_3d:
+        grid_decode = "uint h = pid3.y; uint z = pid3.z;"
+    else:
+        grid_decode = "uint zh = pid3.y; uint z = zh / H; uint h = zh % H;"
+    _mz = f"(z / {mask_batch_div})" if mask_batch_div is not None else "z"
+
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+// Tiled FA-2 backward dQ + delta ({elem} in/out, fp32 compute) for biased attention.
+kernel void {kernel_name}(
+{sig},
+    uint3 pid3 [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint BJ = {BJ}u, BK = {BK}u, D = {D}u, TPG = {TPG}u;
+    const float inv_ln2 = 1.4426950408889634f;
+    {scale_decl}
+{bind_lines}
+    uint j_block = pid3.x; {grid_decode}
+    uint j_start = j_block * BJ;
+
+    uint q_base   = z*q_sz  + h*q_sh;
+    uint k_base   = z*k_sz  + h*k_sh;
+    uint v_base   = z*v_sz  + h*v_sh;
+    uint o_base   = z*o_sz  + h*o_sh;
+    uint do_base  = z*do_sz + h*do_sh;
+    uint dq_base  = z*dq_sz + h*dq_sh;
+    uint lse_base = z*lse_sz + h*lse_sh;
+    uint dlt_base = z*dlt_sz + h*dlt_sh;
+    uint bias_base = z*b_sz + h*b_sh;
+    uint mask_base = {_mz}*mask_sz + h*mask_sh;
+
+    threadgroup float tg_Q[{BJ} * {D}];
+    threadgroup float dq_acc[{BJ} * {D}];
+    threadgroup float tg_K[{BK} * {D}];
+    threadgroup float tg_V[{BK} * {D}];
+    threadgroup float tg_P[{BJ} * {BK}];
+    threadgroup float tg_dS[{BJ} * {BK}];
+    threadgroup float tg_lse[{BJ}];
+    threadgroup float tg_delta[{BJ}];
+    threadgroup uchar tg_mask[{BK}];
+
+    for (uint i = lid; i < BJ*D; i += TPG) {{
+        uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
+        tg_Q[i] = (jrow < N_CTX) ? float(Q[q_base + jrow*q_sm + dd*q_sk]) : 0.0f;
+        dq_acc[i] = 0.0f;
+    }}
+    // delta[j] = rowsum(O[j]*dO[j]); store it; load lse
+    for (uint i = lid; i < BJ; i += TPG) {{
+        uint jrow = j_start + i;
+        float dl = 0.0f;
+        if (jrow < N_CTX) {{
+            for (uint d = 0u; d < D; d++)
+                dl += float(O[o_base + jrow*o_sm + d*o_sk]) * float(dO[do_base + jrow*do_sm + d*do_sk]);
+            Delta[dlt_base + jrow*dlt_sm] = {store_cast("dl")};
+        }}
+        tg_delta[i] = dl;
+        tg_lse[i] = (jrow < N_CTX) ? Lse[lse_base + jrow*lse_sm] : 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint n_k = (N_CTX + BK - 1u) / BK;
+    for (uint kb = 0u; kb < n_k; kb++) {{
+        uint k_start = kb * BK;
+        for (uint i = lid; i < BK*D; i += TPG) {{
+            uint kk = i / D, dd = i % D; uint krow = k_start + kk;
+            tg_K[i] = (krow < N_CTX) ? float(K[k_base + krow*k_sn + dd*k_sk]) : 0.0f;
+            tg_V[i] = (krow < N_CTX) ? float(V[v_base + krow*v_sn + dd*v_sk]) : 0.0f;
+        }}
+        for (uint i = lid; i < BK; i += TPG) {{
+            uint krow = k_start + i;
+            tg_mask[i] = (krow < N_CTX) ? Mask[mask_base + krow*mask_sn] : (uchar)1;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P[j,k]
+        for (uint i = lid; i < BJ*BK; i += TPG) {{
+            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
+            if (jrow < N_CTX && krow < N_CTX && tg_mask[kk] == 0) {{
+                float s = 0.0f;
+                for (uint d = 0u; d < D; d++) s += tg_Q[jj*D + d] * tg_K[kk*D + d];
+                s = s*scale + float(Bias[bias_base + jrow*b_sm + krow*b_sn]);
+                tg_P[i] = exp2((s - tg_lse[jj]) * inv_ln2);
+            }} else {{
+                tg_P[i] = 0.0f;
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // dP -> dS
+        for (uint i = lid; i < BJ*BK; i += TPG) {{
+            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj;
+            if (tg_P[i] != 0.0f) {{
+                float dp = 0.0f;
+                for (uint d = 0u; d < D; d++) dp += float(dO[do_base + jrow*do_sm + d*do_sk]) * tg_V[kk*D + d];
+                tg_dS[i] = tg_P[i] * (dp - tg_delta[jj]);
+            }} else {{
+                tg_dS[i] = 0.0f;
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // dQ[j,d] += sum_k dS[j,k] * K[k,d]
+        for (uint i = lid; i < BJ*D; i += TPG) {{
+            uint jj = i / D, dd = i % D;
+            float acc = 0.0f;
+            for (uint kk = 0u; kk < BK; kk++) acc += tg_dS[jj*BK + kk] * tg_K[kk*D + dd];
+            dq_acc[i] += acc;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    for (uint i = lid; i < BJ*D; i += TPG) {{
+        uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
+        if (jrow < N_CTX) DQ[dq_base + jrow*dq_sm + dd*dq_sk] = {store_cast("dq_acc[i] * scale")};
+    }}
+}}
+"""
+
+
+def make_flash_attention_bwd_b_kernel(
+    head_dim=32,
+    BLOCK_J=32,
+    BLOCK_K=32,
+    out_dtype="fp32",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="flash_attention_bwd_b",
+    mask_batch_div=None,
+):
+    """Tiled FA-2 BACKWARD dbias for biased/triangle attention (route-only ABI).
+
+    bias is SHARED across the triangle-i axis, so its gradient SUMS over i:
+        db[j,k] = sum_i dS[i,j,k]    where dS[i,j,k] = P*(dO[i]@V[i]ᵀ - delta[i])
+    Grid: (n_j_blocks, n_k_blocks, Z*H); each threadgroup loops over ALL i (trifast
+    assumes I == N, matching its ``for start_i in range(0, N)``). Q/K/V/lse/delta/mask
+    advance by their i-stride each iteration; bias/db do not depend on i. dO read from
+    device. Budget: db_acc + tg_bias + tg_Q + tg_K + tg_V + tg_P = 6 fp32 buffers.
+    """
+    if out_dtype in ("fp32", "f32"):
+        elem, store_cast = "float", lambda e: e
+    elif out_dtype in ("fp16", "f16"):
+        elem, store_cast = "half", lambda e: f"half({e})"
+    elif out_dtype in ("bf16", "bfloat16"):
+        elem, store_cast = "bfloat", lambda e: f"bfloat({e})"
+    else:
+        raise ValueError(f"bwd_b out_dtype must be fp32/fp16/bf16 (got {out_dtype!r})")
+    if arg_decls is None or bindings is None:
+        raise ValueError("make_flash_attention_bwd_b_kernel is route-only (needs arg_decls/bindings)")
+
+    D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
+    TPG = BJ * BK
+    _LOGICAL = [
+        "q_sh", "q_si", "q_sm", "q_sk", "k_sh", "k_si", "k_sn", "k_sk",
+        "v_sh", "v_si", "v_sn", "v_sk", "b_sh", "b_sm", "b_sn",
+        "mask_sz", "mask_si", "mask_sn", "lse_sh", "lse_si", "lse_sm",
+        "dlt_sh", "dlt_si", "dlt_sm", "do_sh", "do_si", "do_sm", "do_sk",
+        "db_sh", "db_sm", "db_sn", "H", "N_CTX", "scale",
+    ]
+    missing = [n for n in _LOGICAL if n not in bindings]
+    if missing:
+        raise ValueError(f"bwd_b bindings missing {missing}")
+    sig = ",\n".join(arg_decls)
+    bind_lines = "\n".join(f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale")
+    scale_decl = f"const float scale = {bindings['scale']};"
+    _mz = f"(z / {mask_batch_div})" if mask_batch_div is not None else "z"
+
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+// Tiled FA-2 backward dbias ({elem} in/out, fp32 compute) for biased attention.
+kernel void {kernel_name}(
+{sig},
+    uint3 pid3 [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint BJ = {BJ}u, BK = {BK}u, D = {D}u, TPG = {TPG}u;
+    const float inv_ln2 = 1.4426950408889634f;
+    {scale_decl}
+{bind_lines}
+    uint j_block = pid3.x, k_block = pid3.y, z = pid3.z;
+    uint j_start = j_block * BJ, k_start = k_block * BK;
+
+    uint q_hbase  = z*q_sh;
+    uint k_hbase  = z*k_sh;
+    uint v_hbase  = z*v_sh;
+    uint do_hbase = z*do_sh;
+    uint lse_hbase = z*lse_sh;
+    uint dlt_hbase = z*dlt_sh;
+    uint bias_base = z*b_sh;
+    uint db_base   = z*db_sh;
+    uint mask_hbase = {_mz}*mask_sz;
+
+    threadgroup float db_acc[{BJ} * {BK}];
+    threadgroup float tg_bias[{BJ} * {BK}];
+    threadgroup float tg_Q[{BJ} * {D}];
+    threadgroup float tg_K[{BK} * {D}];
+    threadgroup float tg_V[{BK} * {D}];
+    threadgroup float tg_P[{BJ} * {BK}];
+    threadgroup float tg_lse[{BJ}];
+    threadgroup float tg_delta[{BJ}];
+    threadgroup uchar tg_mask[{BK}];
+
+    for (uint i = lid; i < BJ*BK; i += TPG) {{
+        db_acc[i] = 0.0f;
+        uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
+        tg_bias[i] = (jrow < N_CTX && krow < N_CTX)
+            ? float(Bias[bias_base + jrow*b_sm + krow*b_sn]) : 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ii = 0u; ii < N_CTX; ii++) {{
+        for (uint i = lid; i < BJ*D; i += TPG) {{
+            uint jj = i / D, dd = i % D; uint jrow = j_start + jj;
+            tg_Q[i] = (jrow < N_CTX) ? float(Q[q_hbase + ii*q_si + jrow*q_sm + dd*q_sk]) : 0.0f;
+        }}
+        for (uint i = lid; i < BK*D; i += TPG) {{
+            uint kk = i / D, dd = i % D; uint krow = k_start + kk;
+            tg_K[i] = (krow < N_CTX) ? float(K[k_hbase + ii*k_si + krow*k_sn + dd*k_sk]) : 0.0f;
+            tg_V[i] = (krow < N_CTX) ? float(V[v_hbase + ii*v_si + krow*v_sn + dd*v_sk]) : 0.0f;
+        }}
+        for (uint i = lid; i < BJ; i += TPG) {{
+            uint jrow = j_start + i;
+            tg_lse[i]   = (jrow < N_CTX) ? Lse[lse_hbase + ii*lse_si + jrow*lse_sm] : 0.0f;
+            tg_delta[i] = (jrow < N_CTX) ? Delta[dlt_hbase + ii*dlt_si + jrow*dlt_sm] : 0.0f;
+        }}
+        for (uint i = lid; i < BK; i += TPG) {{
+            uint krow = k_start + i;
+            tg_mask[i] = (krow < N_CTX) ? Mask[mask_hbase + ii*mask_si + krow*mask_sn] : (uchar)1;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P[j,k]
+        for (uint i = lid; i < BJ*BK; i += TPG) {{
+            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
+            if (jrow < N_CTX && krow < N_CTX && tg_mask[kk] == 0) {{
+                float s = 0.0f;
+                for (uint d = 0u; d < D; d++) s += tg_Q[jj*D + d] * tg_K[kk*D + d];
+                s = s*scale + tg_bias[i];
+                tg_P[i] = exp2((s - tg_lse[jj]) * inv_ln2);
+            }} else {{
+                tg_P[i] = 0.0f;
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // dS[j,k] = P*(dO[i]@V[i]ᵀ - delta[j]); db_acc += dS
+        for (uint i = lid; i < BJ*BK; i += TPG) {{
+            uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj;
+            if (tg_P[i] != 0.0f) {{
+                float dp = 0.0f;
+                for (uint d = 0u; d < D; d++)
+                    dp += float(dO[do_hbase + ii*do_si + jrow*do_sm + d*do_sk]) * tg_V[kk*D + d];
+                db_acc[i] += tg_P[i] * (dp - tg_delta[jj]);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    for (uint i = lid; i < BJ*BK; i += TPG) {{
+        uint jj = i / BK, kk = i % BK; uint jrow = j_start + jj, krow = k_start + kk;
+        if (jrow < N_CTX && krow < N_CTX)
+            DB[db_base + jrow*db_sm + krow*db_sn] = {store_cast("db_acc[i]")};
+    }}
+}}
+"""
+
+
 def make_flash_attention_kernel_tiled(
     head_dim=128,
     BLOCK_M=32,
