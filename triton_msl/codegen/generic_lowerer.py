@@ -5285,7 +5285,27 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if n_ctx_arg is None:
             _refuse("the N_CTX scalar arg")
         z_val = z_arg.index if z_arg is not None else C1
-        h_val = h_arg.index if h_arg is not None else C1
+        # H (heads) is baked into the template as the head divisor (z = zh / H,
+        # h = zh % H), so a WRONG H silently collapses every head to head 0. Resolve
+        # it STRUCTURALLY from the batch/head decomposition (off_hz // H, a divui/remui
+        # on a program_id) so it is independent of the arg's NAME — a kernel that names
+        # its heads scalar anything but "H" (num_heads, nheads, ...) must not silently
+        # mis-compute (the trifast-#1 name-heuristic class). The name lookup is only a
+        # fallback; a genuine single-head kernel has H==1 specialized away (no divui) -> C1.
+        h_val = None
+        for _s in all_ops:
+            if _s.op in ("arith.divui", "arith.remui", "arith.divsi", "arith.remsi") and _s.operand_ids:
+                if any(op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id"
+                       for o in _s.operand_ids):
+                    for o in _s.operand_ids:
+                        _a = arg_by_id.get(o)
+                        if _a is not None and not _a.is_ptr:
+                            h_val = _a.index
+                            break
+            if h_val is not None:
+                break
+        if h_val is None:
+            h_val = h_arg.index if h_arg is not None else C1
 
         # --- causal: an arith.select of shape [block_m, block_n] whose operands
         # include the QK dot result (the tl.where(mask, qk, -inf) causal mask). For MLA
