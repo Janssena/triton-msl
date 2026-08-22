@@ -2216,6 +2216,8 @@ def make_flash_attention_kernel_tiled(
     mask=False,
     lse=False,
     runtime_scale=False,
+    grid_3d=False,
+    mask_batch_div=None,
 ):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
@@ -2419,14 +2421,25 @@ def make_flash_attention_kernel_tiled(
     scale_decl = (
         f"const float scale = {bindings['scale']};" if runtime_scale else f"const float scale = {SCALE!r}f;"
     )
+    # Grid decode. 2-D (default): pid3.y = z*H + h -> z = zh/H, h = zh%H. 3-D
+    # (grid_3d, trifast's pid_j/pid_i/pid_h): the two batch axes are SEPARATE grid
+    # dims -> h = pid3.y (the triangle-i axis), z = pid3.z (batch*heads). H is unused.
+    if grid_3d:
+        grid_decode = "uint h = pid3.y;\n    uint z = pid3.z;"
+    else:
+        grid_decode = "uint zh      = pid3.y;\n    uint z = zh / H;\n    uint h = zh % H;"
+
     # Per-(z,h) base offsets for the optional bias/mask/lse tensors (z,h in scope
     # in the body). Shared-across-an-axis layouts (e.g. trifast's bias, which does
     # not depend on the triangle-i axis) are expressed by a 0 stride from the detector.
+    # ``mask_batch_div`` (trifast: H_heads): the mask is shared across heads, indexed
+    # by (z / div) on its batch axis (mask_start_h = pid_h // H_heads).
     _bb = []
     if bias:
         _bb.append("    uint bias_base = z * b_sz + h * b_sh;")
     if mask:
-        _bb.append("    uint mask_base = z * mask_sz + h * mask_sh;")
+        _mz = f"(z / {mask_batch_div})" if mask_batch_div is not None else "z"
+        _bb.append(f"    uint mask_base = {_mz} * mask_sz + h * mask_sh;")
     if lse:
         _bb.append("    uint lse_base = z * lse_sz + h * lse_sh;")
     biased_base_lines = "\n".join(_bb)
@@ -2497,12 +2510,9 @@ kernel void {kernel_name}(
     // Logical stride / dim aliases (buffer arg or baked constant).
 {bind_lines}
 
-    // Grid: (n_q_blocks, Z*H). program_id(0) = q-block (pid3.x),
-    //                          program_id(1) = z*h    (pid3.y).
+    // Grid: program_id(0) = q-block (pid3.x); batch decode below (2-D or 3-D).
     uint q_block = pid3.x;
-    uint zh      = pid3.y;
-    uint z = zh / H;
-    uint h = zh % H;
+    {grid_decode}
     uint q_start = q_block * BM;
 
     // Per-(z,h) base offsets into each tensor.

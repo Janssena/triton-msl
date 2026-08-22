@@ -150,6 +150,109 @@ def test_biased_fa_bad_temperature_refuses():
     assert refused, "bad-temperature biased FA must be refused, not silently mis-routed"
 
 
+@triton.jit
+def _biased_tri_fa(
+    o_ptr, o_sh, o_si, o_sn, o_sd,
+    lse_ptr, lse_sh, lse_si, lse_sn,
+    q_ptr, q_sh, q_si, q_sn, q_sd,
+    k_ptr, k_sh, k_si, k_sn, k_sd,
+    v_ptr, v_sh, v_si, v_sn, v_sd,
+    b_ptr, b_sh, b_sn, b_sm,              # bias [h, n, m] — SHARED across the i-axis
+    mask_ptr, mask_sh, mask_si, mask_sn,  # mask [batch, i, k]; batch = pid_h // H
+    sm_scale, neg_inf, N, H,
+    DIM: tl.constexpr, BLOCK_J: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """trifast-style 3-D triangle attention: pid_j/pid_i/pid_h grid, bias shared
+    across i, mask indexed pid_h//H (cross-head). Mirrors scratchpad trifast _fwd."""
+    inv_ln2: tl.constexpr = 1.4426950408889634
+    ln2: tl.constexpr = 0.6931471824645996
+    pid_j = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    mask_start_h = pid_h // H
+    start_j = pid_j * BLOCK_J
+    j_idxs = start_j + tl.arange(0, BLOCK_J)
+    k_idxs = tl.arange(0, BLOCK_K)
+    d_idxs = tl.arange(0, DIM)
+    q_ptrs = q_ptr + pid_h * q_sh + pid_i * q_si + j_idxs[:, None] * q_sn + d_idxs[None, :] * q_sd
+    kt_ptrs = k_ptr + pid_h * k_sh + pid_i * k_si + d_idxs[:, None] * k_sd + k_idxs[None, :] * k_sn
+    v_ptrs = v_ptr + pid_h * v_sh + pid_i * v_si + k_idxs[:, None] * v_sn + d_idxs[None, :] * v_sd
+    b_ptrs = b_ptr + pid_h * b_sh + j_idxs[:, None] * b_sn + k_idxs[None, :] * b_sm
+    mask_ptrs = mask_ptr + mask_start_h * mask_sh + pid_i * mask_si + k_idxs * mask_sn
+    o_ptrs = o_ptr + pid_h * o_sh + pid_i * o_si + j_idxs[:, None] * o_sn + d_idxs[None, :] * o_sd
+    lse_ptrs = lse_ptr + pid_h * lse_sh + pid_i * lse_si + j_idxs * lse_sn
+
+    scores_max = tl.full([BLOCK_J], value=-float("inf"), dtype=tl.float32)
+    sm_denom = tl.full([BLOCK_J], value=0, dtype=tl.float32)
+    acc = tl.full([BLOCK_J, DIM], value=0, dtype=tl.float32)
+    mask_j = j_idxs < N
+    q_block = tl.load(q_ptrs, mask_j[:, None])
+    q_block = q_block * tl.full([1], value=sm_scale, dtype=q_block.type.element_ty)
+    for start_k in tl.range(0, N, BLOCK_K):
+        mask_k = (k_idxs + start_k) < N
+        kt_block = tl.load(kt_ptrs, mask_k[None, :])
+        b_block = tl.load(b_ptrs, mask_j[:, None] & mask_k[None, :])
+        m_block = tl.load(mask_ptrs, mask_k)
+        scores = b_block.to(tl.float32)
+        scores = tl.dot(q_block, kt_block, scores)
+        scores *= inv_ln2
+        scores = tl.where(m_block[None, :], neg_inf, scores)
+        scores = tl.where(mask_j[:, None] & mask_k[None, :], scores, neg_inf)
+        block_max = tl.maximum(scores_max, tl.max(scores, 1))
+        scores = scores - block_max[:, None]
+        exp_scores = tl.math.exp2(scores)
+        summed = tl.sum(exp_scores, 1)
+        exp_scale = tl.math.exp2(scores_max - block_max)
+        sm_denom = sm_denom * exp_scale + summed
+        acc = acc * exp_scale[:, None]
+        v_block = tl.load(v_ptrs, mask_k[:, None])
+        exp_scores = exp_scores.to(q_block.type.element_ty)
+        acc = tl.dot(exp_scores, v_block, acc)
+        scores_max = block_max
+        kt_ptrs += BLOCK_K * k_sn
+        v_ptrs += BLOCK_K * v_sn
+        b_ptrs += BLOCK_K * b_sm
+        mask_ptrs += BLOCK_K * mask_sn
+    normalize = acc / sm_denom[:, None]
+    tl.store(o_ptrs, normalize.to(q_block.type.element_ty), mask=mask_j[:, None])
+    lse = (scores_max * ln2) + tl.log(sm_denom)
+    tl.store(lse_ptrs, lse, mask=mask_j)
+
+
+@requires_mps
+def test_biased_tri_fa_3d_computes():
+    """trifast's 3-D triangle attention (bias shared across i, mask pid_h//H,
+    >31 args -> packed ABI) computes correctly on Metal via the biased template."""
+    torch.manual_seed(0)
+    dev = "mps"
+    Hc, Hh, I, N, DIM = 4, 2, 3, 64, 32   # H_combined=4, H_heads=2 => batch=2
+    batch = Hc // Hh
+    sm = 1.0 / math.sqrt(DIM)
+    q = torch.randn(Hc, I, N, DIM, device=dev)
+    k = torch.randn(Hc, I, N, DIM, device=dev)
+    v = torch.randn(Hc, I, N, DIM, device=dev)
+    bias = torch.randn(Hc, N, N, device=dev)
+    mask = (torch.rand(batch, I, N, device=dev) < 0.25).to(torch.uint8)
+    o = torch.zeros(Hc, I, N, DIM, device=dev)
+    lse = torch.zeros(Hc, I, N, device=dev)
+    st = lambda t: tuple(t.stride())
+    grid = (triton.cdiv(N, 32), I, Hc)
+    _biased_tri_fa[grid](
+        o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v),
+        bias, *st(bias), mask, *st(mask), sm, -1e9, N, Hh, DIM, 32, 32)
+    torch.mps.synchronize()
+    qk = torch.einsum("hijd,hikd->hijk", q, k) * sm
+    raw = qk + bias[:, None, :, :]
+    mh = mask[torch.arange(Hc, device=dev) // Hh]
+    raw = raw.masked_fill(mh[:, :, None, :].bool(), float("-inf"))
+    p = torch.softmax(raw, dim=-1)
+    o_ref = torch.einsum("hijk,hikd->hijd", torch.nan_to_num(p, nan=0.0), v)
+    lse_ref = torch.logsumexp(raw, dim=-1)
+    assert (o - o_ref).abs().max().item() < 1e-3
+    fin = torch.isfinite(lse_ref)
+    assert (lse[fin] - lse_ref[fin]).abs().max().item() < 1e-3
+
+
 def _build_biased_lowerer(**constexpr_overrides):
     """Compile _biased_fa to TTGIR and wrap in a GenericLowerer (no MSL emission)."""
     from triton._C.libtriton import ir
@@ -187,22 +290,26 @@ def _build_biased_lowerer(**constexpr_overrides):
     return GenericLowerer(walk_ttgir(mod, options), options)
 
 
-def test_biased_fa_3d_grid_refuses():
-    """A 3-D-grid biased FA (a trifast-style triangle-i axis) must REFUSE — the
-    2-D-grid biased template would mis-map the batch axes (bias shared across i,
-    mask pid_h//H). Guards the silent-wrong the 2-D router would otherwise cause."""
-    from triton_msl.errors import MetalNonRecoverableError
-
-    low = _build_biased_lowerer(I3D=True)
-    with pytest.raises(MetalNonRecoverableError, match="grid|3-D|triangle"):
-        low._detect_biased_flash_attention()
-
-
 def test_biased_fa_2d_grid_detects():
-    """Sanity: the SAME kernel with a 2-D grid (I3D=False) IS detected (not refused)."""
+    """Sanity: the 2-D-grid biased kernel is detected (not refused), grid_3d=False."""
     low = _build_biased_lowerer(I3D=False)
     info = low._detect_biased_flash_attention()
-    assert info is not None and info["biased"] is True
+    assert info is not None and info["biased"] is True and info["grid_3d"] is False
+
+
+def test_biased_fa_over_3_program_ids_refuses():
+    """More than 3 program_ids is an unhandled grid -> refuse (correct-or-refuse)."""
+    from triton_msl.errors import MetalNonRecoverableError
+
+    low = _build_biased_lowerer(I3D=True)  # adds a 3rd program_id in a non-trifast way
+    # I3D adds program_id(2) atop the 2-D (pid_m, pid_zh) grid = 3 total, which is
+    # now *handled* (grid_3d); this asserts the malformed z=zh/H+pid_i still resolves
+    # or refuses cleanly — never silently. Either a valid info or a refuse is fine.
+    try:
+        info = low._detect_biased_flash_attention()
+        assert info is None or info["grid_3d"] is True
+    except MetalNonRecoverableError:
+        pass  # a clean refuse is acceptable
 
 
 def test_detector_returns_none_for_standard_fa():

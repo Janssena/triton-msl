@@ -5571,15 +5571,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "resolved unambiguously; refusing rather than emit silently-wrong output."
             )
 
-        # The biased tiled template is 2-D-grid (z = zh/H, h = zh%H, per-(z,h)
-        # bias/mask). A 3-D grid — a THIRD program_id, as in trifast's
-        # pid_j/pid_i/pid_h triangle-attention — maps the batch axes differently
-        # (bias shared across the i-axis; mask indexed pid_h//H_heads), which this
-        # template does NOT model. Routing it would silently mis-compute, so REFUSE
-        # until the 3-D-grid path (B-step 2) lands. 2-D-grid biased FA is unaffected.
+        # Grid dimensionality. 2 program_ids = the 2-D (q-block, z*h) grid. 3 =
+        # trifast's triangle attention (pid_j q-block, pid_i i-axis, pid_h
+        # batch*heads): the two batch axes are SEPARATE grid dims, bias is shared
+        # across the i-axis (its i-stride is 0), and the mask is shared across heads
+        # (indexed pid_h//H_heads). The template's grid_3d + mask_batch_div model
+        # this. More than 3 program_ids is unhandled -> refuse.
         n_pid = len({s.id for s in allops if s.op == "tt.get_program_id"})
-        if n_pid > 2:
-            _refuse("a 2-D program grid (a 3-D grid / triangle-i axis is not yet supported)")
+        if n_pid > 3 or n_pid < 2:
+            _refuse(f"a 2-D or 3-D program grid (got {n_pid} program_ids)")
+        grid_3d = n_pid == 3
 
         q_res = resolve_2d(load_addr(dot_qk.operand_ids[0]))
         k_res = resolve_2d(load_addr(dot_qk.operand_ids[1]))
@@ -5750,8 +5751,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         out_dtype = "f16" if str(self.graph.args[o_res[0]].elem_type) in ("fp16", "f16") else "f32"
 
+        # 3-D grid (trifast): a tensor whose batch chain is 1-level has NO
+        # dependence on the second batch axis (the triangle-i axis, h = pid3.y).
+        # Its resolver h-slot is C1 (a missing leg), but the CORRECT stride is 0
+        # (SHARED across i) — e.g. trifast's bias [h_combined, n, n] is shared over
+        # i. In 2-D grid this can't happen (a 1-level chain there means H=1 -> h=0,
+        # so the stride is irrelevant). Convert C1 h-slots to 0 in 3-D mode.
+        if grid_3d:
+            for _res in (q_res, k_res, v_res, o_res, b_res):
+                if _res[1][1] == C1:
+                    _res[1][1] = "c0"  # shared across the i-axis -> stride 0 (not 1)
+
         return {
             "biased": True,
+            "grid_3d": grid_3d,
             "q": q_res[0], "k": k_res[0], "v": v_res[0], "out": o_res[0],
             "bias": b_res[0], "mask": m_res[0], "lse": lse_res[0],
             # strides in resolver order; the template mapping handles the Kᵀ swap.
@@ -5759,6 +5772,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "o_strides": o_res[1], "b_strides": b_res[1],
             "m_strides": m_res[1], "lse_strides": lse_res[1],
             "scale_arg": scale_arg,
+            # In 2-D, H drives z=zh/H. In 3-D, the same resolved divui(pid_h, H) IS
+            # the mask cross-head divisor (mask_start_h = pid_h // H_heads).
             "N_CTX": n_ctx_arg, "H": h_arg,
             "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
             "out_dtype": out_dtype, "causal": False,
@@ -5845,9 +5860,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         def _uint_expr(entry):
             """A stride/dim entry -> MSL uint expression (packed slot / individual
-            buffer / baked 1u)."""
+            buffer / baked 1u / baked 0u for a shared-across-i axis)."""
             if entry == C1:
                 return "1u"
+            if entry == "c0":
+                return "0u"
             if isinstance(entry, int) and entry in scalar_pos:
                 return f"_bpk[{scalar_pos[entry]}]" if packed else f"bsc_{entry}"
             raise MetalNonRecoverableError(
@@ -5876,6 +5893,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "scale": _scale_expr(info["scale_arg"]),
         }
 
+        # 3-D grid (trifast): h = pid3.y (triangle-i), z = pid3.z (batch*heads); the
+        # mask is shared across heads, indexed (z / H_heads). The resolved H arg is
+        # that divisor (mask_start_h = pid_h // H); C1 means H=1 -> no divisor.
+        grid_3d = bool(info.get("grid_3d"))
+        mask_batch_div = None
+        if grid_3d and info["H"] != C1:
+            mask_batch_div = _uint_expr(info["H"])
         Dc = head_dim if head_dim <= 64 else 64
         msl = make_flash_attention_kernel_tiled(
             head_dim, block_m, block_n, Dc=Dc,
@@ -5883,10 +5907,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             arg_decls=arg_decls, bindings=bindings,
             kernel_name=_sanitize_msl_name(self.graph.func_name),
             bias=True, mask=True, lse=True, runtime_scale=True,
+            grid_3d=grid_3d, mask_batch_div=mask_batch_div,
         )
         self.effective_block_size = block_m * block_n
         self._flash_attention = ("flash_attention", msl, block_m * block_n)
-        self._used_pid_axes = {0, 1}
+        self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
         self._prescan_stores()
         return msl
 
