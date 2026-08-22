@@ -4702,6 +4702,59 @@ kernel void int8_matmul_fast(
 """
 
 
+def make_int8_matmul_pergroup(group_size=128):
+    """Weight-only INT8 matmul with PER-GROUP quantization (GPTQ-style): every
+    ``group_size`` elements along K share a (scale, zero). Scalar (one thread per
+    output) — correct-first coverage for the per-group case the per-N fast kernel
+    (``make_int8_matmul_fast``) cannot express; it applies ``scale``/``zero`` per K
+    group inside the accumulation. A fast per-group MMA variant is a perf follow-up.
+
+    Fully STRIDE-GENERIC (every operand's strides are runtime buffers), so it works
+    for any weight layout ([K,N] or [N,K]) and any scale/zero layout ([n_groups,N]
+    or [N,n_groups]) — the router forwards the kernel's own stride args. ``dequant:
+    w = (float(weight) - zero_g) * scale_g``; ``out = input @ w``.
+
+    Buffers: input,weight,output,scales,zeros, M,N,K, then the row/col strides
+    isr,isc (input) / wsk,wsn (weight, as fn of k,n) / osr,osc (output) / ssg,ssn
+    (scale, as fn of group,n) / zsg,zsn (zero).
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void int8_matmul_pergroup(
+    device const float* input   [[buffer(0)]],
+    device const char*  weight  [[buffer(1)]],
+    device float*       output  [[buffer(2)]],
+    device const float* scales  [[buffer(3)]],
+    device const float* zeros   [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& isr [[buffer(8)]],  constant uint& isc [[buffer(9)]],
+    constant uint& wsk [[buffer(10)]], constant uint& wsn [[buffer(11)]],
+    constant uint& osr [[buffer(12)]], constant uint& osc [[buffer(13)]],
+    constant uint& ssg [[buffer(14)]], constant uint& ssn [[buffer(15)]],
+    constant uint& zsg [[buffer(16)]], constant uint& zsn [[buffer(17)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    const uint GROUP = {group_size}u;
+    uint row = gid / N;
+    uint col = gid % N;
+    if (row >= M || col >= N) return;
+
+    float acc = 0.0f;
+    for (uint k = 0u; k < K; k++) {{
+        uint g = k / GROUP;
+        float s = scales[g * ssg + col * ssn];
+        float z = zeros[g * zsg + col * zsn];
+        float w = (float(weight[k * wsk + col * wsn]) - z) * s;
+        acc += input[row * isr + k * isc] * w;
+    }}
+    output[row * osr + col * osc] = acc;
+}}
+"""
+
+
 def make_int8_gemv():
     """Fast weight-only INT8 GEMV (M=1 decode) — the dominant LLM-inference shape.
 

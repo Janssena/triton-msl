@@ -3095,10 +3095,134 @@ class _TemplateMixin:
                 return None
             return _find_load(o.operand_ids[0], d + 1)
 
-        for _bc in (scale_bc, zero_bc):
-            _ld = _find_load(_bc)
-            if _ld is not None and _ld.id in _loop_op_ids:
-                return None  # per-group (loop-variant) scale/zero -> refuse
+        _pergroup = any(
+            (_find_load(_bc) is not None and _find_load(_bc).id in _loop_op_ids)
+            for _bc in (scale_bc, zero_bc)
+        )
+        if _pergroup:
+            # PER-GROUP int8 (GPTQ): scale/zero loaded in the K-loop at k//G. The per-N
+            # fast kernel can't express it (dropping the group boundary is the silent-wrong
+            # closed by 8e3526a). Route to the scalar per-group template (stride-generic),
+            # resolving G + every operand's strides exact-or-refuse. Validated e2e.
+            if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
+                return None
+            if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+                return None
+            if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+                return None
+            try:
+                _sd = self.infer_dot_strides()
+            except Exception:  # noqa: BLE001
+                return None
+            if not _sd or not all(_sd.get(x) for x in ("A", "B", "C")):
+                return None
+            # A stride can be a runtime ARG (its index) or a compile-time constant 1
+            # (equal_to_1 specialization folds a contiguous stride out of the arg list;
+            # infer_dot_strides then reports "1"). Encode const-1 as the sentinel -1 (the
+            # dispatch passes literal 1); a stride that is neither an arg nor "1" -> None
+            # (refuse).
+            _nti = {a.name: i for i, a in enumerate(args)}
+
+            def _sidx(nm):
+                if nm == "1":
+                    return -1
+                return _nti.get(nm)
+
+            _stride_idx = [
+                _sidx(_sd["A"][0]), _sidx(_sd["A"][1]),   # isr, isc
+                _sidx(_sd["B"][0]), _sidx(_sd["B"][1]),   # wsk, wsn
+                _sidx(_sd["C"][0]), _sidx(_sd["C"][1]),   # osr, osc
+            ]
+
+            def _vec_stride(tid):
+                # a `range * stride` offset tensor -> the arg index of `stride`; a bare
+                # `range` (stride folded to 1) -> -1.
+                o = op_by_id.get(tid)
+                if o is None:
+                    return None
+                if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.expand_dims") and o.operand_ids:
+                    return _vec_stride(o.operand_ids[0])
+                if o.op == "arith.muli":
+                    for oid in o.operand_ids:
+                        sub = op_by_id.get(oid)
+                        if sub is not None and sub.op in ("tt.splat", "tt.broadcast") and sub.operand_ids:
+                            ai = arg_id_to_idx.get(sub.operand_ids[0])
+                            if ai is not None:
+                                return ai
+                        ai = arg_id_to_idx.get(oid)
+                        if ai is not None:
+                            return ai
+                    return None
+                return -1  # no stride multiply -> stride == 1
+
+            def _G_from_divsi(dv):
+                d = op_by_id.get(dv)
+                if d is None or d.op not in ("arith.divsi", "arith.divui"):
+                    return None
+                for x in d.operand_ids:
+                    c = op_by_id.get(x)
+                    if c is not None and c.op == "arith.constant":
+                        try:
+                            return int(str(c.attrs.get("value", "")).split(":")[0].strip())
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            def _scalar_stride_and_G(tid):
+                # `g * ssg` where g = divsi/divui(_, G) -> (ssg_arg_idx, G); a bare
+                # `g` (ssg folded to 1) -> (-1, G).
+                o = op_by_id.get(tid)
+                if o is None:
+                    return None, None
+                if o.op in ("arith.divsi", "arith.divui"):
+                    return -1, _G_from_divsi(tid)
+                if o.op != "arith.muli":
+                    return None, None
+                _ssg = _g = None
+                for oid in o.operand_ids:
+                    ai = arg_id_to_idx.get(oid)
+                    if ai is not None:
+                        _ssg = ai
+                    else:
+                        _gv = _G_from_divsi(oid)
+                        if _gv is not None:
+                            _g = _gv
+                return _ssg, _g
+
+            def _resolve_scz(bc):
+                # scale/zero load addr = addptr(splat(addptr(ptr, g*sg)), offs_n*sn).
+                ld = _find_load(bc)
+                if ld is None or not ld.operand_ids:
+                    return None
+                outer = op_by_id.get(ld.operand_ids[0])
+                if outer is None or outer.op != "tt.addptr" or len(outer.operand_ids) < 2:
+                    return None
+                nstride = _vec_stride(outer.operand_ids[1])
+                base = op_by_id.get(outer.operand_ids[0])
+                if base is None or base.op != "tt.splat" or not base.operand_ids:
+                    return None
+                inner = op_by_id.get(base.operand_ids[0])
+                if inner is None or inner.op != "tt.addptr" or len(inner.operand_ids) < 2:
+                    return None
+                ptr = arg_id_to_idx.get(inner.operand_ids[0])
+                gstride, gval = _scalar_stride_and_G(inner.operand_ids[1])
+                if None in (nstride, ptr, gstride, gval):
+                    return None
+                return ptr, gstride, nstride, gval
+
+            _sc = _resolve_scz(scale_bc)
+            _zc = _resolve_scz(zero_bc)
+            if _sc is None or _zc is None:
+                return None
+            s_ptr, ssg, ssn, g_s = _sc
+            z_ptr, zsg, zsn, g_z = _zc
+            if s_ptr != 3 or z_ptr != 4 or g_s != g_z or g_s <= 0:
+                return None
+            _stride_idx += [ssg, ssn, zsg, zsn]
+            if any(i is None for i in _stride_idx):
+                return None
+            from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
+            return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx))
 
         # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
         try:

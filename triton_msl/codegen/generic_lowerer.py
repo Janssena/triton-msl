@@ -1112,8 +1112,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self.effective_block_size = 32
             import re as _re
 
+            # Untagged fast per-N descriptor: [0] IS the MSL (starts with #include). A
+            # TAGGED descriptor (e.g. "pergroup_int8") carries its MSL at [1].
+            _qmsl = _qdesc[1] if (isinstance(_qdesc[0], str) and not _qdesc[0].startswith("#include")) else _qdesc[0]
             _kname = _sanitize_msl_name(self.graph.func_name)
-            return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_kname}(", _qdesc[0], count=1)
+            return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_kname}(", _qmsl, count=1)
 
         # QUANTIZED INT4 GEMV (decode): weight-only int4 (GPTQ/AWQ per-group) decode GEMV
         # with a packed-nibble unpack + per-group scale/zero. Checked BEFORE int8 (it is
