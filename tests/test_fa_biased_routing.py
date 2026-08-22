@@ -220,12 +220,14 @@ def _biased_tri_fa(
 
 
 @requires_mps
-def test_biased_tri_fa_3d_computes():
+@pytest.mark.parametrize("DIM", [32, 64])
+def test_biased_tri_fa_3d_computes(DIM):
     """trifast's 3-D triangle attention (bias shared across i, mask pid_h//H,
-    >31 args -> packed ABI) computes correctly on Metal via the biased template."""
+    >31 args -> packed ABI) computes correctly on Metal via the biased template.
+    DIM=32 routes to the scalar tiled template; DIM=64 to the simd-MMA fast path."""
     torch.manual_seed(0)
     dev = "mps"
-    Hc, Hh, I, N, DIM = 4, 2, 3, 64, 32   # H_combined=4, H_heads=2 => batch=2
+    Hc, Hh, I, N = 4, 2, 3, 64   # H_combined=4, H_heads=2 => batch=2
     batch = Hc // Hh
     sm = 1.0 / math.sqrt(DIM)
     q = torch.randn(Hc, I, N, DIM, device=dev)

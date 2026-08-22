@@ -5900,17 +5900,47 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         mask_batch_div = None
         if grid_3d and info["H"] != C1:
             mask_batch_div = _uint_expr(info["H"])
-        Dc = head_dim if head_dim <= 64 else 64
-        msl = make_flash_attention_kernel_tiled(
-            head_dim, block_m, block_n, Dc=Dc,
-            causal=info["causal"], out_dtype=info["out_dtype"],
-            arg_decls=arg_decls, bindings=bindings,
-            kernel_name=_sanitize_msl_name(self.graph.func_name),
-            bias=True, mask=True, lse=True, runtime_scale=True,
-            grid_3d=grid_3d, mask_batch_div=mask_batch_div,
+
+        # FAST PATH: route to the simdgroup-MMA template (the shipped fast FA kernel,
+        # ~10x the scalar tiled template) when eligible — head_dim %8==0, block_m==32,
+        # head_dim<=192 (tg budget), and the CONTIGUOUS innermost strides the simd
+        # transpose-loads require (head-dim stride == 1). Otherwise the scalar tiled
+        # template handles arbitrary strides (correctness-first). Correct-or-refuse:
+        # only take the fast path when provably contiguous; else the tiled fallback.
+        qs2, ks2, vs2, os2 = info["q_strides"], info["k_strides"], info["v_strides"], info["o_strides"]
+        simd_eligible = (
+            head_dim % 8 == 0
+            and block_m == 32
+            and 64 <= head_dim <= 192  # TPG=(Dv/8)/8>=1 needs Dv>=64; tg budget caps <=192
+            and qs2[3] == C1        # Q head-dim (col) contiguous
+            and ks2[2] == C1        # K head-dim (Kᵀ row) contiguous
+            and vs2[3] == C1        # V head-dim (col) contiguous
+            and os2[3] == C1        # Out head-dim (col) contiguous
         )
-        self.effective_block_size = block_m * block_n
-        self._flash_attention = ("flash_attention", msl, block_m * block_n)
+        if simd_eligible:
+            from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup
+
+            msl = make_flash_attention_kernel_simdgroup(
+                head_dim, 32, 64,
+                causal=info["causal"], out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                bias=True, mask=True, lse=True, runtime_scale=True,
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div,
+            )
+            self.effective_block_size = 256
+        else:
+            Dc = head_dim if head_dim <= 64 else 64
+            msl = make_flash_attention_kernel_tiled(
+                head_dim, block_m, block_n, Dc=Dc,
+                causal=info["causal"], out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                bias=True, mask=True, lse=True, runtime_scale=True,
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div,
+            )
+            self.effective_block_size = block_m * block_n
+        self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
         self._prescan_stores()
         return msl

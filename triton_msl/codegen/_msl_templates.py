@@ -1848,6 +1848,12 @@ def make_flash_attention_kernel_simdgroup(
     scale=None,
     v_head_dim=None,
     half_accumulate=False,
+    bias=False,
+    mask=False,
+    lse=False,
+    runtime_scale=False,
+    grid_3d=False,
+    mask_batch_div=None,
 ):
     """simdgroup_matrix FlashAttention-2 (fp32/fp16, causal/non-causal, head_dim=128).
 
@@ -1951,8 +1957,24 @@ def make_flash_attention_kernel_simdgroup(
         "H",
         "N_CTX",
     ]
+    # Biased/triangle-attention extensions (bias/mask/lse/runtime_scale/grid_3d/
+    # mask_batch_div): all no-ops when off, so a plain-FA emission is byte-identical.
+    # These mirror the tiled template's fusions (bias into the score, mask -> -inf,
+    # per-row lse, runtime scale, 3-D grid, cross-head mask divisor) but on the MMA
+    # kernel — the fast path for trifast. Extra uint stride aliases append to _LOGICAL;
+    # the Bias/Mask/Lse pointers come from the routed arg_decls (route-only path).
+    _bias_uint = []
+    if bias:
+        _bias_uint += ["b_sz", "b_sh", "b_sm", "b_sn"]
+    if mask:
+        _bias_uint += ["mask_sz", "mask_sh", "mask_sn"]
+    if lse:
+        _bias_uint += ["lse_sz", "lse_sh", "lse_sm"]
+    _LOGICAL = _LOGICAL + _bias_uint
     if (arg_decls is None) != (bindings is None):
         raise ValueError("arg_decls and bindings must be provided together")
+    if (bias or mask or lse or runtime_scale or grid_3d) and arg_decls is None:
+        raise ValueError("simd FA biased/3-D extensions are route-only (need arg_decls/bindings)")
     if arg_decls is None:
         arg_decls = [
             f"    device const {elem}* Q [[buffer(0)]]",
@@ -1965,6 +1987,43 @@ def make_flash_attention_kernel_simdgroup(
         bindings = {nm: f"arg_{nm}" for nm in _LOGICAL}
     sig = ",\n".join(arg_decls)
     bind_lines = "\n".join(f"    const uint {nm} = {bindings[nm]};" for nm in _LOGICAL)
+
+    # ---- biased/3-D helper strings (interpolated as VALUES -> single braces) ----
+    scale_decl = (
+        f"const float scale = {bindings['scale']};" if runtime_scale else f"const float scale = {SCALE!r}f;"
+    )
+    if grid_3d:
+        grid_decode = "uint q_block = pid3.x, h = pid3.y, z = pid3.z;"
+    else:
+        grid_decode = "uint q_block = pid3.x, zh = pid3.y;\n    uint z = zh / H, h = zh % H;"
+    _bb = []
+    if bias:
+        _bb.append("    uint bias_base = z*b_sz + h*b_sh;")
+    if mask:
+        _mz = f"(z / {mask_batch_div})" if mask_batch_div is not None else "z"
+        _bb.append(f"    uint mask_base = {_mz}*mask_sz + h*mask_sh;")
+    if lse:
+        _bb.append("    uint lse_base = z*lse_sz + h*lse_sh;")
+    biased_base_lines = "\n".join(_bb)
+    if lse:
+        lse_store = (
+            "\n    // ---- per-query log-sum-exp: lse = m + log(l) (natural log) ----\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            "    if (lid < BM) {\n"
+            "        uint qr = q_start + lid;\n"
+            "        if (qr < N_CTX) {\n"
+            "            float lv = tg_l[lid];\n"
+            "            Lse[lse_base + qr*lse_sm] = (lv > 0.0f) ? (tg_m[lid] + log(lv)) : -INFINITY;\n"
+            "        }\n"
+            "    }"
+        )
+    else:
+        lse_store = ""
+
+    # bias/mask cell fragments (guard-independent; combined with the guard in block()).
+    _bias_add = "\n                    s += float(Bias[bias_base + qrow_b*b_sm + kvrow_b*b_sn]);" if bias else ""
+    _mask_apply = "\n                    if (Mask[mask_base + kvrow_b*mask_sn] != 0) s = -INFINITY;" if mask else ""
+
     if elem == "half":
         p_buffers = f"    threadgroup half tgP[{BM} * {BN}];\n    threadgroup {acc_buf} on_scratch[{n_groups} * 64];"
         p_write, p_src = "tgP[r*BN+cj] = half(p);", "tgP"
@@ -1984,6 +2043,19 @@ def make_flash_attention_kernel_simdgroup(
 
     def block(mode):
         g, qd, kd = guard_decls(mode)
+        # Score cell: plain FA keeps the original ternary (byte-identical); the biased
+        # path adds bias into the score + a mask -> -inf inside the valid branch. qrow_b
+        # / kvrow_b index the bias/mask (q_start/kv_start/pr/cj all in scope here).
+        if bias or mask:
+            score_cell = (
+                "uint qrow_b = q_start + pr; uint kvrow_b = kv_start + cj;\n"
+                "                float s;\n"
+                "                if (" + g + ") {\n"
+                "                    s = tg_S[pr*BN+cj]*scale;" + _bias_add + _mask_apply + "\n"
+                "                } else { s = -INFINITY; }"
+            )
+        else:
+            score_cell = "float s = " + g + " ? (tg_S[pr*BN+cj]*scale) : -INFINITY;"
         if mode == "full":
             kload = "            simdgroup_load(kf, K + k_base + (kv_start + sgitg*8u)*k_sn + kc*k_sk, k_sn, 0, true);"
         else:
@@ -2041,7 +2113,7 @@ def make_flash_attention_kernel_simdgroup(
             float pm = -INFINITY;
             for (uint cj = cA; cj < cB; cj++) {
                 %(KD)s
-                float s = %(GUARD)s ? (tg_S[pr*BN+cj]*scale) : -INFINITY;
+                %(SCORE_CELL)s
                 tg_S[pr*BN+cj] = s; pm = max(pm, s);
             }
             tg_pmax[pr*8u + pc] = pm;
@@ -2100,6 +2172,7 @@ def make_flash_attention_kernel_simdgroup(
             "QD_PR": qd.replace("q_start + r", "q_start + pr"),  # q_row for row = pr
             "KD": kd,
             "GUARD": g,
+            "SCORE_CELL": score_cell,
             "PWRITE": p_write,
             "PWRITE_PR": p_write.replace("[r*BN", "[pr*BN"),  # prob store for row = pr
             "PLOADT": p_load_t,
@@ -2147,12 +2220,12 @@ kernel void {kernel_name}(
     uint sgitg [[simdgroup_index_in_threadgroup]]
 ) {{
     const uint BM = {BM}u, BN = {BN}u, D = {D}u, NT = {NT}u, TPG = {TPG}u;
-    const float scale = {SCALE!r}f;
+    {scale_decl}
 {bind_lines}
-    uint q_block = pid3.x, zh = pid3.y;
-    uint z = zh / H, h = zh % H;
+    {grid_decode}
     uint q_start = q_block * BM;
     uint q_base = z*q_sz+h*q_sh, k_base = z*k_sz+h*k_sh, v_base = z*v_sz+h*v_sh, o_base = z*o_sz+h*o_sh;
+{biased_base_lines}
 
     threadgroup {elem} tgQ[{BM} * {D}];
     threadgroup {acc_buf}  tg_S[{BM} * {BN}];
@@ -2181,6 +2254,7 @@ kernel void {kernel_name}(
         uint kv_start = n_full * BN;
 {block_tail}
     }}
+{lse_store}
 
     for (uint i=lid;i<4u*64u;i+=NT) adiag[i]=0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
