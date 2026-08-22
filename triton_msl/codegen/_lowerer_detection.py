@@ -80,6 +80,57 @@ class _DetectionMixin:
         # too, so a single recursive walk handles every step.
         return self._trace_ptr_source(op.operand_ids[0], op_by_id, depth + 1)
 
+    def _norm_input_output_args(self, load_ssa, store_ssa, first_reduce_ssa):
+        """For the softmax / layer-norm fast-template detectors: resolve the INPUT and
+        OUTPUT pointer args from ACTUAL DATAFLOW, and validate the reduced tensor is the
+        loaded tensor directly.
+
+        - INPUT = the arg the ``tt.load`` reads through; OUTPUT = the arg the ``tt.store``
+          writes through (traced via ``_trace_ptr_source``). The old code took the first
+          ptr arg as input and the second as output by DECLARATION ORDER, so an
+          output-first signature ``(out_ptr, x_ptr, n)`` silently swapped the buffers.
+        - The first reduction must operate DIRECTLY on the loaded tensor (only shape/
+          layout ops in between). ``softmax(x*scale)`` / ``norm(x*scale)`` puts an
+          arithmetic op there which the fast template silently drops; those must fall
+          through to the generic (correct) lowering.
+
+        Returns ``(input_name, output_name)`` or ``None`` (refuse the fast template).
+        """
+        op_by_id = {}
+
+        def _collect(ops):
+            for s in ops:
+                op_by_id[s.id] = s
+                if s.region_ops:
+                    _collect(s.region_ops)
+                if s.else_ops:
+                    _collect(s.else_ops)
+
+        _collect(self.graph.ops)
+        in_arg = self._trace_ptr_source(load_ssa.operand_ids[0], op_by_id) if load_ssa.operand_ids else None
+        out_arg = self._trace_ptr_source(store_ssa.operand_ids[0], op_by_id) if store_ssa.operand_ids else None
+        if in_arg is None or out_arg is None or in_arg.id == out_arg.id:
+            return None
+
+        _TRANSPARENT = {
+            "ttg.convert_layout", "tt.reshape", "tt.broadcast", "tt.expand_dims",
+            "tt.splat", "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+        }
+
+        def _direct(vid, depth=0):
+            if depth > 32:
+                return False
+            if vid == load_ssa.id:
+                return True
+            o = op_by_id.get(vid)
+            if o is None or o.op not in _TRANSPARENT:
+                return False
+            return any(_direct(x, depth + 1) for x in (o.operand_ids or []))
+
+        if not (first_reduce_ssa.operand_ids and _direct(first_reduce_ssa.operand_ids[0])):
+            return None
+        return in_arg.name, out_arg.name
+
     def _resolve_dot_ptr_roles(self, dot_ssa, all_ptr_args):
         """Return ``[A_ptr, B_ptr, C_ptr]`` by tracing dot operands and the
         ``tt.store`` target back to their kernel function args.
@@ -2477,21 +2528,14 @@ class _DetectionMixin:
         if red_ops != ["max", "sum"]:
             return None
 
-        # Identify ptr args (input vs output) and the n scalar arg.
-        input_arg = None
-        output_arg = None
-        for arg in self.graph.args:
-            if not arg.is_ptr:
-                continue
-            # Output arg is whichever ptr the tt.store writes through. Look
-            # for the arg whose name appears in the store op's chain.
-            # Heuristic: input is the first ptr arg, output is the second.
-            if input_arg is None:
-                input_arg = arg.name
-            elif output_arg is None:
-                output_arg = arg.name
-        if input_arg is None or output_arg is None:
+        # Identify ptr args (input vs output) from ACTUAL DATAFLOW (traced from the
+        # load/store), not declaration order, and require the max-reduce to operate
+        # directly on the loaded tensor (else a softmax(x*scale) silently drops the
+        # scale). reduce_ops[0] is the max reduce (the [max, sum] order verified above).
+        io = self._norm_input_output_args(load_ssa, store_ssa, reduce_ops[0])
+        if io is None:
             return None
+        input_arg, output_arg = io
 
         # Row length / stride: the kernel's single scalar arg. The template
         # uses ONE scalar for BOTH the row stride (row_start = pid * n) and the
@@ -2601,17 +2645,13 @@ class _DetectionMixin:
             if ssa.op in ("math.exp", "math.exp2"):
                 return None
 
-        input_arg = None
-        output_arg = None
-        for arg in self.graph.args:
-            if not arg.is_ptr:
-                continue
-            if input_arg is None:
-                input_arg = arg.name
-            elif output_arg is None:
-                output_arg = arg.name
-        if input_arg is None or output_arg is None:
+        # Input/output ptrs from ACTUAL DATAFLOW (not declaration order), and the mean
+        # reduce (reduce_ops[0], first sum) must operate directly on the loaded tensor
+        # (else a norm(x*scale) silently drops the scale). Mirrors _detect_softmax.
+        io = self._norm_input_output_args(load_ssa, store_ssa, reduce_ops[0])
+        if io is None:
             return None
+        input_arg, output_arg = io
 
         # The row length is the SOLE scalar arg (BLOCK_SIZE is constexpr, not in args).
         # Without this guard the first non-ptr arg was grabbed as the row length, so a
@@ -2632,11 +2672,46 @@ class _DetectionMixin:
         if block_size > 1024:
             return None
 
+        # --- eps: the fast template must use the KERNEL's epsilon from rsqrt(var + eps),
+        #     NOT a hardcoded default. A wrong eps is a silent-wrong (worst on low-
+        #     variance rows). Extract the float constant; if it can't be resolved, refuse
+        #     to the generic lowering (which applies the real eps). ---
+        _obid = {o.id: o for o in self.graph.ops}
+
+        def _const_float(oid, depth=0):
+            if depth > 8:
+                return None
+            o = _obid.get(oid)
+            if o is None:
+                return None
+            if o.op == "arith.constant":
+                try:
+                    return float(str(o.attrs.get("value", "")).split(":")[0].strip())
+                except (TypeError, ValueError):
+                    return None
+            if o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "arith.extf", "arith.truncf") and o.operand_ids:
+                return _const_float(o.operand_ids[0], depth + 1)
+            return None
+
+        eps_val = None
+        for ssa in self.graph.ops:
+            if ssa.op in ("math.rsqrt", "math.sqrt") and ssa.operand_ids:
+                inner = _obid.get(ssa.operand_ids[0])
+                if inner is not None and inner.op == "arith.addf":
+                    for oid in inner.operand_ids:
+                        c = _const_float(oid)
+                        if c is not None:
+                            eps_val = c
+                break
+        if eps_val is None:
+            return None
+
         return {
             "input_arg": input_arg,
             "output_arg": output_arg,
             "n_arg": n_arg,
             "block_size": block_size,
+            "eps": eps_val,
         }
 
     def _detect_transpose_via_reshape(self):

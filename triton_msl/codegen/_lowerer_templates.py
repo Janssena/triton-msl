@@ -1298,10 +1298,11 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
                 arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
-        # eps default — matches torch.nn.LayerNorm. Most layer-norm Triton
-        # kernels pass eps as a constexpr, so it doesn\\'t reach codegen as
-        # a runtime arg.
-        eps_literal = "1e-6f"
+        # eps comes from the KERNEL's own rsqrt(var + eps) (extracted by the detector,
+        # exact-or-refuse), NOT a hardcoded default — a wrong eps is a silent-wrong
+        # (worst on low-variance rows). ``info["eps"]`` is always present (the detector
+        # refuses when it can't resolve the constant).
+        eps_literal = f"{float(info['eps'])!r}f"
 
         lines = []
         lines.append("#include <metal_stdlib>")
