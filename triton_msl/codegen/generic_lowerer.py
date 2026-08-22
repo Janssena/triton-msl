@@ -5623,6 +5623,53 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if m_res is None:
             _refuse("the mask pointer/strides")
 
+        def _mask_batch_divisor(mask_addr):
+            """The mask's batch (z) offset. Returns the divisor arg index iff it is
+            ``divui(program_id, arg)`` (trifast's cross-head mask_start_h = pid_h //
+            H_heads) so the 3-D template can index the shared mask by (z / div);
+            returns None when the offset is the batch id directly (a per-head mask, no
+            divisor). This VERIFIES the divisor feeds the mask rather than reusing the
+            first pid-division found — a 3-D kernel with an unrelated pid-division and
+            a per-head mask must NOT get a spurious divisor."""
+            a = skip_layout(mask_addr)
+            op = op_by_id.get(a)
+            if op is None or op.op != "tt.addptr":
+                return None
+            sb = op_by_id.get(skip_layout(op.operand_ids[0]))
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            scal = op_by_id.get(sb.operand_ids[0])
+            if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                return None
+            inner = op_by_id.get(scal.operand_ids[0])
+            z_muli_id = inner.operand_ids[1] if (inner is not None and inner.op == "tt.addptr"
+                                                 and len(inner.operand_ids) >= 2) else scal.operand_ids[1]
+            z_muli = op_by_id.get(z_muli_id)
+            if z_muli is None or z_muli.op != "arith.muli":
+                return None
+            # SCALAR muli(offset, STRIDE_ARG): the stride is a direct kernel arg; the
+            # offset is the other (computed) operand (e.g. mask_start_h = pid_h // H).
+            off_id = None
+            for oid in z_muli.operand_ids:
+                if arg_by_id.get(oid) is not None:
+                    continue  # the stride arg
+                off_id = oid
+            if off_id is None:
+                return None
+            off = op_by_id.get(skip_layout(off_id))
+            if off is None or off.op not in ("arith.divui", "arith.divsi"):
+                return None
+            if not any(op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id"
+                       for o in off.operand_ids):
+                return None
+            for o in off.operand_ids:
+                ar = arg_by_id.get(o)
+                if ar is not None and not ar.is_ptr:
+                    return ar.index
+            return None
+
+        mask_div = _mask_batch_divisor(mask_loads[0].operand_ids[0])
+
         # Runtime Q-scale: mulf(load(Q), splat(scale_arg)).
         scale_arg = None
         for s in allops:
@@ -5774,7 +5821,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "scale_arg": scale_arg,
             # In 2-D, H drives z=zh/H. In 3-D, the same resolved divui(pid_h, H) IS
             # the mask cross-head divisor (mask_start_h = pid_h // H_heads).
-            "N_CTX": n_ctx_arg, "H": h_arg,
+            "N_CTX": n_ctx_arg, "H": h_arg, "mask_div": mask_div,
             "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
             "out_dtype": out_dtype, "causal": False,
         }
@@ -5893,13 +5940,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "scale": _scale_expr(info["scale_arg"]),
         }
 
-        # 3-D grid (trifast): h = pid3.y (triangle-i), z = pid3.z (batch*heads); the
-        # mask is shared across heads, indexed (z / H_heads). The resolved H arg is
-        # that divisor (mask_start_h = pid_h // H); C1 means H=1 -> no divisor.
+        # 3-D grid (trifast): h = pid3.y (triangle-i), z = pid3.z (batch*heads). When
+        # the mask's batch offset is divui(pid_h, H_heads) (cross-head-shared mask,
+        # mask_start_h = pid_h // H_heads) the detector reports that divisor as
+        # info["mask_div"]; the template then indexes the mask by (z / div). None
+        # (per-head mask) -> no divisor. VERIFIED to feed the mask (not a stray divui).
         grid_3d = bool(info.get("grid_3d"))
         mask_batch_div = None
-        if grid_3d and info["H"] != C1:
-            mask_batch_div = _uint_expr(info["H"])
+        if grid_3d and info.get("mask_div") is not None:
+            mask_batch_div = _uint_expr(info["mask_div"])
 
         # FAST PATH: route to the simdgroup-MMA template (the shipped fast FA kernel,
         # ~10x the scalar tiled template) when eligible — head_dim %8==0, block_m==32,
