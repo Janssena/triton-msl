@@ -1893,7 +1893,20 @@ def make_flash_attention_kernel_simdgroup(
     if not (BM == 32 and BN == 64 and D % 8 == 0 and Dv % 8 == 0):
         raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, head_dim%8==0, v_head_dim%8==0")
     n_groups = NT // 32
-    TPG = (Dv // 8) // n_groups
+    # TPG = output col-tiles (8-wide) each simdgroup owns. When Dv/8 < n_groups (a
+    # SMALL head_dim, e.g. Dv=32 -> 4 tiles < 8 groups), the plain floor gives 0
+    # (a zero-length o[4][TPG] -> compile error). Clamp to >=1 and, when there are
+    # then MORE (group,tile) slots than real col-tiles, gate the V-load / PV-MMA /
+    # store on `ct*8 < Dv` so the surplus groups idle. For Dv a multiple of 64
+    # (64/128/192) TPG*n_groups*8 == Dv exactly -> no guard, byte-identical to before.
+    TPG = max(1, (Dv // 8) // n_groups)
+    need_ct_guard = TPG * n_groups * 8 > Dv
+    # ct-guard fragments (value-level, NOT wrapping any barrier -> no divergent-barrier
+    # UB). Empty when not needed -> byte-identical for Dv multiple of 64. In the biased
+    # path Dv==D so the `< D` bound is the v_head_dim bound.
+    _ct_off = "(ct*8u < D ? ct*8u : 0u)" if need_ct_guard else "ct*8u"   # full V-load clamp
+    _ct_tail_g = " && (ct*8u + cc < D)" if need_ct_guard else ""          # tail V-staging value
+    _ct_store_g = " && (dc2 < D)" if need_ct_guard else ""                # final store value
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(D))
     if out_dtype in ("fp16", "f16"):
         elem, store_cast = "half", lambda e: f"half({e})"
@@ -2072,7 +2085,7 @@ def make_flash_attention_kernel_simdgroup(
         if mode == "full":
             vload = (
                 "            for (uint kk=0u;kk<BN;kk+=8u)\n"
-                "                simdgroup_load(vfs[kk/8u], V + v_base + (kv_start + kk)*v_sn + (ct*8u)*v_sk, v_sn);"
+                "                simdgroup_load(vfs[kk/8u], V + v_base + (kv_start + kk)*v_sn + (" + _ct_off + ")*v_sk, v_sn);"
             )
         else:
             vload = (
@@ -2080,7 +2093,7 @@ def make_flash_attention_kernel_simdgroup(
                 "                threadgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "                for (uint e = lid%%32u; e < 64u; e += 32u) {\n"
                 "                    uint rr = e / 8u, cc = e %% 8u; uint kvr = kv_start + kk + rr;\n"
-                "                    tgKV[sgitg*64u + rr*8u + cc] = (kvr < N_CTX) ? V[v_base + kvr*v_sn + (ct*8u + cc)*v_sk] : %(elem)s(0);\n"
+                "                    tgKV[sgitg*64u + rr*8u + cc] = (kvr < N_CTX" + _ct_tail_g + ") ? V[v_base + kvr*v_sn + (ct*8u + cc)*v_sk] : %(elem)s(0);\n"
                 "                }\n"
                 "                simdgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "                simdgroup_load(vfs[kk/8u], tgKV + sgitg*64u, 8u);\n"
@@ -2189,7 +2202,7 @@ def make_flash_attention_kernel_simdgroup(
         "            for (uint e=lid%32u;e<64u;e+=32u) {\n"
         "                uint dr=e/8u, dc=e%8u;\n"
         "                uint qr2=(q_start+rb*8u+dr), dc2=(ct*8u+dc);\n"
-        "                if (qr2 < N_CTX)\n"
+        "                if (qr2 < N_CTX" + _ct_store_g + ")\n"
         f"                    Out[o_base + qr2*o_sm + dc2*o_sk] = {store_cast('on_scratch[sgitg*64u+e]')};\n"
         "            }\n"
         "            threadgroup_barrier(mem_flags::mem_threadgroup);"

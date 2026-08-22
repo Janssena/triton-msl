@@ -93,3 +93,14 @@ def test_simd_fa_fp32_causal(Z, H, N_CTX):
     _launch(lib, "flash_attention", q, k, v, out)
     torch.mps.synchronize()
     assert (out - _ref(q, k, v, causal=True)).abs().max().item() < 1e-3
+
+
+def test_simd_small_head_ct_guard_gated():
+    """Small head_dim (Dv<64) emits the ct-guard so surplus simdgroups idle
+    (TPG=(Dv/8)/8 would be 0 otherwise); head_dim=128 (an exact multiple of 64)
+    emits NO guard and is byte-identical to before."""
+    s32 = make_flash_attention_kernel_simdgroup(32, 32, 64, out_dtype="fp32")
+    assert "(ct*8u < D ? ct*8u : 0u)" in s32 and "&& (dc2 < D)" in s32
+    s128 = make_flash_attention_kernel_simdgroup(128, 32, 64, out_dtype="fp32")
+    assert "ct*8u < D ?" not in s128 and "&& (dc2 < D)" not in s128
+    assert "(ct*8u)*v_sk" in s128  # unchanged device-direct V-load

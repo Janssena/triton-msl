@@ -5910,8 +5910,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         qs2, ks2, vs2, os2 = info["q_strides"], info["k_strides"], info["v_strides"], info["o_strides"]
         simd_eligible = (
             head_dim % 8 == 0
+            # Valid v_head_dim tilings: <=64 (guarded surplus groups) OR the exact
+            # multiples 128/192. 72..120 (non-64-multiple >64) mis-tile -> tiled path.
+            and (8 <= head_dim <= 64 or head_dim in (128, 192))
             and block_m == 32
-            and 64 <= head_dim <= 192  # TPG=(Dv/8)/8>=1 needs Dv>=64; tg budget caps <=192
             and qs2[3] == C1        # Q head-dim (col) contiguous
             and ks2[2] == C1        # K head-dim (Kᵀ row) contiguous
             and vs2[3] == C1        # V head-dim (col) contiguous
