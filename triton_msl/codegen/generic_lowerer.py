@@ -6062,10 +6062,31 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "refusing rather than emit silently-wrong gradients."
             )
 
+        # DEFINITIVE backward signature, checked BEFORE any _refuse: P is recomputed as
+        # exp2((scores - lse) * inv_ln2), i.e. an exp2 of (or scaling) a SUBTRACTION.
+        # Absent (e.g. a fused GEMM+bias+exp2, or a raw-exp2 attention) => NOT a softmax-
+        # recompute backward => return None (fall through to the generic path). Only once
+        # this shape is confirmed do the resolvers below refuse-on-failure.
+        _has_sub_exp2 = False
+        for _e in allops:
+            if _e.op != "math.exp2" or not _e.operand_ids:
+                continue
+            _inp = op_by_id.get(skip_layout(_e.operand_ids[0]))
+            _subs = list(_inp.operand_ids or []) if (_inp is not None and _inp.op == "arith.mulf") else (
+                [_inp.id] if (_inp is not None and _inp.op == "arith.subf") else [])
+            for _c in _subs:
+                _cop = op_by_id.get(skip_layout(_c))
+                if _cop is not None and _cop.op == "arith.subf":
+                    _has_sub_exp2 = True
+        if not _has_sub_exp2:
+            return None
+
         # 3-D grid + mask divisor + block dims (shared with the forward semantics).
+        # A biased-FA backward has a 2-D or 3-D grid; any other grid shape means this
+        # is NOT our pattern -> fall through (return None), do NOT refuse.
         n_pid = len({s.id for s in allops if s.op == "tt.get_program_id"})
         if n_pid > 3 or n_pid < 2:
-            _refuse(f"a 2-D/3-D grid (got {n_pid} program_ids)")
+            return None
         grid_3d = n_pid == 3
 
         # Q, K, bias from the scores dot.
@@ -6082,7 +6103,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if s.op in ("arith.subf",):
                     yield s
 
+        # The DEFINITIVE backward signature is P = exp2((scores - lse) * inv_ln2): an
+        # exp2 whose input is (or scales) a subtraction. If NO exp2 is of a subtraction
+        # (e.g. a fused GEMM+bias+exp2, or a raw-exp2 attention), this is NOT a softmax-
+        # recompute backward -> return None (fall through to the generic path), do NOT
+        # refuse. Only once the (scores - lse) shape is confirmed do we resolve exact-or-
+        # refuse: a pattern present but a pointer unresolvable IS a broken backward.
         lse_res = lse_addr = None
+        lse_pattern_found = False
         exp2_ops = [s for s in allops if s.op == "math.exp2"]
         for e in exp2_ops:
             inp = op_by_id.get(skip_layout(e.operand_ids[0])) if e.operand_ids else None
@@ -6095,20 +6123,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             for c in cands:
                 cop = op_by_id.get(skip_layout(c))
                 if cop is not None and cop.op == "arith.subf":
+                    lse_pattern_found = True
                     for o in cop.operand_ids:
                         la = load_addr(o)
                         r = resolve_1d(la) if la is not None else None
                         if r is not None:
                             lse_res = r
                             lse_addr = la
+        if not lse_pattern_found:
+            return None  # not a (scores - lse) softmax recompute -> not a biased-FA backward
         if lse_res is None:
             _refuse("the lse (row_max) pointer")
 
-        # mask: the single i1/i8 load.
+        # mask: exactly one i1/i8 load. A biased-FA backward loads exactly one boolean
+        # mask; 0 or 2+ means this is NOT our pattern -> fall through (return None).
+        # Present-but-unresolvable IS a broken backward -> refuse.
         mask_loads = [s for s in allops if s.op == "tt.load"
                       and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))]
         if len(mask_loads) != 1:
-            _refuse("a single boolean mask load")
+            return None
         mask_addr = mask_loads[0].operand_ids[0]
         m_res = resolve_1d(mask_addr)
         if m_res is None:

@@ -24,6 +24,62 @@ requires_mps = pytest.mark.skipif(
 )
 
 
+def _build_lowerer(fn, sig, cex):
+    """Compile an @triton.jit fn to TTGIR and wrap in a GenericLowerer (no emission)."""
+    from triton._C.libtriton import ir
+    from triton.compiler import ASTSource
+    from triton.backends.compiler import GPUTarget
+    from triton_msl.backend.compiler import MetalBackend
+    from triton_msl.codegen.mlir_walker import walk_ttgir
+    from triton_msl.codegen.generic_lowerer import GenericLowerer
+
+    target = GPUTarget("metal", "apple-m4", 32)
+    backend = MetalBackend(target)
+    options = backend.parse_options({})
+    s = ASTSource(fn=fn, signature=sig, constexprs=cex)
+    ctx = ir.context(); ir.load_dialects(ctx)
+    mod = s.make_ir(target, options, backend.get_codegen_implementation(options),
+                    backend.get_module_map(), ctx)
+    md = {}
+    mod = backend.make_ttir(mod, md, options)
+    mod = backend.make_ttgir(mod, md, options)
+    return GenericLowerer(walk_ttgir(mod, options), options)
+
+
+@triton.jit
+def _gemm_bias_exp2(a_ptr, b_ptr, c1_ptr, c2_ptr, o_ptr, M, N, K,
+                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """A fused GEMM+bias+exp2+GEMM+bias: TWO tt.dots with a LOADED C-operand + exp2,
+    NO stability-max. This trips the biased-FA backward TRIGGER but is NOT a backward
+    (no exp2-of-(scores-lse) subtraction) — the detector must fall through (return
+    None), not mis-resolve (silent-wrong gradients) nor over-refuse."""
+    rm = tl.arange(0, BM); rn = tl.arange(0, BN); rk = tl.arange(0, BK)
+    a = tl.load(a_ptr + rm[:, None] * BK + rk[None, :])
+    b = tl.load(b_ptr + rk[:, None] * BN + rn[None, :])
+    c1 = tl.load(c1_ptr + rm[:, None] * BN + rn[None, :])
+    s = tl.dot(a, b, c1)
+    e = tl.math.exp2(s)
+    b2 = tl.load(b_ptr + rm[:, None] * BN + rn[None, :])
+    c2 = tl.load(c2_ptr + rm[:, None] * BN + rn[None, :])
+    o = tl.dot(e.to(tl.float32), b2, c2)
+    tl.store(o_ptr + rm[:, None] * BN + rn[None, :], o)
+
+
+def test_bwd_detector_ignores_gemm_bias_exp2():
+    """Regression (audit #282): the backward detector must NOT claim a fused
+    GEMM+bias+exp2 kernel (≥2 dots + loaded-C + exp2 + no-max). It has no
+    exp2-of-(scores-lse) subtraction, so _detect_biased_fa_backward returns None
+    (falls through) rather than mis-routing or refusing as if it were a backward."""
+    P = "*fp32"
+    low = _build_lowerer(
+        _gemm_bias_exp2,
+        {"a_ptr": P, "b_ptr": P, "c1_ptr": P, "c2_ptr": P, "o_ptr": P,
+         "M": "i32", "N": "i32", "K": "i32"},
+        {"BM": 32, "BN": 32, "BK": 32})
+    assert low._detect_biased_fa_backward() is None
+    assert low._detect_biased_flash_attention() is None
+
+
 # fmt: off
 @triton.jit
 def _bwd_kv(
