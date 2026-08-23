@@ -3129,8 +3129,119 @@ class _TemplateMixin:
                 return None
             if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
                 return None
-            if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+            # A packed int4 weight and an int8 weight BOTH report signless i8, so distinguish
+            # by STRUCTURE: int4 unpacks a nibble (andi 0xF over shrui by (k%2)*4) from a byte
+            # load at k//2, whereas int8 is a direct sitofp(load). If a nibble unpack is
+            # present it MUST verify + FULL loop-k pin (byte//2 dividend == nibble%2 dividend
+            # == the dot A-operand's k index) or REFUSE — never route packed int4 to the
+            # linear int8 template (that would dequantize the wrong nibble: silent-wrong).
+            if _mlir_to_triton_dtype(args[1].elem_type) not in (
+                "int8", "i8", "si8", "uint8", "u8", "ui8",
+            ):
                 return None
+
+            def _q_find(oid, names, seen=None, d=0):
+                if seen is None:
+                    seen = set()
+                if oid in seen or d > 30:
+                    return None
+                seen.add(oid)
+                o = op_by_id.get(oid)
+                if o is None:
+                    return None
+                if o.op in names:
+                    return o
+                for x in (o.operand_ids or []):
+                    r = _q_find(x, names, seen, d + 1)
+                    if r is not None:
+                        return r
+                return None
+
+            def _q_cval(oid):
+                o = op_by_id.get(oid)
+                if o is None or o.op != "arith.constant":
+                    return None
+                try:
+                    return int(str((o.attrs or {}).get("value", "")).split(":")[0].strip())
+                except (TypeError, ValueError):
+                    return None
+
+            def _q_has_const_offset(root, seen=None, d=0):
+                # True if an arith.addi/subi with a CONSTANT (or splat/broadcast of a
+                # constant) operand appears above the make_range in root's cone — i.e. the
+                # k index is SHIFTED (k +/- c), the double-swap. Stops at make_range/load/
+                # arg; muli-by-constant (block scaling pid*BLOCK) is NOT an additive shift.
+                if seen is None:
+                    seen = set()
+                if root in seen or d > 40:
+                    return False
+                seen.add(root)
+                o = op_by_id.get(root)
+                if o is None or o.op in ("tt.make_range", "tt.load"):
+                    return False
+                if o.op in ("arith.addi", "arith.subi"):
+                    for x in (o.operand_ids or []):
+                        xo = op_by_id.get(x)
+                        while xo is not None and xo.op in (
+                            "tt.splat", "tt.broadcast", "ttg.convert_layout",
+                            "tt.expand_dims", "tt.reshape",
+                        ) and xo.operand_ids:
+                            xo = op_by_id.get(xo.operand_ids[0])
+                        if xo is not None and xo.op == "arith.constant":
+                            return True
+                return any(_q_has_const_offset(x, seen, d + 1) for x in (o.operand_ids or []))
+
+            def _q_in_cone(root, target, seen=None, d=0):
+                if seen is None:
+                    seen = set()
+                if root in seen or d > 48:
+                    return False
+                seen.add(root)
+                if root == target:
+                    return True
+                o = op_by_id.get(root)
+                if o is None:
+                    return False
+                return any(_q_in_cone(x, target, seen, d + 1) for x in (o.operand_ids or []))
+
+            _is_int4 = False
+            _andi = _q_find(sub.operand_ids[0], ("arith.andi",))
+            if _andi is not None and len(_andi.operand_ids) == 2:
+                _shr = None
+                _mask_ok = False
+                for _oid in _andi.operand_ids:
+                    _oo = op_by_id.get(_oid)
+                    if _oo is not None and _oo.op == "arith.shrui":
+                        _shr = _oo
+                    elif _q_cval(_oid) == 15:
+                        _mask_ok = True
+                if _mask_ok and _shr is not None and len(_shr.operand_ids) == 2:
+                    _muli = _q_find(_shr.operand_ids[1], ("arith.muli",))
+                    _wload = _q_find(_shr.operand_ids[0], ("tt.load",))
+                    if _muli is not None and _wload is not None and _wload.operand_ids and len(_muli.operand_ids) == 2:
+                        _rem = _q_find(_muli.operand_ids[0], ("arith.remsi",)) or _q_find(
+                            _muli.operand_ids[1], ("arith.remsi",))
+                        _mul4 = any(_q_cval(x) == 4 for x in _muli.operand_ids)
+                        _bdiv = _q_find(_wload.operand_ids[0], ("arith.divsi",))
+                        if (_rem is not None and _mul4 and len(_rem.operand_ids) == 2
+                                and _q_cval(_rem.operand_ids[1]) == 2
+                                and _bdiv is not None and len(_bdiv.operand_ids) == 2
+                                and _q_cval(_bdiv.operand_ids[1]) == 2
+                                and _rem.operand_ids[0] == _bdiv.operand_ids[0]):
+                            # byte//2 and nibble%2 share ONE k index (same_k). FULL pin: that
+                            # k must reach a tt.make_range (a real loop index) with NO constant
+                            # additive offset down to it -> rules out a k-vs-(k+1) shift (the
+                            # double-swap; a single-swap already fails same_k above). The
+                            # ACTIVATION is implicitly pinned to the same k by the tt.dot, which
+                            # contracts A and B over one shared k — so no fragile cross-index
+                            # match is needed (and TTGIR duplicates the make_range per MMA
+                            # layout, making one unreliable anyway).
+                            _kdiv = _bdiv.operand_ids[0]
+                            _kmr = self._trace_to_make_range(_kdiv, list(op_by_id.values()), op_by_id)
+                            if _kmr is not None and not _q_has_const_offset(_kdiv):
+                                _is_int4 = True
+                if not _is_int4:
+                    return None  # nibble-like weight but not the safe pinned packing -> refuse
             try:
                 _sd = self.infer_dot_strides()
             except Exception:  # noqa: BLE001
@@ -3242,6 +3353,11 @@ class _TemplateMixin:
             _stride_idx += [ssg, ssn, zsg, zsn]
             if any(i is None for i in _stride_idx):
                 return None
+            if _is_int4:
+                # B[0] (infer_dot_strides) is the packed weight's BYTE-row stride (wbk),
+                # which the int4 template applies at k//2 — exactly the kernel's addressing.
+                from triton_msl.codegen._msl_templates import make_int4_matmul_pergroup
+                return ("pergroup_int4", make_int4_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx))
             from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
             return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx))
 

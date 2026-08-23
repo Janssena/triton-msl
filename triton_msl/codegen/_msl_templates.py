@@ -2300,10 +2300,15 @@ def _bwd_kv_subtile_size(head_dim, block_j, block_k):
         mem = (4 * ks * D + BJ * D + 2 * BJ * ks) * 4 + (2 * BJ + ks + 16) * 4
         return tpg <= 1024 and mem <= 32768
 
-    ks = block_k
-    while ks > 1 and not _fits(ks):
-        ks //= 2
-    return ks if _fits(ks) else None
+    # KS must DIVIDE block_k — the subtile loop steps by KS through block_k, so a KS that
+    # does not divide it would overshoot the tile and double-write dK/dV for the next
+    # k-block's rows. Triton's tl.arange already forces power-of-2 blocks (for which the
+    # largest fitting divisor is a power of 2), but iterate TRUE divisors descending so the
+    # helper's own invariant holds regardless of caller — never return an overshooting KS.
+    for ks in range(block_k, 0, -1):
+        if block_k % ks == 0 and _fits(ks):
+            return ks
+    return None
 
 
 def make_flash_attention_bwd_kv_kernel(
@@ -2750,10 +2755,13 @@ def _bwd_q_subtile_size(head_dim, block_j, block_k):
         mem = (2 * js * D + 2 * BK * D + 2 * js * BK) * 4 + (2 * js + BK + 16) * 4
         return tpg <= 1024 and mem <= 32768
 
-    js = block_j
-    while js > 1 and not _fits(js):
-        js //= 2
-    return js if _fits(js) else None
+    # JS must DIVIDE block_j (the subtile loop steps by JS); iterate true divisors
+    # descending so a non-power-of-2 block can never yield an overshooting JS (Triton's
+    # tl.arange forces power-of-2 blocks, but keep the invariant caller-independent).
+    for js in range(block_j, 0, -1):
+        if block_j % js == 0 and _fits(js):
+            return js
+    return None
 
 
 def make_flash_attention_bwd_q_kernel(
@@ -4857,6 +4865,56 @@ kernel void int8_matmul_pergroup(
         float s = scales[g * ssg + col * ssn];
         float z = zeros[g * zsg + col * zsn];
         float w = (float(weight[k * wsk + col * wsn]) - z) * s;
+        acc += input[row * isr + k * isc] * w;
+    }}
+    output[row * osr + col * osc] = acc;
+}}
+"""
+
+
+def make_int4_matmul_pergroup(group_size=128):
+    """Weight-only INT4 matmul with PER-GROUP quantization (GPTQ/AWQ), the M>1 GEMM
+    companion to ``make_int4_gemv``. Packed weight is ``uchar`` [K/2, N] — 2 nibbles per
+    byte, LOW nibble for EVEN k / HIGH for odd (the ONLY packing the int4 descriptor
+    routes, pinned to the loop k). Scalar (one thread per output); a fast per-group MMA
+    variant is a perf follow-up. ``w = (float(nibble) - zero_g) * scale_g; out = input @ w``.
+
+    Fully STRIDE-GENERIC. Buffers mirror ``make_int8_matmul_pergroup`` EXCEPT buffer 10 is
+    the BYTE-row (k/2) stride ``wbk`` (weight is [K/2, N], indexed by the byte k/2), and
+    the weight buffer is ``uchar``.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void int4_matmul_pergroup(
+    device const float* input   [[buffer(0)]],
+    device const uchar* weight  [[buffer(1)]],
+    device float*       output  [[buffer(2)]],
+    device const float* scales  [[buffer(3)]],
+    device const float* zeros   [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& isr [[buffer(8)]],  constant uint& isc [[buffer(9)]],
+    constant uint& wbk [[buffer(10)]], constant uint& wsn [[buffer(11)]],
+    constant uint& osr [[buffer(12)]], constant uint& osc [[buffer(13)]],
+    constant uint& ssg [[buffer(14)]], constant uint& ssn [[buffer(15)]],
+    constant uint& zsg [[buffer(16)]], constant uint& zsn [[buffer(17)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    const uint GROUP = {group_size}u;
+    uint row = gid / N;
+    uint col = gid % N;
+    if (row >= M || col >= N) return;
+
+    float acc = 0.0f;
+    for (uint k = 0u; k < K; k++) {{
+        uint g = k / GROUP;
+        float s = scales[g * ssg + col * ssn];
+        float z = zeros[g * zsg + col * zsn];
+        uchar packed = weight[(k / 2u) * wbk + col * wsn];
+        uint w4 = (uint(packed) >> ((k % 2u) * 4u)) & 0xFu;   // low nibble for even k
+        float w = (float(w4) - z) * s;
         acc += input[row * isr + k * isc] * w;
     }}
     output[row * osr + col * osc] = acc;

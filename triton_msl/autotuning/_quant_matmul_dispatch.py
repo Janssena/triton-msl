@@ -53,7 +53,7 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
             return _dispatch_gemv(
                 rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
-        if descriptor[0] == "pergroup_int8":
+        if descriptor[0] in ("pergroup_int8", "pergroup_int4"):
             return _dispatch_pergroup_int8(
                 rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
@@ -198,15 +198,18 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_m
 def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
     """Dispatch the scalar per-group int8 GEMM (make_int8_matmul_pergroup).
 
-    descriptor = ("pergroup_int8", pg_msl, m_idx, n_idx, k_idx,
-                  (isr, isc, wsk, wsn, osr, osc, ssg, ssn, zsg, zsn)).
+    descriptor = ("pergroup_int8"|"pergroup_int4", pg_msl, m_idx, n_idx, k_idx,
+                  (isr, isc, wsk/wbk, wsn, osr, osc, ssg, ssn, zsg, zsn)).
     Buffer order = (input, weight, output, scales, zeros, M, N, K, + the 10 strides);
-    one thread per output element (gid = row*N + col).
+    one thread per output element (gid = row*N + col). The int4 tag routes to
+    make_int4_matmul_pergroup (uchar weight, byte//2 index) — same buffer layout, and
+    buffer 10 is the packed weight's byte-row stride.
     """
     try:
         pg_msl = descriptor[1]
         m_idx, n_idx, k_idx = descriptor[2], descriptor[3], descriptor[4]
         sidx = descriptor[5]
+        _kname = "int4_matmul_pergroup" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup"
     except (TypeError, ValueError, IndexError):
         return False
     if pg_msl is None or rt.is_unsupported(pg_msl):
@@ -221,7 +224,7 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
         lib = rt.get_library(pg_msl)
         _grp = 256
         threads = _math.ceil((M * N) / _grp) * _grp
-        rt.dispatch(lib, "int8_matmul_pergroup", buffers, threads=threads, group_size=_grp)
+        rt.dispatch(lib, _kname, buffers, threads=threads, group_size=_grp)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
