@@ -4819,6 +4819,84 @@ kernel void int8_matmul_fast(
 """
 
 
+def make_int8_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
+    """FAST per-group int8 GEMM: tiled simdgroup MMA, ~4-7x the scalar per-group template.
+
+    The per-N fast kernel folds the per-channel zero into the staged tile and applies
+    scale once in the epilogue (scale/zero constant along K). For PER-GROUP, scale AND
+    zero change every ``group_size`` along K — but a ``bk``-tile sits within ONE group
+    (bk <= group_size, group_size % bk == 0), so fold BOTH per group into the staged
+    dequant tile ``bdeq[kk][nn] = (float(w) - zero_g) * scale_g`` and drop the epilogue
+    scale. Float simdgroup MMA on the fully-dequantized tile; exact vs the scalar kernel.
+
+    Weight [K,N] kn CONTIGUOUS (weight[(k0+kk)*N + n]); input [M,K] / output [M,N]
+    contiguous; scales/zeros [n_groups, N] with runtime strides (ssg, ssn). Each simdgroup
+    computes an (8*rr) x (8*rc) block. DISPATCH: ceil(M/(8*rr))*ceil(N/(8*rc)) groups,
+    32 threads. SIZE CONTRACT: M % (8*rr) == 0, N % (8*rc) == 0, K % bk == 0, bk % 8 == 0,
+    group_size % bk == 0 (routed only when all hold + contiguous inner strides).
+    """
+    if group_size % bk != 0 or bk % 8 != 0:
+        raise ValueError(f"make_int8_matmul_pergroup_fast: need group_size%bk==0, bk%8==0 (G={group_size}, bk={bk})")
+    BN = 8 * rc
+    accs = "\n    ".join(f"simdgroup_float8x8 c{r}_{c}(0.0f);" for r in range(rr) for c in range(rc))
+    afrags = " ".join(f"simdgroup_float8x8 a{r};" for r in range(rr))
+    bfrags = " ".join(f"simdgroup_float8x8 b{c};" for c in range(rc))
+    sub = []
+    for kk in range(0, bk, 8):
+        for r in range(rr):
+            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r*8}u) * K + k0 + {kk}u, K);")
+        for c in range(rc):
+            sub.append(f"simdgroup_load(b{c}, bdeq + {kk*BN}u + {c*8}u, {BN}u);")
+        for r in range(rr):
+            for c in range(rc):
+                sub.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a{r}, b{c}, c{r}_{c});")
+    submma = "\n        ".join(sub)
+    epi = "\n    ".join(
+        f"simdgroup_store(c{r}_{c}, cbuf, 8);\n    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+        f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
+        f"output[(m0 + {r*8}u + mm) * N + (n0 + {c*8}u + nn)] = cbuf[e]; }}\n"
+        f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
+        for r in range(rr) for c in range(rc)
+    )
+    return f"""#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void int8_matmul_pergroup_fast(
+    device const float* input  [[buffer(0)]],
+    device const char*  weight [[buffer(1)]],
+    device float*       output [[buffer(2)]],
+    device const float* scales [[buffer(3)]],
+    device const float* zeros  [[buffer(4)]],
+    constant uint& M [[buffer(5)]], constant uint& N [[buffer(6)]], constant uint& K [[buffer(7)]],
+    constant uint& ssg [[buffer(8)]], constant uint& ssn [[buffer(9)]],
+    uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {{
+    const uint GROUP = {group_size}u;
+    uint ntn = N / {BN}u;
+    uint m0 = (tgid / ntn) * {8*rr}u;
+    uint n0 = (tgid % ntn) * {BN}u;
+    threadgroup float bdeq[{bk*BN}];
+    {accs}
+    {afrags} {bfrags}
+    for (uint k0 = 0u; k0 < K; k0 += {bk}u) {{
+        uint g = k0 / GROUP;
+        for (uint e = tid; e < {bk*BN}u; e += 32u) {{
+            uint kk = e / {BN}u, nn = e % {BN}u;
+            float sc = scales[g * ssg + (n0 + nn) * ssn];
+            float ze = zeros[g * ssg + (n0 + nn) * ssn];
+            bdeq[kk * {BN}u + nn] = (float(weight[(k0 + kk) * N + (n0 + nn)]) - ze) * sc;
+        }}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {submma}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    threadgroup float cbuf[64];
+    {epi}
+}}
+"""
+
+
 def make_int8_matmul_pergroup(group_size=128):
     """Weight-only INT8 matmul with PER-GROUP quantization (GPTQ-style): every
     ``group_size`` elements along K share a (scale, zero). Scalar (one thread per

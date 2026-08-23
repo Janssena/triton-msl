@@ -220,6 +220,28 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
             return False
         # a stride index of -1 means the stride was folded to a compile-time 1.
         strides = [(int(kargs[i]) if i >= 0 else 1) for i in sidx]
+        isr, isc, wsk, wsn, osr, osc, ssg, ssn = strides[0:8]
+
+        # FAST simdgroup-MMA per-group int8 path (descriptor[6..10] = fast_msl, rr, rc, bk,
+        # group_size), selected ONLY when the runtime shape meets its contract: contiguous
+        # row-major input [M,K] / weight [K,N] (kn) / output [M,N], and aligned M/N/K/group.
+        # Otherwise fall through to the stride-generic scalar kernel below (correct for any
+        # layout). int4 (pergroup_int4) has no fast variant yet -> always scalar.
+        _fast = descriptor[6] if len(descriptor) > 6 else None
+        if _fast is not None and descriptor[0] == "pergroup_int8" and not rt.is_unsupported(_fast):
+            rr, rc, bk, g_s = descriptor[7], descriptor[8], descriptor[9], descriptor[10]
+            tm, tn = 8 * rr, 8 * rc
+            if (M % tm == 0 and N % tn == 0 and K % bk == 0 and g_s % bk == 0
+                    and isc == 1 and wsn == 1 and osc == 1
+                    and isr == K and wsk == N and osr == N):
+                flib = rt.get_library(_fast)
+                fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
+                fthreads = (M // tm) * (N // tn) * 32
+                rt.dispatch(flib, "int8_matmul_pergroup_fast", fbuf, threads=fthreads, group_size=32)
+                if launch_exit_hook:
+                    launch_exit_hook(launch_metadata)
+                return True
+
         buffers = list(kargs[0:5]) + [M, N, K] + strides
         lib = rt.get_library(pg_msl)
         _grp = 256

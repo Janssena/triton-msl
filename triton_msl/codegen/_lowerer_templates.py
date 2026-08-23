@@ -3358,8 +3358,16 @@ class _TemplateMixin:
                 # which the int4 template applies at k//2 — exactly the kernel's addressing.
                 from triton_msl.codegen._msl_templates import make_int4_matmul_pergroup
                 return ("pergroup_int4", make_int4_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx))
-            from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
-            return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx))
+            from triton_msl.codegen._msl_templates import (
+                make_int8_matmul_pergroup, make_int8_matmul_pergroup_fast,
+            )
+            # Carry a FAST simdgroup-MMA variant (~4-7x); the dispatch selects it only when
+            # the runtime sizes/strides meet its contract (contiguous kn/row-major, aligned
+            # M/N/K/group), else falls back to the stride-generic scalar template.
+            _rr, _rc, _bk = 4, 2, 32
+            _fast = make_int8_matmul_pergroup_fast(g_s, _rr, _rc, _bk) if (g_s % _bk == 0) else None
+            return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx),
+                    _fast, _rr, _rc, _bk, g_s)
 
         # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
         try:
