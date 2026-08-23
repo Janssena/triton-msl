@@ -3105,17 +3105,42 @@ class _DetectionMixin:
                 if const_match and (mr_pos == -1 or const_match.start() < mr_pos):
                     descending = True
 
-        # Identify stride scalars: they appear in arith.muli with the
-        # make_range offsets. For now, name-based heuristic: first scalar
-        # arg = stride_xm, second scalar arg = stride_zm. This matches
-        # the sort_kernel signature (X, stride_xm, Z, stride_zm).
+        # Identify the row-stride scalars. They appear as a factor of a make_range
+        # (the row offset) in an arith.muli. The canonical sort signature carries ONLY
+        # the strides as runtime scalars (X, stride_xm, Z, stride_zm), so a POSITIONAL
+        # pick would silently mis-assign if a NON-stride scalar (e.g. a runtime row count)
+        # were present. Guard it structurally: verify EVERY runtime scalar arg is actually
+        # a row-stride (a make_range coefficient); if any is not, the positional pick is
+        # ambiguous -> REFUSE rather than guess (correct-or-refuse). Constexpr strides
+        # (no runtime scalars) stay the safe None case (template uses the baked N).
+        def _flatten_ops(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _flatten_ops(s.region_ops)
+                if s.else_ops:
+                    yield from _flatten_ops(s.else_ops)
+
+        _all_ops = list(_flatten_ops(self.graph.ops))
+        _obid = {s.id: s for s in _all_ops}
+
+        def _is_row_stride(arg):
+            for o in _all_ops:
+                if o.op == "arith.muli" and arg.id in (o.operand_ids or []):
+                    for other in o.operand_ids:
+                        if other != arg.id and self._trace_to_make_range(other, _all_ops, _obid) is not None:
+                            return True
+            return False
+
         stride_xm_name = None
         stride_zm_name = None
-        if len(scalar_args) >= 2:
+        if len(scalar_args) >= 1:
+            if not all(_is_row_stride(a) for a in scalar_args):
+                return None  # a non-stride runtime scalar is present -> can't positionally pick
+            if len(scalar_args) > 2:
+                return None  # more stride-like scalars than the 2 rows (xm, zm) -> ambiguous
             stride_xm_name = scalar_args[0].name
-            stride_zm_name = scalar_args[1].name
-        elif len(scalar_args) >= 1:
-            stride_xm_name = stride_zm_name = scalar_args[0].name
+            stride_zm_name = scalar_args[1].name if len(scalar_args) >= 2 else scalar_args[0].name
 
         # Require M <= 1024 so each row fits in one thread within the tg
         if M > 1024:

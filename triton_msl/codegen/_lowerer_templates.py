@@ -2667,11 +2667,32 @@ class _TemplateMixin:
         if rem is None or not mul4 or len(rem.operand_ids) != 2 or _cint(rem.operand_ids[1]) != 2:
             return None
 
-        # --- weight byte index uses k // 2. ---
+        # --- FULL loop-k pinning of the nibble/byte packing (correct-or-refuse). ---
+        # make_int4_gemv bakes: byte = k//2, nibble = k%2 (LOW nibble for EVEN k), and
+        # pairs the dequantized weight with the activation x[k] — all keyed by the SAME
+        # reduction index k. The structural nibble/byte ops (%2, //2, mask 0xF, *4) are
+        # necessary but NOT sufficient: a high-nibble-first packing `(k+1)%2`, or a
+        # `(k+1)//2` byte index, has a DIFFERENT dividend and would route yet silently
+        # dequantize the wrong nibble/byte (reproduced: err ~7.6). So pin all three
+        # indices to ONE ssa value: the byte-divsi dividend == the nibble-remsi dividend
+        # == the activation-load index. Any k-vs-(k+1) skew (single OR double swap)
+        # yields distinct ssa ids here and REFUSES.
         if w_load is None or not w_load.operand_ids:
             return None
-        if _find(w_load.operand_ids[0], ("arith.divsi",)) is None:
-            return None  # (the byte-index divsi(_, 2) — value checked via group below)
+        byte_divsi = _find(w_load.operand_ids[0], ("arith.divsi",))
+        if byte_divsi is None or len(byte_divsi.operand_ids) != 2 or _cint(byte_divsi.operand_ids[1]) != 2:
+            return None  # byte index must be exactly k // 2
+        k_idx = byte_divsi.operand_ids[0]
+        if rem.operand_ids[0] != k_idx:
+            return None  # nibble k%2 must use the SAME index as the byte k//2
+        x_load = _find(x_bc, ("tt.load",))
+        if x_load is None or not x_load.operand_ids:
+            return None
+        x_addr = op_by_id.get(x_load.operand_ids[0])
+        if x_addr is None or x_addr.op != "tt.addptr" or len(x_addr.operand_ids) != 2:
+            return None
+        if x_addr.operand_ids[1] != k_idx:
+            return None  # activation x[k] must use that SAME reduction index k
 
         # --- per-group scale/zero: address uses g = k // GROUP; extract + match GROUP. ---
         def _group_of(bc):

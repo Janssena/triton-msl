@@ -5354,7 +5354,39 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if _a is not None and not _a.is_ptr:
                     _nctx_cands.add(_a.index)
             if len(_nctx_cands) == 1:
-                n_ctx_index = next(iter(_nctx_cands))
+                _cand = next(iter(_nctx_cands))
+                # CROSS-CHECK (positively verify the pick is a LENGTH, not merely a unique
+                # range-compared scalar): the seq-len drives the KV-loop extent, so the pick
+                # must be the scf.for upper bound — directly (non-causal) or an operand of the
+                # causal min((start_m+1)*BM, N_CTX). Trace every scf.for bound through
+                # casts + min/select to its arg(s); require the pick among them. This rejects
+                # a kernel that assumes divisibility (no seq-len mask) yet uniquely compares a
+                # DIFFERENT scalar (e.g. valid_len) to a tile index. If no scf.for bound
+                # resolves to any arg (e.g. a constexpr trip count), trust the unique pick.
+                _bound_args = set()
+                for _s in all_ops:
+                    if _s.op != "scf.for" or len(_s.operand_ids or []) < 2:
+                        continue
+                    _stack, _seen2 = [_s.operand_ids[1]], set()
+                    while _stack:
+                        _bid = _stack.pop()
+                        if _bid in _seen2:
+                            continue
+                        _seen2.add(_bid)
+                        _ba = arg_by_id.get(_bid)
+                        if _ba is not None and not _ba.is_ptr:
+                            _bound_args.add(_ba.index)
+                            continue
+                        _bo = op_by_id.get(_bid)
+                        if _bo is not None and _bo.op in (
+                            "arith.minsi", "arith.minui", "arith.maxsi", "arith.maxui",
+                            "arith.select", "arith.index_cast", "arith.index_castui",
+                            "arith.extsi", "arith.extui", "arith.trunci",
+                        ) and _bo.operand_ids:
+                            _stack.extend(_bo.operand_ids)
+                if (not _bound_args) or (_cand in _bound_args):
+                    n_ctx_index = _cand
+                # else: the unique range-compared scalar is not the loop bound -> refuse
         if n_ctx_index is None:
             _refuse("the N_CTX scalar arg")
         z_val = z_arg.index if z_arg is not None else C1
@@ -6875,6 +6907,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
                 "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
             })
+            # Error-type parity with the q/b branches: refuse LOUDLY (MetalNonRecoverableError
+            # -> CPU fallback) if the scalar path can't tile this head_dim within 32 KB
+            # (e.g. head_dim=256), instead of letting the maker raise a bare ValueError.
+            if not simd_ok:
+                from triton_msl.codegen._msl_templates import _bwd_kv_subtile_size
+                if _bwd_kv_subtile_size(head_dim, block_j, block_k) is None:
+                    raise MetalNonRecoverableError(
+                        f"Refusing to emit silently-wrong output: backward dK/dV head_dim={head_dim} "
+                        f"(BLOCK_J={block_j}, BLOCK_K={block_k}) cannot be k-subtiled within Metal's "
+                        f"1024-thread / 32 KB threadgroup limits.")
             kv_maker = make_flash_attention_bwd_kv_kernel_simd if simd_ok else make_flash_attention_bwd_kv_kernel
             msl = kv_maker(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
@@ -6983,6 +7025,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         head_dim = info["head_dim"]
         block_m, block_n = info["block_m"], info["block_n"]
+
+        # Anti-silent-wrong (parity with the standard hd128 path): the tiled biased
+        # template computes the FULL output tile and gates writes only on the N_CTX
+        # boundary, so a tighter WITHIN-tile output store mask would be SILENTLY DROPPED
+        # (clobbering the masked-off rows). Refuse it here using the SAME shared triviality
+        # check the standard path uses; fa_ctx_index = the resolved N_CTX arg so a
+        # renamed-seqlen tile boundary (om < N / om < seqlen) is still recognized as
+        # trivial and passes through, while a tighter/value mask refuses.
+        if self._template_output_mask_nontrivial(is_fa=True, fa_ctx_index=info.get("N_CTX")):
+            raise MetalNonRecoverableError(
+                "Biased/triangle FlashAttention with a non-tile-boundary output store mask "
+                "is not supported: the tiled biased template computes the FULL output tile "
+                "and gates writes only on the N_CTX boundary, silently DROPPING any tighter "
+                "store mask (e.g. tl.store(o, acc, mask=om < BOUND) with BOUND < N_CTX, or a "
+                "value mask). Refusing to emit silently-wrong output. Use a full-tile store "
+                "(the om < N_CTX tile boundary is honored automatically) or apply the "
+                "partial-output mask in a separate elementwise kernel."
+            )
+
         has_mask = bool(info.get("has_mask", info.get("mask") is not None))
         role_name = {
             info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
