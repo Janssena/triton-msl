@@ -4897,6 +4897,119 @@ kernel void int8_matmul_pergroup_fast(
 """
 
 
+def make_varlen_flash_attention(
+    head_dim=64, causal=False, out_dtype="fp32",
+    arg_decls=None, bindings=None, kernel_name="varlen_fa",
+):
+    """VARLEN FlashAttention-2 (packed cu_seqlens, route-only ABI). One thread per query
+    row; K/V tiles staged in threadgroup memory; online softmax with a register acc.
+
+    The dominant real-world FA shape (vLLM / flash-attn / HF): sequences are PACKED into
+    [total_tokens, H, head_dim] and indexed per batch b by cu_seqlens (cu_q[b] gives the
+    row offset, cu_q[b+1]-cu_q[b] the length). The dense [Z,H,N,D] FA templates can't
+    express this; the generic per-element path is correct but ~0.04 TF. This tiled kernel
+    is ~8-9x that, EXACT vs the per-sequence reference.
+
+    ``bindings`` (from the detector): pointer names Q/K/V/O/CUQ/CUK, the heads count H, and
+    the token/head/dim strides per tensor (q_st,q_sh,q_sk, k_.., v_.., o_..). Grid is 2-D
+    (tgpos.x = q-block, tgpos.y = batch*H); BLOCK_M threads/threadgroup; dispatched by the
+    native-grid ``dispatch_flash_attention`` (descriptor ("flash_attention", msl, BLOCK_M)).
+    """
+    if arg_decls is None or bindings is None:
+        raise ValueError("make_varlen_flash_attention is route-only (needs arg_decls/bindings)")
+    if out_dtype in ("fp32", "f32"):
+        elem, store_cast = "float", lambda e: e
+    elif out_dtype in ("fp16", "f16"):
+        elem, store_cast = "half", lambda e: f"half({e})"
+    else:
+        raise ValueError(f"varlen FA out_dtype must be fp32/fp16 (got {out_dtype!r})")
+    D = head_dim
+    BM = BN = 32
+    scale = float(D) ** -0.5
+    inv_ln2 = 1.4426950408889634
+    _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
+             "q_st", "q_sh", "q_sk", "k_st", "k_sh", "k_sk",
+             "v_st", "v_sh", "v_sk", "o_st", "o_sh", "o_sk"]
+    missing = [n for n in _need if n not in bindings]
+    if missing:
+        raise ValueError(f"varlen FA bindings missing {missing}")
+    b = bindings
+    causal_guard = "&& (qrow >= krow)" if causal else ""
+    sig = ",\n".join(arg_decls)
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+// Varlen FlashAttention-2 ({elem} in/out, fp32 compute), packed cu_seqlens.
+kernel void {kernel_name}(
+{sig},
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint D = {D}u, BM = {BM}u, BN = {BN}u;
+    const float scale = {scale}f, inv_ln2 = {inv_ln2}f;
+    const uint nheads = {b['H']};
+    const uint q_st = {b['q_st']}, q_sh = {b['q_sh']}, q_sk = {b['q_sk']};
+    const uint k_st = {b['k_st']}, k_sh = {b['k_sh']}, k_sk = {b['k_sk']};
+    const uint v_st = {b['v_st']}, v_sh = {b['v_sh']}, v_sk = {b['v_sk']};
+    const uint o_st = {b['o_st']}, o_sh = {b['o_sh']}, o_sk = {b['o_sk']};
+    uint m_block = tgpos.x, bh = tgpos.y;
+    uint bb = bh / nheads, h = bh % nheads;
+
+    uint q_start = uint({b['CUQ']}[bb]);
+    uint seqlen_q = uint({b['CUQ']}[bb + 1u]) - q_start;
+    if (m_block * BM >= seqlen_q) return;
+    uint k_start = uint({b['CUK']}[bb]);
+    uint seqlen_k = uint({b['CUK']}[bb + 1u]) - k_start;
+
+    uint row = lid;
+    uint qrow = m_block * BM + row;
+    bool valid = (qrow < seqlen_q);
+
+    float q_reg[{D}];
+    float acc[{D}];
+    for (uint d = 0u; d < D; d++) {{
+        q_reg[d] = valid ? float({b['Q']}[(q_start + qrow) * q_st + h * q_sh + d * q_sk]) : 0.0f;
+        acc[d] = 0.0f;
+    }}
+    float m_i = -INFINITY, l_i = 0.0f;
+
+    threadgroup float tg_K[{BN} * {D}];
+    threadgroup float tg_V[{BN} * {D}];
+
+    for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
+        for (uint e = lid; e < BN * D; e += BM) {{
+            uint kk = e / D, dd = e % D; uint krow = kt + kk;
+            bool kv = (krow < seqlen_k);
+            tg_K[e] = kv ? float({b['K']}[(k_start + krow) * k_st + h * k_sh + dd * k_sk]) : 0.0f;
+            tg_V[e] = kv ? float({b['V']}[(k_start + krow) * v_st + h * v_sh + dd * v_sk]) : 0.0f;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {{
+            for (uint kk = 0u; kk < BN; kk++) {{
+                uint krow = kt + kk;
+                if (krow < seqlen_k {causal_guard}) {{
+                    float s = 0.0f;
+                    for (uint d = 0u; d < D; d++) s += q_reg[d] * tg_K[kk * D + d];
+                    s *= scale;
+                    float m_new = max(m_i, s);
+                    float alpha = exp2((m_i - m_new) * inv_ln2);
+                    float p = exp2((s - m_new) * inv_ln2);
+                    l_i = l_i * alpha + p;
+                    for (uint d = 0u; d < D; d++) acc[d] = acc[d] * alpha + p * tg_V[kk * D + d];
+                    m_i = m_new;
+                }}
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    if (valid) {{
+        for (uint d = 0u; d < D; d++)
+            {b['O']}[(q_start + qrow) * o_st + h * o_sh + d * o_sk] = {store_cast("acc[d] / l_i")};
+    }}
+}}
+"""
+
+
 def make_int4_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     """FAST per-group INT4 GEMM: the int8 fast kernel with the nibble unpack folded into
     the staged dequant tile. Packed uchar weight [K/2, N] contiguous (LOW nibble for EVEN
