@@ -222,22 +222,23 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
         strides = [(int(kargs[i]) if i >= 0 else 1) for i in sidx]
         isr, isc, wsk, wsn, osr, osc, ssg, ssn = strides[0:8]
 
-        # FAST simdgroup-MMA per-group int8 path (descriptor[6..10] = fast_msl, rr, rc, bk,
+        # FAST simdgroup-MMA per-group path (descriptor[6..10] = fast_msl, rr, rc, bk,
         # group_size), selected ONLY when the runtime shape meets its contract: contiguous
-        # row-major input [M,K] / weight [K,N] (kn) / output [M,N], and aligned M/N/K/group.
-        # Otherwise fall through to the stride-generic scalar kernel below (correct for any
-        # layout). int4 (pergroup_int4) has no fast variant yet -> always scalar.
+        # row-major input [M,K] / weight [K,N] kn (for int4, packed [K/2,N] with byte-row
+        # stride wsk==N) / output [M,N], and aligned M/N/K/group. Otherwise fall through to
+        # the stride-generic scalar kernel below (correct for any layout).
         _fast = descriptor[6] if len(descriptor) > 6 else None
-        if _fast is not None and descriptor[0] == "pergroup_int8" and not rt.is_unsupported(_fast):
+        if _fast is not None and descriptor[0] in ("pergroup_int8", "pergroup_int4") and not rt.is_unsupported(_fast):
             rr, rc, bk, g_s = descriptor[7], descriptor[8], descriptor[9], descriptor[10]
             tm, tn = 8 * rr, 8 * rc
             if (M % tm == 0 and N % tn == 0 and K % bk == 0 and g_s % bk == 0
                     and isc == 1 and wsn == 1 and osc == 1
                     and isr == K and wsk == N and osr == N):
+                _fkname = "int4_matmul_pergroup_fast" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup_fast"
                 flib = rt.get_library(_fast)
                 fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
                 fthreads = (M // tm) * (N // tn) * 32
-                rt.dispatch(flib, "int8_matmul_pergroup_fast", fbuf, threads=fthreads, group_size=32)
+                rt.dispatch(flib, _fkname, fbuf, threads=fthreads, group_size=32)
                 if launch_exit_hook:
                     launch_exit_hook(launch_metadata)
                 return True

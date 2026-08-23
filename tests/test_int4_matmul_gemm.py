@@ -125,3 +125,14 @@ def test_int4_gemm_nonstandard_packing_refuses(kernel):
     args, _, _ = _setup(8, 16, 256, 128, "kn", "gn")
     with pytest.raises(MetalNonRecoverableError):
         kernel[(1, 1)](*args, BM=32, BN=16, BK=64, G=128)
+
+
+@requires_mps
+@pytest.mark.parametrize("M,N,K,G", [(32, 16, 256, 128), (64, 32, 512, 128), (128, 64, 1024, 64)])
+def test_int4_gemm_fast_path_correct(M, N, K, G):
+    # M%(8*rr)==0, N%(8*rc)==0, K%bk==0, G%bk==0 + contiguous kn -> FAST simdgroup-MMA
+    # int4 path (int4_matmul_pergroup_fast, ~the int8 fast speed). Must stay exact.
+    args, c, ref = _setup(M, N, K, G, "kn", "gn")
+    _int4_gemm[(triton.cdiv(M, 32), triton.cdiv(N, 16))](*args, BM=32, BN=16, BK=64, G=G)
+    torch.mps.synchronize()
+    assert (c - ref).abs().max().item() < 1e-2
