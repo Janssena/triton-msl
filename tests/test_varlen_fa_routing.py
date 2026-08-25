@@ -188,11 +188,12 @@ def test_varlen_fp16():
 
 
 @requires_mps
-@pytest.mark.parametrize("D", [32, 64])
+@pytest.mark.parametrize("D", [32, 64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_varlen_fp16_mma(D, causal):
-    # fp16 + head_dim%8==0 + fits tg -> the simdgroup-MMA fast path (~5x the scalar template).
-    # Exercise it across hd 32/64, non-causal + standard causal; EXACT vs the per-seq reference.
+    # fp16 + head_dim%8==0 + fits tg -> the register-O simdgroup-MMA fast path (~7.6x the
+    # scalar template at D=64). Exercise hd 32/64/128, non-causal + standard causal (D=128
+    # uses the register-resident O + diagonal-MMA rescale); EXACT vs the per-seq reference.
     scale = 1.0 / math.sqrt(D)
     kern = _varlen_causal_fwd if causal else _varlen_fwd
     q, k, v, o, cu_q, cu_k = _run_varlen(kern, [48, 32, 17], [48, 32, 17], 3, D, torch.float16, scale)

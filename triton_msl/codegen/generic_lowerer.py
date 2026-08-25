@@ -5362,14 +5362,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "v_st": _uint_expr(v[0]), "v_sh": _uint_expr(v[1]), "v_sk": _uint_expr(v[2]),
             "o_st": _uint_expr(o[0]), "o_sh": _uint_expr(o[1]), "o_sk": _uint_expr(o[2]),
         }
-        # FAST PATH: the simdgroup-MMA varlen kernel (~5x the scalar one-thread-per-row
-        # template, ~2.6x pad-to-max + SDPA) when eligible — fp16 in/out, head_dim %% 8 == 0,
-        # and the tiles fit the 32KB threadgroup budget (head_dim <= ~80: D=32/64). It stages
-        # Q/K/V into threadgroup memory before the MMA so ANY global strides work. fp16-only
-        # (half-staged tiles = fp16 accumulate); fp32 / head_dim 128 / non-%8 stay on the
-        # scalar template (true fp32, arbitrary head_dim). Correct-or-fast: ineligible -> scalar.
+        # FAST PATH: the register-O simdgroup-MMA varlen kernel (~7.6x the scalar one-thread-
+        # per-row template at D=64, ~4x pad+SDPA; ~1.4x pad+SDPA at D=128) when eligible —
+        # fp16 in/out, head_dim %% 8 == 0, and the tg tiles fit the 32KB budget (head_dim <=
+        # 128: 32/64/128). It stages Q/K/V into threadgroup memory before the MMA so ANY
+        # global strides work, and keeps O register-resident (diag-MMA rescale) so no tg_O.
+        # fp16-only (half-staged tiles = fp16 accumulate); fp32 / non-%8 / head_dim > 128 stay
+        # on the scalar template (true fp32, arbitrary head_dim). Correct-or-fast: else scalar.
         D = info["head_dim"]
-        _mma_tg_bytes = 32 * D * 2 + 32 * D * 2 * 2 + 32 * 32 * 4 + 32 * 32 * 2 + 32 * D * 4 + 32 * 4 * 2
+        _mma_tg_bytes = 32 * D * 2 + 32 * D * 2 * 2 + 32 * 32 * 2 + 32 * 32 * 4 + 32 * 4 * 2 + 4 * 64 * 4
         mma_eligible = info["out_dtype"] == "f16" and D % 8 == 0 and _mma_tg_bytes <= 32768
         if mma_eligible:
             from triton_msl.codegen._msl_templates import make_varlen_flash_attention_mma

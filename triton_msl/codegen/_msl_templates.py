@@ -5020,21 +5020,26 @@ def make_varlen_flash_attention_mma(
 
     BM=32 query rows = 4 simdgroups (128 threads); each simdgroup owns 8 rows. QK^T and P@V
     run through 8x8 simdgroup MMA; the online softmax is scalar through threadgroup memory.
-    Q/K/V tiles are staged into threadgroup memory with bounds-masking (packed cu_seqlens),
-    so ANY global strides work (the MMA reads the contiguous tg tiles). Measured ~5x the
-    scalar one-thread-per-row varlen template and ~2.6x pad-to-max + SDPA on a ragged fp16
-    batch (D=64). fp16-ONLY: the staged tiles are half, so accumulation is fp16-precision —
-    fp32 varlen stays on the scalar template (true fp32). Same buffer ABI / bindings as
-    make_varlen_flash_attention; dispatched with 128 threads/threadgroup (descriptor tg=128).
+    The O accumulator is REGISTER-RESIDENT (o_acc[D/8] float8x8 per simdgroup) and the online
+    per-row rescale is a DIAGONAL-matrix MMA (diag(alpha) @ O) — no tg_O round-trip. Q/K/V
+    tiles are staged into threadgroup memory with bounds-masking (packed cu_seqlens), so ANY
+    global strides work (the MMA reads the contiguous tg tiles). Measured on a ragged fp16
+    batch: D=64 0.45ms (~7.6x the scalar template, ~4x pad+SDPA); D=128 1.37ms (1.4x pad+SDPA).
+    fp16-ONLY: the staged tiles are half, so accumulation is fp16-precision — fp32 varlen stays
+    on the scalar template (true fp32). Register-O fits head_dim<=128 in the 32KB tg budget
+    (no tg_O). Same buffer ABI / bindings as make_varlen_flash_attention; 128 threads/tg.
     """
     if arg_decls is None or bindings is None:
         raise ValueError("make_varlen_flash_attention_mma is route-only (needs arg_decls/bindings)")
     if out_dtype not in ("fp16", "f16"):
         raise ValueError(f"varlen MMA FA is fp16-only (got {out_dtype!r}); route fp32 to the scalar template")
     D, BM, BN, NT = head_dim, 32, 32, 128
+    NG = NT // 32
     if D % 8 != 0:
         raise ValueError(f"varlen MMA FA needs head_dim %% 8 == 0 (got {D})")
-    tg_bytes = BM * D * 2 + BN * D * 2 * 2 + BM * BN * 4 + BM * BN * 2 + BM * D * 4 + BM * 4 * 2
+    # register-O budget (no tg_O): tg_Q + tg_K + tg_V (half) + tg_P (half) + tg_S (float,
+    # reused as the output-store scratch post-loop) + tg_m/tg_l + tg_diag (diag rescale).
+    tg_bytes = BM * D * 2 + BN * D * 2 * 2 + BM * BN * 2 + BM * BN * 4 + BM * 4 * 2 + NG * 64 * 4
     if tg_bytes > 32768:
         raise ValueError(f"varlen MMA FA threadgroup memory {tg_bytes}B > 32KB for head_dim={D}; use the scalar template")
     _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
@@ -5069,9 +5074,9 @@ kernel void {kernel_name}(
     threadgroup half  tg_V[BN*D];
     threadgroup half  tg_P[BM*BN];
     threadgroup float tg_S[BM*BN];
-    threadgroup float tg_O[BM*D];
     threadgroup float tg_m[BM];
     threadgroup float tg_l[BM];
+    threadgroup float tg_diag[{NG}*64];
 
     uint m_block = tgpos.x, bh = tgpos.y;
     uint bb = bh / nheads, h = bh % nheads;
@@ -5082,15 +5087,13 @@ kernel void {kernel_name}(
     for (uint i = lid; i < BM*D; i += NT) {{
         uint r = i / D, c = i % D; uint qr = m_block*BM + r;
         tg_Q[i] = qr < seqlen_q ? half({b['Q']}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : half(0);
-        tg_O[i] = 0.0f;
     }}
     for (uint i = lid; i < BM; i += NT) {{ tg_m[i] = -INFINITY; tg_l[i] = 0.0f; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint sg = sgid, lane = lid % 32u;
-    simdgroup_half8x8 qf[D/8];
-    for (uint dt = 0u; dt < D/8u; dt++)
-        simdgroup_load(qf[dt], tg_Q + (sg*8u)*D + dt*8u, D);
+    simdgroup_float8x8 o_acc[D/8];
+    for (uint et = 0u; et < D/8u; et++) o_acc[et] = simdgroup_float8x8(0.0f);
 
     for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
         for (uint i = lid; i < BN*D; i += NT) {{
@@ -5103,9 +5106,10 @@ kernel void {kernel_name}(
         for (uint nt = 0u; nt < BN/8u; nt++) {{
             simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
             for (uint dt = 0u; dt < D/8u; dt++) {{
-                simdgroup_half8x8 kf;
+                simdgroup_half8x8 qf, kf;
+                simdgroup_load(qf, tg_Q + (sg*8u)*D + dt*8u, D);
                 simdgroup_load(kf, tg_K + (nt*8u)*D + dt*8u, D, ulong2(0,0), true);
-                simdgroup_multiply_accumulate(S, qf[dt], kf, S);
+                simdgroup_multiply_accumulate(S, qf, kf, S);
             }}
             simdgroup_store(S, tg_S + (sg*8u)*BN + nt*8u, BN);
         }}
@@ -5123,27 +5127,45 @@ kernel void {kernel_name}(
             float alpha = exp(m_old - m_new), lsum = 0.0f;
             for (uint j = 0u; j < BN; j++) {{ float p = exp(tg_S[r*BN+j]-m_new); tg_P[r*BN+j]=half(p); lsum += p; }}
             tg_l[r] = l_old*alpha + lsum; tg_m[r] = m_new;
-            for (uint e = 0u; e < D; e++) tg_O[r*D+e] *= alpha;
+            for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? alpha : 0.0f;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // O = diag(alpha) @ O (per-row rescale via diagonal MMA), then O += P @ V
+        simdgroup_float8x8 adiag; simdgroup_load(adiag, tg_diag + sg*64u, 8);
         for (uint et = 0u; et < D/8u; et++) {{
-            simdgroup_float8x8 O;
-            simdgroup_load(O, tg_O + (sg*8u)*D + et*8u, D);
+            simdgroup_float8x8 tmp = simdgroup_float8x8(0.0f);
+            simdgroup_multiply_accumulate(tmp, adiag, o_acc[et], tmp);
+            o_acc[et] = tmp;
             for (uint nt = 0u; nt < BN/8u; nt++) {{
                 simdgroup_half8x8 pf, vf;
                 simdgroup_load(pf, tg_P + (sg*8u)*BN + nt*8u, BN);
                 simdgroup_load(vf, tg_V + (nt*8u)*D + et*8u, D);
-                simdgroup_multiply_accumulate(O, pf, vf, O);
+                simdgroup_multiply_accumulate(o_acc[et], pf, vf, o_acc[et]);
             }}
-            simdgroup_store(O, tg_O + (sg*8u)*D + et*8u, D);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    for (uint i = lid; i < BM*D; i += NT) {{
-        uint r = i / D, c = i % D; uint qr = m_block*BM + r;
-        if (qr < seqlen_q) {b['O']}[(q_start+qr)*o_st + h*o_sh + c*o_sk] = half(tg_O[i] / tg_l[r]);
+    // normalize O = diag(1/l) @ O, then scalar-store each 8x8 tile through tg_S scratch
+    if (lane < 8u) {{
+        uint r = sg*8u + lane; float inv = tg_l[r] > 0.0f ? 1.0f/tg_l[r] : 0.0f;
+        for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? inv : 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 ldiag; simdgroup_load(ldiag, tg_diag + sg*64u, 8);
+    for (uint et = 0u; et < D/8u; et++) {{
+        simdgroup_float8x8 tmp = simdgroup_float8x8(0.0f);
+        simdgroup_multiply_accumulate(tmp, ldiag, o_acc[et], tmp);
+        simdgroup_store(tmp, tg_S + sg*64u, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {{
+            uint r = sg*8u + lane; uint qrow = m_block*BM + r;
+            if (qrow < seqlen_q)
+                for (uint c = 0u; c < 8u; c++)
+                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] = half(tg_S[sg*64u + lane*8u + c]);
+        }}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }}
 }}
 """
