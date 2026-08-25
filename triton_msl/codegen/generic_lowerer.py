@@ -840,6 +840,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if _bwd_info is not None:
                 return self._lower_biased_fa_backward(_bwd_info)
         if len(_fa_dots) >= 2 and _fa_has_exp and _fa_has_max:
+            # VARLEN (packed cu_seqlens) FA-2: the dominant real-world FA shape (flash-attn /
+            # vLLM), which the dense [Z,H,N,D] templates can't express and the generic path
+            # runs ~0.04 TF. Route the tiled varlen template FIRST — its 4-float + 2-int-ptr +
+            # 2-seqlen-subi signature cannot collide with dense/biased/MLA FA (checked before
+            # the dense detectors below). Returns None for non-varlen (falls through) and for
+            # causal varlen (v1 non-causal only; causal stays on the correct generic path).
+            _varlen_info = self._detect_varlen_flash_attention()
+            if _varlen_info is not None:
+                return self._lower_varlen_flash_attention(_varlen_info)
             _fa_maxdim = 0
             _fa_mindim = 1 << 30
             for _d in _fa_dots:
@@ -4896,6 +4905,356 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env_types[ssa.id] = input_dtype
         if dst_shape:
             self.env_shapes[ssa.id] = dst_shape
+
+    def _detect_varlen_flash_attention(self):
+        """Recognize a VARLEN (packed cu_seqlens) FlashAttention-2 forward kernel and
+        resolve its ABI for the tiled varlen template. Returns None (correct-or-refuse)
+        for anything that is not an UNAMBIGUOUS non-causal varlen FA — the caller then
+        falls through to the dense-FA path (which loudly refuses varlen) so a
+        mis-recognition can never silently mis-compute.
+
+        The varlen signature (flash-attn / vLLM ABI) is highly distinctive and CANNOT
+        collide with the dense/biased/MLA FA kernels:
+          * exactly 4 float pointer args (Q,K,V,Out) + exactly 2 int pointer args
+            (cu_seqlens_q, cu_seqlens_k) — dense FA has 0 int ptrs, biased/MLA have
+            >4 float ptrs;
+          * exactly 2 dots + a math.exp (FA2 online softmax);
+          * exactly 2 ``arith.subi``, each = (load(cu[b+1]) - load(cu[b])) over the SAME
+            int pointer, across 2 DISTINCT cu pointers (the per-batch seqlens);
+          * heads count H = the divisor of a divsi/remsi(program_id, H).
+        v1 routes the NON-CAUSAL case only: any row-vs-col compare (a cmpi whose BOTH
+        operand cones reach a make_range) -> refuse, so causal varlen stays on the
+        correct generic path rather than risk a wrong mask.
+        """
+        def _flat(ops):
+            for s in ops:
+                yield s
+                if getattr(s, "region_ops", None):
+                    yield from _flat(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    yield from _flat(s.else_ops)
+
+        def _is_int(et):
+            return (et or "").lstrip("s").lstrip("u").startswith("i")
+
+        def _is_float(et):
+            return (et or "").startswith("f")
+
+        ops = list(_flat(self.graph.ops))
+        obid = {o.id: o for o in ops}
+        args = self.graph.args
+        argid = {getattr(a, "id", None): a for a in args}
+        ptrs = [a for a in args if a.is_ptr]
+        int_ptrs = [a for a in ptrs if _is_int(getattr(a, "elem_type", None))]
+        flt_ptrs = [a for a in ptrs if _is_float(getattr(a, "elem_type", None))]
+        if len(flt_ptrs) != 4 or len(int_ptrs) != 2:
+            return None
+        dots = [o for o in ops if o.op == "tt.dot"]
+        if len(dots) != 2:
+            return None
+        if not any(_op_is_exp(o.op) for o in ops):
+            return None
+
+        def _trace_to_arg(oid, d=0):
+            if d > 40:
+                return None
+            if oid in argid:
+                return argid[oid]
+            o = obid.get(oid)
+            if o is None or not o.operand_ids:
+                return None
+            return _trace_to_arg(o.operand_ids[0], d + 1)
+
+        def _load_ptr_arg(load):
+            return _trace_to_arg(load.operand_ids[0]) if load.operand_ids else None
+
+        # exactly 2 subi, each subtracting two i32 loads of the SAME int ptr; 2 distinct cus
+        subis = [o for o in ops if o.op == "arith.subi" and len(o.operand_ids or []) == 2]
+        seqlen_subis = []
+        cu_used = set()
+        for s in subis:
+            lo0, lo1 = obid.get(s.operand_ids[0]), obid.get(s.operand_ids[1])
+            if lo0 is None or lo1 is None or lo0.op != "tt.load" or lo1.op != "tt.load":
+                continue
+            p0, p1 = _load_ptr_arg(lo0), _load_ptr_arg(lo1)
+            if p0 is None or p0 is not p1 or not _is_int(getattr(p0, "elem_type", None)):
+                continue
+            seqlen_subis.append((s, p0))
+            cu_used.add(p0.index)
+        if len(seqlen_subis) != 2 or len(cu_used) != 2:
+            return None
+
+        # H = divsi/remsi(program_id, H_arg) divisor
+        H_arg = None
+        for o in ops:
+            if o.op in ("arith.divsi", "arith.remsi", "arith.divui", "arith.remui") and o.operand_ids:
+                if any(obid.get(x) is not None and obid.get(x).op in ("tt.get_program_id", "tt.program_id")
+                       for x in o.operand_ids):
+                    for x in o.operand_ids:
+                        a = argid.get(x)
+                        if a is not None and not a.is_ptr:
+                            H_arg = a
+            if H_arg is not None:
+                break
+        if H_arg is None:
+            return None
+
+        def _find_load(oid, seen=None, d=0):
+            if seen is None:
+                seen = set()
+            if oid in seen or d > 40:
+                return None
+            seen.add(oid)
+            o = obid.get(oid)
+            if o is None:
+                return None
+            if o.op == "tt.load":
+                return o
+            for x in (o.operand_ids or []):
+                r = _find_load(x, seen, d + 1)
+                if r is not None:
+                    return r
+            return None
+
+        d0, d1 = dots
+        q_load = _find_load(d0.operand_ids[0])
+        k_load = _find_load(d0.operand_ids[1])
+        v_load = _find_load(d1.operand_ids[1]) or _find_load(d1.operand_ids[0])
+        stores = [o for o in ops if o.op == "tt.store"]
+        if not stores or q_load is None or k_load is None or v_load is None:
+            return None
+        q_arg = _load_ptr_arg(q_load)
+        k_arg = _load_ptr_arg(k_load)
+        v_arg = _load_ptr_arg(v_load)
+        o_arg = _trace_to_arg(stores[0].operand_ids[0])
+        if any(r is None for r in (q_arg, k_arg, v_arg, o_arg)):
+            return None
+        if not (_is_float(q_arg.elem_type) and _is_float(o_arg.elem_type)):
+            return None
+
+        # head_dim + out dtype from the Q load / Out arg tensor type
+        import re
+        m = re.search(r"tensor<(\d+)x(\d+)x", getattr(q_load, "type_str", "") or "")
+        if m is None:
+            return None
+        head_dim = int(m.group(2))
+        _od = {"f32": "f32", "f16": "f16"}.get(o_arg.elem_type)
+        if _od is None:
+            return None  # varlen template is fp32/fp16 only (bf16 -> generic)
+
+        def _cone_has(oid, pred, seen=None, d=0):
+            if seen is None:
+                seen = set()
+            if oid in seen or d > 48:
+                return False
+            seen.add(oid)
+            o = obid.get(oid)
+            if o is None:
+                return False
+            if pred(o):
+                return True
+            return any(_cone_has(x, pred, seen, d + 1) for x in (o.operand_ids or []))
+
+        _is_mr = lambda o: o.op == "tt.make_range"
+        # NON-CAUSAL only: a row-vs-col compare (both operand cones reach a make_range) -> refuse
+        for o in ops:
+            if o.op == "arith.cmpi" and len(o.operand_ids or []) == 2:
+                if _cone_has(o.operand_ids[0], _is_mr) and _cone_has(o.operand_ids[1], _is_mr):
+                    return None
+
+        _is_cu_load = lambda o: (
+            o.op == "tt.load"
+            and (lambda p: p is not None and _is_int(getattr(p, "elem_type", None)))(_load_ptr_arg(o))
+        )
+        _is_offh = lambda o: o.op in ("arith.remsi", "arith.remui", "arith.divsi", "arith.divui")
+
+        def _muli_terms(addr_oid, seen=None, acc=None):
+            if seen is None:
+                seen, acc = set(), []
+            if addr_oid in seen:
+                return acc
+            seen.add(addr_oid)
+            o = obid.get(addr_oid)
+            if o is None:
+                return acc
+            if o.op == "arith.muli":
+                acc.append(o)
+            for x in (o.operand_ids or []):
+                _muli_terms(x, seen, acc)
+            return acc
+
+        C1 = "c1"
+
+        def _resolve_strides(load):
+            # (token_idx, head_idx, dim_entry): token/head = int arg indices (required);
+            # dim = C1 when folded (equal_to_1) else the stride arg index. Classify each
+            # address muli by its index: cu-load -> token, remsi/divsi(pid) -> head,
+            # make_range -> dim. Order matters (token's cu-load address also carries an
+            # off_z divsi, so cu-load is tested first).
+            st = sh = None
+            sk = C1
+            for mul in _muli_terms(load.operand_ids[0]):
+                if len(mul.operand_ids or []) != 2:
+                    continue
+                a0, a1 = mul.operand_ids
+                sa0, sa1 = _trace_to_arg(a0), _trace_to_arg(a1)
+                if sa0 is not None and not sa0.is_ptr and (sa1 is None or sa1.is_ptr):
+                    stride_arg, idx = sa0, a1
+                elif sa1 is not None and not sa1.is_ptr and (sa0 is None or sa0.is_ptr):
+                    stride_arg, idx = sa1, a0
+                else:
+                    continue
+                if _cone_has(idx, _is_cu_load):
+                    st = stride_arg.index
+                elif _cone_has(idx, _is_offh):
+                    sh = stride_arg.index
+                elif _cone_has(idx, _is_mr):
+                    sk = stride_arg.index
+            return st, sh, sk
+
+        def _cu_in_cone(load):
+            found = set()
+
+            def walk(oid, seen=None, d=0):
+                if seen is None:
+                    seen = set()
+                if oid in seen or d > 48:
+                    return
+                seen.add(oid)
+                o = obid.get(oid)
+                if o is None:
+                    return
+                if o.op == "tt.load":
+                    p = _load_ptr_arg(o)
+                    if p is not None and _is_int(getattr(p, "elem_type", None)):
+                        found.add(p.index)
+                for x in (o.operand_ids or []):
+                    walk(x, seen, d + 1)
+
+            walk(load.operand_ids[0])
+            return found
+
+        q = _resolve_strides(q_load)
+        k = _resolve_strides(k_load)
+        v = _resolve_strides(v_load)
+        o = _resolve_strides(stores[0])
+        # token + head strides MUST resolve for all four (a folded/unresolved token or
+        # head offset would silently address the wrong row/head).
+        if any(t[0] is None or t[1] is None for t in (q, k, v, o)):
+            return None
+
+        cuq = _cu_in_cone(q_load)
+        cuk = _cu_in_cone(k_load)
+        if len(cuq) != 1 or len(cuk) != 1:
+            return None
+        cuq_idx, cuk_idx = next(iter(cuq)), next(iter(cuk))
+        if cuq_idx == cuk_idx or {cuq_idx, cuk_idx} != cu_used:
+            return None
+
+        # softmax scale: the CONSTANT multiplied into Q before dot0 (q * qk_scale). The
+        # template BAKES this scale, so a kernel that scales differently (custom sm_scale,
+        # scale on the dot RESULT) must NOT route -> refuse when no constant Q-scale is
+        # found. Mirrors the dense FA detector's scale extraction (refuse-on-absent).
+        _LAYOUT = ("ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+                   "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims")
+        scale = None
+        sid = d0.operand_ids[0]
+        seen2 = set()
+        while sid in obid and sid not in seen2:
+            seen2.add(sid)
+            sop = obid[sid]
+            if sop.op == "arith.mulf":
+                for oid in sop.operand_ids:
+                    sub = obid.get(oid)
+                    if sub is not None and sub.op == "arith.constant":
+                        val = sub.attrs.get("value")
+                        if isinstance(val, (int, float)):
+                            scale = float(val)
+                break
+            if sop.operand_ids and sop.op in _LAYOUT:
+                sid = sop.operand_ids[0]
+                continue
+            break
+        if scale is None:
+            return None
+
+        return {
+            "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
+                      "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
+            "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
+            "q": q, "k": k, "v": v, "o": o,
+        }
+
+    def _lower_varlen_flash_attention(self, info: dict) -> str:
+        """Emit the tiled varlen FA-2 template (make_varlen_flash_attention) for a detected
+        packed-cu_seqlens kernel + set the native-2-D-grid ('flash_attention', msl, BM=32)
+        dispatch descriptor. info from _detect_varlen_flash_attention (which refuses on any
+        ambiguity, so every arg/stride here resolved unambiguously)."""
+        from triton_msl.codegen._msl_templates import make_varlen_flash_attention
+
+        C1 = "c1"
+        MAX_BUFFERS = 31  # mirrors driver._MAX_METAL_BUFFERS
+        args = self.graph.args
+        if len(args) > MAX_BUFFERS:
+            raise MetalNonRecoverableError(
+                "varlen FlashAttention with >31 args (packed-scalar ABI) is not supported; "
+                "refusing rather than risk a mis-bound buffer."
+            )
+        for i, a in enumerate(args):
+            if i != a.index:
+                raise MetalNonRecoverableError(
+                    "varlen FlashAttention arg list is not densely indexed; refusing."
+                )
+        roles = info["roles"]
+        role_of_idx = {
+            roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
+            roles["cuq"]: "CUQ", roles["cuk"]: "CUK",
+        }
+        arg_decls = []
+        for a in args:
+            if a.is_ptr:
+                role = role_of_idx.get(a.index)
+                if role is None:
+                    raise MetalNonRecoverableError(
+                        "varlen FlashAttention has a pointer arg with no resolved role; refusing."
+                    )
+                if role in ("CUQ", "CUK"):
+                    arg_decls.append(f"    device const int* {role} [[buffer({a.index})]]")
+                else:
+                    msl_ty = triton_type_to_msl(a.elem_type)
+                    qual = "device" if role == "Out" else "device const"
+                    arg_decls.append(f"    {qual} {msl_ty}* {role} [[buffer({a.index})]]")
+            else:
+                arg_decls.append(f"    constant uint& bsc_{a.index} [[buffer({a.index})]]")
+
+        def _uint_expr(entry):
+            if entry == C1:
+                return "1u"
+            if isinstance(entry, int):
+                return f"bsc_{entry}"
+            raise MetalNonRecoverableError(
+                "varlen FlashAttention stride/dim could not be mapped to a kernel arg; refusing."
+            )
+
+        q, k, v, o = info["q"], info["k"], info["v"], info["o"]
+        bindings = {
+            "Q": "Q", "K": "K", "V": "V", "O": "Out", "CUQ": "CUQ", "CUK": "CUK",
+            "H": _uint_expr(info["H"]),
+            "q_st": _uint_expr(q[0]), "q_sh": _uint_expr(q[1]), "q_sk": _uint_expr(q[2]),
+            "k_st": _uint_expr(k[0]), "k_sh": _uint_expr(k[1]), "k_sk": _uint_expr(k[2]),
+            "v_st": _uint_expr(v[0]), "v_sh": _uint_expr(v[1]), "v_sk": _uint_expr(v[2]),
+            "o_st": _uint_expr(o[0]), "o_sh": _uint_expr(o[1]), "o_sk": _uint_expr(o[2]),
+        }
+        msl = make_varlen_flash_attention(
+            head_dim=info["head_dim"], causal=False, out_dtype=info["out_dtype"],
+            arg_decls=arg_decls, bindings=bindings,
+            kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
+        )
+        self.effective_block_size = 32
+        self._flash_attention = ("flash_attention", msl, 32)
+        self._used_pid_axes = {0, 1}
+        self._prescan_stores()
+        return msl
 
     def _detect_flash_attention(self):
         """Recognize a FlashAttention forward kernel and extract its params.

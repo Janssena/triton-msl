@@ -4899,7 +4899,7 @@ kernel void int8_matmul_pergroup_fast(
 
 def make_varlen_flash_attention(
     head_dim=64, causal=False, out_dtype="fp32",
-    arg_decls=None, bindings=None, kernel_name="varlen_fa",
+    arg_decls=None, bindings=None, kernel_name="varlen_fa", scale=None,
 ):
     """VARLEN FlashAttention-2 (packed cu_seqlens, route-only ABI). One thread per query
     row; K/V tiles staged in threadgroup memory; online softmax with a register acc.
@@ -4925,7 +4925,9 @@ def make_varlen_flash_attention(
         raise ValueError(f"varlen FA out_dtype must be fp32/fp16 (got {out_dtype!r})")
     D = head_dim
     BM = BN = 32
-    scale = float(D) ** -0.5
+    # The detector BAKES the kernel's own constant Q-scale (refuses if absent); default to
+    # the canonical 1/sqrt(head_dim) only for the route-free template smoke test.
+    scale = float(D) ** -0.5 if scale is None else float(scale)
     inv_ln2 = 1.4426950408889634
     _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
              "q_st", "q_sh", "q_sk", "k_st", "k_sh", "k_sk",
