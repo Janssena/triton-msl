@@ -76,3 +76,31 @@ def test_varlen_fa_template_exact(lens, H, D, causal):
                 threads=(nmb * BM, bh, 1), group_size=(BM, 1, 1))
     torch.mps.synchronize()
     assert (o - _ref(q, k, v, cu, H, D, causal)).abs().max().item() < 2e-3
+
+
+@requires_mps
+@pytest.mark.parametrize("dt,elem,tol", [
+    (torch.float16, "half", 2e-2),
+    (torch.bfloat16, "bfloat", 6e-2),
+])
+def test_varlen_fa_template_dtypes(dt, elem, tol):
+    # The scalar template's non-fp32 dtype paths (half / bfloat) — reached when a fp16/bf16
+    # varlen kernel is MMA-INELIGIBLE (non-%8 head_dim, or the tg budget). Route-free so it
+    # exercises the codegen directly (bf16 @jit kernels often won't compile at odd head_dims).
+    dev = "mps"; torch.manual_seed(0); H, D = 2, 64; lens = [48, 32]
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), device=dev, dtype=torch.int32)
+    T = int(cu[-1])
+    q = torch.randn(T, H, D, device=dev, dtype=dt); k = torch.randn(T, H, D, device=dev, dtype=dt)
+    v = torch.randn(T, H, D, device=dev, dtype=dt); o = torch.zeros(T, H, D, device=dev, dtype=dt)
+    decls = [f"    device const {elem}* Q [[buffer(0)]]", f"    device const {elem}* K [[buffer(1)]]",
+             f"    device const {elem}* V [[buffer(2)]]", f"    device {elem}* Out [[buffer(3)]]",
+             "    device const int* cu_q [[buffer(4)]]", "    device const int* cu_k [[buffer(5)]]",
+             "    constant uint& H [[buffer(6)]]"]
+    out_dtype = "fp16" if dt == torch.float16 else "bf16"
+    msl = make_varlen_flash_attention(D, False, out_dtype=out_dtype, arg_decls=decls, bindings=_packed_bindings(D))
+    from triton_msl.backend.compile_shader_runtime import CompileShaderRuntime
+    rt = CompileShaderRuntime(); lib = rt.get_library(msl); BM = 32
+    rt.dispatch(lib, "varlen_fa", [q, k, v, o, cu, cu, H],
+                threads=(math.ceil(max(lens) / BM) * BM, len(lens) * H, 1), group_size=(BM, 1, 1))
+    torch.mps.synchronize()
+    assert (o.float() - _ref(q, k, v, cu, H, D, False).float()).abs().max().item() < tol
