@@ -363,6 +363,58 @@ def test_gqa_varlen_not_misrouted():
     assert err < 1e-2, f"GQA varlen mis-computed (routed as MHA?): err {err:.2e}"
 
 
+@triton.jit
+def _batch_inner_varlen(Q, K, V, Out, cu_q, cu_k,
+    sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
+    NB, max_seqlen, SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+    start_m = tl.program_id(0); off_bh = tl.program_id(1)
+    off_h = off_bh // NB; off_b = off_bh % NB          # BATCH-INNER (template assumes head-inner)
+    q_start = tl.load(cu_q + off_b); seqlen_q = tl.load(cu_q + off_b + 1) - q_start
+    k_start = tl.load(cu_k + off_b); seqlen_k = tl.load(cu_k + off_b + 1) - k_start
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_n = tl.arange(0, BLOCK_N); offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd, mask=offs_m[:, None] < seqlen_q, other=0.) * SCALE
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32); l_i = tl.zeros([BLOCK_M], tl.float32); acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    for start_n in range(0, max_seqlen, BLOCK_N):
+        kn = start_n + offs_n
+        k = tl.load(K + (k_start + kn)[:, None] * skt + off_h * skh + offs_d[None, :] * skd, mask=kn[:, None] < seqlen_k, other=0.)
+        qk = tl.where(kn[None, :] < seqlen_k, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
+        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij); alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
+        v = tl.load(V + (k_start + kn)[:, None] * svt + off_h * svh + offs_d[None, :] * svd, mask=kn[:, None] < seqlen_k, other=0.)
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
+    tl.store(Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod, (acc / l_i[:, None]).to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
+
+
+@requires_mps
+def test_batch_inner_varlen_not_misrouted():
+    # BATCH-INNER packing (off_h = bh // NB, off_b = bh % NB) is the opposite of the
+    # template's head-inner assumption (h = bh % nheads). Routing it would mistake NB for
+    # nheads and SWAP batch<->head (silent-wrong). The detector must refuse (off_h is a
+    # divsi, not remsi(pid, H)) -> fallback computes correctly. cu is padded to H+1 entries
+    # so that even a hypothetical misroute stays in-bounds (a detectable wrong result, never
+    # an out-of-bounds runaway loop) — the test can only pass or fail, never hang.
+    dev = "mps"; torch.manual_seed(0)
+    H, D, NB = 3, 64, 2
+    scale = 1.0 / math.sqrt(D)
+    cu = torch.tensor([0, 48, 80, 80], device=dev, dtype=torch.int32)  # NB=2 real + 1 phantom
+    q = torch.randn(80, H, D, device=dev); k = torch.randn(80, H, D, device=dev)
+    v = torch.randn(80, H, D, device=dev); o = torch.zeros(80, H, D, device=dev)
+    BM = BN = 32
+    _batch_inner_varlen[(triton.cdiv(48, BM), H * NB)](
+        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+        NB, 48, scale, BM, BN, D)
+    torch.mps.synchronize()
+    ref = torch.zeros_like(q)
+    for b in range(NB):
+        s, e = cu[b].item(), cu[b + 1].item()
+        for h in range(H):
+            sc = (q[s:e, h].float() @ k[s:e, h].float().transpose(-2, -1)) * scale
+            ref[s:e, h] = (torch.softmax(sc, -1) @ v[s:e, h].float()).to(ref.dtype)
+    err = (o - ref).abs().max().item()
+    assert err < 1e-2, f"batch-inner varlen mis-computed (routed as head-inner?): err {err:.2e}"
+
+
 @requires_mps
 def test_dense_fa_not_misrouted():
     # A DENSE [Z,H,N,D] FA kernel (0 int-pointer args) must NOT be captured by the varlen

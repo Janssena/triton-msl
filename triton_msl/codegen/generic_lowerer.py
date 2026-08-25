@@ -5185,6 +5185,41 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if cuq_idx == cuk_idx or {cuq_idx, cuk_idx} != cu_used:
             return None
 
+        # CONVENTION GUARD (correct-or-refuse): the template assumes HEAD-INNER batch/head
+        # packing -- h = bh % nheads, batch = bh // nheads. Verify off_h = remsi(pid, H) and
+        # the cu_seqlens batch offset = divsi(pid, H), same H. A batch-inner kernel
+        # (off_h = pid // NB) otherwise routes with NB mistaken for H, swapping batch<->head
+        # (silent-wrong) AND reading cu_seqlens out of bounds (garbage seqlen -> runaway loop).
+        _pid = lambda o: o.op in ("tt.get_program_id", "tt.program_id")
+
+        def _div_by_H(op, kinds):
+            if op is None or op.op not in kinds or len(op.operand_ids or []) != 2:
+                return False
+            num, den = op.operand_ids
+            da = _trace_to_arg(den)
+            return da is not None and da.index == H_arg.index and _cone_has(num, _pid)
+
+        if not _div_by_H(obid.get(_peel_core(qh_i)), ("arith.remsi", "arith.remui")):
+            return None
+
+        def _cu_batch_divH(cu_idx):
+            for ld in ops:
+                if ld.op != "tt.load" or not ld.operand_ids:
+                    continue
+                p = _load_ptr_arg(ld)
+                if p is None or p.index != cu_idx:
+                    continue
+                addr = obid.get(ld.operand_ids[0])
+                if addr is None or addr.op != "tt.addptr" or len(addr.operand_ids or []) < 2:
+                    continue
+                if _cone_has(addr.operand_ids[1],
+                             lambda o: _div_by_H(o, ("arith.divsi", "arith.divui"))):
+                    return True
+            return False
+
+        if not (_cu_batch_divH(cuq_idx) and _cu_batch_divH(cuk_idx)):
+            return None
+
         # --- causal: PRECISE correct-or-refuse. The template's causal_guard is the standard
         # within-sequence lower-triangular ``qrow >= krow``. Recognize EXACTLY that and route
         # causal=True; refuse (return None -> generic stays correct) on any other row-vs-col
