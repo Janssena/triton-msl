@@ -5033,12 +5033,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if not (_is_float(q_arg.elem_type) and _is_float(o_arg.elem_type)):
             return None
 
-        # head_dim + out dtype from the Q load / Out arg tensor type
+        # tile shapes from the load tensor types: Q=[BM,D], K/V=[BN,D]. The template
+        # HARD-CODES BM==BN==32 and loops a single head_dim D over Q/K/V, so:
+        #  * a kernel with BLOCK_M != 32 launches cdiv(seqlen, BLOCK_M) blocks but the
+        #    template advances 32 rows/block -> rows past 32*nblocks are never written
+        #    (silent-wrong); likewise BLOCK_N != 32 mis-stages the K/V tile;
+        #  * a different Q vs K/V head_dim (asymmetric) mis-sizes the K/V loop.
+        # Require BM==BN==32 and a single shared head_dim; otherwise refuse (-> generic).
         import re
-        m = re.search(r"tensor<(\d+)x(\d+)x", getattr(q_load, "type_str", "") or "")
-        if m is None:
+        def _shape(o):
+            mm = re.search(r"tensor<(\d+)x(\d+)x", getattr(o, "type_str", "") or "")
+            return (int(mm.group(1)), int(mm.group(2))) if mm else None
+        qsh, ksh, vsh = _shape(q_load), _shape(k_load), _shape(v_load)
+        if qsh is None or ksh is None or vsh is None:
             return None
-        head_dim = int(m.group(2))
+        head_dim = qsh[1]
+        if qsh[0] != 32 or ksh[0] != 32 or vsh[0] != 32:
+            return None  # template is fixed BLOCK_M==BLOCK_N==32
+        if ksh[1] != head_dim or vsh[1] != head_dim:
+            return None  # Q/K/V must share head_dim (symmetric); asymmetric -> generic
         _od = {"f32": "f32", "f16": "f16"}.get(o_arg.elem_type)
         if _od is None:
             return None  # varlen template is fp32/fp16 only (bf16 -> generic)

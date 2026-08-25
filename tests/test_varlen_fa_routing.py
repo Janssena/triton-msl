@@ -416,6 +416,32 @@ def test_batch_inner_varlen_not_misrouted():
 
 
 @requires_mps
+def test_varlen_block64_not_misrouted():
+    # The template hard-codes BLOCK_M==BLOCK_N==32. A kernel launched with BLOCK_M=64 spawns
+    # cdiv(seqlen, 64) blocks; if routed, the 32-rows/block template would leave the upper
+    # half of each 64-row block unwritten (silent-wrong). The detector must refuse on the
+    # tile shape (Q tile [64, D]) -> fallback computes all rows correctly.
+    D = 64
+    scale = 1.0 / math.sqrt(D)
+    # _varlen_fwd is generic over BLOCK_M/BLOCK_N constexprs; launch it at 64.
+    dev = "mps"; torch.manual_seed(0)
+    cu = torch.tensor([0, 96, 160], device=dev, dtype=torch.int32)
+    q = torch.randn(160, 2, D, device=dev); k = torch.randn(160, 2, D, device=dev)
+    v = torch.randn(160, 2, D, device=dev); o = torch.zeros(160, 2, D, device=dev)
+    max_seqlen = 96
+    try:
+        _varlen_fwd[(triton.cdiv(max_seqlen, 64), 2 * 2)](
+            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+            2, max_seqlen, scale, 64, 64, D)
+        torch.mps.synchronize()
+    except MetalNonRecoverableError:
+        return  # refused loudly — safe
+    ref = _ref_varlen(q, k, v, cu, cu, 2, D, scale)
+    err = (o - ref).abs().max().item()
+    assert err < 1e-3, f"BLOCK_M=64 varlen mis-computed (routed with 32-row template?): err {err:.2e}"
+
+
+@requires_mps
 def test_dense_fa_not_misrouted():
     # A DENSE [Z,H,N,D] FA kernel (0 int-pointer args) must NOT be captured by the varlen
     # detector — it stays on the dense FA path and stays correct.
