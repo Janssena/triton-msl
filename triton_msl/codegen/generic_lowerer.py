@@ -5726,40 +5726,53 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # head addptr chain as muli(off_h, SH); the 1-level chain (H==1, single head) has no
         # head index and can't be GQA. return None -> the caller falls through to the
         # head_dim>64 refusal / generic path (both correct), NOT a routed wrong result.
+        # BATCH/HEAD CONVENTION GUARD (correct-or-refuse): the templates compute
+        # z = zh / H, h = zh % H (head-inner packing). A batch-inner kernel (h = zh // Z,
+        # z = zh % Z) otherwise routes with z/h swapped -> silent-wrong (measured err ~0.97
+        # at head_dim 128). Verify off_h = remsi(pid, H) and off_z = divsi(pid, H) (same H).
         if not is_mla:
-            def _head_index_dense(addr_id):
+            def _bh_offsets_dense(addr_id):
+                """(off_z, off_h) from the 2-level scalar batch/head addptr chain, or
+                (None, None) for the 1-level (H==1, single-head) chain / an unresolved walk."""
                 if addr_id is None:
-                    return None
+                    return None, None
                 a = _skip_layout(addr_id)
                 op = op_by_id.get(a)
                 if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
-                    return None
+                    return None, None
                 row_side = _skip_layout(op.operand_ids[0])
                 rop = op_by_id.get(row_side)
                 if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
                     row_side = _skip_layout(rop.operand_ids[0])
                     rop = op_by_id.get(row_side)
                 if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
-                    return None
+                    return None, None
                 splat_base = op_by_id.get(rop.operand_ids[0])
                 if splat_base is None or splat_base.op != "tt.splat" or not splat_base.operand_ids:
-                    return None
+                    return None, None
                 scal = op_by_id.get(splat_base.operand_ids[0])
                 if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
-                    return None
+                    return None, None
                 inner_arg = arg_by_id.get(scal.operand_ids[0])
+                inner = op_by_id.get(scal.operand_ids[0])
                 if inner_arg is not None and inner_arg.is_ptr:
-                    return None  # 1-level (H==1): single head, no head index
-                hmuli = op_by_id.get(scal.operand_ids[1])
-                if hmuli is None or hmuli.op != "arith.muli":
-                    return None
-                off_h = None
-                for oid in hmuli.operand_ids:
-                    aarg = arg_by_id.get(oid)
-                    if aarg is not None and not aarg.is_ptr:
-                        continue  # the SH stride arg
-                    off_h = oid
-                return off_h
+                    return None, None  # 1-level (H==1): single head
+                if inner is None or inner.op != "tt.addptr" or len(inner.operand_ids) < 2:
+                    return None, None
+
+                def _off_of_muli(muli_id):
+                    mop = op_by_id.get(muli_id)
+                    if mop is None or mop.op != "arith.muli":
+                        return None
+                    off = None
+                    for oid in mop.operand_ids:
+                        aarg = arg_by_id.get(oid)
+                        if aarg is not None and not aarg.is_ptr:
+                            continue  # the stride arg
+                        off = oid
+                    return off
+
+                return _off_of_muli(inner.operand_ids[1]), _off_of_muli(scal.operand_ids[1])
 
             def _peel_core_dense(oid):
                 seen = set()
@@ -5771,15 +5784,49 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     cur = op_by_id.get(cur.operand_ids[0])
                 return cur.id if cur is not None else None
 
-            _qh, _kh, _vh = (_head_index_dense(q_addr), _head_index_dense(k_addr),
-                             _head_index_dense(v_addr))
+            _is_pid_d = lambda o: o.op in ("tt.get_program_id", "tt.program_id")
+
+            def _cone_pid_d(oid, seen=None, dep=0):
+                if seen is None:
+                    seen = set()
+                if oid in seen or dep > 48:
+                    return False
+                seen.add(oid)
+                o = op_by_id.get(oid)
+                if o is None:
+                    return False
+                if _is_pid_d(o):
+                    return True
+                return any(_cone_pid_d(x, seen, dep + 1) for x in (o.operand_ids or []))
+
+            def _divmod_arg(oid, kinds):
+                # peeled core must be a kinds-op dividing a program_id by a non-ptr arg;
+                # returns that divisor arg index (the head count) or None.
+                c = op_by_id.get(_peel_core_dense(oid)) if oid is not None else None
+                if c is None or c.op not in kinds or len(c.operand_ids) != 2:
+                    return None
+                num, den = c.operand_ids
+                da = arg_by_id.get(den)
+                if da is not None and not da.is_ptr and _cone_pid_d(num):
+                    return da.index
+                return None
+
+            _qz, _qh = _bh_offsets_dense(q_addr)
+            _kz, _kh = _bh_offsets_dense(k_addr)
+            _vz, _vh = _bh_offsets_dense(v_addr)
             if not (_qh is None and _kh is None and _vh is None):
+                # multi-head: GQA (Q/K/V must share off_h) + convention (off_h=remsi(pid,H),
+                # off_z=divsi(pid,H), same H).
                 if _qh is None or _kh is None or _vh is None:
                     return None  # mixed multi/single head (e.g. MQA H_kv==1) -> refuse
                 _qc, _kc, _vc = (_peel_core_dense(_qh), _peel_core_dense(_kh),
                                  _peel_core_dense(_vh))
                 if not (_qc is not None and _qc == _kc == _vc):
                     return None  # GQA/MQA: K/V head index differs from Q -> refuse
+                _hH = _divmod_arg(_qh, ("arith.remsi", "arith.remui"))
+                _zH = _divmod_arg(_qz, ("arith.divsi", "arith.divui"))
+                if _hH is None or _zH is None or _hH != _zH:
+                    return None  # not head-inner z=zh//H, h=zh%H (e.g. batch-inner) -> refuse
 
         # --- tile dims from the dot shapes -----------------------------------
         # dot 0 (QK^T): A = [block_m, head_dim], result = [block_m, block_n].

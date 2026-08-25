@@ -92,6 +92,54 @@ def _dense_mha_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
+@triton.jit
+def _dense_batch_inner_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
+                          svz, svh, svn, svk, soz, soh, som, sok,
+                          Z, H, N, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
+    sm = tl.program_id(0); zh = tl.program_id(1); h = zh // Z; z = zh % Z  # BATCH-INNER
+    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.)
+    q = q * (1.0 / math.sqrt(D))
+    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32); acc = tl.zeros([BM, D], tl.float32)
+    for kn in range(0, N, BN):
+        kk = kn + on
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.)
+        qk = tl.dot(q, tl.trans(k))
+        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1); acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.)
+        acc += tl.dot(p, v); mi = m2
+    tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
+
+
+@requires_mps
+@pytest.mark.parametrize("D", [64, 128])
+def test_dense_batch_inner_not_misrouted(D):
+    # BATCH-INNER packing (h = zh // Z, z = zh % Z) is the opposite of the templates'
+    # head-inner assumption (z = zh // H, h = zh % H). Routing it swaps batch<->head
+    # (silent-wrong, err ~0.97 at hd128). The detector must refuse (off_h is a divsi, not
+    # remsi(pid, H)) -> fallback computes correctly. Dense mis-map stays in-bounds (z,h both
+    # small) so this can only pass or fail, never hang.
+    dev = "mps"; torch.manual_seed(0)
+    Z, H, N = 2, 3, 64
+    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    st = lambda t: t.stride()
+    try:
+        _dense_batch_inner_fa[(triton.cdiv(N, 32), Z * H)](
+            q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
+        torch.mps.synchronize()
+    except MetalNonRecoverableError:
+        return  # refused loudly — safe
+    ref = torch.zeros_like(o)
+    for z in range(Z):
+        for h in range(H):
+            sc = (q[z, h].float() @ k[z, h].float().transpose(-2, -1)) / math.sqrt(D)
+            ref[z, h] = (torch.softmax(sc, -1) @ v[z, h].float())
+    err = (o - ref).abs().max().item()
+    assert err < 1e-2, f"dense batch-inner hd{D} mis-computed (routed head-inner?): err {err:.2e}"
+
+
 @requires_mps
 @pytest.mark.parametrize("D", [64, 128])
 def test_dense_mha_still_routes_correct(D):
