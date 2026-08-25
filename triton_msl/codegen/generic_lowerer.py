@@ -6832,11 +6832,71 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         grid_3d = n_pid == 3
 
         # Q, K, bias from the scores dot.
-        q_res = resolve_2d(load_addr(scores_dot.operand_ids[0]))
-        k_res = resolve_2d(load_addr(scores_dot.operand_ids[1]))
+        _q_addr0 = load_addr(scores_dot.operand_ids[0])
+        _k_addr0 = load_addr(scores_dot.operand_ids[1])
+        q_res = resolve_2d(_q_addr0)
+        k_res = resolve_2d(_k_addr0)
         b_res = resolve_2d(load_addr(scores_dot.operand_ids[2]))
         if not (q_res and k_res and b_res):
             _refuse("Q/K/bias")
+
+        # GQA/MQA GUARD (correct-or-refuse; parity with the forward paths): the backward
+        # templates apply the SAME batch/head offset (z,h) to Q, K, V, dK, dV. Grouped-/
+        # multi-query attention gives K/V a DIFFERENT head (off_h // group), which the
+        # template would silently mis-address (wrong dK/dV). Q and K must share their scalar
+        # batch/head OFFSET SSAs; a K head that goes through an extra divsi/distinct remsi
+        # differs -> return None (fall through to the generic path). Verified: a biased-GQA
+        # _bwd_kv otherwise routes (kind=kv) and mis-computes dK/dV.
+        def _scal_of(addr_id):
+            if addr_id is None:
+                return None
+            addr_id = skip_layout(addr_id)
+            op = op_by_id.get(addr_id)
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
+            row_side = skip_layout(op.operand_ids[0])
+            rop = op_by_id.get(row_side)
+            if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
+                row_side = skip_layout(rop.operand_ids[0])
+                rop = op_by_id.get(row_side)
+            if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
+                return None
+            sb = op_by_id.get(rop.operand_ids[0])
+            if sb is None or sb.op != "tt.splat" or not sb.operand_ids:
+                return None
+            return sb.operand_ids[0]
+
+        def _scalar_offsets(scal_id):
+            scal = op_by_id.get(scal_id)
+            if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                return None
+
+            def _muli_off(muli_id):
+                m = op_by_id.get(muli_id)
+                if m is None or m.op != "arith.muli":
+                    return None
+                for oid in m.operand_ids:
+                    a = arg_by_id.get(oid)
+                    if a is not None and not a.is_ptr:
+                        continue  # the stride arg
+                    return oid  # the offset SSA (off_h / off_z)
+                return None
+
+            offs = []
+            o1 = _muli_off(scal.operand_ids[1])
+            if o1 is not None:
+                offs.append(o1)
+            inner = op_by_id.get(scal.operand_ids[0])
+            if inner is not None and inner.op == "tt.addptr" and len(inner.operand_ids) >= 2:
+                o2 = _muli_off(inner.operand_ids[1])
+                if o2 is not None:
+                    offs.append(o2)
+            return frozenset(offs)
+
+        _q_offs = _scalar_offsets(_scal_of(_q_addr0))
+        _k_offs = _scalar_offsets(_scal_of(_k_addr0))
+        if _q_offs is None or _k_offs is None or _q_offs != _k_offs:
+            return None  # GQA/MQA or Q/K batch-head offset mismatch -> generic path
 
         # lse: the exp2 input is mulf(subf(scores, splat(lse)), inv_ln2). Find the
         # subf feeding an exp2 whose non-dot operand traces to a load.
