@@ -126,7 +126,7 @@ def _varlen_causal_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
 
 
-def _ref_varlen(q, k, v, cu_q, cu_k, H, D, scale, causal=False):
+def _ref_varlen(q, k, v, cu_q, cu_k, H, D, scale, causal=False, strict=False):
     out = torch.zeros_like(q)
     for b in range(len(cu_q) - 1):
         qs, qe = cu_q[b].item(), cu_q[b + 1].item()
@@ -136,11 +136,12 @@ def _ref_varlen(q, k, v, cu_q, cu_k, H, D, scale, causal=False):
             kb = k[ks:ke, h].float()
             vb = v[ks:ke, h].float()
             sc = (qb @ kb.transpose(-2, -1)) * scale
-            if causal:
+            if causal or strict:
                 lq, lk = qe - qs, ke - ks
                 rows = torch.arange(lq, device=q.device)[:, None]
                 cols = torch.arange(lk, device=q.device)[None, :]
-                sc = sc.masked_fill(rows < cols, float("-inf"))
+                mask = rows < cols if causal else rows <= cols  # >= vs strict >
+                sc = sc.masked_fill(mask, float("-inf"))
             out[qs:qe, h] = (torch.softmax(sc, -1) @ vb).to(out.dtype)
     return out
 
@@ -210,17 +211,81 @@ def test_varlen_bakes_nonstandard_scale():
 
 
 @requires_mps
-def test_varlen_causal_correct_or_refuse():
-    # v1 routes NON-causal only: causal varlen must be correct-or-refuse (never silent-wrong).
+@pytest.mark.parametrize("D", [32, 64, 128])
+def test_varlen_causal_routes_and_correct(D):
+    # Standard within-sequence lower-triangular causal (offs_m >= kn) routes with the
+    # template's causal_guard and is EXACT vs a causal per-sequence reference.
+    scale = 1.0 / math.sqrt(D)
+    q, k, v, o, cu_q, cu_k = _run_varlen(_varlen_causal_fwd, [48, 40, 33], [48, 40, 33], 2, D, torch.float32, scale)
+    ref = _ref_varlen(q, k, v, cu_q, cu_k, 2, D, scale, causal=True)
+    err = (o - ref).abs().max().item()
+    assert err < 1e-3, f"varlen causal hd{D} err {err:.2e}"
+
+
+@triton.jit
+def _varlen_strict_causal_fwd(
+    Q, K, V, Out, cu_q, cu_k,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_vt, stride_vh, stride_vd,
+    stride_ot, stride_oh, stride_od,
+    H, max_seqlen, SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_bh = tl.program_id(1)
+    off_b = off_bh // H
+    off_h = off_bh % H
+    q_start = tl.load(cu_q + off_b)
+    seqlen_q = tl.load(cu_q + off_b + 1) - q_start
+    k_start = tl.load(cu_k + off_b)
+    seqlen_k = tl.load(cu_k + off_b + 1) - k_start
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_ptrs = Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0) * SCALE
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    for start_n in range(0, max_seqlen, BLOCK_N):
+        kn = start_n + offs_n
+        k_ptrs = K + (k_start + kn)[:, None] * stride_kt + off_h * stride_kh + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
+        qk = tl.dot(q, tl.trans(k).to(q.dtype))
+        strict = offs_m[:, None] > kn[None, :]                # STRICT > (not the template's >=)
+        qk = tl.where((kn[None, :] < seqlen_k) & strict, qk, float("-inf"))
+        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
+        v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
+        v = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh + offs_d[None, :] * stride_od
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
+
+
+@requires_mps
+def test_varlen_strict_causal_not_misrouted():
+    # A NON-standard row-vs-col mask (strict > instead of the template's >=) must NOT be
+    # routed as >= causal — that would silent-wrong the diagonal. Correct-or-refuse: the
+    # detector refuses -> the kernel computes on the fallback path. Either way the OUTPUT
+    # must match the STRICT reference (never the >= result). This proves not-silent-wrong.
     D = 64
     scale = 1.0 / math.sqrt(D)
     try:
-        q, k, v, o, cu_q, cu_k = _run_varlen(_varlen_causal_fwd, [48, 40], [48, 40], 2, D, torch.float32, scale)
+        q, k, v, o, cu_q, cu_k = _run_varlen(_varlen_strict_causal_fwd, [48, 40], [48, 40], 2, D, torch.float32, scale)
     except MetalNonRecoverableError:
         return  # refused loudly — safe
-    ref = _ref_varlen(q, k, v, cu_q, cu_k, 2, D, scale, causal=True)
-    err = (o - ref).abs().max().item()
-    assert err < 1e-3, f"varlen causal routed but wrong: err {err:.2e}"
+    ref_strict = _ref_varlen(q, k, v, cu_q, cu_k, 2, D, scale, strict=True)
+    # strict > fully masks each sequence's first row (no strictly-earlier key) -> nan in
+    # BOTH kernel and ref. Compare finite positions; masked rows must stay non-finite (a >=
+    # misroute would attend to the diagonal -> a FINITE value there).
+    finite = ref_strict.isfinite()
+    err = (o[finite] - ref_strict[finite]).abs().max().item()
+    assert err < 1e-3, f"strict-causal mis-computed (routed as >=?): err {err:.2e}"
+    assert not torch.isfinite(o[~finite]).any(), "strict-masked rows became finite -> routed as >="
 
 
 @triton.jit

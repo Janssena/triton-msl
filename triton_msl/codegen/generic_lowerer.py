@@ -844,8 +844,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # vLLM), which the dense [Z,H,N,D] templates can't express and the generic path
             # runs ~0.04 TF. Route the tiled varlen template FIRST — its 4-float + 2-int-ptr +
             # 2-seqlen-subi signature cannot collide with dense/biased/MLA FA (checked before
-            # the dense detectors below). Returns None for non-varlen (falls through) and for
-            # causal varlen (v1 non-causal only; causal stays on the correct generic path).
+            # the dense detectors below). Returns None for non-varlen (falls through); routes
+            # both non-causal AND standard within-seq causal (a non-standard mask refuses).
             _varlen_info = self._detect_varlen_flash_attention()
             if _varlen_info is not None:
                 return self._lower_varlen_flash_attention(_varlen_info)
@@ -4922,9 +4922,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
           * exactly 2 ``arith.subi``, each = (load(cu[b+1]) - load(cu[b])) over the SAME
             int pointer, across 2 DISTINCT cu pointers (the per-batch seqlens);
           * heads count H = the divisor of a divsi/remsi(program_id, H).
-        v1 routes the NON-CAUSAL case only: any row-vs-col compare (a cmpi whose BOTH
-        operand cones reach a make_range) -> refuse, so causal varlen stays on the
-        correct generic path rather than risk a wrong mask.
+        Both NON-CAUSAL and standard within-sequence lower-triangular CAUSAL route: causal
+        is recognized PRECISELY (a row-vs-col ``>=`` where the row reaches program_id(0) and
+        the col does not) and any other row-vs-col compare (strict ``>``, reversed, absolute,
+        windowed) refuses -> the generic path, never a wrong mask.
         """
         def _flat(ops):
             for s in ops:
@@ -5056,12 +5057,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return any(_cone_has(x, pred, seen, d + 1) for x in (o.operand_ids or []))
 
         _is_mr = lambda o: o.op == "tt.make_range"
-        # NON-CAUSAL only: a row-vs-col compare (both operand cones reach a make_range) -> refuse
-        for o in ops:
-            if o.op == "arith.cmpi" and len(o.operand_ids or []) == 2:
-                if _cone_has(o.operand_ids[0], _is_mr) and _cone_has(o.operand_ids[1], _is_mr):
-                    return None
-
         _is_cu_load = lambda o: (
             o.op == "tt.load"
             and (lambda p: p is not None and _is_int(getattr(p, "elem_type", None)))(_load_ptr_arg(o))
@@ -5151,6 +5146,41 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if cuq_idx == cuk_idx or {cuq_idx, cuk_idx} != cu_used:
             return None
 
+        # --- causal: PRECISE correct-or-refuse. The template's causal_guard is the standard
+        # within-sequence lower-triangular ``qrow >= krow``. Recognize EXACTLY that and route
+        # causal=True; refuse (return None -> generic stays correct) on any other row-vs-col
+        # compare (strict >, reversed direction, absolute q_start/k_start positions, windowed).
+        # A "row-vs-col compare" = a cmpi whose BOTH operand cones reach a make_range (the
+        # bounds masks compare a make_range to a scalar seqlen, so only ONE side is a range).
+        # Direction is read from program-vs-loop dependence, NOT make_range identity: with
+        # BLOCK_M==BLOCK_N the offs_m/offs_n aranges are CSE'd to ONE op, so identity can't
+        # tell row from col. The query ROW (offs_m = pid(0)*BM + arange) reaches
+        # program_id(0); the kv COL (kn = loop_start + arange) reaches NO program_id. Require
+        # LHS=row (pid0, within-seq), RHS=col (a make_range, no program_id, within-seq).
+        _pid0 = lambda o: o.op == "tt.get_program_id" and int(o.attrs.get("axis", 0)) == 0
+        _anypid = lambda o: o.op == "tt.get_program_id"
+        both_mr = [
+            c for c in ops
+            if c.op == "arith.cmpi" and len(c.operand_ids or []) == 2
+            and _cone_has(c.operand_ids[0], _is_mr) and _cone_has(c.operand_ids[1], _is_mr)
+        ]
+        causal = False
+        if both_mr:
+            def _std_causal(c):
+                if c.attrs.get("predicate_name") not in ("sge", "uge"):
+                    return False  # only >= (lower-tri incl. diagonal); strict/reversed -> refuse
+                lhs, rhs = c.operand_ids
+                return (
+                    _cone_has(lhs, _pid0) and not _cone_has(lhs, _is_cu_load)
+                    and _cone_has(rhs, _is_mr) and not _cone_has(rhs, _anypid)
+                    and not _cone_has(rhs, _is_cu_load)
+                )
+
+            if all(_std_causal(c) for c in both_mr):
+                causal = True
+            else:
+                return None
+
         # softmax scale: the CONSTANT multiplied into Q before dot0 (q * qk_scale). The
         # template BAKES this scale, so a kernel that scales differently (custom sm_scale,
         # scale on the dot RESULT) must NOT route -> refuse when no constant Q-scale is
@@ -5182,7 +5212,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
                       "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
             "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
-            "q": q, "k": k, "v": v, "o": o,
+            "causal": causal, "q": q, "k": k, "v": v, "o": o,
         }
 
     def _lower_varlen_flash_attention(self, info: dict) -> str:
@@ -5246,7 +5276,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "o_st": _uint_expr(o[0]), "o_sh": _uint_expr(o[1]), "o_sk": _uint_expr(o[2]),
         }
         msl = make_varlen_flash_attention(
-            head_dim=info["head_dim"], causal=False, out_dtype=info["out_dtype"],
+            head_dim=info["head_dim"], causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
             arg_decls=arg_decls, bindings=bindings,
             kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
         )
