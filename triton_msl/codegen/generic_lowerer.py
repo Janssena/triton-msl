@@ -5717,6 +5717,70 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         elif len({q_idx, k_idx, v_idx, o_idx}) != 4:
             _refuse("four distinct pointer roles")
 
+        # GQA/MQA GUARD (correct-or-refuse): the FA templates index K/V with the SAME head
+        # offset as Q (h = zh % H applied to all three). Grouped-/multi-query attention
+        # (Llama/Mistral/Qwen) gives K/V FEWER heads, indexed by a DIFFERENT head (off_h //
+        # group, or a distinct remsi), which the template would silently mis-address
+        # (measured max err ~1.1 at head_dim 128). Require Q, K, V to share the SAME head-
+        # offset SSA (peeled through layout ops). off_h lives in the 2-level scalar batch/
+        # head addptr chain as muli(off_h, SH); the 1-level chain (H==1, single head) has no
+        # head index and can't be GQA. return None -> the caller falls through to the
+        # head_dim>64 refusal / generic path (both correct), NOT a routed wrong result.
+        if not is_mla:
+            def _head_index_dense(addr_id):
+                if addr_id is None:
+                    return None
+                a = _skip_layout(addr_id)
+                op = op_by_id.get(a)
+                if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                    return None
+                row_side = _skip_layout(op.operand_ids[0])
+                rop = op_by_id.get(row_side)
+                if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
+                    row_side = _skip_layout(rop.operand_ids[0])
+                    rop = op_by_id.get(row_side)
+                if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
+                    return None
+                splat_base = op_by_id.get(rop.operand_ids[0])
+                if splat_base is None or splat_base.op != "tt.splat" or not splat_base.operand_ids:
+                    return None
+                scal = op_by_id.get(splat_base.operand_ids[0])
+                if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                    return None
+                inner_arg = arg_by_id.get(scal.operand_ids[0])
+                if inner_arg is not None and inner_arg.is_ptr:
+                    return None  # 1-level (H==1): single head, no head index
+                hmuli = op_by_id.get(scal.operand_ids[1])
+                if hmuli is None or hmuli.op != "arith.muli":
+                    return None
+                off_h = None
+                for oid in hmuli.operand_ids:
+                    aarg = arg_by_id.get(oid)
+                    if aarg is not None and not aarg.is_ptr:
+                        continue  # the SH stride arg
+                    off_h = oid
+                return off_h
+
+            def _peel_core_dense(oid):
+                seen = set()
+                cur = op_by_id.get(oid)
+                while (cur is not None and cur.id not in seen and cur.operand_ids
+                       and cur.op in ("tt.splat", "tt.broadcast", "tt.expand_dims",
+                                      "ttg.convert_layout", "tt.reshape")):
+                    seen.add(cur.id)
+                    cur = op_by_id.get(cur.operand_ids[0])
+                return cur.id if cur is not None else None
+
+            _qh, _kh, _vh = (_head_index_dense(q_addr), _head_index_dense(k_addr),
+                             _head_index_dense(v_addr))
+            if not (_qh is None and _kh is None and _vh is None):
+                if _qh is None or _kh is None or _vh is None:
+                    return None  # mixed multi/single head (e.g. MQA H_kv==1) -> refuse
+                _qc, _kc, _vc = (_peel_core_dense(_qh), _peel_core_dense(_kh),
+                                 _peel_core_dense(_vh))
+                if not (_qc is not None and _qc == _kc == _vc):
+                    return None  # GQA/MQA: K/V head index differs from Q -> refuse
+
         # --- tile dims from the dot shapes -----------------------------------
         # dot 0 (QK^T): A = [block_m, head_dim], result = [block_m, block_n].
         a_shape = _extract_shape(self._find_op_type_str(dot_qk.operand_ids[0]))
