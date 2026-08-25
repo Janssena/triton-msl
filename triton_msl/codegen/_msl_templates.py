@@ -4921,8 +4921,10 @@ def make_varlen_flash_attention(
         elem, store_cast = "float", lambda e: e
     elif out_dtype in ("fp16", "f16"):
         elem, store_cast = "half", lambda e: f"half({e})"
+    elif out_dtype in ("bf16", "bfloat16"):
+        elem, store_cast = "bfloat", lambda e: f"bfloat({e})"
     else:
-        raise ValueError(f"varlen FA out_dtype must be fp32/fp16 (got {out_dtype!r})")
+        raise ValueError(f"varlen FA out_dtype must be fp32/fp16/bf16 (got {out_dtype!r})")
     D = head_dim
     BM = BN = 32
     # The detector BAKES the kernel's own constant Q-scale (refuses if absent); default to
@@ -5031,8 +5033,13 @@ def make_varlen_flash_attention_mma(
     """
     if arg_decls is None or bindings is None:
         raise ValueError("make_varlen_flash_attention_mma is route-only (needs arg_decls/bindings)")
-    if out_dtype not in ("fp16", "f16"):
-        raise ValueError(f"varlen MMA FA is fp16-only (got {out_dtype!r}); route fp32 to the scalar template")
+    # 16-bit MMA only (half/bfloat staged tiles, fp32 accumulate). fp32 -> scalar template.
+    if out_dtype in ("fp16", "f16"):
+        TILE, SGT = "half", "simdgroup_half8x8"
+    elif out_dtype in ("bf16", "bfloat16"):
+        TILE, SGT = "bfloat", "simdgroup_bfloat8x8"
+    else:
+        raise ValueError(f"varlen MMA FA is fp16/bf16-only (got {out_dtype!r}); route fp32 to the scalar template")
     D, BM, BN, NT = head_dim, 32, 32, 128
     NG = NT // 32
     if D % 8 != 0:
@@ -5069,10 +5076,10 @@ kernel void {kernel_name}(
     const uint k_st = {b['k_st']}, k_sh = {b['k_sh']}, k_sk = {b['k_sk']};
     const uint v_st = {b['v_st']}, v_sh = {b['v_sh']}, v_sk = {b['v_sk']};
     const uint o_st = {b['o_st']}, o_sh = {b['o_sh']}, o_sk = {b['o_sk']};
-    threadgroup half  tg_Q[BM*D];
-    threadgroup half  tg_K[BN*D];
-    threadgroup half  tg_V[BN*D];
-    threadgroup half  tg_P[BM*BN];
+    threadgroup {TILE} tg_Q[BM*D];
+    threadgroup {TILE} tg_K[BN*D];
+    threadgroup {TILE} tg_V[BN*D];
+    threadgroup {TILE} tg_P[BM*BN];
     threadgroup float tg_S[BM*BN];
     threadgroup float tg_m[BM];
     threadgroup float tg_l[BM];
@@ -5086,7 +5093,7 @@ kernel void {kernel_name}(
 
     for (uint i = lid; i < BM*D; i += NT) {{
         uint r = i / D, c = i % D; uint qr = m_block*BM + r;
-        tg_Q[i] = qr < seqlen_q ? half({b['Q']}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : half(0);
+        tg_Q[i] = qr < seqlen_q ? {TILE}({b['Q']}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : {TILE}(0);
     }}
     for (uint i = lid; i < BM; i += NT) {{ tg_m[i] = -INFINITY; tg_l[i] = 0.0f; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5098,15 +5105,15 @@ kernel void {kernel_name}(
     for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
         for (uint i = lid; i < BN*D; i += NT) {{
             uint r = i / D, c = i % D; uint kr = kt + r; bool ok = kr < seqlen_k;
-            tg_K[i] = ok ? half({b['K']}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : half(0);
-            tg_V[i] = ok ? half({b['V']}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : half(0);
+            tg_K[i] = ok ? {TILE}({b['K']}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : {TILE}(0);
+            tg_V[i] = ok ? {TILE}({b['V']}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : {TILE}(0);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint nt = 0u; nt < BN/8u; nt++) {{
             simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
             for (uint dt = 0u; dt < D/8u; dt++) {{
-                simdgroup_half8x8 qf, kf;
+                {SGT} qf, kf;
                 simdgroup_load(qf, tg_Q + (sg*8u)*D + dt*8u, D);
                 simdgroup_load(kf, tg_K + (nt*8u)*D + dt*8u, D, ulong2(0,0), true);
                 simdgroup_multiply_accumulate(S, qf, kf, S);
@@ -5125,7 +5132,7 @@ kernel void {kernel_name}(
             }}
             float m_new = max(m_old, m_blk);
             float alpha = exp(m_old - m_new), lsum = 0.0f;
-            for (uint j = 0u; j < BN; j++) {{ float p = exp(tg_S[r*BN+j]-m_new); tg_P[r*BN+j]=half(p); lsum += p; }}
+            for (uint j = 0u; j < BN; j++) {{ float p = exp(tg_S[r*BN+j]-m_new); tg_P[r*BN+j]={TILE}(p); lsum += p; }}
             tg_l[r] = l_old*alpha + lsum; tg_m[r] = m_new;
             for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? alpha : 0.0f;
         }}
@@ -5138,7 +5145,7 @@ kernel void {kernel_name}(
             simdgroup_multiply_accumulate(tmp, adiag, o_acc[et], tmp);
             o_acc[et] = tmp;
             for (uint nt = 0u; nt < BN/8u; nt++) {{
-                simdgroup_half8x8 pf, vf;
+                {SGT} pf, vf;
                 simdgroup_load(pf, tg_P + (sg*8u)*BN + nt*8u, BN);
                 simdgroup_load(vf, tg_V + (nt*8u)*D + et*8u, D);
                 simdgroup_multiply_accumulate(o_acc[et], pf, vf, o_acc[et]);
@@ -5163,7 +5170,7 @@ kernel void {kernel_name}(
             uint r = sg*8u + lane; uint qrow = m_block*BM + r;
             if (qrow < seqlen_q)
                 for (uint c = 0u; c < 8u; c++)
-                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] = half(tg_S[sg*64u + lane*8u + c]);
+                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] = {TILE}(tg_S[sg*64u + lane*8u + c]);
         }}
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }}

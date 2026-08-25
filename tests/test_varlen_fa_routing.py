@@ -203,6 +203,21 @@ def test_varlen_fp16_mma(D, causal):
 
 
 @requires_mps
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_bf16_mma(D, causal):
+    # bf16 (Llama/modern inference; the DENSE FA path refuses bf16 as a silent-wrong) routes
+    # to the bfloat8x8 MMA fast path (same 2-byte tiles as fp16 -> fits hd128). EXACT vs the
+    # per-sequence reference within bf16 tolerance.
+    scale = 1.0 / math.sqrt(D)
+    kern = _varlen_causal_fwd if causal else _varlen_fwd
+    q, k, v, o, cu_q, cu_k = _run_varlen(kern, [48, 32, 17], [48, 32, 17], 3, D, torch.bfloat16, scale)
+    ref = _ref_varlen(q, k, v, cu_q, cu_k, 3, D, scale, causal=causal)
+    err = (o.float() - ref.float()).abs().max().item()
+    assert err < 6e-2, f"bf16 MMA {'causal' if causal else 'full'} hd{D} err {err:.2e}"
+
+
+@requires_mps
 def test_varlen_cross_attention_seqlens():
     # seqlen_q != seqlen_k per batch (cross attention) — cu_q and cu_k differ.
     D = 64

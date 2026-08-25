@@ -4939,7 +4939,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return (et or "").lstrip("s").lstrip("u").startswith("i")
 
         def _is_float(et):
-            return (et or "").startswith("f")
+            return (et or "").startswith("f") or (et or "").startswith("bf")  # f16/f32 + bf16
 
         ops = list(_flat(self.graph.ops))
         obid = {o.id: o for o in ops}
@@ -5052,9 +5052,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return None  # template is fixed BLOCK_M==BLOCK_N==32
         if ksh[1] != head_dim or vsh[1] != head_dim:
             return None  # Q/K/V must share head_dim (symmetric); asymmetric -> generic
-        _od = {"f32": "f32", "f16": "f16"}.get(o_arg.elem_type)
+        _od = {"f32": "f32", "f16": "f16", "bf16": "bf16"}.get(o_arg.elem_type)
         if _od is None:
-            return None  # varlen template is fp32/fp16 only (bf16 -> generic)
+            return None  # varlen template is fp32/fp16/bf16 only
 
         def _cone_has(oid, pred, seen=None, d=0):
             if seen is None:
@@ -5371,12 +5371,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # on the scalar template (true fp32, arbitrary head_dim). Correct-or-fast: else scalar.
         D = info["head_dim"]
         _mma_tg_bytes = 32 * D * 2 + 32 * D * 2 * 2 + 32 * 32 * 2 + 32 * 32 * 4 + 32 * 4 * 2 + 4 * 64 * 4
-        mma_eligible = info["out_dtype"] == "f16" and D % 8 == 0 and _mma_tg_bytes <= 32768
+        mma_eligible = info["out_dtype"] in ("f16", "bf16") and D % 8 == 0 and _mma_tg_bytes <= 32768
         if mma_eligible:
             from triton_msl.codegen._msl_templates import make_varlen_flash_attention_mma
 
             msl = make_varlen_flash_attention_mma(
-                head_dim=D, causal=bool(info.get("causal")), out_dtype="fp16",
+                head_dim=D, causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
             )
