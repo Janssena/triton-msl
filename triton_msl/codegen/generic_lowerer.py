@@ -5138,6 +5138,45 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if any(t[0] is None or t[1] is None for t in (q, k, v, o)):
             return None
 
+        # GQA/MQA GUARD (correct-or-refuse): the template indexes K/V with the SAME head
+        # index as Q (h = bh % nheads). Grouped-query attention indexes K/V by a DIFFERENT
+        # head (off_h_kv = off_h // group, fewer kv heads), which the template would silently
+        # mis-address. Require Q, K, V to share the SAME head-index SSA (peeled through
+        # layout ops); a K/V head that goes through an extra divsi (GQA) or a different
+        # remsi (MQA) differs -> refuse (return None -> generic stays correct).
+        def _head_index(load):
+            for mul in _muli_terms(load.operand_ids[0]):
+                if len(mul.operand_ids or []) != 2:
+                    continue
+                a0, a1 = mul.operand_ids
+                sa0, sa1 = _trace_to_arg(a0), _trace_to_arg(a1)
+                if sa0 is not None and not sa0.is_ptr and (sa1 is None or sa1.is_ptr):
+                    idx = a1
+                elif sa1 is not None and not sa1.is_ptr and (sa0 is None or sa0.is_ptr):
+                    idx = a0
+                else:
+                    continue
+                if not _cone_has(idx, _is_cu_load) and _cone_has(idx, _is_offh):
+                    return idx
+            return None
+
+        def _peel_core(oid):
+            op = obid.get(oid)
+            seen = set()
+            while (op is not None and op.id not in seen and op.operand_ids
+                   and op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims",
+                                 "ttg.convert_layout", "tt.reshape")):
+                seen.add(op.id)
+                op = obid.get(op.operand_ids[0])
+            return op.id if op is not None else None
+
+        qh_i, kh_i, vh_i = _head_index(q_load), _head_index(k_load), _head_index(v_load)
+        if qh_i is None or kh_i is None or vh_i is None:
+            return None
+        qh_c, kh_c, vh_c = _peel_core(qh_i), _peel_core(kh_i), _peel_core(vh_i)
+        if not (qh_c is not None and qh_c == kh_c == vh_c):
+            return None
+
         cuq = _cu_in_cone(q_load)
         cuk = _cu_in_cone(k_load)
         if len(cuq) != 1 or len(cuk) != 1:

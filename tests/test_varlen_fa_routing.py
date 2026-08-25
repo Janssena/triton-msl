@@ -307,6 +307,62 @@ def _dense_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk, svz, svh, svn,
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
+@triton.jit
+def _gqa_varlen_fwd(Q, K, V, Out, cu_q, cu_k,
+    sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
+    H, GROUP, max_seqlen, SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+    start_m = tl.program_id(0); off_bh = tl.program_id(1)
+    off_b = off_bh // H; off_h = off_bh % H
+    off_h_kv = off_h // GROUP                       # GQA: fewer kv heads (Llama/Mistral)
+    q_start = tl.load(cu_q + off_b); seqlen_q = tl.load(cu_q + off_b + 1) - q_start
+    k_start = tl.load(cu_k + off_b); seqlen_k = tl.load(cu_k + off_b + 1) - k_start
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_n = tl.arange(0, BLOCK_N); offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd, mask=offs_m[:, None] < seqlen_q, other=0.) * SCALE
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32); l_i = tl.zeros([BLOCK_M], tl.float32); acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    for start_n in range(0, max_seqlen, BLOCK_N):
+        kn = start_n + offs_n
+        k = tl.load(K + (k_start + kn)[:, None] * skt + off_h_kv * skh + offs_d[None, :] * skd, mask=kn[:, None] < seqlen_k, other=0.)
+        qk = tl.where(kn[None, :] < seqlen_k, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
+        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij); alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
+        v = tl.load(V + (k_start + kn)[:, None] * svt + off_h_kv * svh + offs_d[None, :] * svd, mask=kn[:, None] < seqlen_k, other=0.)
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
+    tl.store(Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod, (acc / l_i[:, None]).to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
+
+
+@requires_mps
+def test_gqa_varlen_not_misrouted():
+    # GQA/MQA (Llama/Mistral): K/V have H/GROUP heads, indexed by off_h // GROUP -- a
+    # DIFFERENT head index than Q. The varlen template applies Q's head index to K/V, so
+    # routing GQA would SILENT-WRONG. The detector must refuse (Q/K/V head-index mismatch)
+    # -> the kernel computes on the fallback path. Output must match the GQA reference.
+    dev = "mps"; torch.manual_seed(0)
+    H, Hkv, D = 4, 2, 64
+    G = H // Hkv
+    scale = 1.0 / math.sqrt(D)
+    cu = torch.tensor([0, 48, 80], device=dev, dtype=torch.int32)
+    q = torch.randn(80, H, D, device=dev); k = torch.randn(80, Hkv, D, device=dev)
+    v = torch.randn(80, Hkv, D, device=dev); o = torch.zeros(80, H, D, device=dev)
+    BM = BN = 32
+    try:
+        _gqa_varlen_fwd[(triton.cdiv(48, BM), 2 * H)](
+            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+            H, G, 48, scale, BM, BN, D)
+        torch.mps.synchronize()
+    except MetalNonRecoverableError:
+        return  # refused loudly — safe
+    ref = torch.zeros_like(q)
+    for b in range(len(cu) - 1):
+        s, e = cu[b].item(), cu[b + 1].item()
+        for h in range(H):
+            hk = h // G
+            sc = (q[s:e, h].float() @ k[s:e, hk].float().transpose(-2, -1)) * scale
+            ref[s:e, h] = (torch.softmax(sc, -1) @ v[s:e, hk].float()).to(ref.dtype)
+    err = (o - ref).abs().max().item()
+    assert err < 1e-2, f"GQA varlen mis-computed (routed as MHA?): err {err:.2e}"
+
+
 @requires_mps
 def test_dense_fa_not_misrouted():
     # A DENSE [Z,H,N,D] FA kernel (0 int-pointer args) must NOT be captured by the varlen
