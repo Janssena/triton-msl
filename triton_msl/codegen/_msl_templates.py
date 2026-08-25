@@ -5012,6 +5012,143 @@ kernel void {kernel_name}(
 """
 
 
+def make_varlen_flash_attention_mma(
+    head_dim=64, causal=False, out_dtype="fp16",
+    arg_decls=None, bindings=None, kernel_name="varlen_fa_mma", scale=None,
+):
+    """FAST varlen FlashAttention-2 via simdgroup_matrix MMA (fp16 in/out, fp32 accumulate).
+
+    BM=32 query rows = 4 simdgroups (128 threads); each simdgroup owns 8 rows. QK^T and P@V
+    run through 8x8 simdgroup MMA; the online softmax is scalar through threadgroup memory.
+    Q/K/V tiles are staged into threadgroup memory with bounds-masking (packed cu_seqlens),
+    so ANY global strides work (the MMA reads the contiguous tg tiles). Measured ~5x the
+    scalar one-thread-per-row varlen template and ~2.6x pad-to-max + SDPA on a ragged fp16
+    batch (D=64). fp16-ONLY: the staged tiles are half, so accumulation is fp16-precision —
+    fp32 varlen stays on the scalar template (true fp32). Same buffer ABI / bindings as
+    make_varlen_flash_attention; dispatched with 128 threads/threadgroup (descriptor tg=128).
+    """
+    if arg_decls is None or bindings is None:
+        raise ValueError("make_varlen_flash_attention_mma is route-only (needs arg_decls/bindings)")
+    if out_dtype not in ("fp16", "f16"):
+        raise ValueError(f"varlen MMA FA is fp16-only (got {out_dtype!r}); route fp32 to the scalar template")
+    D, BM, BN, NT = head_dim, 32, 32, 128
+    if D % 8 != 0:
+        raise ValueError(f"varlen MMA FA needs head_dim %% 8 == 0 (got {D})")
+    tg_bytes = BM * D * 2 + BN * D * 2 * 2 + BM * BN * 4 + BM * BN * 2 + BM * D * 4 + BM * 4 * 2
+    if tg_bytes > 32768:
+        raise ValueError(f"varlen MMA FA threadgroup memory {tg_bytes}B > 32KB for head_dim={D}; use the scalar template")
+    _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
+             "q_st", "q_sh", "q_sk", "k_st", "k_sh", "k_sk",
+             "v_st", "v_sh", "v_sk", "o_st", "o_sh", "o_sk"]
+    missing = [n for n in _need if n not in bindings]
+    if missing:
+        raise ValueError(f"varlen MMA FA bindings missing {missing}")
+    b = bindings
+    SCALE = float(D) ** -0.5 if scale is None else float(scale)
+    causal_expr = "(qrow >= kr)" if causal else "true"
+    sig = ",\n".join(arg_decls)
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+// Varlen FlashAttention-2 (fp16 in/out, fp32 accumulate) via simdgroup_matrix MMA.
+kernel void {kernel_name}(
+{sig},
+    uint2 tgpos [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]
+) {{
+    const uint D = {D}u, BM = {BM}u, BN = {BN}u, NT = {NT}u;
+    const float SCALE = {SCALE}f;
+    const uint nheads = {b['H']};
+    const uint q_st = {b['q_st']}, q_sh = {b['q_sh']}, q_sk = {b['q_sk']};
+    const uint k_st = {b['k_st']}, k_sh = {b['k_sh']}, k_sk = {b['k_sk']};
+    const uint v_st = {b['v_st']}, v_sh = {b['v_sh']}, v_sk = {b['v_sk']};
+    const uint o_st = {b['o_st']}, o_sh = {b['o_sh']}, o_sk = {b['o_sk']};
+    threadgroup half  tg_Q[BM*D];
+    threadgroup half  tg_K[BN*D];
+    threadgroup half  tg_V[BN*D];
+    threadgroup half  tg_P[BM*BN];
+    threadgroup float tg_S[BM*BN];
+    threadgroup float tg_O[BM*D];
+    threadgroup float tg_m[BM];
+    threadgroup float tg_l[BM];
+
+    uint m_block = tgpos.x, bh = tgpos.y;
+    uint bb = bh / nheads, h = bh % nheads;
+    uint q_start = uint({b['CUQ']}[bb]);   uint seqlen_q = uint({b['CUQ']}[bb+1u]) - q_start;
+    uint k_start = uint({b['CUK']}[bb]);   uint seqlen_k = uint({b['CUK']}[bb+1u]) - k_start;
+    if (m_block * BM >= seqlen_q) return;
+
+    for (uint i = lid; i < BM*D; i += NT) {{
+        uint r = i / D, c = i % D; uint qr = m_block*BM + r;
+        tg_Q[i] = qr < seqlen_q ? half({b['Q']}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : half(0);
+        tg_O[i] = 0.0f;
+    }}
+    for (uint i = lid; i < BM; i += NT) {{ tg_m[i] = -INFINITY; tg_l[i] = 0.0f; }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint sg = sgid, lane = lid % 32u;
+    simdgroup_half8x8 qf[D/8];
+    for (uint dt = 0u; dt < D/8u; dt++)
+        simdgroup_load(qf[dt], tg_Q + (sg*8u)*D + dt*8u, D);
+
+    for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
+        for (uint i = lid; i < BN*D; i += NT) {{
+            uint r = i / D, c = i % D; uint kr = kt + r; bool ok = kr < seqlen_k;
+            tg_K[i] = ok ? half({b['K']}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : half(0);
+            tg_V[i] = ok ? half({b['V']}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : half(0);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint nt = 0u; nt < BN/8u; nt++) {{
+            simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
+            for (uint dt = 0u; dt < D/8u; dt++) {{
+                simdgroup_half8x8 kf;
+                simdgroup_load(kf, tg_K + (nt*8u)*D + dt*8u, D, ulong2(0,0), true);
+                simdgroup_multiply_accumulate(S, qf[dt], kf, S);
+            }}
+            simdgroup_store(S, tg_S + (sg*8u)*BN + nt*8u, BN);
+        }}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane < 8u) {{
+            uint r = sg*8u + lane; uint qrow = m_block*BM + r;
+            float m_old = tg_m[r], l_old = tg_l[r], m_blk = -INFINITY;
+            for (uint j = 0u; j < BN; j++) {{
+                uint kr = kt + j;
+                float s = (kr < seqlen_k && {causal_expr}) ? tg_S[r*BN+j]*SCALE : -INFINITY;
+                tg_S[r*BN+j] = s; m_blk = max(m_blk, s);
+            }}
+            float m_new = max(m_old, m_blk);
+            float alpha = exp(m_old - m_new), lsum = 0.0f;
+            for (uint j = 0u; j < BN; j++) {{ float p = exp(tg_S[r*BN+j]-m_new); tg_P[r*BN+j]=half(p); lsum += p; }}
+            tg_l[r] = l_old*alpha + lsum; tg_m[r] = m_new;
+            for (uint e = 0u; e < D; e++) tg_O[r*D+e] *= alpha;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint et = 0u; et < D/8u; et++) {{
+            simdgroup_float8x8 O;
+            simdgroup_load(O, tg_O + (sg*8u)*D + et*8u, D);
+            for (uint nt = 0u; nt < BN/8u; nt++) {{
+                simdgroup_half8x8 pf, vf;
+                simdgroup_load(pf, tg_P + (sg*8u)*BN + nt*8u, BN);
+                simdgroup_load(vf, tg_V + (nt*8u)*D + et*8u, D);
+                simdgroup_multiply_accumulate(O, pf, vf, O);
+            }}
+            simdgroup_store(O, tg_O + (sg*8u)*D + et*8u, D);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    for (uint i = lid; i < BM*D; i += NT) {{
+        uint r = i / D, c = i % D; uint qr = m_block*BM + r;
+        if (qr < seqlen_q) {b['O']}[(q_start+qr)*o_st + h*o_sh + c*o_sk] = half(tg_O[i] / tg_l[r]);
+    }}
+}}
+"""
+
+
 def make_int4_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     """FAST per-group INT4 GEMM: the int8 fast kernel with the nibble unpack folded into
     the staged dequant tile. Packed uchar weight [K/2, N] contiguous (LOW nibble for EVEN

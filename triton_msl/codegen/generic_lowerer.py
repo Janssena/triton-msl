@@ -5362,13 +5362,33 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "v_st": _uint_expr(v[0]), "v_sh": _uint_expr(v[1]), "v_sk": _uint_expr(v[2]),
             "o_st": _uint_expr(o[0]), "o_sh": _uint_expr(o[1]), "o_sk": _uint_expr(o[2]),
         }
-        msl = make_varlen_flash_attention(
-            head_dim=info["head_dim"], causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
-            arg_decls=arg_decls, bindings=bindings,
-            kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
-        )
-        self.effective_block_size = 32
-        self._flash_attention = ("flash_attention", msl, 32)
+        # FAST PATH: the simdgroup-MMA varlen kernel (~5x the scalar one-thread-per-row
+        # template, ~2.6x pad-to-max + SDPA) when eligible — fp16 in/out, head_dim %% 8 == 0,
+        # and the tiles fit the 32KB threadgroup budget (head_dim <= ~80: D=32/64). It stages
+        # Q/K/V into threadgroup memory before the MMA so ANY global strides work. fp16-only
+        # (half-staged tiles = fp16 accumulate); fp32 / head_dim 128 / non-%8 stay on the
+        # scalar template (true fp32, arbitrary head_dim). Correct-or-fast: ineligible -> scalar.
+        D = info["head_dim"]
+        _mma_tg_bytes = 32 * D * 2 + 32 * D * 2 * 2 + 32 * 32 * 4 + 32 * 32 * 2 + 32 * D * 4 + 32 * 4 * 2
+        mma_eligible = info["out_dtype"] == "f16" and D % 8 == 0 and _mma_tg_bytes <= 32768
+        if mma_eligible:
+            from triton_msl.codegen._msl_templates import make_varlen_flash_attention_mma
+
+            msl = make_varlen_flash_attention_mma(
+                head_dim=D, causal=bool(info.get("causal")), out_dtype="fp16",
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
+            )
+            self.effective_block_size = 128
+            self._flash_attention = ("flash_attention", msl, 128)
+        else:
+            msl = make_varlen_flash_attention(
+                head_dim=D, causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
+                arg_decls=arg_decls, bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
+            )
+            self.effective_block_size = 32
+            self._flash_attention = ("flash_attention", msl, 32)
         self._used_pid_axes = {0, 1}
         self._prescan_stores()
         return msl

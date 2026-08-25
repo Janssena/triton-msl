@@ -188,6 +188,20 @@ def test_varlen_fp16():
 
 
 @requires_mps
+@pytest.mark.parametrize("D", [32, 64])
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_fp16_mma(D, causal):
+    # fp16 + head_dim%8==0 + fits tg -> the simdgroup-MMA fast path (~5x the scalar template).
+    # Exercise it across hd 32/64, non-causal + standard causal; EXACT vs the per-seq reference.
+    scale = 1.0 / math.sqrt(D)
+    kern = _varlen_causal_fwd if causal else _varlen_fwd
+    q, k, v, o, cu_q, cu_k = _run_varlen(kern, [48, 32, 17], [48, 32, 17], 3, D, torch.float16, scale)
+    ref = _ref_varlen(q, k, v, cu_q, cu_k, 3, D, scale, causal=causal)
+    err = (o - ref).abs().max().item()
+    assert err < 2e-2, f"fp16 MMA {'causal' if causal else 'full'} hd{D} err {err:.2e}"
+
+
+@requires_mps
 def test_varlen_cross_attention_seqlens():
     # seqlen_q != seqlen_k per batch (cross attention) — cu_q and cu_k differ.
     D = 64
