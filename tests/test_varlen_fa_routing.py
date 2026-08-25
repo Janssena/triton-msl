@@ -203,6 +203,21 @@ def test_varlen_fp16_mma(D, causal):
 
 
 @requires_mps
+@pytest.mark.parametrize("D", [32, 64])
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_fp32_mma(D, causal):
+    # fp32 routes to the MMA path too, but with TRUE float tiles (float8x8 MMA at BN=16) —
+    # not the fp16-precision half tiles. The tight tolerance (5e-5) fails if fp32 ever
+    # regresses to half-staged (fp16) accumulation. hd 32/64 (fp32 hd128 stays scalar).
+    scale = 1.0 / math.sqrt(D)
+    kern = _varlen_causal_fwd if causal else _varlen_fwd
+    q, k, v, o, cu_q, cu_k = _run_varlen(kern, [48, 32, 17], [48, 32, 17], 3, D, torch.float32, scale)
+    ref = _ref_varlen(q, k, v, cu_q, cu_k, 3, D, scale, causal=causal)
+    err = (o - ref).abs().max().item()
+    assert err < 5e-5, f"fp32 MMA {'causal' if causal else 'full'} hd{D} err {err:.2e} (fp16 fallback?)"
+
+
+@requires_mps
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_varlen_bf16_mma(D, causal):

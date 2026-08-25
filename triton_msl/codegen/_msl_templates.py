@@ -5033,20 +5033,24 @@ def make_varlen_flash_attention_mma(
     """
     if arg_decls is None or bindings is None:
         raise ValueError("make_varlen_flash_attention_mma is route-only (needs arg_decls/bindings)")
-    # 16-bit MMA only (half/bfloat staged tiles, fp32 accumulate). fp32 -> scalar template.
+    # Staged-tile type + kv-block width. fp16/bf16 use 2-byte tiles (BN=32); fp32 uses TRUE
+    # float tiles (float8x8 MMA) at BN=16 so the doubled tile bytes still fit the 32KB tg
+    # budget. All accumulate in fp32 (o_acc + the diag rescale are float8x8 regardless).
     if out_dtype in ("fp16", "f16"):
-        TILE, SGT = "half", "simdgroup_half8x8"
+        TILE, SGT, TB, BN = "half", "simdgroup_half8x8", 2, 32
     elif out_dtype in ("bf16", "bfloat16"):
-        TILE, SGT = "bfloat", "simdgroup_bfloat8x8"
+        TILE, SGT, TB, BN = "bfloat", "simdgroup_bfloat8x8", 2, 32
+    elif out_dtype in ("fp32", "f32"):
+        TILE, SGT, TB, BN = "float", "simdgroup_float8x8", 4, 16
     else:
-        raise ValueError(f"varlen MMA FA is fp16/bf16-only (got {out_dtype!r}); route fp32 to the scalar template")
-    D, BM, BN, NT = head_dim, 32, 32, 128
+        raise ValueError(f"varlen MMA FA dtype must be fp16/bf16/fp32 (got {out_dtype!r})")
+    D, BM, NT = head_dim, 32, 128
     NG = NT // 32
     if D % 8 != 0:
         raise ValueError(f"varlen MMA FA needs head_dim %% 8 == 0 (got {D})")
-    # register-O budget (no tg_O): tg_Q + tg_K + tg_V (half) + tg_P (half) + tg_S (float,
+    # register-O budget (no tg_O): tg_Q + tg_K + tg_V + tg_P (TB bytes each) + tg_S (float,
     # reused as the output-store scratch post-loop) + tg_m/tg_l + tg_diag (diag rescale).
-    tg_bytes = BM * D * 2 + BN * D * 2 * 2 + BM * BN * 2 + BM * BN * 4 + BM * 4 * 2 + NG * 64 * 4
+    tg_bytes = BM * D * TB + BN * D * TB * 2 + BM * BN * TB + BM * BN * 4 + BM * 4 * 2 + NG * 64 * 4
     if tg_bytes > 32768:
         raise ValueError(f"varlen MMA FA threadgroup memory {tg_bytes}B > 32KB for head_dim={D}; use the scalar template")
     _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",

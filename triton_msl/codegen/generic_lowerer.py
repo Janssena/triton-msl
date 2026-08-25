@@ -5370,8 +5370,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # fp16-only (half-staged tiles = fp16 accumulate); fp32 / non-%8 / head_dim > 128 stay
         # on the scalar template (true fp32, arbitrary head_dim). Correct-or-fast: else scalar.
         D = info["head_dim"]
-        _mma_tg_bytes = 32 * D * 2 + 32 * D * 2 * 2 + 32 * 32 * 2 + 32 * 32 * 4 + 32 * 4 * 2 + 4 * 64 * 4
-        mma_eligible = info["out_dtype"] in ("f16", "bf16") and D % 8 == 0 and _mma_tg_bytes <= 32768
+        # register-O MMA tg budget, matching make_varlen_flash_attention_mma: fp16/bf16 use
+        # 2-byte tiles at BN=32; fp32 uses true float tiles at BN=16 (so the doubled bytes
+        # still fit 32KB). tg = BM*D*TB + BN*D*TB*2 + BM*BN*TB + BM*BN*4 + BM*4*2 + 4*64*4.
+        _tb, _bn = (4, 16) if info["out_dtype"] == "f32" else (2, 32)
+        _mma_tg_bytes = 32 * D * _tb + _bn * D * _tb * 2 + 32 * _bn * _tb + 32 * _bn * 4 + 32 * 4 * 2 + 4 * 64 * 4
+        mma_eligible = info["out_dtype"] in ("f16", "bf16", "f32") and D % 8 == 0 and _mma_tg_bytes <= 32768
         if mma_eligible:
             from triton_msl.codegen._msl_templates import make_varlen_flash_attention_mma
 
@@ -6804,6 +6808,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "refusing rather than emit silently-wrong gradients."
             )
 
+        # A 2-D-grid backward (fewer than 3 program ids) makes the q/kv templates use their
+        # z = zh // H; h = zh % H head/batch decode -- a head-inner convention no kernel
+        # exercises (trifast uses a 3-D grid). A batch-inner 2-D kernel would silently swap
+        # batch<->head there; rather than route through the unvalidated 2-D branch, refuse
+        # it (correct-or-refuse -> generic/CPU). Only the 3-D grid path is validated.
+        _BWD_2D_MSG = (
+            "Biased-FA backward on a 2-D grid (fewer than 3 program ids) is not supported: "
+            "the q/kv head/batch decomposition (z = zh // H; h = zh % H) is unvalidated and "
+            "could silently swap batch<->head. Refusing rather than emit silently-wrong "
+            "gradients. Use a 3-D grid (separate program ids for k-block, i, and head)."
+        )
+
         # DEFINITIVE backward signature, checked BEFORE any _refuse: P is recomputed as
         # exp2((scores - lse) * inv_ln2), i.e. an exp2 of (or scaling) a SUBTRACTION.
         # Absent (e.g. a fused GEMM+bias+exp2, or a raw-exp2 attention) => NOT a softmax-
@@ -7094,6 +7110,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if len(set(roles)) != 10:
                 _refuse("ten distinct pointer roles")
 
+            if not grid_3d:
+                raise MetalNonRecoverableError(_BWD_2D_MSG)
             return {
                 "bwd_kind": "q", "grid_3d": grid_3d,
                 "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
@@ -7440,6 +7458,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if len(set(roles)) != 10:
             _refuse("ten distinct pointer roles")
 
+        if not grid_3d:
+            raise MetalNonRecoverableError(_BWD_2D_MSG)
         return {
             "bwd_kind": "kv", "grid_3d": grid_3d,
             "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
