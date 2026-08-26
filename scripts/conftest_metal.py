@@ -528,6 +528,22 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_unsupported)
             continue
 
+        # 64-bit argmin/argmax (incl. min/max-with-indices and tie-break variants) REFUSES
+        # LOUDLY since the 2026-06-25 Triton-lens re-audit: the SIMD-shuffle argminmax has
+        # no 64-bit overload, and the old 32-bit staging silently truncated the high word
+        # (argmax over i64 values > 2^31 returned a WRONG INDEX — these upstream tests only
+        # "passed" because their small values never exercised the high word). Intentional
+        # correct-or-refuse; skip like the other documented refusals (the baseline report
+        # predates the guard and was never reconciled).
+        if (("int64" in test_id or "uint64" in test_id)
+                and func_name in ("test_reduce1d", "test_reduce")
+                and ("argm" in test_id or "with-indices" in test_id)):
+            item.add_marker(pytest.mark.skip(
+                reason="Metal: 64-bit argmin/argmax refuses loudly (SIMD-shuffle has no "
+                       "64-bit path; 32-bit staging silently truncated — intentional "
+                       "correct-or-refuse, _lowerer_reduce 64-bit guard)"))
+            continue
+
         # Skip input_precision modes Apple GPU can\'t honor: tf32, tf32x3,
         # bf16x3, bf16x6. All are CUDA-specific emulation modes that map
         # back to ieee on Metal, producing numerics the reference path

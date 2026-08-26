@@ -5183,11 +5183,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 op = obid.get(op.operand_ids[0])
             return op.id if op is not None else None
 
-        qh_i, kh_i, vh_i = _head_index(q_load), _head_index(k_load), _head_index(v_load)
-        if qh_i is None or kh_i is None or vh_i is None:
+        # Re-review 2026-08-25: the OUTPUT store's head index must ALSO match (a kernel
+        # writing O at off_h+1 otherwise routed and the template wrote the WRONG head).
+        qh_i, kh_i, vh_i, oh_i = (_head_index(q_load), _head_index(k_load),
+                                  _head_index(v_load), _head_index(stores[0]))
+        if qh_i is None or kh_i is None or vh_i is None or oh_i is None:
             return None
-        qh_c, kh_c, vh_c = _peel_core(qh_i), _peel_core(kh_i), _peel_core(vh_i)
-        if not (qh_c is not None and qh_c == kh_c == vh_c):
+        qh_c, kh_c, vh_c, oh_c = (_peel_core(qh_i), _peel_core(kh_i),
+                                  _peel_core(vh_i), _peel_core(oh_i))
+        if not (qh_c is not None and qh_c == kh_c == vh_c == oh_c):
             return None
 
         cuq = _cu_in_cone(q_load)
@@ -5197,6 +5201,48 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         cuq_idx, cuk_idx = next(iter(cuq)), next(iter(cuk))
         if cuq_idx == cuk_idx or {cuq_idx, cuk_idx} != cu_used:
             return None
+
+        # CU-LOAD PIN (re-review 2026-08-25): the token offset in each address must use the
+        # SEQUENCE-START cu load — the SUBTRAHEND of that pointer's seqlen subi
+        # (q_start = load(cu[b]); seqlen = load(cu[b+1]) - q_start). A kernel addressing Q
+        # at load(cu[b+1]) (or any other cu read) otherwise routed while the template
+        # hard-codes cu[b]. Pin Q + the output store to cu_q's subtrahend, K/V to cu_k's.
+        _start_load_of = {}
+        for _s, _p in seqlen_subis:
+            _sub_op = obid.get(_s.operand_ids[1])
+            if _sub_op is None or _sub_op.op != "tt.load":
+                return None
+            _start_load_of[_p.index] = _sub_op.id
+
+        def _cu_load_ids(load):
+            found = set()
+
+            def walk(oid, seen=None, d=0):
+                if seen is None:
+                    seen = set()
+                if oid in seen or d > 48:
+                    return
+                seen.add(oid)
+                o = obid.get(oid)
+                if o is None:
+                    return
+                if o.op == "tt.load":
+                    p = _load_ptr_arg(o)
+                    if p is not None and _is_int(getattr(p, "elem_type", None)):
+                        found.add(o.id)
+                for x in (o.operand_ids or []):
+                    walk(x, seen, d + 1)
+
+            walk(load.operand_ids[0])
+            return found
+
+        if _cu_load_ids(q_load) != {_start_load_of[cuq_idx]}:
+            return None
+        if _cu_load_ids(stores[0]) != {_start_load_of[cuq_idx]}:
+            return None
+        for _ld in (k_load, v_load):
+            if _cu_load_ids(_ld) != {_start_load_of[cuk_idx]}:
+                return None
 
         # CONVENTION GUARD (correct-or-refuse): the template assumes HEAD-INNER batch/head
         # packing -- h = bh % nheads, batch = bh // nheads. Verify off_h = remsi(pid, H) and
@@ -5273,27 +5319,47 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # scale on the dot RESULT) must NOT route -> refuse when no constant Q-scale is
         # found. Mirrors the dense FA detector's scale extraction (refuse-on-absent).
         _LAYOUT = ("ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-                   "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims")
-        scale = None
-        sid = d0.operand_ids[0]
-        seen2 = set()
-        while sid in obid and sid not in seen2:
-            seen2.add(sid)
-            sop = obid[sid]
-            if sop.op == "arith.mulf":
-                for oid in sop.operand_ids:
-                    sub = obid.get(oid)
-                    if sub is not None and sub.op == "arith.constant":
-                        val = sub.attrs.get("value")
-                        if isinstance(val, (int, float)):
-                            scale = float(val)
-                break
-            if sop.operand_ids and sop.op in _LAYOUT:
-                sid = sop.operand_ids[0]
-                continue
-            break
-        if scale is None:
+                   "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
+                   "arith.truncf", "arith.extf", "tt.fp_to_fp")
+
+        def _const_factors(oid):
+            """All arith.constant factors multiplied into this dot-operand cone (walked
+            through layout/cast ops and CHAINED mulfs, stopping at the load). Re-review
+            2026-08-25: the old walk baked only the FIRST mulf's constant, silently
+            DROPPING any other factor — a split scale (q*=a; k*=b, or q*a*b) mis-scaled."""
+            out = []
+            stack, seen3 = [oid], set()
+            while stack:
+                cur = stack.pop()
+                if cur in seen3:
+                    continue
+                seen3.add(cur)
+                op = obid.get(cur)
+                if op is None:
+                    continue
+                if op.op == "arith.mulf":
+                    for x in op.operand_ids or []:
+                        sub = obid.get(x)
+                        if sub is not None and sub.op == "arith.constant":
+                            val = sub.attrs.get("value")
+                            if isinstance(val, (int, float)):
+                                out.append(float(val))
+                                continue
+                        stack.append(x)
+                elif op.op in _LAYOUT and op.operand_ids:
+                    stack.append(op.operand_ids[0])
+                # anything else (tt.load, splat of a runtime scalar, ...) terminates
+            return out
+
+        _qf = _const_factors(d0.operand_ids[0])
+        _kf = _const_factors(d0.operand_ids[1])
+        _vf = _const_factors(d1.operand_ids[0]) + _const_factors(d1.operand_ids[1])
+        # Exactly ONE constant factor, on the Q side — the template bakes exactly that.
+        # A K-, V-, or P-side factor, or a second Q factor, would be silently dropped ->
+        # refuse (return None -> the dense path refuses loudly / generic computes correctly).
+        if len(_qf) != 1 or _kf or _vf:
             return None
+        scale = _qf[0]
 
         return {
             "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
@@ -5839,15 +5905,23 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _qz, _qh = _bh_offsets_dense(q_addr)
             _kz, _kh = _bh_offsets_dense(k_addr)
             _vz, _vh = _bh_offsets_dense(v_addr)
-            if not (_qh is None and _kh is None and _vh is None):
-                # multi-head: GQA (Q/K/V must share off_h) + convention (off_h=remsi(pid,H),
-                # off_z=divsi(pid,H), same H).
-                if _qh is None or _kh is None or _vh is None:
+            # Re-review 2026-08-25: the OUTPUT store's batch/head offsets must ALSO match —
+            # a kernel writing O at off_h+1 otherwise routed and the template wrote the
+            # WRONG head (the guard only compared the input loads).
+            _oz, _ohh = _bh_offsets_dense(stores[0].operand_ids[0])
+            if not (_qh is None and _kh is None and _vh is None and _ohh is None):
+                # multi-head: GQA (Q/K/V + store must share off_h AND off_z) + convention
+                # (off_h=remsi(pid,H), off_z=divsi(pid,H), same H).
+                if _qh is None or _kh is None or _vh is None or _ohh is None:
                     return None  # mixed multi/single head (e.g. MQA H_kv==1) -> refuse
-                _qc, _kc, _vc = (_peel_core_dense(_qh), _peel_core_dense(_kh),
-                                 _peel_core_dense(_vh))
-                if not (_qc is not None and _qc == _kc == _vc):
-                    return None  # GQA/MQA: K/V head index differs from Q -> refuse
+                _qc, _kc, _vc, _oc = (_peel_core_dense(_qh), _peel_core_dense(_kh),
+                                      _peel_core_dense(_vh), _peel_core_dense(_ohh))
+                if not (_qc is not None and _qc == _kc == _vc == _oc):
+                    return None  # GQA/MQA or store-head mismatch -> refuse
+                _zq, _zo = _peel_core_dense(_qz) if _qz is not None else None, \
+                    _peel_core_dense(_oz) if _oz is not None else None
+                if _zq is None or _zo is None or _zq != _zo:
+                    return None  # store batch offset differs from Q's -> refuse
                 _hH = _divmod_arg(_qh, ("arith.remsi", "arith.remui"))
                 _zH = _divmod_arg(_qz, ("arith.divsi", "arith.divui"))
                 if _hH is None or _zH is None or _hH != _zH:
@@ -6067,6 +6141,51 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             break
         if scale is None:
             _refuse("the softmax scale constant")
+
+        # SPLIT-SCALE GUARD (re-review 2026-08-25): the template bakes ONLY the Q-side
+        # constant. A kernel that also multiplies a constant into K, V, or a second Q
+        # factor (e.g. the sqrt-split ``q *= a; k *= b``) otherwise routed with that
+        # factor silently DROPPED (confirmed err ~2.0 at hd128). Scan every dot-operand
+        # cone (through layout/cast ops and chained mulfs, stopping at loads) and refuse
+        # on any constant factor beyond the single baked Q-side one.
+        _SG_LAYOUT = (
+            "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+            "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
+            "arith.truncf", "arith.extf", "tt.fp_to_fp",
+        )
+
+        def _sg_const_factors(oid):
+            out = []
+            stack, seen4 = [oid], set()
+            while stack:
+                cur = stack.pop()
+                if cur in seen4:
+                    continue
+                seen4.add(cur)
+                op4 = op_by_id.get(cur)
+                if op4 is None:
+                    continue
+                if op4.op == "arith.mulf":
+                    for x in op4.operand_ids or []:
+                        sub4 = op_by_id.get(x)
+                        if sub4 is not None and sub4.op == "arith.constant":
+                            v4 = sub4.attrs.get("value")
+                            if isinstance(v4, (int, float)):
+                                out.append(float(v4))
+                                continue
+                        stack.append(x)
+                elif op4.op in _SG_LAYOUT and op4.operand_ids:
+                    stack.append(op4.operand_ids[0])
+            return out
+
+        _sg_q = _sg_const_factors(dot_qk.operand_ids[0])
+        _sg_k = _sg_const_factors(dot_qk.operand_ids[1])
+        _sg_pv = _sg_const_factors(dot_pv.operand_ids[0]) + _sg_const_factors(dot_pv.operand_ids[1])
+        if len(_sg_q) != 1 or _sg_k or _sg_pv:
+            _refuse(
+                "a single Q-side softmax scale (a K/V-side or second constant factor "
+                "would be silently dropped by the template)"
+            )
 
         # --- out_dtype: the output pointer's element type --------------------
         out_arg = arg_by_id.get(self.graph.args[o_idx].id)
@@ -6875,6 +6994,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if rop is not None and rop.op == "tt.broadcast" and rop.operand_ids:
                 row_side = skip_layout(rop.operand_ids[0])
                 rop = op_by_id.get(row_side)
+            # SINGLE-addptr fused-offset form (the db store): the splat of the scalar base
+            # sits directly under the terminal addptr — return its scalar chain.
+            if rop is not None and rop.op == "tt.splat" and rop.operand_ids:
+                return rop.operand_ids[0]
             if rop is None or rop.op != "tt.addptr" or len(rop.operand_ids) < 2:
                 return None
             sb = op_by_id.get(rop.operand_ids[0])
@@ -6913,6 +7036,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _k_offs = _scalar_offsets(_scal_of(_k_addr0))
         if _q_offs is None or _k_offs is None or _q_offs != _k_offs:
             return None  # GQA/MQA or Q/K batch-head offset mismatch -> generic path
+
+        def _offs_match_q(addr_id, subset=False):
+            """Re-review 2026-08-25: the backward templates apply Q's scalar
+            (start_h, start_i) offsets to V, O/dO and EVERY gradient store — a V read or a
+            dK/dV/dQ store at a different head (e.g. pid_h+1) routed and was silently
+            mis-addressed. True iff this address's scalar offsets equal Q's (subset=True
+            for the head-only bias-gradient chain: its offsets must be a subset of Q's,
+            i.e. share the same head SSA)."""
+            if addr_id is None:
+                return False
+            _o = _scalar_offsets(_scal_of(addr_id))
+            if _o is None:
+                return False
+            return _o <= _q_offs if subset else _o == _q_offs
 
         # lse: the exp2 input is mulf(subf(scores, splat(lse)), inv_ln2). Find the
         # subf feeding an exp2 whose non-dot operand traces to a load.
@@ -7020,7 +7157,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # dP dot = dot(dO, Vᵀ): the dot (not scores) whose op0 load is one of
             # {O,dO} -> that's dO; op1 -> V. (tl.dot without an explicit acc still
             # emits a 3-operand tt.dot with a zero C, so match on op0/op1, not count.)
-            do_addr = v_res = None
+            do_addr = v_res = _v_addr_q = None
             for d in dots:
                 if d.id == scores_dot.id or len(d.operand_ids or []) < 2:
                     continue
@@ -7029,9 +7166,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if a0 is not None and a1 is not None and a0 in [c[0] for c in od_cands]:
                     do_addr = a0
                     v_res = resolve_2d(a1)
+                    _v_addr_q = a1
                     break
             if do_addr is None or v_res is None:
                 _refuse("the dO / V pointers (dP = dO @ Vᵀ)")
+            _o_addr_q = next(la for la, r in od_cands if la != do_addr)
+            if not (_offs_match_q(_v_addr_q) and _offs_match_q(do_addr) and _offs_match_q(_o_addr_q)):
+                return None  # V/dO/O batch-head offsets differ from Q's -> generic path
             do_res = next(r for la, r in od_cands if la == do_addr)
             o_res = next(r for la, r in od_cands if la != do_addr)
 
@@ -7053,16 +7194,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return False
                 return False
 
-            dlt_res = dq_res = None
+            dlt_res = dq_res = _dq_addr = None
             for st_ in stores:
                 if len(st_.operand_ids) > 1 and _traces_to_reduce(st_.operand_ids[1]):
                     dlt_res = resolve_1d(st_.operand_ids[0])
                 else:
                     dq_res = resolve_2d(st_.operand_ids[0])
+                    _dq_addr = st_.operand_ids[0]
             if dlt_res is None:
                 _refuse("the delta output store")
             if dq_res is None:
                 _refuse("the dQ output store")
+            if not _offs_match_q(_dq_addr):
+                return None  # dQ store batch-head offsets differ from Q's -> generic path
 
             # scale: sm_scale is folded into K (mulf with a splat of a float arg).
             scale_arg = None
@@ -7177,6 +7321,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             v_res = resolve_2d(v_addr)
             if do_res is None or v_res is None:
                 _refuse("the dO / V pointers (dP = dO @ Vᵀ)")
+            if not (_offs_match_q(v_addr) and _offs_match_q(do_addr)):
+                return None  # V/dO batch-head offsets differ from Q's -> generic path
 
             # delta LOADED: subf(dP_result, delta_load) -> the load.
             dlt_res = dlt_addr = None
@@ -7250,6 +7396,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
             if len(stores) != 1:
                 _refuse("a single dbias store")
+            if not _offs_match_q(stores[0].operand_ids[0], subset=True):
+                return None  # db store head offset differs from Q's -> generic path
             db_res = _resolve_db(stores[0].operand_ids[0])
             if db_res is None:
                 _refuse("the dbias store pointer")
@@ -7343,15 +7491,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse("the dO pointer (dV = Pᵀ @ dO)")
 
         # dP dot = dot(dO, Vᵀ): its FIRST operand's load == dO. V = 2nd operand's load.
-        v_res = None
+        v_res = _v_addr_kv = None
         for d in dots:
             if len(d.operand_ids or []) >= 2 and load_addr(d.operand_ids[0]) == do_addr:
-                cand = resolve_2d(load_addr(d.operand_ids[1]))
+                _va = load_addr(d.operand_ids[1])
+                cand = resolve_2d(_va)
                 if cand is not None and cand[0] not in (q_res[0], k_res[0], b_res[0], do_res[0]):
                     v_res = cand
+                    _v_addr_kv = _va
                     break
         if v_res is None:
             _refuse("the V pointer (dP = dO @ Vᵀ)")
+        if not (_offs_match_q(_v_addr_kv) and _offs_match_q(do_addr)):
+            return None  # V/dO batch-head offsets differ from Q's -> generic path
 
         # delta: dscores = P * (dP - delta). Find subf(dot_result, load) -> the load.
         dlt_res = None
@@ -7395,6 +7547,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             addr_r = resolve_2d(st_.operand_ids[0])
             if addr_r is None:
                 continue
+            if not _offs_match_q(st_.operand_ids[0]):
+                return None  # dK/dV store batch-head offsets differ from Q's -> generic path
             sc = _traces_scale_mul(st_.operand_ids[1]) if len(st_.operand_ids) > 1 else None
             if sc is not None and dk_res is None:
                 dk_res, scale_from_dk = addr_r, sc
