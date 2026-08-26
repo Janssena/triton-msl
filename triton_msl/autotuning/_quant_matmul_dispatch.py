@@ -221,27 +221,65 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
         # a stride index of -1 means the stride was folded to a compile-time 1.
         strides = [(int(kargs[i]) if i >= 0 else 1) for i in sidx]
         isr, isc, wsk, wsn, osr, osc, ssg, ssn = strides[0:8]
+        zsg, zsn = strides[8], strides[9]
+
+        # M/N POSITIONAL-SANITY + memory-safety gate (re-review 2026-08-25): the descriptor
+        # hard-codes m_idx/n_idx/k_idx = 5/6/7, but in the canonical maskless 2-D-grid
+        # kernel M and N are DEAD args — a kernel declaring them as (N, M, K) routed and the
+        # template then wrote/read OUT OF BOUNDS (partial output + NaN from OOB scale
+        # reads). There is no structural anchor for dead args, so anchor at RUNTIME: the
+        # furthest element each tensor is indexed at must lie inside that tensor. This makes
+        # the launch memory-safe unconditionally and refuses (fail-closed driver raise)
+        # every non-square M/N swap under standard layouts. Skipped only for negative
+        # strides (formula invalid; the scalar template doesn't support those anyway).
+        _g_s = descriptor[10] if len(descriptor) > 10 else None
+        if _g_s and all(_s >= 0 for _s in strides):
+            _ng = (K + _g_s - 1) // _g_s
+            _wrow = ((K - 1) // 2) * wsk if descriptor[0] == "pergroup_int4" else (K - 1) * wsk
+            _bounds = (
+                ((M - 1) * isr + (K - 1) * isc, kargs[0]),
+                (_wrow + (N - 1) * wsn, kargs[1]),
+                ((M - 1) * osr + (N - 1) * osc, kargs[2]),
+                ((_ng - 1) * ssg + (N - 1) * ssn, kargs[3]),
+                ((_ng - 1) * zsg + (N - 1) * zsn, kargs[4]),
+            )
+            for _mx, _t in _bounds:
+                if hasattr(_t, "numel") and _mx >= _t.numel():
+                    return False
 
         # FAST simdgroup-MMA per-group path (descriptor[6..10] = fast_msl, rr, rc, bk,
         # group_size), selected ONLY when the runtime shape meets its contract: contiguous
         # row-major input [M,K] / weight [K,N] kn (for int4, packed [K/2,N] with byte-row
-        # stride wsk==N) / output [M,N], and aligned M/N/K/group. Otherwise fall through to
-        # the stride-generic scalar kernel below (correct for any layout).
+        # stride wsk==N) / output [M,N], aligned M/N/K/group, and ZEROS laid out like the
+        # SCALES (the fast MSL indexes zeros with ssg/ssn — re-review 2026-08-25: a zeros
+        # tensor with its own layout, e.g. GPTQ qzeros transposed vs scales, was silently
+        # mis-indexed, err ~3.6-6.5). Otherwise fall through to the stride-generic scalar
+        # kernel below (correct for any layout — it consumes zsg/zsn separately).
         _fast = descriptor[6] if len(descriptor) > 6 else None
         if _fast is not None and descriptor[0] in ("pergroup_int8", "pergroup_int4") and not rt.is_unsupported(_fast):
-            rr, rc, bk, g_s = descriptor[7], descriptor[8], descriptor[9], descriptor[10]
-            tm, tn = 8 * rr, 8 * rc
-            if (M % tm == 0 and N % tn == 0 and K % bk == 0 and g_s % bk == 0
-                    and isc == 1 and wsn == 1 and osc == 1
-                    and isr == K and wsk == N and osr == N):
-                _fkname = "int4_matmul_pergroup_fast" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup_fast"
-                flib = rt.get_library(_fast)
-                fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
-                fthreads = (M // tm) * (N // tn) * 32
-                rt.dispatch(flib, _fkname, fbuf, threads=fthreads, group_size=32)
-                if launch_exit_hook:
-                    launch_exit_hook(launch_metadata)
-                return True
+            try:
+                rr, rc, bk, g_s = descriptor[7], descriptor[8], descriptor[9], descriptor[10]
+                tm, tn = 8 * rr, 8 * rc
+                if (M % tm == 0 and N % tn == 0 and K % bk == 0 and g_s % bk == 0
+                        and isc == 1 and wsn == 1 and osc == 1
+                        and isr == K and wsk == N and osr == N
+                        and zsg == ssg and zsn == ssn):
+                    _fkname = "int4_matmul_pergroup_fast" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup_fast"
+                    flib = rt.get_library(_fast)
+                    fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
+                    fthreads = (M // tm) * (N // tn) * 32
+                    rt.dispatch(flib, _fkname, fbuf, threads=fthreads, group_size=32)
+                    if launch_exit_hook:
+                        launch_exit_hook(launch_metadata)
+                    return True
+            except Exception:  # noqa: BLE001
+                # A fast-path failure (e.g. compile error) must not kill the launch: mark
+                # the fast MSL unsupported (no per-launch retry) and fall through to the
+                # scalar per-group kernel in the same descriptor (correct for any layout).
+                try:
+                    rt.mark_unsupported(_fast)
+                except Exception:  # noqa: BLE001
+                    pass
 
         buffers = list(kargs[0:5]) + [M, N, K] + strides
         lib = rt.get_library(pg_msl)

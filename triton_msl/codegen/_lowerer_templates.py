@@ -2955,6 +2955,13 @@ class _TemplateMixin:
             return None
         if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
             return None
+        # SCALE/ZERO dtype (re-review 2026-08-25): the templates declare
+        # ``device const float*`` for scale/zero pointers — a non-f32 tensor (e.g. GPTQ's
+        # fp16 scales) would be reinterpreted as float bits (garbage, no error). Refuse
+        # the quant route; the generic lowering handles half/bf16 loads correctly.
+        for _sza in (args[3:4] + args[4:5]):
+            if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in ("fp32", "f32", "float"):
+                return None
 
         # --- Runtime stride contract: make_int8_gemv reads weight[n*K + k], so the
         #     weight row stride (args[7]) must equal K (args[6]) at dispatch. ---
@@ -3128,6 +3135,15 @@ class _TemplateMixin:
             if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
                 return None
             if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+                return None
+            # SCALE/ZERO dtype (re-review 2026-08-25): every quant template declares
+            # ``device const float*`` for scales/zeros, so a non-f32 scale/zero tensor
+            # (e.g. GPTQ's fp16 scales) would be REINTERPRETED as float bits — garbage
+            # output with no error. Refuse the quant route; the generic lowering loads
+            # half/bf16 correctly.
+            if _mlir_to_triton_dtype(args[3].elem_type) not in ("fp32", "f32", "float"):
+                return None
+            if _mlir_to_triton_dtype(args[4].elem_type) not in ("fp32", "f32", "float"):
                 return None
             # A packed int4 weight and an int8 weight BOTH report signless i8, so distinguish
             # by STRUCTURE: int4 unpacks a nibble (andi 0xF over shrui by (k%2)*4) from a byte
@@ -3408,6 +3424,13 @@ class _TemplateMixin:
             return None
         if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
             return None
+        # SCALE/ZERO dtype (re-review 2026-08-25): the templates declare
+        # ``device const float*`` for scale/zero pointers — a non-f32 tensor (e.g. GPTQ's
+        # fp16 scales) would be reinterpreted as float bits (garbage, no error). Refuse
+        # the quant route; the generic lowering handles half/bf16 loads correctly.
+        for _sza in (args[3:4] + args[4:5]):
+            if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in ("fp32", "f32", "float"):
+                return None
 
         # --- Runtime stride contract. The fast kernel hard-codes row-major addressing:
         #       input[m*K + k]  -> A row stride == K (args[7])
@@ -3523,6 +3546,10 @@ class _TemplateMixin:
         if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
             return None
         if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+            return None
+        # SCALE dtype (re-review 2026-08-25): the template declares ``device const float*``
+        # for the scale — a non-f32 scale (e.g. fp16) would be reinterpreted as float bits.
+        if getattr(args[3], "is_ptr", False) and _mlir_to_triton_dtype(args[3].elem_type) not in ("fp32", "f32", "float"):
             return None
 
         try:

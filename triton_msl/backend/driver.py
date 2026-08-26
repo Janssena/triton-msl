@@ -614,7 +614,18 @@ class MetalLauncher:
                             return
 
                     # --- Existing elementwise 1-D-grid fast path (needs self._msl) ---
-                    if self._msl is not None and not _rt.is_unsupported(self._msl):
+                    # FAIL-CLOSED kernels must NOT take this path: a quantized (or MLA)
+                    # kernel's self._msl has a template ABI the positional 1-thread-per-
+                    # element dispatch mis-binds (re-review 2026-08-25: a quant launch the
+                    # dequant dispatch declined — e.g. the M/N-swap bounds gate — fell
+                    # through HERE when its grid was 1-D and ran the template mis-bound:
+                    # garbage output instead of the refusal below).
+                    if (
+                        self._msl is not None
+                        and not _rt.is_unsupported(self._msl)
+                        and not _quant_unhandled
+                        and not _mla_unhandled
+                    ):
                         # Every NON-tensor scalar arg must have a compile_shader-safe
                         # declared type (fp16/bf16 scalars mis-bind to 0.0). (Fix 4.)
                         scalars_ok = _compile_shader_scalars_ok(self, kargs)
