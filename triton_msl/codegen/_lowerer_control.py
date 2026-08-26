@@ -141,7 +141,84 @@ class _ControlFlowMixin:
             init_total = 1
             for d in init_shape:
                 init_total *= d
-            if len(init_shape) >= 2 and init_total > bs:
+            if len(init_shape) >= 2 and init_total > bs and getattr(self, "_needs_wrapping", False):
+                # WRAP regime (GitHub issue #4.4): the whole scf.for body is emitted INSIDE
+                # the per-element ``for _loop_e`` loop, so the cooperative smem representation
+                # below would re-init + re-accumulate the tile once PER ELEMENT (broken MSL /
+                # wrong numbers). The correct representation here is the per-element SCALAR
+                # fallback: each ``_loop_e`` iteration is one independent element, so a plain
+                # ``float iter_N`` declared inside the wrap loop accumulates exactly that
+                # element. That is only valid when the loop uses the accumulator ELEMENTWISE —
+                # verify by tainting the block-arg + result and walking all ops: any
+                # cross-element consumer (reduce/dot/trans/broadcast/expand_dims/...) of an
+                # accumulator-derived value refuses loudly (correct-or-refuse) instead of
+                # reaching Metal as a cryptic compile error.
+                _ba_ids = ssa.attrs.get("block_arg_ids", [])
+                _taint = set()
+                if i + 1 < len(_ba_ids):
+                    _taint.add(_ba_ids[i + 1])
+                if ssa.result_ids and i < len(ssa.result_ids):
+                    _taint.add(ssa.result_ids[i])
+                elif ssa.id is not None:
+                    _taint.add(ssa.id)
+                # Ops that keep a value per-element under the wrap loop. arith./math. are
+                # elementwise; convert_layout is a layout no-op in this pipeline; addptr/load
+                # are lowered per-element; store/yield are the sinks.
+                _PASS_OK = {
+                    "ttg.convert_layout",
+                    "tt.store",
+                    "scf.yield",
+                    "tt.bitcast",
+                    "tt.fp_to_fp",
+                    "tt.addptr",
+                    "tt.load",
+                }
+
+                def _elemwise_taint_walk(ops):
+                    for _o in ops:
+                        if any(x in _taint for x in (_o.operand_ids or [])):
+                            if _o.op.startswith(("arith.", "math.")) or _o.op in _PASS_OK:
+                                _taint.add(_o.id)
+                            elif _o.op == "scf.for":
+                                # A NESTED loop carrying the accumulator: its classifier run
+                                # diverts the same way (per-element scalar), so taint flows
+                                # through — propagate to the matching block-arg + result and
+                                # allow. Tainted LOOP BOUNDS (operand 0..2) would be a
+                                # cross-element scalar dependency -> refuse.
+                                _n_ba = _o.attrs.get("block_arg_ids", []) if _o.attrs else []
+                                _n_rid = _o.result_ids or []
+                                for _k, _x in enumerate(_o.operand_ids or []):
+                                    if _x in _taint:
+                                        if _k < 3:
+                                            return False  # tainted bound/step
+                                        _j = _k - 3
+                                        if _j + 1 < len(_n_ba):
+                                            _taint.add(_n_ba[_j + 1])
+                                        if _j < len(_n_rid):
+                                            _taint.add(_n_rid[_j])
+                            else:
+                                return False
+                        if _o.region_ops and not _elemwise_taint_walk(_o.region_ops):
+                            return False
+                        if _o.else_ops and not _elemwise_taint_walk(_o.else_ops):
+                            return False
+                    return True
+
+                if not _elemwise_taint_walk(self.graph.ops):
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    raise MetalNonRecoverableError(
+                        f"a {init_shape[0]}x{init_shape[1]} loop-carried accumulator "
+                        f"({init_total} elements) with only {bs} threads is consumed by a "
+                        "non-elementwise op (reduce/dot/broadcast/...); the fewer-threads-"
+                        "than-tile lowering supports elementwise accumulation only. Launch "
+                        f"with num_warps = BLOCK/32 so the threadgroup covers the tile, or "
+                        "reduce the tile (GitHub issue #4.4).",
+                        op_name="scf.for",
+                    )
+                # Elementwise-safe: FALL THROUGH to the scalar fallback below — a plain
+                # per-element scalar inside the wrap loop is the correct lowering.
+            elif len(init_shape) >= 2 and init_total > bs:
                 # Allocate persistent shared memory for this iter_arg
                 smem_name = f"smem_iter_{self._shared_counter}"
                 self._shared_counter += 1
