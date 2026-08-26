@@ -2745,6 +2745,13 @@ class _TemplateMixin:
             return None
         if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8", "uint8", "u8"):
             return None
+        # make_int4_gemv declares scale/zero as ``device const float*``. Refuse a
+        # half/bfloat buffer instead of reinterpreting its bits as fp32 in the template.
+        for _sza in (args[3:4] + args[4:5]):
+            if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in (
+                "fp32", "f32", "float",
+            ):
+                return None
 
         # --- weight/scale row-stride arg indices (verified at dispatch: w_row == K/2,
         #     s_row == ng == K/group). Traced from the [N,1] row-offset muli. ---

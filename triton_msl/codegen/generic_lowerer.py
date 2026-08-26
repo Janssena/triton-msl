@@ -5208,10 +5208,111 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # at load(cu[b+1]) (or any other cu read) otherwise routed while the template
         # hard-codes cu[b]. Pin Q + the output store to cu_q's subtrahend, K/V to cu_k's.
         _start_load_of = {}
+
+        def _int_constant(oid):
+            op = obid.get(oid)
+            if op is None or op.op != "arith.constant":
+                return None
+            try:
+                return int(str((op.attrs or {}).get("value", "")).split(":")[0].strip())
+            except (TypeError, ValueError):
+                return None
+
+        def _canonical_cu_pair(seqlen_subi, cu_arg):
+            """Classify an exact adjacent CU pair by its batch-index convention."""
+            end_load = obid.get(seqlen_subi.operand_ids[0])
+            start_load = obid.get(seqlen_subi.operand_ids[1])
+            if end_load is None or start_load is None:
+                return "unrecognized"
+            end_addr = obid.get(end_load.operand_ids[0]) if end_load.operand_ids else None
+            start_addr = obid.get(start_load.operand_ids[0]) if start_load.operand_ids else None
+            if (
+                end_addr is None
+                or start_addr is None
+                or end_addr.op != "tt.addptr"
+                or start_addr.op != "tt.addptr"
+                or len(end_addr.operand_ids or []) != 2
+                or len(start_addr.operand_ids or []) != 2
+                or start_addr.operand_ids[0] != getattr(cu_arg, "id", None)
+            ):
+                return "unrecognized"
+
+            def _base_plus_constant(oid):
+                """Return an exact ``(base SSA, constant)`` for base or base+constant."""
+                core_id = _peel_core(oid)
+                core = obid.get(core_id)
+                seen = set()
+                while (
+                    core is not None
+                    and core.id not in seen
+                    and core.op in ("arith.extui", "arith.extsi", "arith.index_cast")
+                    and len(core.operand_ids or []) == 1
+                ):
+                    seen.add(core.id)
+                    core_id = _peel_core(core.operand_ids[0])
+                    core = obid.get(core_id)
+                if core is None or core.op != "arith.addi" or len(core.operand_ids or []) != 2:
+                    return core_id, 0
+                lhs, rhs = core.operand_ids
+                lhs_c, rhs_c = _int_constant(lhs), _int_constant(rhs)
+                if lhs_c is not None and rhs_c is None:
+                    return rhs, lhs_c
+                if rhs_c is not None and lhs_c is None:
+                    return lhs, rhs_c
+                return None
+
+            batch_off = start_addr.operand_ids[1]
+            start_form = _base_plus_constant(batch_off)
+            if start_form is None:
+                return "unrecognized"
+            batch_base, start_delta = start_form
+
+            # Triton emits canonical ``cu + b + 1`` as addptr(addptr(cu, b), 1).
+            if end_addr.operand_ids[0] == start_addr.id:
+                adjacent = _int_constant(end_addr.operand_ids[1]) == 1
+            else:
+                # Also accept the equivalent fused form addptr(cu, addi(b, 1)). Keep the
+                # relationship SSA-exact: both indices must reduce to the same base with
+                # constants differing by exactly one.
+                adjacent = False
+                if end_addr.operand_ids[0] == getattr(cu_arg, "id", None):
+                    end_form = _base_plus_constant(end_addr.operand_ids[1])
+                    if end_form is not None:
+                        end_base, end_delta = end_form
+                        adjacent = end_base == batch_base and end_delta == start_delta + 1
+            if not adjacent:
+                return "unrecognized"
+
+            core = obid.get(_peel_core(batch_base))
+            if core is None or len(core.operand_ids or []) != 2:
+                return "unrecognized"
+            divisor = _trace_to_arg(core.operand_ids[1])
+            pid_h = (
+                _cone_has(
+                    core.operand_ids[0],
+                    lambda o: o.op in ("tt.get_program_id", "tt.program_id"),
+                )
+                and divisor is not None
+                and divisor.index == H_arg.index
+            )
+            if core.op in ("arith.divsi", "arith.divui") and pid_h:
+                return "canonical" if start_delta == 0 else "shifted"
+            if core.op in ("arith.remsi", "arith.remui") and pid_h and start_delta == 0:
+                return "batch_inner"
+            return "unrecognized"
+
         for _s, _p in seqlen_subis:
             _sub_op = obid.get(_s.operand_ids[1])
-            if _sub_op is None or _sub_op.op != "tt.load":
+            _pair_kind = _canonical_cu_pair(_s, _p)
+            if _sub_op is None or _sub_op.op != "tt.load" or _pair_kind == "unrecognized":
                 return None
+            if _pair_kind == "batch_inner":
+                return None
+            if _pair_kind == "shifted":
+                raise MetalNonRecoverableError(
+                    "varlen FlashAttention cannot route a proven shifted cu_seqlens "
+                    "convention; the generic fallback is not yet safe for this dot layout."
+                )
             _start_load_of[_p.index] = _sub_op.id
 
         def _cu_load_ids(load):
@@ -5949,10 +6050,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                                       _peel_core_dense(_vh), _peel_core_dense(_ohh))
                 if not (_qc is not None and _qc == _kc == _vc == _oc):
                     return None  # GQA/MQA or store-head mismatch -> refuse
-                _zq, _zo = _peel_core_dense(_qz) if _qz is not None else None, \
-                    _peel_core_dense(_oz) if _oz is not None else None
-                if _zq is None or _zo is None or _zq != _zo:
-                    return None  # store batch offset differs from Q's -> refuse
+                _zq, _zk, _zv, _zo = (
+                    _peel_core_dense(_off) if _off is not None else None
+                    for _off in (_qz, _kz, _vz, _oz)
+                )
+                if _zq is None or not (_zq == _zk == _zv == _zo):
+                    return None  # K/V/store batch offset differs from Q's -> refuse
                 _hH = _divmod_arg(_qh, ("arith.remsi", "arith.remui"))
                 _zH = _divmod_arg(_qz, ("arith.divsi", "arith.divui"))
                 if _hH is None or _zH is None or _hH != _zH:
@@ -7052,6 +7155,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return oid  # the offset SSA (off_h / off_z)
                 return None
 
+            # Preserve the address-chain order: for the canonical
+            # ptr + h*stride_h + z*stride_z form this is (z_off, h_off).
             offs = []
             o1 = _muli_off(scal.operand_ids[1])
             if o1 is not None:
@@ -7061,7 +7166,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 o2 = _muli_off(inner.operand_ids[1])
                 if o2 is not None:
                     offs.append(o2)
-            return frozenset(offs)
+            return tuple(offs)
 
         _q_offs = _scalar_offsets(_scal_of(_q_addr0))
         _k_offs = _scalar_offsets(_scal_of(_k_addr0))
@@ -7080,7 +7185,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _o = _scalar_offsets(_scal_of(addr_id))
             if _o is None:
                 return False
-            return _o <= _q_offs if subset else _o == _q_offs
+            if subset:
+                # Bias-gradient addresses carry only the head leg. In a full
+                # canonical (z, h) pair it is the inner/second entry; _bwd_b's
+                # Q itself is head-only, so its singleton pair must match exactly.
+                if len(_q_offs) == 1:
+                    return _o == _q_offs
+                return len(_o) == 1 and len(_q_offs) == 2 and _o[0] == _q_offs[1]
+            return _o == _q_offs
 
         # lse: the exp2 input is mulf(subf(scores, splat(lse)), inv_ln2). Find the
         # subf feeding an exp2 whose non-dot operand traces to a load.

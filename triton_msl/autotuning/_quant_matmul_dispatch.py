@@ -179,11 +179,28 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_m
             return False
         _s = lambda i: (int(kargs[i]) if i >= 0 else 1)
         scale = kargs[3]
+        strides = tuple(_s(i) for i in (isr, isc, wsk, wsn, osr, osc, ssn_idx))
+        isr_v, isc_v, wsk_v, wsn_v, osr_v, osc_v, ssn_v = strides
+
+        # M/N POSITIONAL-SANITY + memory-safety gate, matching the asymmetric
+        # per-group path but omitting its real zeros tensor. M/N are dead in the
+        # recognized Triton body, so prove the positional interpretation at runtime
+        # against every buffer extent before launching the hard-coded template ABI.
+        if all(s >= 0 for s in strides):
+            bounds = (
+                ((M - 1) * isr_v + (K - 1) * isc_v, kargs[0]),
+                ((K - 1) * wsk_v + (N - 1) * wsn_v, kargs[1]),
+                ((M - 1) * osr_v + (N - 1) * osc_v, kargs[2]),
+                ((N - 1) * ssn_v, scale),
+            )
+            for max_index, tensor in bounds:
+                if hasattr(tensor, "numel") and max_index >= tensor.numel():
+                    return False
+
         zeros = _torch.zeros(1, dtype=getattr(scale, "dtype", None), device=getattr(scale, "device", None))
         # input(0), weight(1), output(2), scale(3), zeros(synth,4), M,N,K, strides...
         buffers = list(kargs[0:4]) + [zeros, M, N, K,
-                                      _s(isr), _s(isc), _s(wsk), _s(wsn), _s(osr), _s(osc),
-                                      0, _s(ssn_idx), 0, 0]  # ssg=0, ssn, zsg=0, zsn=0
+                                      *strides[:6], 0, ssn_v, 0, 0]  # ssg=0, ssn, zsg=0, zsn=0
         lib = rt.get_library(pg_msl)
         _grp = 256
         threads = _math.ceil((M * N) / _grp) * _grp
