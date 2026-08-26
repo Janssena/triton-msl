@@ -5244,6 +5244,32 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if _cu_load_ids(_ld) != {_start_load_of[cuk_idx]}:
                 return None
 
+        # MAX_SEQLEN BOUND (re-review 2026-08-25 V1): the kernel's kv loop runs to its own
+        # ``max_seqlen`` ARG (masking kn < seqlen_k), i.e. it attends min(seqlen_k,
+        # max_seqlen) keys — but the templates looped to seqlen_k unconditionally, silently
+        # attending MORE keys whenever max_seqlen < seqlen_k (err ~0.6-0.8). Resolve the
+        # scf.for upper bound to its arg so the templates can clamp; unresolvable -> refuse.
+        _ms_arg = None
+        for _sf in ops:
+            if _sf.op != "scf.for" or len(_sf.operand_ids or []) < 2:
+                continue
+            _b = _sf.operand_ids[1]
+            for _ in range(8):
+                if _b in argid:
+                    break
+                _bo = obid.get(_b)
+                if _bo is None or not _bo.operand_ids:
+                    break
+                _b = _bo.operand_ids[0]
+            _a = argid.get(_b)
+            if _a is None or _a.is_ptr:
+                return None  # kv-loop bound isn't a plain scalar arg -> refuse
+            if _ms_arg is not None and _ms_arg != _a.index:
+                return None  # multiple loops with different bounds -> refuse
+            _ms_arg = _a.index
+        if _ms_arg is None:
+            return None
+
         # CONVENTION GUARD (correct-or-refuse): the template assumes HEAD-INNER batch/head
         # packing -- h = bh % nheads, batch = bh // nheads. Verify off_h = remsi(pid, H) and
         # the cu_seqlens batch offset = divsi(pid, H), same H. A batch-inner kernel
@@ -5365,7 +5391,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
                       "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
             "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
-            "causal": causal, "q": q, "k": k, "v": v, "o": o,
+            "max_seqlen": _ms_arg, "causal": causal, "q": q, "k": k, "v": v, "o": o,
         }
 
     def _lower_varlen_flash_attention(self, info: dict) -> str:
@@ -5422,7 +5448,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         q, k, v, o = info["q"], info["k"], info["v"], info["o"]
         bindings = {
             "Q": "Q", "K": "K", "V": "V", "O": "Out", "CUQ": "CUQ", "CUK": "CUK",
-            "H": _uint_expr(info["H"]),
+            "H": _uint_expr(info["H"]), "MAXS": _uint_expr(info["max_seqlen"]),
             "q_st": _uint_expr(q[0]), "q_sh": _uint_expr(q[1]), "q_sk": _uint_expr(q[2]),
             "k_st": _uint_expr(k[0]), "k_sh": _uint_expr(k[1]), "k_sk": _uint_expr(k[2]),
             "v_st": _uint_expr(v[0]), "v_sh": _uint_expr(v[1]), "v_sk": _uint_expr(v[2]),
@@ -5430,11 +5456,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         }
         # FAST PATH: the register-O simdgroup-MMA varlen kernel (~7.6x the scalar one-thread-
         # per-row template at D=64, ~4x pad+SDPA; ~1.4x pad+SDPA at D=128) when eligible —
-        # fp16 in/out, head_dim %% 8 == 0, and the tg tiles fit the 32KB budget (head_dim <=
-        # 128: 32/64/128). It stages Q/K/V into threadgroup memory before the MMA so ANY
-        # global strides work, and keeps O register-resident (diag-MMA rescale) so no tg_O.
-        # fp16-only (half-staged tiles = fp16 accumulate); fp32 / non-%8 / head_dim > 128 stay
-        # on the scalar template (true fp32, arbitrary head_dim). Correct-or-fast: else scalar.
+        # fp16/bf16 (2-byte tiles, BN=32, hd<=128) or fp32 (TRUE float tiles, BN=16,
+        # hd<=~112), head_dim %% 8 == 0, tiles within the 32KB tg budget. Q/K/V stage into
+        # threadgroup memory before the MMA so ANY global strides work; O stays register-
+        # resident (diag-MMA rescale). Ineligible dims fall to the scalar template.
         D = info["head_dim"]
         # register-O MMA tg budget, matching make_varlen_flash_attention_mma: fp16/bf16 use
         # 2-byte tiles at BN=32; fp32 uses true float tiles at BN=16 (so the doubled bytes
@@ -5453,6 +5478,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self.effective_block_size = 128
             self._flash_attention = ("flash_attention", msl, 128)
         else:
+            if 2 * 32 * D * 4 > 32768:  # scalar template stages float tg_K/tg_V tiles
+                raise MetalNonRecoverableError(
+                    f"varlen FlashAttention head_dim={D} exceeds the scalar template's "
+                    "32KB threadgroup budget (float K/V tiles); refusing at lowering "
+                    "rather than failing at Metal pipeline creation. Use head_dim <= 128."
+                )
             msl = make_varlen_flash_attention(
                 head_dim=D, causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,

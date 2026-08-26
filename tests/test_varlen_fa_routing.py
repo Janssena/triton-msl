@@ -233,6 +233,52 @@ def test_varlen_bf16_mma(D, causal):
 
 
 @requires_mps
+@pytest.mark.parametrize("dt,tol", [(torch.float16, 2e-2), (torch.float32, 1e-4)])
+def test_varlen_max_seqlen_clamp(dt, tol):
+    # Re-review 2026-08-25 V1: the kernel's kv loop runs to its own max_seqlen ARG, i.e. it
+    # attends min(seqlen_k, max_seqlen) keys — the templates used to loop to seqlen_k and
+    # silently attended MORE keys whenever max_seqlen was smaller (err ~0.6-0.9). The
+    # templates now clamp to the kernel's own bound. Grid covers cdiv(max_seqlen, BM)
+    # query blocks, so rows past it stay unwritten (zero) — exactly the kernel's semantics.
+    dev = "mps"; torch.manual_seed(0)
+    H, D = 2, 64
+    cu = torch.tensor([0, 48], device=dev, dtype=torch.int32)
+    T, MAXS = 48, 32
+    scale = 1.0 / math.sqrt(D)
+    q = torch.randn(T, H, D, device=dev, dtype=dt); k = torch.randn(T, H, D, device=dev, dtype=dt)
+    v = torch.randn(T, H, D, device=dev, dtype=dt); o = torch.zeros(T, H, D, device=dev, dtype=dt)
+    _varlen_fwd[(triton.cdiv(MAXS, 32), H)](
+        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+        H, MAXS, scale, 32, 32, D)
+    torch.mps.synchronize()
+    ref = torch.zeros_like(o)
+    for h in range(H):
+        sc = (q[:MAXS, h].float() @ k[:MAXS, h].float().T) * scale
+        ref[:MAXS, h] = (torch.softmax(sc, -1) @ v[:MAXS, h].float()).to(ref.dtype)
+    err = (o.float() - ref.float()).abs().max().item()
+    assert err < tol, f"max_seqlen clamp violated (attended keys past the kernel's bound): err {err:.2e}"
+    assert (o[MAXS:] == 0).all(), "rows past the launched grid were written"
+
+
+@requires_mps
+def test_varlen_hd_over_128_refuses_cleanly():
+    # Re-review 2026-08-25 V3: head_dim > 128 exceeds the scalar template's 32KB tg budget;
+    # this used to reach Metal pipeline creation as a raw OutOfResources failure. It now
+    # refuses at lowering (MetalNonRecoverableError -> clean fallback) or computes.
+    D = 256  # > 128 (power of 2 for tl.arange): overflows both varlen tg budgets
+    scale = 1.0 / math.sqrt(D)
+    try:
+        q, k, v, o, cu_q, cu_k = _run_varlen(_varlen_fwd, [40, 24], [40, 24], 2, D, torch.float32, scale)
+    except MetalNonRecoverableError:
+        return  # clean refusal — the goal
+    except Exception as e:  # noqa: BLE001
+        pytest.fail(f"hd>128 died with a raw {type(e).__name__} instead of a clean refusal")
+    ref = _ref_varlen(q, k, v, cu_q, cu_k, 2, D, scale)
+    err = (o - ref).abs().max().item()
+    assert err < 1e-3
+
+
+@requires_mps
 def test_varlen_cross_attention_seqlens():
     # seqlen_q != seqlen_k per batch (cross attention) — cu_q and cu_k differ.
     D = 64

@@ -132,8 +132,13 @@ class _ControlFlowMixin:
             init_val = self._lookup(init_id)
             # Prefer result type, fall back to init value type
             init_type = self.env_types.get(init_id, "fp32")
-            # Use result type if it's more specific (e.g., i64 vs i32)
-            if result_elem in ("i64",) and init_type in ("i32", "fp32"):
+            # Use result type if it's more specific (e.g., i64 vs i32). INTEGER inits only:
+            # ``result_elem`` is the FIRST result's element type applied to EVERY iter-arg,
+            # so an i64 counter carried FIRST used to "upgrade" a co-carried fp32
+            # accumulator to ``long`` — truncating the float every iteration (re-review
+            # 2026-08-25 F1: order-dependent silent-wrong, acc_err ~2.8). A float init
+            # keeps its own type.
+            if result_elem in ("i64",) and init_type == "i32":
                 init_type = result_elem
 
             # Check if this iter_arg is a 2D tensor too large for scalar
@@ -176,6 +181,24 @@ class _ControlFlowMixin:
 
                 def _elemwise_taint_walk(ops):
                     for _o in ops:
+                        if _o.op == "scf.if":
+                            # Walk the branches FIRST (their scf.yields taint via _PASS_OK),
+                            # then propagate any tainted branch-yield to the if's results —
+                            # otherwise a consumer of the if RESULT escaped the walk
+                            # (re-review 2026-08-25 F3; benign today only because every
+                            # order-changing consumer also exits the wrap regime).
+                            if _o.region_ops and not _elemwise_taint_walk(_o.region_ops):
+                                return False
+                            if _o.else_ops and not _elemwise_taint_walk(_o.else_ops):
+                                return False
+                            _yld = [y for y in list(_o.region_ops or []) + list(_o.else_ops or [])
+                                    if y.op == "scf.yield"]
+                            if any(y.id in _taint or any(x in _taint for x in (y.operand_ids or []))
+                                   for y in _yld):
+                                _taint.add(_o.id)
+                                for _rid in (_o.result_ids or []):
+                                    _taint.add(_rid)
+                            continue
                         if any(x in _taint for x in (_o.operand_ids or [])):
                             if _o.op.startswith(("arith.", "math.")) or _o.op in _PASS_OK:
                                 _taint.add(_o.id)
@@ -254,6 +277,8 @@ class _ControlFlowMixin:
                     msl_type = "float"
                 elif init_type in ("i64",):
                     msl_type = "long"
+                elif init_type in ("u64", "ui64"):
+                    msl_type = "ulong"  # 32-bit uint would truncate (mirrors _lower_scf_if)
                 elif init_type.startswith("u"):
                     msl_type = "uint"
                 else:
@@ -285,6 +310,8 @@ class _ControlFlowMixin:
                 msl_type = "float"
             elif init_type in ("i64",):
                 msl_type = "long"
+            elif init_type in ("u64", "ui64"):
+                msl_type = "ulong"  # 32-bit uint would truncate (mirrors _lower_scf_if)
             elif init_type.startswith("u"):
                 msl_type = "uint"
             else:

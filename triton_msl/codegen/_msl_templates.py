@@ -4938,6 +4938,12 @@ def make_varlen_flash_attention(
     if missing:
         raise ValueError(f"varlen FA bindings missing {missing}")
     b = bindings
+    # MAXS = the kernel's own kv-loop bound (max_seqlen arg): the kernel attends
+    # min(seqlen_k, max_seqlen) keys, so the template must clamp identically (re-review
+    # 2026-08-25: looping to seqlen_k silently attended MORE keys when max_seqlen was
+    # smaller). Route-only default (no MAXS binding) = seqlen_k, the old behavior.
+    _maxs = b.get("MAXS")
+    kmax_expr = f"min(seqlen_k, uint({_maxs}))" if _maxs else "seqlen_k"
     causal_guard = "&& (qrow >= krow)" if causal else ""
     sig = ",\n".join(arg_decls)
     return f"""#include <metal_stdlib>
@@ -4980,10 +4986,11 @@ kernel void {kernel_name}(
     threadgroup float tg_K[{BN} * {D}];
     threadgroup float tg_V[{BN} * {D}];
 
-    for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
+    uint kmax = {kmax_expr};
+    for (uint kt = 0u; kt < kmax; kt += BN) {{
         for (uint e = lid; e < BN * D; e += BM) {{
             uint kk = e / D, dd = e % D; uint krow = kt + kk;
-            bool kv = (krow < seqlen_k);
+            bool kv = (krow < kmax);
             tg_K[e] = kv ? float({b['K']}[(k_start + krow) * k_st + h * k_sh + dd * k_sk]) : 0.0f;
             tg_V[e] = kv ? float({b['V']}[(k_start + krow) * v_st + h * v_sh + dd * v_sk]) : 0.0f;
         }}
@@ -4991,7 +4998,7 @@ kernel void {kernel_name}(
         if (valid) {{
             for (uint kk = 0u; kk < BN; kk++) {{
                 uint krow = kt + kk;
-                if (krow < seqlen_k {causal_guard}) {{
+                if (krow < kmax {causal_guard}) {{
                     float s = 0.0f;
                     for (uint d = 0u; d < D; d++) s += q_reg[d] * tg_K[kk * D + d];
                     s *= scale;
@@ -5027,9 +5034,10 @@ def make_varlen_flash_attention_mma(
     tiles are staged into threadgroup memory with bounds-masking (packed cu_seqlens), so ANY
     global strides work (the MMA reads the contiguous tg tiles). Measured on a ragged fp16
     batch: D=64 0.45ms (~7.6x the scalar template, ~4x pad+SDPA); D=128 1.37ms (1.4x pad+SDPA).
-    fp16-ONLY: the staged tiles are half, so accumulation is fp16-precision — fp32 varlen stays
-    on the scalar template (true fp32). Register-O fits head_dim<=128 in the 32KB tg budget
-    (no tg_O). Same buffer ABI / bindings as make_varlen_flash_attention; 128 threads/tg.
+    DTYPES: fp16/bf16 stage 2-byte tiles (BN=32, head_dim<=128); fp32 stages TRUE float
+    tiles (float8x8 MMA, BN=16, head_dim<=~112). Accumulation is fp32 in every case
+    (simdgroup_float8x8 S/o_acc). Ineligible dims fall to the scalar template. Same buffer
+    ABI / bindings as make_varlen_flash_attention; 128 threads/tg.
     """
     if arg_decls is None or bindings is None:
         raise ValueError("make_varlen_flash_attention_mma is route-only (needs arg_decls/bindings)")
@@ -5060,13 +5068,16 @@ def make_varlen_flash_attention_mma(
     if missing:
         raise ValueError(f"varlen MMA FA bindings missing {missing}")
     b = bindings
+    # MAXS: clamp to the kernel's own kv-loop bound (see make_varlen_flash_attention).
+    _maxs = b.get("MAXS")
+    kmax_expr = f"min(seqlen_k, uint({_maxs}))" if _maxs else "seqlen_k"
     SCALE = float(D) ** -0.5 if scale is None else float(scale)
     causal_expr = "(qrow >= kr)" if causal else "true"
     sig = ",\n".join(arg_decls)
     return f"""#include <metal_stdlib>
 using namespace metal;
 
-// Varlen FlashAttention-2 (fp16 in/out, fp32 accumulate) via simdgroup_matrix MMA.
+// Varlen FlashAttention-2 ({TILE} in/out, fp32 accumulate) via simdgroup_matrix MMA.
 kernel void {kernel_name}(
 {sig},
     uint2 tgpos [[threadgroup_position_in_grid]],
@@ -5094,6 +5105,7 @@ kernel void {kernel_name}(
     uint q_start = uint({b['CUQ']}[bb]);   uint seqlen_q = uint({b['CUQ']}[bb+1u]) - q_start;
     uint k_start = uint({b['CUK']}[bb]);   uint seqlen_k = uint({b['CUK']}[bb+1u]) - k_start;
     if (m_block * BM >= seqlen_q) return;
+    uint kmax = {kmax_expr};
 
     for (uint i = lid; i < BM*D; i += NT) {{
         uint r = i / D, c = i % D; uint qr = m_block*BM + r;
@@ -5106,9 +5118,9 @@ kernel void {kernel_name}(
     simdgroup_float8x8 o_acc[D/8];
     for (uint et = 0u; et < D/8u; et++) o_acc[et] = simdgroup_float8x8(0.0f);
 
-    for (uint kt = 0u; kt < seqlen_k; kt += BN) {{
+    for (uint kt = 0u; kt < kmax; kt += BN) {{
         for (uint i = lid; i < BN*D; i += NT) {{
-            uint r = i / D, c = i % D; uint kr = kt + r; bool ok = kr < seqlen_k;
+            uint r = i / D, c = i % D; uint kr = kt + r; bool ok = kr < kmax;
             tg_K[i] = ok ? {TILE}({b['K']}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : {TILE}(0);
             tg_V[i] = ok ? {TILE}({b['V']}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : {TILE}(0);
         }}
@@ -5131,7 +5143,7 @@ kernel void {kernel_name}(
             float m_old = tg_m[r], l_old = tg_l[r], m_blk = -INFINITY;
             for (uint j = 0u; j < BN; j++) {{
                 uint kr = kt + j;
-                float s = (kr < seqlen_k && {causal_expr}) ? tg_S[r*BN+j]*SCALE : -INFINITY;
+                float s = (kr < kmax && {causal_expr}) ? tg_S[r*BN+j]*SCALE : -INFINITY;
                 tg_S[r*BN+j] = s; m_blk = max(m_blk, s);
             }}
             float m_new = max(m_old, m_blk);
@@ -5160,7 +5172,7 @@ kernel void {kernel_name}(
 
     // normalize O = diag(1/l) @ O, then scalar-store each 8x8 tile through tg_S scratch
     if (lane < 8u) {{
-        uint r = sg*8u + lane; float inv = tg_l[r] > 0.0f ? 1.0f/tg_l[r] : 0.0f;
+        uint r = sg*8u + lane; float inv = 1.0f/tg_l[r];  // l==0 (empty kv) -> inf -> NaN rows, matching the kernel's own 0/0 semantics
         for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? inv : 0.0f;
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
