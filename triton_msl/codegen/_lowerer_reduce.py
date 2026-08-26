@@ -731,6 +731,28 @@ class _ReduceScanMixin:
             # Accumulate into the local variable for the next reduce
             if next_reduce and acc_var:
                 reduce_input_id = next_reduce.operand_ids[0]
+                # DOUBLE-COUNT GUARD (re-review 2026-08-25 F2): this phase loop strides
+                # ``_loop_e`` over the KERNEL's _total_elements, but a reduce input SMALLER
+                # than that wraps (make_range lowers to ``_loop_e % range_size``) and is
+                # accumulated MULTIPLE times — e.g. a 256-wide tl.sum inside a 512-element
+                # kernel summed every element exactly TWICE, silently. No correct kernel
+                # can currently hit this (the result was always wrong); refuse loudly until
+                # the phase loop runs per-input extents.
+                _rin_shape = self.env_shapes.get(reduce_input_id)
+                _rin_total = 1
+                for _d in _rin_shape or ():
+                    _rin_total *= _d
+                if _rin_shape and _rin_total != total:
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    raise MetalNonRecoverableError(
+                        f"a {_rin_total}-element reduction inside a {total}-element "
+                        "kernel would be accumulated with wrapped (repeated) elements "
+                        "by the multipass phase loop — the result would silently "
+                        "over-count. Refusing. Make the reduced tensor span the "
+                        "kernel's full element count, or reduce in a separate kernel.",
+                        op_name="tt.reduce",
+                    )
                 input_var = self._lookup(reduce_input_id)
                 # Cast input to accumulator type to avoid Metal ambiguity
                 cast_input = f"({acc_msl_type}){input_var}"
