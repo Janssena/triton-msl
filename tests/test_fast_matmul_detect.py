@@ -1,5 +1,5 @@
 """Compile-time detector: eligible matmuls emit a fast_matmul descriptor in
-cached metadata; ineligible ones do not. Inspects ~/.cache/triton_msl/*.meta.json
+cached metadata; ineligible ones do not. Inspects the MSL cache's ``*.meta.json``
 (the descriptor round-trips through the JSON cache as a list of str+ints).
 Serial GPU.
 
@@ -7,6 +7,28 @@ NOTE: The test kernels use stride_* named args so that _detect_simple_dot()
 rejects them (has_strides=True) and the kernel routes through
 _lower_dot_via_prebuilt_template -> _lower_dot_simple_template, which is the
 path where the fast_matmul descriptor is recorded.
+
+CACHE honors ``TRITON_MSL_CACHE_DIR`` (the same variable the compiler itself
+uses), so an isolated-cache run inspects the cache the product actually wrote.
+These tests ``rmtree`` that directory, so hard-coding the shared default made an
+isolated run both inspect the wrong location AND delete the developer's shared
+cache.
+
+Each test needs a genuinely COLD compile: it inspects the ``meta.json`` the backend
+writes, which only happens if the kernel is actually lowered. Two caches can prevent
+that, and BOTH have to be cold or the assertions fail for a reason unrelated to the
+detector:
+
+- the MSL cache (what we inspect), and
+- Triton's own cache -- a hit there serves the compiled artifact without ever calling
+  ``make_msl``, so no ``meta.json`` is written at all.
+
+Rather than deleting shared caches (destructive, and order-dependent: whichever test
+ran first would warm the kernels for the rest), the ``cold_caches`` fixture points BOTH
+cache dirs at a per-test tmp dir and clears the JIT's in-memory cache for the kernels in
+this module. That makes each test hermetic and order-independent -- which matters,
+because under randomized test order the shared-cache version failed 4/5 (found
+2026-08-27 after adding pytest-randomly).
 """
 
 import os, glob, json, shutil, pytest
@@ -19,7 +41,63 @@ except Exception:
     HAS = False
 requires = pytest.mark.skipif(not HAS, reason="MPS needed")
 
-CACHE = os.path.expanduser("~/.cache/triton_msl")
+
+def _cache_dir():
+    """The MSL cache the compiler is CURRENTLY writing to (read per call, so the
+    fixture's per-test override is honoured)."""
+    return os.environ.get("TRITON_MSL_CACHE_DIR") or os.path.expanduser("~/.cache/triton_msl")
+
+
+@pytest.fixture()
+def cold_caches(tmp_path, monkeypatch):
+    """Give one test private, empty MSL + Triton caches, and drop the in-memory JIT
+    cache so the kernel really is recompiled.
+
+    Triton constructs its cache manager per compile and reads ``TRITON_CACHE_DIR`` then,
+    so the monkeypatched value takes effect for compiles inside the test. The JIT
+    function objects are module-level and persist across tests, so their in-memory cache
+    has to be cleared explicitly or the second test to use a kernel never compiles it.
+    """
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    os.makedirs(tmp_path / "msl", exist_ok=True)
+    _clear_jit_caches()
+    yield tmp_path
+
+
+def _clear_jit_caches():
+    """Drop the in-memory compiled-kernel cache on every JITFunction in this module.
+
+    The attribute is ``device_caches`` on the Triton in use (3.7.0) -- NOT ``cache``,
+    which does not exist and made an earlier version of this fixture a silent no-op:
+    ``getattr(obj, "cache", None)`` was always None, nothing was cleared, and the tests
+    still failed under some orders. Probe for known names rather than assuming one, and
+    assert that at least one kernel was actually cleared so a future Triton rename shows
+    up as a test failure instead of silently restoring the order-dependence.
+    """
+    cleared = 0
+    for obj in list(globals().values()):
+        if not hasattr(obj, "run"):  # not a JITFunction
+            continue
+        for attr in ("device_caches", "cache"):
+            store = getattr(obj, attr, None)
+            if store is None:
+                continue
+            try:
+                if hasattr(store, "values") and store and all(hasattr(v, "clear") or isinstance(v, (list, tuple, dict)) for v in store.values()):
+                    for v in store.values():
+                        # device_caches maps device -> (kernel_cache_dict, ...)
+                        for part in (v if isinstance(v, (list, tuple)) else (v,)):
+                            if hasattr(part, "clear"):
+                                part.clear()
+                store.clear()
+                cleared += 1
+            except Exception:  # noqa: BLE001 - best effort per attribute
+                pass
+    assert cleared, (
+        "no JITFunction cache was cleared -- Triton likely renamed the in-memory cache "
+        "attribute. Fix _clear_jit_caches, or these tests silently depend on run order."
+    )
 
 
 @triton.jit
@@ -133,7 +211,7 @@ def _mm_bf16_out(
 
 def _descriptors():
     out = []
-    for p in glob.glob(os.path.join(CACHE, "*.meta.json")):
+    for p in glob.glob(os.path.join(_cache_dir(), "*.meta.json")):
         with open(p) as f:
             m = json.load(f)
         if m.get("fast_matmul"):
@@ -164,8 +242,7 @@ def _run(kernel, A, B, C, M, N, K):
 
 
 @requires
-def test_eligible_fp32_emits_descriptor(monkeypatch):
-    shutil.rmtree(CACHE, ignore_errors=True)
+def test_eligible_fp32_emits_descriptor(monkeypatch, cold_caches):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     M = N = K = 256
     A = torch.randn(M, K, device="mps")
@@ -192,8 +269,7 @@ def test_eligible_fp32_emits_descriptor(monkeypatch):
 
 
 @requires
-def test_fp16_output_emits_half_variant_descriptor(monkeypatch):
-    shutil.rmtree(CACHE, ignore_errors=True)
+def test_fp16_output_emits_half_variant_descriptor(monkeypatch, cold_caches):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     M = N = K = 256
     A = torch.randn(M, K, device="mps", dtype=torch.float16)
@@ -217,8 +293,7 @@ def test_fp16_output_emits_half_variant_descriptor(monkeypatch):
 
 
 @requires
-def test_bf16_emits_descriptor_and_computes(monkeypatch):
-    shutil.rmtree(CACHE, ignore_errors=True)
+def test_bf16_emits_descriptor_and_computes(monkeypatch, cold_caches):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     M = N = K = 256
     A = torch.randn(M, K, device="mps", dtype=torch.bfloat16)
@@ -232,8 +307,7 @@ def test_bf16_emits_descriptor_and_computes(monkeypatch):
 
 
 @requires
-def test_flag_off_no_descriptor(monkeypatch):
-    shutil.rmtree(CACHE, ignore_errors=True)
+def test_flag_off_no_descriptor(monkeypatch, cold_caches):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "0")
     M = N = K = 256
     A = torch.randn(M, K, device="mps")
@@ -272,14 +346,13 @@ def _mm_abbrev(
 
 
 @requires
-def test_abbreviated_name_emits_descriptor(monkeypatch):
+def test_abbreviated_name_emits_descriptor(monkeypatch, cold_caches):
     """Abbreviated stride-arg names route through _lower_simple_dot_inline.
 
     The new call site at the top of that method must emit the fast_matmul
     descriptor with indices (3, 4, 5, 32, 128) — same contract as the
     stride_* path through _lower_dot_simple_template.
     """
-    shutil.rmtree(CACHE, ignore_errors=True)
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     M = N = K = 256
     A = torch.randn(M, K, device="mps")

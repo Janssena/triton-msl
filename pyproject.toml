@@ -49,6 +49,13 @@ triton = [
 dev = [
     "pytest>=7.0",
     "pytest-timeout",
+    # Randomizes test order to surface order/state dependence. Several real bugs here
+    # were order-dependent (a kernel warmed by an earlier test hid a recompile; stale
+    # threadgroup memory turned an out-of-bounds read into NaNs only after other GPU
+    # work ran), so a fixed collection order can hide them indefinitely.
+    # NOTE: pass `-p no:randomly` for upstream-conformance ratchet runs, whose
+    # before/after totals are only comparable at a fixed order.
+    "pytest-randomly>=3.12",
     "ruff>=0.4.0",
 ]
 
