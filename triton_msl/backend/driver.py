@@ -833,10 +833,21 @@ class MetalLauncher:
                     # produced a reach-sized contiguous source — otherwise fall through
                     # to the dense numel copy (never memmove copy_bytes from a smaller
                     # source, which would over-read the heap).
+                    # TensorWrapper (triton.reinterpret, e.g. uint8 over int8) lacks
+                    # is_contiguous/as_strided/storage_offset but shares its base
+                    # tensor's storage BYTE-FOR-BYTE -- only the dtype label differs.
+                    # The base therefore answers every layout question and stands in
+                    # for the faithful mirror AND the copy-back tensor (the copy-back
+                    # builds a scratch via _torch.empty(dtype=tensor.dtype), which
+                    # crashes on a wrapper's triton dtype). For a plain tensor,
+                    # _layout_t IS arg, so this is a no-op. A wrapper-like object with
+                    # neither method nor base falls back to the dense copy, matching
+                    # _strided_storage_reach's safe reach==numel default.
+                    _layout_t = arg if hasattr(arg, "is_contiguous") else getattr(arg, "base", None)
                     _faithful_src = None
-                    if (not arg.is_contiguous()) and copy_bytes > nbytes:
+                    if _layout_t is not None and (not _layout_t.is_contiguous()) and copy_bytes > nbytes:
                         try:
-                            flat = arg.as_strided((reach_elems,), (1,), arg.storage_offset())
+                            flat = _layout_t.as_strided((reach_elems,), (1,), _layout_t.storage_offset())
                             _cand = flat.cpu().contiguous()
                             if _cand.numel() * _cand.element_size() >= copy_bytes:
                                 _faithful_src = _cand
@@ -862,10 +873,14 @@ class MetalLauncher:
                             # (Inputs are restored byte-identical; a strided output
                             # is written correctly. Most callers pass output indices
                             # so inputs never reach here at all.)
+                            # _layout_t, not arg: the copy-back scatters through
+                            # tensor.shape/stride and allocates scratch by
+                            # tensor.dtype -- for a TensorWrapper that must be the
+                            # base (same storage bytes); for a plain tensor it IS arg.
                             tensor_copies.append(
                                 (
                                     metal_buf,
-                                    arg,
+                                    _layout_t,
                                     nbytes,
                                     cpu_tensor,
                                     ("faithful_strided", reach_elems, arg.element_size()),
