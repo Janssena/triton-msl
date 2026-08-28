@@ -15,6 +15,7 @@ Mixed into ``GenericLowerer`` because every method reads instance state
 and inserts MSL into ``self.kb``\'s body.
 """
 
+import os
 import re
 
 from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
@@ -1178,6 +1179,14 @@ class _ReduceScanMixin:
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
+        # A full reduce yields a UNIFORM scalar -- every thread holds the same value --
+        # so the one thread that stores it is correct under any indexing. Declare DIRECT
+        # so the store does not have to fall back to inferring a layout from the size.
+        # (Reached for a 2-D tile via the multipass path, which rebinds the reduce input
+        # to a per-thread accumulator and re-enters this scalar path.)
+        self._register_1d_layout(ssa.id, "direct")
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, "direct")
 
     def _lower_reduce_1d_i64(self, ssa, input_var, combine_op, msl_type, shared_dtype):
         """1-D full reduce for 64-bit ints via a shared-memory tree (Metal has
@@ -1218,6 +1227,10 @@ class _ReduceScanMixin:
         kb.raw_line(f"    {msl_type} {result_var} = {sh}[0];")
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
+        # Uniform scalar (every thread reads sh[0]) -- see the 32-bit twin above.
+        self._register_1d_layout(ssa.id, "direct")
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, "direct")
 
     def _lower_reduce_multi_value(self, ssa: SSAValue):
         """Multi-value reduce: argmax/argmin (2-value) or Welford (3-value).
@@ -1507,6 +1520,13 @@ class _ReduceScanMixin:
             self.env_types[ssa.result_ids[0]] = val_shared_dtype
             self.env[ssa.result_ids[1]] = result_idx
             self.env_types[ssa.result_ids[1]] = "i32"
+        # Full 1-D reduce to a UNIFORM scalar (every thread reads shared_val[0] /
+        # shared_idx[0] above), so any thread's store is correct under any indexing --
+        # same reasoning as the scalar full-reduce sites. Declare DIRECT so a 1-D store
+        # of this result does not fall back to size-inferring a layout.
+        self._register_1d_layout(ssa.id, "direct")
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, "direct")
 
     def _lower_reduce_2d_argminmax(self, ssa, axis, input_shape):
         """Lower 2D argmin/argmax: find min/max value and index along axis.
@@ -1517,32 +1537,21 @@ class _ReduceScanMixin:
         M, N = input_shape[0], input_shape[1]
         total = M * N
 
-        # (#6 reduce-probe) axis=0 argmin/argmax on a SQUARE (M==N) tile mis-broadcasts
-        # the index (column-0's index to every column); rectangular tiles are correct.
-        if axis == 0 and M == N:
-            from triton_msl.errors import MetalNonRecoverableError
-
-            raise MetalNonRecoverableError(
-                "2-D argmin/argmax along axis=0 on a square (M==N) tile mis-broadcasts "
-                "the index. Refusing. Use a non-square tile or reduce along axis=1.",
-                op_name="tt.reduce",
-            )
-        # (#5 reduce-probe) axis=1, BOTH value AND index consumed: the value is moved to
-        # simple layout (convert_layout) before its store but the index is not, so the
-        # index store broadcasts row-0's index. Index-only / value-only is correct.
-        if axis == 1 and ssa.result_ids and len(ssa.result_ids) >= 2:
-            _used_ids = set()
-            for o in self.graph.ops:
-                _used_ids.update(o.operand_ids or [])
-            if ssa.result_ids[0] in _used_ids and ssa.result_ids[1] in _used_ids:
-                from triton_msl.errors import MetalNonRecoverableError
-
-                raise MetalNonRecoverableError(
-                    "2-D argmin/argmax along axis=1 with BOTH the value and the index "
-                    "consumed mis-stores the index (broadcasts row-0's index). Refusing. "
-                    "Use the value or the index alone, or separate kernels.",
-                    op_name="tt.reduce",
-                )
+        # (reduce-probe #5/#6, FIXED 2026-08-26) Two refusals used to live here:
+        #
+        #   * axis=0 on a SQUARE (M==N) tile "mis-broadcasts the index"
+        #   * axis=1 with BOTH value and index consumed "broadcasts row-0's index"
+        #
+        # Neither was a reduce bug -- this function always broadcast correctly
+        # (shared[lid % N] for axis=0, shared[lid / N] for axis=1). Both were STORE
+        # bugs. The store inferred the 1-D layout from the result's SIZE, which cannot
+        # tell an axis=0 result (size N) from an axis=1 one (size M) on a square tile;
+        # and it decided "was this converted to simple layout?" from a KERNEL-WIDE flag,
+        # so a converted value dragged an unconverted index onto the wrong layout.
+        #
+        # Both are now resolved structurally: this reduce records its broadcast layout
+        # per result id (below) and the store consults that, plus a per-value
+        # convert_layout check. See _value_1d_layout_of / _traces_to_converted_layout.
 
         val_var = self._lookup(ssa.operand_ids[0])
         idx_var = self._lookup(ssa.operand_ids[1])
@@ -1660,6 +1669,16 @@ class _ReduceScanMixin:
         else:
             self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid % {N}u];")
             self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid % {N}u];")
+        # Record the layout these results are broadcast in, so the STORE does not have to
+        # infer it from the result's SIZE. Size is ambiguous on a square tile: an axis=0
+        # result has size N, an axis=1 result has size M, and when M == N the store
+        # matched the axis=1 rule and emitted `lid % N == 0 ? out[lid / N]` -- every
+        # thread that stored read column 0, so column 0's index was broadcast to the whole
+        # output (reduce-probe #6, previously refused for square tiles).
+        _layout = "direct" if axis == 0 else "blocked"
+        self._register_1d_layout(ssa.id, _layout)
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, _layout)
         # Barrier AFTER the broadcast read of the pooled result arrays — without it a SECOND
         # argminmax in the same kernel re-stages those (declare_threadgroup_array-pooled)
         # arrays and races this read, so a tail of rows return their own index. Twin of the
@@ -1911,6 +1930,14 @@ class _ReduceScanMixin:
             self.env_shapes[ssa.id] = (M,)
         else:
             self.env_shapes[ssa.id] = (N,)
+        # Declare the broadcast layout for the store (see _register_1d_layout): axis=1
+        # read result_shared[lid / N] (BLOCKED, per row), axis=0 read
+        # result_shared[lid % N] (DIRECT, per column). Without this the store falls back
+        # to inferring the layout from the result's size, which is ambiguous.
+        _layout = "blocked" if axis == 1 else "direct"
+        self._register_1d_layout(ssa.id, _layout)
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, _layout)
 
     def _lower_reduce_3d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
         """Lower a 3D axis-specific reduction.
@@ -2301,43 +2328,39 @@ class _ReduceScanMixin:
                 f"<= 1024 elements."
             )
 
-        # Determine element type and MSL type
-        input_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
-        is_int = not (input_dtype.startswith("fp") or input_dtype.startswith("bf"))
-        is_i64 = input_dtype in ("i64", "u64", "ui64")
-        is_u64 = input_dtype in ("u64", "ui64")
-        # 64-bit ints must NOT truncate to i32 (cumsum/scan wrapped at 2^31, re-audit #13);
-        # the shared accumulator-type helper handles it (scan has no unsigned max/min).
-        msl_type, shared_dtype = self._reduce_acc_msl_type(input_dtype)
+        # PER-SLOT dtypes. A multi-value scan's slots are independent tensors and may
+        # differ in type -- upstream's cummax is `associative_scan((value, index_i64))`,
+        # a float/int32 value beside an int64 index. Staging every slot with operand-0's
+        # dtype truncated the others (re-audit #14: an fp32 sum slot staged as i32 came
+        # back all zeros), which is why this used to refuse outright. Give each slot its
+        # own staging type instead, so the scan COMPUTES rather than refusing; the
+        # truncation the refusal guarded is pinned by tests/test_scan_multivalue_dtypes.py.
+        #
+        # (A single operand-0 `input_dtype`/`msl_type`/`shared_dtype` used to be computed
+        # here; the lists below replaced every use, so those scalars were dead and were
+        # removed. 64-bit slots still must not truncate to i32 -- cumsum wrapped at 2^31,
+        # re-audit #13 -- which is why each slot goes through _reduce_acc_msl_type.)
+        slot_dtypes = [self.env_types.get(o, "fp32") for o in ssa.operand_ids]
+        slot_msl, slot_shared = [], []
+        for _d in slot_dtypes:
+            _m, _s = self._reduce_acc_msl_type(_d)
+            slot_msl.append(_m)
+            slot_shared.append(_s)
 
-        # A multi-value scan stages EVERY slot with operand-0's dtype (single
-        # shared_dtype), so a mixed-dtype scan (e.g. i32 count + fp32 sum) silently
-        # truncates the other slots (re-audit #14: the fp32 sum slot became i32 -> all
-        # zeros). Refuse mixed-dtype multi-value scans; same-dtype scans proceed.
-        if n_values > 1:
-            _slot_dtypes = {self.env_types.get(o, "fp32") for o in ssa.operand_ids}
-            if len(_slot_dtypes) > 1:
-                from triton_msl.errors import MetalNonRecoverableError
-
-                raise MetalNonRecoverableError(
-                    "multi-value tl.associative_scan with mixed operand dtypes is not "
-                    "supported — all slots would be staged with the first operand's "
-                    "dtype, silently truncating the others. Refusing.",
-                    op_name="tt.scan",
-                )
-
-        # Allocate shared memory for each input value
+        # Allocate shared memory for each input value, in that slot's own dtype
         shared_names = []
         for i in range(n_values):
             shared_name = f"scan_shared_{self._shared_counter}"
             self._shared_counter += 1
-            self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
+            self.kb.declare_threadgroup_array(shared_name, dtype=slot_shared[i], size=total)
             shared_names.append(shared_name)
 
         # Write input values to shared memory
         for i, operand_id in enumerate(ssa.operand_ids):
             input_var = self._lookup(operand_id)
-            cast = f"({msl_type})" if input_dtype == "bf16" else ""
+            # bf16 has no native MSL type (it lives in a float register), so make the
+            # narrowing explicit -- per slot, not by operand 0's dtype.
+            cast = f"({slot_msl[i]})" if slot_dtypes[i] == "bf16" else ""
             self.kb.raw_line(f"    if (lid < {total}u) {shared_names[i]}[lid] = {cast}{input_var};")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
@@ -2366,7 +2389,7 @@ class _ReduceScanMixin:
                     init_idx = f"(lid % {N}u)"
                 else:
                     init_idx = f"({(M - 1)}u * {N}u + (lid % {N}u))"
-            self.kb.raw_line(f"    {msl_type} {acc_var} = ({msl_type}){shared_names[i]}[{init_idx}];")
+            self.kb.raw_line(f"    {slot_msl[i]} {acc_var} = ({slot_msl[i]}){shared_names[i]}[{init_idx}];")
 
         # Emit scan loop
         if not reverse:
@@ -2389,16 +2412,19 @@ class _ReduceScanMixin:
                     idx_expr = f"scan_j * {N}u + (lid % {N}u)"
                 else:
                     idx_expr = f"({M - 1}u - scan_j) * {N}u + (lid % {N}u)"
-            self.kb.raw_line(f"        {msl_type} {rhs_var} = ({msl_type}){shared_names[i]}[{idx_expr}];")
+            self.kb.raw_line(f"        {slot_msl[i]} {rhs_var} = ({slot_msl[i]}){shared_names[i]}[{idx_expr}];")
 
         # Map block args to accumulator (lhs) and current element (rhs) vars
         block_arg_ids = ssa.attrs.get("block_arg_ids", [])
         if block_arg_ids and len(block_arg_ids) >= 2 * n_values:
             for i in range(n_values):
+                # Per-slot types so the combine body lowers each slot at its OWN width:
+                # cummax's `tl.where(gt, i0, i1)` must compare/select longs for the i64
+                # index slot while the value slot stays float/int.
                 self.env[block_arg_ids[i]] = acc_vars[i]
-                self.env_types[block_arg_ids[i]] = shared_dtype
+                self.env_types[block_arg_ids[i]] = slot_shared[i]
                 self.env[block_arg_ids[n_values + i]] = rhs_vars[i]
-                self.env_types[block_arg_ids[n_values + i]] = shared_dtype
+                self.env_types[block_arg_ids[n_values + i]] = slot_shared[i]
 
         # Lower body ops (combine function) and find scan.return operands
         scan_return_ids = []
@@ -2434,7 +2460,7 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"    if (lid < {total}u) {shared_names[0]}[lid] = {acc_vars[0]};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             result_var = self._next_var("scan_result")
-            self.kb.raw_line(f"    {msl_type} {result_var} = ({msl_type}){shared_names[0]}[lid % {total}u];")
+            self.kb.raw_line(f"    {slot_msl[0]} {result_var} = ({slot_msl[0]}){shared_names[0]}[lid % {total}u];")
             for i in range(1, n_values):
                 self.kb.raw_line(f"    if (lid < {total}u) {shared_names[i]}[lid] = {acc_vars[i]};")
             if n_values > 1:
@@ -2442,7 +2468,7 @@ class _ReduceScanMixin:
             acc_vars_out = [result_var]
             for i in range(1, n_values):
                 rv = self._next_var("scan_result")
-                self.kb.raw_line(f"    {msl_type} {rv} = ({msl_type}){shared_names[i]}[lid % {total}u];")
+                self.kb.raw_line(f"    {slot_msl[i]} {rv} = ({slot_msl[i]}){shared_names[i]}[lid % {total}u];")
                 acc_vars_out.append(rv)
         else:
             acc_vars_out = acc_vars
@@ -2451,11 +2477,11 @@ class _ReduceScanMixin:
         if ssa.result_ids and len(ssa.result_ids) >= n_values:
             for i in range(n_values):
                 self.env[ssa.result_ids[i]] = acc_vars_out[i]
-                self.env_types[ssa.result_ids[i]] = shared_dtype
+                self.env_types[ssa.result_ids[i]] = slot_shared[i]
                 self.env_shapes[ssa.result_ids[i]] = input_shape
         else:
             self.env[ssa.id] = acc_vars_out[0]
-            self.env_types[ssa.id] = shared_dtype
+            self.env_types[ssa.id] = slot_shared[0]
             self.env_shapes[ssa.id] = input_shape
 
     # -- Shared memory ops (ttg.local_alloc / ttg.local_load) --

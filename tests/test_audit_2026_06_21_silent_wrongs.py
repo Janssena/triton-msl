@@ -545,16 +545,21 @@ def _join_split(a, o0, o1, N: tl.constexpr):
 
 
 @requires
-@pytest.mark.parametrize("N", [32, 256])
-def test_split_refuses_at_small_sizes(N):
-    # tt.split de-interleave mis-matches the store index -> wrong at ALL sizes (the old
-    # guard only refused >1024). Now refuses everywhere (re-audit #8).
+@pytest.mark.parametrize("N", [8, 32, 256])
+def test_split_de_interleaves_correctly(N):
+    # tt.split's de-interleave mis-matched the STORE index, so output[k] received source
+    # element 2k — wrong at every size (re-audit #8 measured 32 and 256), which is why it
+    # refused outright. The split itself was right: thread lid holds the pair at row lid.
+    # The store was applying a blocked index because it inferred layout from the result's
+    # SIZE, and a split of (N,2) yields size N == the input's first dim. The split now
+    # declares its layout, so this computes.
     a = torch.arange(2 * N, device="mps", dtype=torch.float32)
     o0 = torch.empty(N, device="mps")
     o1 = torch.empty(N, device="mps")
-    with pytest.raises(MetalNonRecoverableError):
-        _join_split[(1,)](a, o0, o1, N=N)
-        torch.mps.synchronize()
+    _join_split[(1,)](a, o0, o1, N=N)
+    torch.mps.synchronize()
+    assert torch.allclose(o0.cpu(), a.cpu()[0::2]), f"split even lane wrong at N={N}"
+    assert torch.allclose(o1.cpu(), a.cpu()[1::2]), f"split odd lane wrong at N={N}"
 
 
 # --- Re-audit #9 (2026-06-23): softmax fp16/bf16 output + i32-reduce precision ---
@@ -1099,16 +1104,23 @@ def _mixed_scan(a, b, oc, osu, N: tl.constexpr):
 
 
 @requires
-def test_mixed_dtype_multivalue_scan_refuses():
+def test_mixed_dtype_multivalue_scan_keeps_every_slot():
     # A multi-value scan staged every slot with operand-0's dtype, truncating the others
-    # (re-audit #14: fp32 sum slot -> i32 -> zeros). Mixed-dtype now refuses.
-    a = torch.ones(8, device="mps", dtype=torch.int32)
-    b = (torch.arange(8, device="mps", dtype=torch.float32) + 1) * 0.1
-    oc = torch.empty(8, device="mps", dtype=torch.int32)
-    osu = torch.empty(8, device="mps")
-    with pytest.raises(MetalNonRecoverableError):
-        _mixed_scan[(1,)](a, b, oc, osu, N=8)
-        torch.mps.synchronize()
+    # (re-audit #14: fp32 sum slot -> i32 -> zeros). That was closed by REFUSING
+    # mixed-dtype scans, which also refused upstream's legitimate cummax
+    # (value + int64 index) and cost ~316 conformance tests. Now each slot is staged in
+    # its OWN dtype, so this computes; the original silent-wrong is pinned by asserting
+    # the fp32 slot keeps its fraction instead of coming back as zeros.
+    N = 8
+    a = torch.ones(N, device="mps", dtype=torch.int32)
+    b = (torch.arange(N, device="mps", dtype=torch.float32) + 1) * 0.1
+    oc = torch.empty(N, device="mps", dtype=torch.int32)
+    osu = torch.empty(N, device="mps")
+    _mixed_scan[(1,)](a, b, oc, osu, N=N)
+    torch.mps.synchronize()
+    assert (oc.cpu() == torch.arange(1, N + 1, dtype=torch.int32)).all(), "int slot wrong"
+    assert torch.allclose(osu.cpu(), torch.cumsum(b.cpu(), 0), atol=1e-5), (
+        "fp32 slot truncated to int (the re-audit #14 silent-wrong)")
 
 
 @triton.jit
@@ -1256,22 +1268,34 @@ def _argmax2d_ax0(x, oi, M: tl.constexpr, N: tl.constexpr):
 
 
 @requires
-def test_argmax2d_index_layout_refuses_broken_cases():
-    # The reduce-surface probe found two 2D argmax INDEX-layout silent-wrongs (the value
-    # is convert_layout'd before its store but the index is not): axis=1 with BOTH value
-    # and index consumed broadcasts row-0's index; axis=0 on a SQUARE tile broadcasts
-    # column-0's index. Both now refuse; rectangular axis=0 still computes.
+def test_argmax2d_index_layout_correct_in_all_cases():
+    # The reduce-surface probe found two 2-D argmax INDEX-layout silent-wrongs: axis=1
+    # with BOTH value and index consumed broadcast row-0's index; axis=0 on a SQUARE
+    # tile broadcast column-0's index. Both were closed by refusing.
+    #
+    # Neither was a reduce bug — the reduce always broadcast correctly. Both were STORE
+    # bugs: the store inferred the 1-D layout from the result's SIZE (ambiguous when
+    # M == N) and read "was this converted to simple layout?" from a KERNEL-WIDE flag
+    # (so a converted value dragged an unconverted index onto the wrong layout). Both
+    # are now resolved structurally, so all four cases must COMPUTE.
     X = torch.randn(8, 8, device="mps")
+
+    # axis=1, both value and index consumed (was: row-0's index everywhere)
     ov = torch.empty(8, device="mps")
     oi = torch.empty(8, device="mps", dtype=torch.int32)
-    with pytest.raises(MetalNonRecoverableError):
-        _argmax2d_both[(1,)](X, ov, oi, M=8, N=8)
-        torch.mps.synchronize()
+    _argmax2d_both[(1,)](X, ov, oi, M=8, N=8)
+    torch.mps.synchronize()
+    rv, ri = X.cpu().max(dim=1)
+    assert torch.allclose(ov.cpu(), rv, atol=1e-5), "axis=1 value wrong"
+    assert oi.cpu().tolist() == ri.tolist(), "axis=1 index broadcast row 0"
+
+    # axis=0 on a SQUARE tile (was: column-0's index everywhere)
     oi2 = torch.empty(8, device="mps", dtype=torch.int32)
-    with pytest.raises(MetalNonRecoverableError):
-        _argmax2d_ax0[(1,)](X, oi2, M=8, N=8)
-        torch.mps.synchronize()  # square
-    # rectangular axis=0 is correct (not over-refused)
+    _argmax2d_ax0[(1,)](X, oi2, M=8, N=8)
+    torch.mps.synchronize()
+    assert oi2.cpu().tolist() == X.cpu().argmax(0).tolist(), "square axis=0 index broadcast column 0"
+
+    # rectangular axis=0 always worked and must not regress
     Xr = torch.randn(4, 8, device="mps")
     oi3 = torch.empty(8, device="mps", dtype=torch.int32)
     _argmax2d_ax0[(1,)](Xr, oi3, M=4, N=8)

@@ -1279,8 +1279,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # For kernels with constant tensors (e.g. tl.full) but no make_range,
         # graph.block_size may be too small (defaults to num_warps*32).
         # Scan tensor type_strs to find the actual max tensor size.
+        # Walk nested regions too: a tensor living only inside an scf.for / scf.if body
+        # is just as real, and missing it leaves the kernel sized for the narrower
+        # top-level tiles -- the same silent truncation this scan exists to prevent.
+        def _scan_nested(ops):
+            for _o in ops:
+                yield _o
+                if getattr(_o, "region_ops", None):
+                    yield from _scan_nested(_o.region_ops)
+                if getattr(_o, "else_ops", None):
+                    yield from _scan_nested(_o.else_ops)
+
         max_tensor_size = block_size
-        for ssa in self.graph.ops:
+        for ssa in _scan_nested(self.graph.ops):
             shape = _extract_shape(ssa.type_str)
             if shape:
                 total = 1
@@ -1288,7 +1299,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     total *= d
                 if total > max_tensor_size:
                     max_tensor_size = total
-        if max_tensor_size > block_size and max_tensor_size <= 1024:
+        if max_tensor_size > block_size:
+            # No 1024 cap here. Capping meant that when the WIDEST tensor exceeded 1024
+            # the widening was skipped entirely and the kernel kept the SMALLER tile's
+            # block size -- silently truncating every wider tensor (a tl.sum over a
+            # 2048-element load returned 16). Sizes above 1024 are already handled
+            # below: `block_size > 1024` takes the wrapping / multipass path, which
+            # dispatches 1024 threads and strides over _total_elements. Widening here is
+            # what lets that path see the real extent.
             block_size = max_tensor_size
 
         # If total elements exceed the thread count, use a wrapping loop so
@@ -1681,6 +1699,64 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 block_size = 1024  # Cap dispatch to Metal max
 
         self.effective_block_size = block_size
+
+        # COVERAGE BACKSTOP -- should be unreachable, and is kept because the thing it
+        # guards already regressed once.
+        #
+        # The real fix for mixed tile widths is the max-tensor widening above: block_size
+        # is set to the WIDEST tensor, so nothing is left uncovered. That widening used
+        # to be capped at 1024, and above the cap it was skipped entirely -- the kernel
+        # then kept the narrower tile's size and silently truncated every wider tensor
+        # (`tl.sum` over a 2048-element load returned 16). This check makes a
+        # reintroduction of that class loud instead of silent: if any tensor is wider
+        # than the threadgroup with no mechanism covering it, refuse.
+        #
+        # Only the plain scalar path is checked. The wrapping, MEPT and multipass paths
+        # each carry their own multiplicity, and cooperative staging (tt.dot operands,
+        # scan/trans/gather/...) legitimately covers tiles wider than the threadgroup
+        # through its own strided loops -- none of those are truncation. A bare
+        # tt.reduce does NOT stage, so a reduce wider than the threadgroup with no wrap
+        # loop is exactly the truncation this catches.
+        _staging_ops = any(
+            ssa.op
+            in (
+                "tt.dot",
+                "ttg.local_alloc",
+                "tt.trans",
+                "tt.gather",
+                "tt.cat",
+                "tt.join",
+                "tt.split",
+                "tt.scan",
+                "tt.histogram",
+            )
+            for ssa in all_ops_iter
+        )
+        if (
+            not self._needs_wrapping
+            and not getattr(self, "_mept_single_pass", False)
+            and not use_multipass
+            and not _staging_ops
+        ):
+            _widest, _widest_op = 0, None
+            for _ssa in all_ops_iter:
+                _sh = _extract_shape(_ssa.type_str) if getattr(_ssa, "type_str", None) else None
+                if not _sh:
+                    continue
+                _t = 1
+                for _d in _sh:
+                    _t *= _d
+                if _t > _widest:
+                    _widest, _widest_op = _t, _ssa.op
+            if _widest > block_size:
+                raise MetalNonRecoverableError(
+                    f"kernel mixes tile widths: a {_widest}-element tensor (from "
+                    f"{_widest_op}) would be processed by only {block_size} threads with "
+                    "no wrapping loop, silently truncating it to the first "
+                    f"{block_size} elements. Refusing (correct-or-refuse). Use a single "
+                    "tile width, or split into separate kernels.",
+                    op_name=_widest_op or "tt.load",
+                )
 
         # If the kernel is too large for the generic lowerer (cooperative ops
         # with > 1024 total elements), emit a minimal kernel with UNSUPPORTED
@@ -3558,28 +3634,86 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if store_shape and len(store_shape) == 1 and store_shape[0] < self.effective_block_size:
                 store_1d_guard = store_shape[0]
 
+        # The wrapping regime emits ONE loop over the kernel's dominant tile, so every
+        # op inside it runs that many times. A store whose own tile is SMALLER (a
+        # histogram's bins, a small output beside a large input) then runs past the end
+        # of its buffer and corrupts whatever follows -- silently, since the store's own
+        # elements are still written correctly. Guard by the store's own extent.
+        store_wrap_guard = None
+        # Only meaningful when the store index is driven by the lid / wrap variable, so
+        # that bounding that variable actually bounds the write.
+        _idx_var = self._lid_expr
+        _idx_driven = _idx_var == str(offsets) or _idx_var in re.findall(r"[A-Za-z_]\w*", str(offsets))
+        if _idx_driven and not self._is_scalar_ptr(ptr_id):
+            wrap_shape = self.env_shapes.get(ptr_id)
+            if not wrap_shape:
+                for op in self.graph.ops:
+                    if op.id == ptr_id and op.type_str:
+                        wrap_shape = _extract_shape(op.type_str)
+                        break
+            if wrap_shape:
+                wrap_total = 1
+                for _d in wrap_shape:
+                    wrap_total *= _d
+                # How many distinct index values actually execute this store: the wrap
+                # extent when wrapping, otherwise the dispatched threadgroup.
+                span = (
+                    getattr(self, "_total_elements", 0)
+                    if getattr(self, "_needs_wrapping", False)
+                    else self.effective_block_size
+                )
+                if 0 < wrap_total < span:
+                    store_wrap_guard = wrap_total
+
+        clauses = []
         if store_1d_guard is not None:
             lid = self._lid_expr
-            if val_converted:
-                # After convert_layout, thread i has element i. Simple guard.
-                guard = f"{lid} < {store_1d_guard}u"
+            # Did the value come from a 2-D reduce whose broadcast layout we recorded?
+            # That is authoritative; the size-matching below cannot tell an axis=0 result
+            # from an axis=1 one on a square tile.
+            _rec_layout = self._value_1d_layout_of(val_id)
+            if self._traces_to_converted_layout(val_id):
+                # THIS value was redistributed: thread i has element i. Simple guard.
+                clauses.append(f"{lid} < {store_1d_guard}u")
+            elif _rec_layout == "direct":
+                # Thread i holds element i (axis=0 reduce broadcast as shared[lid % N],
+                # or a tt.split pair). Store from the first `size` threads, index by lid.
+                clauses.append(f"{lid} < {store_1d_guard}u")
+            elif _rec_layout == "blocked":
+                # Thread i holds element i / N. One thread per row block.
+                shape = self._effective_2d_shape
+                if shape and len(shape) >= 2 and shape[1] > 0:
+                    N = shape[1]
+                    offsets = f"({lid} / {N}u)"
+                    clauses.append(f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u")
+                else:
+                    clauses.append(f"{lid} < {store_1d_guard}u")
+            elif val_converted:
+                # Kernel-wide convert_layout flag: blunter than the per-value check
+                # above, and reached only when no producer declared. Reported so its
+                # remaining reach can be measured and shrunk.
+                self._report_undeclared_layout("kernel-wide-convert-flag", store_1d_guard)
+                clauses.append(f"{lid} < {store_1d_guard}u")
             else:
-                # After a 2D reduce (axis=1), the result is per-row and the
-                # broadcast uses lid / N (blocked). Fix: use lid / N as the
-                # store index and select one thread per row block.
+                # UNDECLARED: no producer told us this value's layout, so fall back to
+                # inferring it from the result's SIZE. That inference is what produced
+                # three separate silent-wrongs (reduce-probe #5/#6, re-audit #8), so it
+                # is a last resort, not a design.
+                self._report_undeclared_layout("size-inference", store_1d_guard)
                 shape = self._effective_2d_shape
                 if shape and len(shape) >= 2 and store_1d_guard == shape[0] and shape[1] > 0:
                     N = shape[1]
                     offsets = f"({lid} / {N}u)"
-                    guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
+                    clauses.append(f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u")
                 else:
-                    guard = f"{lid} < {store_1d_guard}u"
-            if mask_var:
-                self.kb.raw_line(f"    if ({guard} && {mask_var}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
-            else:
-                self.kb.raw_line(f"    if ({guard}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
-        elif mask_var:
-            self.kb.raw_line(f"    if ({mask_var}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
+                    clauses.append(f"{lid} < {store_1d_guard}u")
+        if store_wrap_guard is not None:
+            clauses.append(f"{self._lid_expr} < {store_wrap_guard}u")
+        if mask_var:
+            clauses.append(str(mask_var))
+
+        if clauses:
+            self.kb.raw_line(f"    if ({' && '.join(clauses)}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
         else:
             self.kb.raw_line(f"    {base_ptr}[{offsets}] = {cast_val};")
 
@@ -4296,7 +4430,66 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _scalar_mode = (
                 not getattr(self, "_mept_single_pass", False) and self.env_n_elems.get(ssa.operand_ids[0], 1) == 1
             )
-            if narrow is not None and _scalar_mode:
+            # A SHARED-MEMORY-backed source (an oversized tile / loop-carried
+            # accumulator) resolves through ``_lookup`` to the bare threadgroup ARRAY
+            # NAME, so the scalar round-trip below emitted
+            # ``static_cast<half>(smem_iter_N)`` — casting a ``threadgroup float*`` to a
+            # scalar, which Metal rejects (invalid MSL; loud, never silently wrong).
+            # Quantize cooperatively in place instead, mirroring what the binary
+            # elementwise path already does for smem operands (_lowerer_emission), and
+            # re-register the result as smem-backed so the store keeps its cooperative
+            # path. Storage stays fp32 (a narrow->wide round-trip) exactly like the
+            # scalar branch, so the VALUE quantizes while downstream arithmetic still
+            # reads floats. Reached by an fp16 varlen-shaped FA kernel that falls to the
+            # generic path (2026-08-26); the loop degenerates safely for any tile size.
+            _smem_src = getattr(self, "_shared_mem_descs", {}).get(ssa.operand_ids[0])
+            if narrow is not None and _smem_src is not None:
+                # This path updates the source array in place to avoid allocating a
+                # second full-tile buffer (the generic varlen kernel already sits at
+                # Metal's threadgroup-memory limit). That is only SSA-correct when the
+                # cast is the source value's sole consumer. If another op also reads
+                # the fp32 source, in-place quantization would silently change that
+                # consumer to fp16/bf16 values. Refuse that uncommon aliasing shape
+                # until the lowerer can allocate/lifetime-reuse distinct storage.
+                def _all_ops(ops):
+                    for _op in ops:
+                        yield _op
+                        if getattr(_op, "region_ops", None):
+                            yield from _all_ops(_op.region_ops)
+                        if getattr(_op, "else_ops", None):
+                            yield from _all_ops(_op.else_ops)
+
+                _src_id = ssa.operand_ids[0]
+                _other_consumers = [
+                    _op
+                    for _op in _all_ops(self.graph.ops)
+                    if _op is not ssa and _src_id in (_op.operand_ids or [])
+                ]
+                if _other_consumers:
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    raise MetalNonRecoverableError(
+                        "fp16/bf16 conversion of a shared-memory-backed value with "
+                        "another consumer cannot quantize the source array in place "
+                        "without violating SSA semantics. Refusing rather than "
+                        "silently rounding the original value; materialize the cast "
+                        "in a separate kernel or remove the additional consumer.",
+                        op_name="arith.truncf",
+                    )
+                _smem_name, _smem_shape, _ = _smem_src
+                _smem_total = 1
+                for _d in _smem_shape:
+                    _smem_total *= _d
+                _bs = self.effective_block_size
+                self.kb.raw_line(f"    for (uint _tq = lid; _tq < {_smem_total}u; _tq += {_bs}u) {{")
+                self.kb.raw_line(
+                    f"        {_smem_name}[_tq] = static_cast<float>(static_cast<{narrow}>({_smem_name}[_tq]));"
+                )
+                self.kb.raw_line("    }")
+                self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                self.env[ssa.id] = _smem_name
+                self._shared_mem_descs[ssa.id] = (_smem_name, _smem_shape, "fp32")
+            elif narrow is not None and _scalar_mode:
                 # SCALAR fp32->fp16/bf16: round-trip narrow->wide so the VALUE
                 # actually quantizes (e.g. 2049.0 -> 2048.0) while the register
                 # stays float for downstream arithmetic — mirrors the FP8 branch.
@@ -5516,6 +5709,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "varlen FlashAttention arg list is not densely indexed; refusing."
                 )
         roles = info["roles"]
+        # V verification (issue #4 item 3): this path has NO first-four ordering gate,
+        # so the structural dot-1 check is the ONLY V cross-check here.
+        self._fa_verify_v_role(roles["v"])
         role_of_idx = {
             roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
             roles["cuq"]: "CUQ", roles["cuk"]: "CUK",
@@ -8029,6 +8225,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "partial-output mask in a separate elementwise kernel."
             )
 
+        # V verification (issue #4 item 3): the biased/triangle path is the one the
+        # reporter's kernel takes and has NO first-four ordering gate, so the
+        # structural dot-1 check is the ONLY V cross-check here.
+        self._fa_verify_v_role(info["v"])
+
         has_mask = bool(info.get("has_mask", info.get("mask") is not None))
         role_name = {
             info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
@@ -8228,6 +8429,85 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self._prescan_stores()
         return msl
 
+    def _fa_verify_v_role(self, detected_v_index):
+        """Structurally verify the FA detector's V pointer role, or refuse.
+
+        V used to be the ONE unverified pointer role (issue #4 item 3, residual class):
+        Q, K and Out are cross-checked through dot 0 (QK^T) and the store, but V is the
+        second operand of dot 1 (P@V), invisible to that mechanism — so a detector
+        stride-chain trace that resolved V to a distinct-but-WRONG arg sailed past every
+        gate and the template read attention values from the wrong tensor.
+
+        V IS verifiable: it is BY DEFINITION the second operand of the earliest dot
+        whose FIRST operand depends on dot 0's result (that is P@V). Trace that operand
+        back to a kernel arg with the same tracer Q/K/Out use and require agreement.
+        Every leg is fail-safe: no second dot, no dot-0-dependent dot, or an
+        untraceable operand (e.g. a loop-carried V pointer) falls back to the
+        detector's answer. Only a POSITIVE structural trace that DISAGREES refuses.
+
+        Called from ALL THREE FA template paths. The dense path also pins Q/K/V/Out to
+        args 0-3 in order, so this is defense-in-depth there; the varlen and
+        biased/triangle (trifast) paths have NO ordering gate — this is their only V
+        verification, and the biased path is exactly where the reporter's silent-wrong
+        lived.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        def _walk(ops):
+            for s in ops:
+                yield s
+                if getattr(s, "region_ops", None):
+                    yield from _walk(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    yield from _walk(s.else_ops)
+
+        _all = list(_walk(self.graph.ops))
+        _dots = [s for s in _all if s.op == "tt.dot"]
+        if len(_dots) < 2:
+            return  # no P@V dot to verify against — fail-safe
+        _order = {s.id: i for i, s in enumerate(_all)}
+        _dot_qk = min(_dots, key=lambda d: _order[d.id])
+        _dot0_ids = {_dot_qk.id} | set(getattr(_dot_qk, "result_ids", None) or [])
+        _by_id = {s.id: s for s in _all}
+
+        def _depends_on_dot0(start_id, limit=256):
+            seen, stack = set(), [start_id]
+            while stack and len(seen) < limit:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                if cur in _dot0_ids:
+                    return True
+                _o = _by_id.get(cur)
+                if _o is not None:
+                    stack.extend(_o.operand_ids or [])
+            return False
+
+        _dot_pv = next(
+            (
+                d
+                for d in sorted(_dots, key=lambda d: _order[d.id])
+                if d.id not in _dot0_ids
+                and len(d.operand_ids) >= 2
+                and _depends_on_dot0(d.operand_ids[0])
+            ),
+            None,
+        )
+        if _dot_pv is None:
+            return  # fail-safe: structure not recognized, detector's answer stands
+        _v_arg = self._trace_ptr_source(_dot_pv.operand_ids[1])
+        if _v_arg is not None and _v_arg.index != detected_v_index:
+            raise MetalNonRecoverableError(
+                "FlashAttention V pointer role disagrees between the FA detector's "
+                f"stride-chain trace (arg {detected_v_index}) and the structural dot-1 "
+                f"operand trace (arg {_v_arg.index}, '{_v_arg.name}'). The dot-1 "
+                "trace follows P@V's actual operand, so a disagreement means the "
+                "detector mis-resolved V and the template would read attention "
+                "values from the WRONG tensor. Refusing rather than silently "
+                "mis-compute (issue #4 item 3)."
+            )
+
     def _lower_flash_attention_template(self, info: dict) -> str:
         """Emit the head-dim-tiled FA2 MSL (Task 1) for a detected FA kernel.
 
@@ -8301,9 +8581,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Defense-in-depth (carry item 2): cross-check Q/K/Out roles against the
         # generic dot-pointer resolver. dot 0 is QK^T (operands Q, K) and the
         # single store targets Out, so _resolve_dot_ptr_roles(dot0, ...) returns
-        # [Q, K, Out, <extras incl. V>]. V is the 2nd operand of dot 1 (P@V), not
-        # dot 0, so it is NOT verifiable this way and is intentionally not cross-
-        # checked here — the detector's V stride-chain trace stands for it.
+        # [Q, K, Out, <extras incl. V>]. V is cross-checked separately below
+        # through dot 1 — see the V verification block.
         def _fa_walk(ops):
             for s in ops:
                 yield s
@@ -8328,6 +8607,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"resolver q={r_idx['q']},k={r_idx['k']},out={r_idx['out']}). "
                     "Refusing rather than risk a mis-bound buffer."
                 )
+
+        # V verification (issue #4 item 3): see _fa_verify_v_role. On THIS dense path
+        # the first-four-in-order gate above already pins v == 2, so the structural
+        # check is defense-in-depth here; its live value is on the varlen and
+        # biased/triangle paths, which have no ordering gate and call it too.
+        self._fa_verify_v_role(info["v"])
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the
         # binding order matches the launcher exactly: pointers as device buffers,
@@ -8709,19 +8994,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         total = N * 2
 
-        # tt.split is SILENTLY WRONG at ALL sizes (re-audit #8): the de-interleave maps
-        # thread lid -> source row (lid % N) but the downstream store keeps the join-era
-        # output index (lid / 2), so output[k] receives source element 2k (every other
-        # element) — verified wrong at N=32 and N=256, not just the >1024 staging cap.
-        # The layout/store mismatch is a real follow-up (reconcile the per-thread layout
-        # the split produces with the store-offset emission); until then, REFUSE rather
-        # than mis-compute. (Was a >1024-only guard, which missed the small-N silent-wrong.)
-        raise MetalNonRecoverableError(
-            f"tt.split (de-interleave of a {total}-element input) is not correctly "
-            f"lowered: the de-interleave layout does not match the store index, so it "
-            f"mis-computes at every size. Refusing rather than silently mis-compute.",
-            op_name="tt.split",
-        )
+        # (re-audit #8, FIXED 2026-08-26) This used to refuse unconditionally: the
+        # de-interleave gives thread lid the pair at row lid, which is RIGHT, but the
+        # store kept a join-era blocked index (`lid % 2 == 0 ? out[lid / 2]`), so
+        # output[k] received source element 2k — every other element, at every size.
+        #
+        # The store was applying the blocked rule because it inferred the layout from the
+        # result's SIZE, and a split of an (N,2) input yields size N, which equals the
+        # input's first dim. Same root cause as the argmin/argmax index refusals. The
+        # split now DECLARES its layout (registered on the results below) and the store
+        # honours it, so this computes.
+        #
+        # The >1024 staging cap is a separate, still-real limit and is enforced below.
+        if total > self.effective_block_size and not self._needs_wrapping:
+            raise MetalNonRecoverableError(
+                f"tt.split of a {total}-element input with only "
+                f"{self.effective_block_size} threads and no wrapping loop: the staging "
+                f"writes one element per thread, so the tail would be left uninitialized "
+                f"and the de-interleave silently wrong. Refusing (correct-or-refuse).",
+                op_name="tt.split",
+            )
 
         # Determine types
         input_dtype = self.env_types.get(src_id, "i32")
@@ -8778,6 +9070,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         out_shape = (N,)
         self.env_shapes[rid1] = out_shape
         self.env_shapes[rid2] = out_shape
+        # Thread lid holds the pair at row lid, so both results are in DIRECT layout.
+        # Declaring it stops the store from re-deriving a (wrong) blocked layout from
+        # the result's size — the re-audit #8 mis-compute.
+        self._register_1d_layout(rid1, "direct")
+        self._register_1d_layout(rid2, "direct")
 
     def _lower_tt_histogram(self, ssa: SSAValue):
         """tt.histogram → threadgroup atomic histogram.
@@ -8825,45 +9122,178 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Each thread increments bins — use stride loop to cover all M elements.
         # Trace back to find the source pointer for re-loading values.
         src_ptr_name = None
+        src_load_op = None
         trace_id = ssa.operand_ids[0]
         for op in self.graph.ops:
             if op.id == trace_id and op.op == "tt.load" and op.operand_ids:
                 # Found the load — trace its ptr to the function arg
+                src_load_op = op
                 ptr_id = op.operand_ids[0]
                 ptr_info = self.env_is_ptr.get(ptr_id)
                 if ptr_info:
                     src_ptr_name = ptr_info[0]
                 break
 
-        # Mask handling: the mask was computed inside the (now-closed) wrapping
-        # loop, so its variable is out of scope in the histogram loop. Recompute
-        # it symbolically using `_h` as the loop index. Fall back to the original
-        # variable reference when we aren't inside a wrapping loop (still in scope).
-        mask_extra = ""
-        if len(ssa.operand_ids) >= 2:
-            mask_operand_id = ssa.operand_ids[1]
-            if in_loop and src_ptr_name:
-                recomputed = self._synthesize_mask_for_index(mask_operand_id, "_h")
-                if recomputed is not None:
-                    mask_extra = f" && ({recomputed})"
-                # If we couldn't recompute, omit the mask rather than reference
-                # an out-of-scope variable. The bounds check `_h < M` still keeps
-                # us from reading past the input.
-            else:
-                mask_var = self._lookup(mask_operand_id)
-                mask_extra = f" && {mask_var}"
+        # How the tile's elements reach the bins.
+        #
+        # Re-reading the input flatly as ``src[_h]`` discards everything the source
+        # ``tl.load`` expressed -- its address arithmetic, its mask and its ``other=``.
+        # Measured consequences: ``tl.load(a + OFF + i)`` binned ``a[0:N]`` instead of
+        # the offset window, and a masked load both read past the end of the tensor and
+        # counted the masked-out lanes into the bins. All silent.
+        #
+        # The per-thread loaded value already has all three applied correctly, so prefer
+        # it. Re-reading is only necessary when one thread does not hold exactly one
+        # element -- the wrapping regime -- and there the flat address is only valid if
+        # the load really was ``base + arange(0, M)``; anything else refuses.
+        from triton_msl.errors import MetalNonRecoverableError
 
-        if src_ptr_name:
-            self.kb.raw_line(f"    for (uint _h = lid; _h < {M}u; _h += {bs}u) {{")
-            self.kb.raw_line(f"        int _hval = static_cast<int>({src_ptr_name}[_h]);")
+        _val_id = ssa.operand_ids[0]
+        _arr = getattr(self, "env_array", {}).get(_val_id)
+
+        # tt.histogram carries its OWN mask operand, separate from anything the source
+        # load had: `tl.histogram(x, N, mask)` bins only the lanes the mask selects.
+        # Upstream test_histogram_mask does exactly this over an UNMASKED load, so the
+        # two masks are independent and BOTH must be honoured.
+        _hist_mask_id = ssa.operand_ids[1] if len(ssa.operand_ids) >= 2 else None
+        _hist_mask_arr = (
+            getattr(self, "env_array", {}).get(_hist_mask_id) if _hist_mask_id is not None else None
+        )
+
+        def _flat_arange_load() -> bool:
+            """True when the load's address is exactly ``base + arange(0, M)``, so a
+            flat ``src[_h]`` re-read reproduces it."""
+            if src_load_op is None or not src_load_op.operand_ids:
+                return False
+            by_id = {}
+
+            def _walk(ops):
+                for _o in ops:
+                    by_id[_o.id] = _o
+                    if getattr(_o, "region_ops", None):
+                        _walk(_o.region_ops)
+                    if getattr(_o, "else_ops", None):
+                        _walk(_o.else_ops)
+
+            _walk(self.graph.ops)
+            cur = src_load_op.operand_ids[0]
+            for _ in range(16):
+                op = by_id.get(cur)
+                if op is None:
+                    return False
+                if op.op == "tt.addptr" and len(op.operand_ids) >= 2:
+                    # The pointer half must be the bare arg; the offset half a make_range.
+                    # Merely appearing in env_is_ptr is insufficient: chained addptr
+                    # results live there too. Their tuple carries a non-zero accumulated
+                    # offset, which a flat base[_h] re-read would silently discard.
+                    _base_info = self.env_is_ptr.get(op.operand_ids[0])
+                    if _base_info is None or _base_info[1] not in (0, "0", ""):
+                        return False
+                    cur = op.operand_ids[1]
+                    continue
+                if op.op in ("tt.broadcast", "tt.splat", "tt.expand_dims", "arith.extsi", "arith.extui"):
+                    if not op.operand_ids:
+                        return False
+                    cur = op.operand_ids[0]
+                    continue
+                if op.op == "tt.make_range":
+                    start = int(op.attrs.get("start", 0) or 0)
+                    end = int(op.attrs.get("end", 0) or 0)
+                    return start == 0 and end == M
+                return False
+            return False
+
+        if _arr is not None:
+            # MEPT register-array form: thread lid owns elements [lid*n, lid*n + n).
+            # The array elements already carry mask/other, so bin them directly.
+            _arr_name, _arr_n = _arr[0], _arr[1]
+            if _hist_mask_arr is not None:
+                _hm = f" && {_hist_mask_arr[0]}[_ai]"
+            elif _hist_mask_id is not None:
+                _hm = f" && {self._lookup(_hist_mask_id)}"
+            else:
+                _hm = ""
+            self.kb.raw_line(f"    for (uint _ai = 0; _ai < {_arr_n}u; ++_ai) {{")
+            self.kb.raw_line(f"        uint _h = lid * {_arr_n}u + _ai;")
+            self.kb.raw_line(f"        if (_h < {M}u{_hm}) atomic_fetch_add_explicit("
+                             f"&{hist_name}[(uint){_arr_name}[_ai]], 1, memory_order_relaxed);")
+            self.kb.raw_line(f"    }}")
+        elif not in_loop:
+            # One element per thread: the loaded value IS this thread's element, and the
+            # histogram's own mask variable is still in scope here.
+            _hm = f" && {self._lookup(_hist_mask_id)}" if _hist_mask_id is not None else ""
             self.kb.raw_line(
-                f"        if (_h < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);"
+                f"    if (lid < {M}u{_hm}) atomic_fetch_add_explicit("
+                f"&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);"
+            )
+        elif src_ptr_name and _flat_arange_load():
+            mask_extra = ""
+            other_expr = None
+            if len(src_load_op.operand_ids) >= 2:
+                _mask_id = None
+                for _op_id in src_load_op.operand_ids[1:]:
+                    if _mask_id is None and (_op_id in self.env_is_mask or self._is_mask(_op_id)):
+                        _mask_id = _op_id
+                    elif _mask_id is not None:
+                        if _op_id in getattr(self, "env_array", {}):
+                            raise MetalNonRecoverableError(
+                                "tt.histogram over a load whose 'other' is a per-element "
+                                "array: the staged re-read cannot re-address it. "
+                                "Refusing (correct-or-refuse).",
+                                op_name="tt.histogram",
+                            )
+                        other_expr = self._lookup(_op_id)
+                        break
+                if _mask_id is not None:
+                    recomputed = self._synthesize_mask_for_index(_mask_id, "_h")
+                    if recomputed is None:
+                        raise MetalNonRecoverableError(
+                            "masked tt.histogram over a tile larger than the threadgroup: "
+                            "the load's mask cannot be re-synthesized against the "
+                            "histogram index, so it could only be dropped -- which would "
+                            "read past the input and count masked-out elements into the "
+                            "bins. Refusing (correct-or-refuse).",
+                            op_name="tt.histogram",
+                        )
+                    mask_extra = recomputed
+            # The histogram's OWN mask must be re-synthesized against _h too: its
+            # variable was computed in the enclosing wrapping loop and is out of scope.
+            _hist_mask_expr = ""
+            if _hist_mask_id is not None:
+                _hm_syn = self._synthesize_mask_for_index(_hist_mask_id, "_h")
+                if _hm_syn is None:
+                    raise MetalNonRecoverableError(
+                        "tt.histogram with a mask over a tile wider than the "
+                        "threadgroup: the histogram's own mask cannot be re-synthesized "
+                        "against the accumulation index, so it could only be dropped -- "
+                        "which would bin the lanes it excludes. "
+                        "Refusing (correct-or-refuse).",
+                        op_name="tt.histogram",
+                    )
+                _hist_mask_expr = f"({_hm_syn})"
+            self.kb.raw_line(f"    for (uint _h = lid; _h < {M}u; _h += {bs}u) {{")
+            if mask_extra:
+                # Masked-out lanes contribute the load's `other` fill, exactly as the
+                # tile would hold it -- and are never dereferenced.
+                self.kb.raw_line(
+                    f"        int _hval = ({mask_extra}) ? static_cast<int>({src_ptr_name}[_h])"
+                    f" : static_cast<int>({other_expr if other_expr is not None else '0'});"
+                )
+            else:
+                self.kb.raw_line(f"        int _hval = static_cast<int>({src_ptr_name}[_h]);")
+            _add = f"atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);"
+            self.kb.raw_line(
+                f"        {f'if ({_hist_mask_expr}) ' if _hist_mask_expr else ''}{_add}"
             )
             self.kb.raw_line(f"    }}")
         else:
-            # Fallback: use the loaded input_var (only works when not wrapping)
-            self.kb.raw_line(
-                f"    if (lid < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);"
+            raise MetalNonRecoverableError(
+                "tt.histogram over a tile wider than the threadgroup whose source load "
+                "is not a plain `base + arange(0, N)`: the histogram would have to "
+                "re-read the input flatly, which drops the load's address arithmetic "
+                "(and any mask/other) and bins the wrong elements. "
+                "Refusing (correct-or-refuse).",
+                op_name="tt.histogram",
             )
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
@@ -8892,6 +9322,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = "i32"
         self.env_shapes[ssa.id] = (N,)
+        # Bins are read at hist[lid] (or hist[_loop_e]), so thread i holds bin i:
+        # DIRECT layout. Declaring it means the store no longer depends on the
+        # kernel-wide convert_layout flag happening to be set.
+        self._register_1d_layout(ssa.id, "direct")
+        for _rid in ssa.result_ids or []:
+            self._register_1d_layout(_rid, "direct")
 
     def _synthesize_mask_for_index(self, mask_id: int, index_var: str, _depth: int = 0):
         """Recompute a boolean mask expression using `index_var` as the loop index.
@@ -8903,8 +9339,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         `index_var` substituted for make_range-derived values.
 
         Returns an MSL expression string (parenthesized) on success, or None if
-        the mask is too complex to synthesize (caller falls back to dropping the
-        mask, relying on the bounds check to keep reads safe).
+        the mask is too complex to synthesize.
+
+        None means REFUSE, not "drop the mask". The old contract dropped it and relied
+        on the tile bounds check ``_h < M`` to keep reads safe -- but ``M`` bounds the
+        TILE, not the tensor, so dropping it read past the input and counted masked-out
+        elements into the bins (2026-08-26).
         """
         if _depth > 8:
             return None
@@ -8912,6 +9352,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         op_by_id = {op.id: op for op in self.graph.ops}
         op = op_by_id.get(mask_id)
         if op is None:
+            # Not produced by an op: a kernel ARGUMENT (block argument), e.g. the bound
+            # in `mask=i < n_elements`. Those are function parameters -- in scope
+            # everywhere, including the histogram's own loop, and loop-invariant -- so
+            # the name resolves correctly here. Without this the whole mask failed to
+            # synthesize and the caller had to refuse a perfectly ordinary masked load.
+            # Array- and shared-memory-backed values are NOT loop-invariant scalars.
+            if (
+                mask_id in self.env
+                and mask_id not in getattr(self, "env_array", {})
+                and mask_id not in getattr(self, "_shared_mem_descs", {})
+                and isinstance(self.env.get(mask_id), str)
+            ):
+                return f"({self.env[mask_id]})"
             return None
 
         name = op.op
@@ -9455,8 +9908,163 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Any other op breaks structural resolution.
         return None
 
-    def _rebuild_staged_fill_mask(self, mask_id, op_by_id, M, N):
-        """Structurally rebuild a cooperative over-threadgroup store's
+    # Producers that pass a value through unchanged as far as the thread-to-element
+    # mapping is concerned (dtype/shape wrappers, layout conversions).
+    _LAYOUT_PASSTHROUGH_OPS = (
+        "ttg.convert_layout",
+        "tt.splat",
+        "tt.broadcast",
+        "tt.expand_dims",
+        "tt.reshape",
+        "arith.extsi",
+        "arith.extui",
+        "arith.trunci",
+        "arith.sitofp",
+        "arith.uitofp",
+        "arith.fptosi",
+        "arith.fptoui",
+        "arith.bitcast",
+        "arith.extf",
+        "arith.truncf",
+    )
+
+    def _layout_op_index(self):
+        """id -> op across nested regions (built per call; graphs here are small)."""
+        by_id = {}
+
+        def _walk(ops):
+            for _o in ops:
+                by_id[_o.id] = _o
+                if getattr(_o, "region_ops", None):
+                    _walk(_o.region_ops)
+                if getattr(_o, "else_ops", None):
+                    _walk(_o.else_ops)
+
+        _walk(self.graph.ops)
+        return by_id
+
+    def _traces_to_converted_layout(self, val_id, depth=8):
+        """True when THIS value went through a ttg.convert_layout redistribution.
+
+        The store used to test ``bool(self._converted_layout_ids)`` -- a KERNEL-WIDE
+        flag. When a 2-D argmin/argmax had its value converted but its index not, that
+        flag put BOTH stores on the simple layout, so the index (still broadcast as
+        ``shared[lid / N]``) stored row 0's index for every row (reduce-probe #5).
+        """
+        conv = getattr(self, "_converted_layout_ids", None)
+        if not conv:
+            return False
+        by_id = self._layout_op_index()
+        cur = val_id
+        for _ in range(depth):
+            if cur in conv:
+                return True
+            op = by_id.get(cur)
+            if op is None or not op.operand_ids:
+                return False
+            if op.op in self._LAYOUT_PASSTHROUGH_OPS:
+                cur = op.operand_ids[0]
+                continue
+            return False
+        return False
+
+    def _report_undeclared_layout(self, how, size):
+        """A 1-D store whose thread-to-element layout no producer declared: REFUSE.
+
+        Such a store can only be emitted by GUESSING the layout, and that guess is
+        exactly what produced three silent-wrongs -- axis=0 argmin/argmax on a square
+        tile (reduce-probe #6), axis=1 with both results consumed (#5), and tt.split
+        (re-audit #8). In each case the emitted code looked reasonable and returned the
+        wrong elements.
+
+        Refusing is now the DEFAULT (flipped 2026-08-27). Every producer this path could
+        reach across the full upstream conformance suite (9,342 tests) and the project
+        suite now calls ``_register_1d_layout`` -- verified by running both suites with
+        this refusal live: 198 upstream failures with 0 undeclared-layout errors, so
+        this path is UNREACHABLE on every kernel either suite exercises. Measuring
+        lesson, kept because it bit: an earlier flip attempt counted fallbacks via a
+        WARN print, which pytest CAPTURES for passing tests (the count silently read as
+        zero), and regressed 51 upstream ``test_reduce`` cases. Count refusals with an
+        exception (cannot be captured away), never with prints under pytest.
+
+        ``TRITON_MSL_INFER_LAYOUT=1`` opts back into the historical size/kernel-wide-flag
+        inference for a kernel this project's test surface does not cover, in the same
+        spirit as ``TRITON_MSL_LEGACY=1`` for the legacy parser -- it can be silently
+        wrong, and exists as a way forward while the producer is taught to declare.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        msg = (
+            f"1-D store layout was not declared by its producer, so it could only be "
+            f"resolved by {how} -- a guess that has silently stored the wrong elements "
+            f"before (kernel={self.graph.func_name}, size={size}, "
+            f"2d_shape={self._effective_2d_shape}). Refusing (correct-or-refuse). The "
+            f"producer should call _register_1d_layout; set TRITON_MSL_INFER_LAYOUT=1 to "
+            f"fall back to the historical inference (may be silently wrong)."
+        )
+        if os.environ.get("TRITON_MSL_INFER_LAYOUT") == "1":
+            if os.environ.get("TRITON_MSL_WARN_UNDECLARED_LAYOUT") == "1":
+                import sys as _sys
+
+                print(f"[triton-msl] {msg}", file=_sys.stderr)
+            return
+        raise MetalNonRecoverableError(msg, op_name="tt.store")
+
+    def _register_1d_layout(self, value_id, layout):
+        """Record the thread-to-element mapping a 1-D value is produced in.
+
+        ``"direct"``  -- thread i holds element i (store: ``if (lid < size) out[lid]``)
+        ``"blocked"`` -- thread i holds element i / N (store: one thread per row block)
+
+        Producers must declare this because the STORE cannot infer it from the value's
+        SIZE. A 2-D axis=0 reduce yields size N and an axis=1 reduce size M, so on a
+        square tile they are indistinguishable; ``tt.split`` of an (N,2) input yields
+        size N, which equals the input's first dim. In every one of those cases the
+        size heuristic picked the blocked rule and silently stored the wrong elements
+        (reduce-probe #5/#6, re-audit #8).
+        """
+        if not hasattr(self, "_value_1d_layout"):
+            self._value_1d_layout = {}
+        self._value_1d_layout[value_id] = layout
+
+    def _value_1d_layout_of(self, val_id, depth=8):
+        """The recorded layout of a stored 1-D value, or None if not traceable.
+
+        Only pass-through producers are followed. An op that COMBINES two values (say
+        ``tl.argmax(x,0) + tl.argmax(x,1)``) has no single layout, so this returns None
+        and the caller keeps its previous behaviour rather than guessing.
+        """
+        rec = getattr(self, "_value_1d_layout", None)
+        if not rec:
+            return None
+
+        by_id = {}
+
+        def _walk(ops):
+            for _o in ops:
+                by_id[_o.id] = _o
+                if getattr(_o, "region_ops", None):
+                    _walk(_o.region_ops)
+                if getattr(_o, "else_ops", None):
+                    _walk(_o.else_ops)
+
+        _walk(self.graph.ops)
+
+        cur = val_id
+        for _ in range(depth):
+            if cur in rec:
+                return rec[cur]
+            op = by_id.get(cur)
+            if op is None or not op.operand_ids:
+                return None
+            if op.op in self._LAYOUT_PASSTHROUGH_OPS:
+                cur = op.operand_ids[0]
+                continue
+            return None
+        return None
+
+    def _rebuild_staged_fill_mask(self, mask_id, op_by_id, M, N, kind="store"):
+        """Structurally rebuild a cooperative over-threadgroup store's or load's
         per-element mask as a boolean MSL expression in terms of
         ``(_fill_row, _fill_col)``, or raise ``MetalNonRecoverableError`` if it
         cannot be soundly reconstructed (correct-or-refuse).
@@ -9475,11 +10083,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         def _refuse():
             raise MetalNonRecoverableError(
-                "masked cooperative store of a tile larger than the "
+                f"masked cooperative {kind} of a tile larger than the "
                 "threadgroup: the per-element mask is not a single "
                 "structurally-resolvable row/col bounds comparison and cannot "
                 "be safely reconstructed. Refusing (correct-or-refuse).",
-                op_name="tt.store",
+                op_name=f"tt.{kind}",
             )
 
         def _render(terms, cast):
@@ -9732,6 +10340,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # between the load and the local_alloc (e.g. arith.mulf by a scale).
         load_ptr_info = None
         load_addptr_id = None
+        load_op = None
         post_load_ops = []  # (op_type, extra_operand_var) chain, in load order
         cur_id = ssa.operand_ids[0]
         for _depth in range(10):
@@ -9741,6 +10350,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if op.op == "tt.load" and op.operand_ids:
                 load_addptr_id = op.operand_ids[0]
                 load_ptr_info = self.env_is_ptr.get(load_addptr_id)
+                load_op = op
                 break
             if op.operand_ids:
                 if len(op.operand_ids) >= 2:
@@ -9759,6 +10369,63 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     expr = f"({expr} + {other_var})"
             return expr
 
+        def _staged_load_guard():
+            """Resolve the staged load's MASK (and 'other') per (_fill_row, _fill_col).
+
+            The staged fill re-reads the tile straight from global memory, so it must
+            honour the mask the Triton ``tl.load`` carried. Dropping it reads OUT OF
+            BOUNDS whenever the tile overhangs the tensor -- e.g. a varlen FA kernel
+            whose last K/V block starts past the final sequence: the masked lanes then
+            multiply a correct ``p == 0`` by garbage, and ``0 * NaN == NaN`` poisons the
+            accumulator (a NaN silent-wrong, not a loud failure). The scalar path
+            already honours it; this is the same guard, resolved with the same
+            structural machinery the cooperative STORE path uses, refusing rather than
+            guessing when the mask is not structurally resolvable.
+
+            Returns (mask_expr | None, other_expr).
+            """
+            if load_op is None or len(load_op.operand_ids) < 2:
+                return None, "0.0f"
+            mask_id = None
+            other_expr = "0.0f"
+            for _op_id in load_op.operand_ids[1:]:
+                if mask_id is None and (_op_id in self.env_is_mask or self._is_mask(_op_id)):
+                    mask_id = _op_id
+                elif mask_id is not None:
+                    # 'other' fill value: only a uniform scalar is sound here, since
+                    # the staged element is addressed by (_fill_row, _fill_col) rather
+                    # than by lid. A per-element 'other' array refuses below.
+                    if _op_id in self.env_array or _op_id in getattr(self, "_shared_mem_descs", {}):
+                        from triton_msl.errors import MetalNonRecoverableError
+
+                        raise MetalNonRecoverableError(
+                            "masked cooperative load of a tile larger than the "
+                            "threadgroup: the load's 'other' operand is a per-element "
+                            "array, which cannot be re-addressed for the staged fill. "
+                            "Refusing (correct-or-refuse).",
+                            op_name="tt.load",
+                        )
+                    other_expr = self._lookup(_op_id)
+                    break
+            if mask_id is None:
+                return None, other_expr
+            # Raises MetalNonRecoverableError when not structurally resolvable.
+            return self._rebuild_staged_fill_mask(mask_id, op_by_id, M, N, kind="load"), other_expr
+
+        def _emit_staged_fill(raw_expr):
+            """Emit the guarded per-element staged assignment.
+
+            The mask wraps the RAW load and any post-load transform is applied to the
+            selected value -- i.e. ``(mask ? load : other) * scale``, matching Triton's
+            order -- so a non-zero ``other`` is not silently scaled.
+            """
+            mask_expr, other_expr = _staged_load_guard()
+            if mask_expr is None:
+                self.kb.raw_line(f"        {shared_name}[_sa] = {_apply_post_load(raw_expr)};")
+            else:
+                sel = f"({mask_expr} ? ({raw_expr}) : ({other_expr}))"
+                self.kb.raw_line(f"        {shared_name}[_sa] = {_apply_post_load(sel)};")
+
         if total > bs and self._is_2d:
             if load_ptr_info is not None:
                 base_ptr = load_ptr_info[0]
@@ -9768,8 +10435,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                val_expr = _apply_post_load(f"{base_ptr}[{new_offset}]")
-                self.kb.raw_line(f"        {shared_name}[_sa] = {val_expr};")
+                _emit_staged_fill(f"{base_ptr}[{new_offset}]")
                 self.kb.raw_line(f"    }}")
             else:
                 # Couldn't find load pointer — fall back to per-thread value
@@ -9787,10 +10453,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                val_expr = _apply_post_load(f"{base_ptr}[{new_offset}]")
-                self.kb.raw_line(f"        {shared_name}[_sa] = {val_expr};")
+                _emit_staged_fill(f"{base_ptr}[{new_offset}]")
                 self.kb.raw_line(f"    }}")
             else:
+                # Flat contiguous copy: the element address is _sa itself, so there is
+                # no (_fill_row, _fill_col) to resolve a mask against. A masked load
+                # here would read past the tensor exactly like the rebuilt paths did,
+                # so refuse rather than drop the guard.
+                if load_op is not None and len(load_op.operand_ids) >= 2:
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    for _op_id in load_op.operand_ids[1:]:
+                        if _op_id in self.env_is_mask or self._is_mask(_op_id):
+                            raise MetalNonRecoverableError(
+                                "masked cooperative load staged as a flat contiguous "
+                                "copy: the per-element mask cannot be reconstructed for "
+                                "this fill, and dropping it would read out of bounds. "
+                                "Refusing (correct-or-refuse).",
+                                op_name="tt.load",
+                            )
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
                 self.kb.raw_line(f"    }}")
@@ -10486,6 +11167,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if not hasattr(self, "_converted_layout_ids"):
             self._converted_layout_ids = set()
         self._converted_layout_ids.add(ssa.id)
+        # Read back as shared[lid], i.e. thread i holds element i -- the DIRECT layout.
+        # Declared here too so the store can consult one registry instead of also
+        # consulting the convert_layout side-channel.
+        self._register_1d_layout(ssa.id, "direct")
 
 
 # ---------------------------------------------------------------------------

@@ -1000,6 +1000,16 @@ class _ControlFlowMixin:
         # In Triton, a scalar atomic (ptr is !tt.ptr, not tensor<Nx!tt.ptr>)
         # is per-program, not per-thread. Guard with lid == 0.
         is_scalar = not ssa.is_tensor
+        scalar_result_shared = None
+        if is_scalar:
+            # The scalar result is logically available to every thread after a later
+            # tt.splat, but only lid 0 executes the device atomic below.  A plain local
+            # therefore leaves every other thread holding result_zero; labelling that
+            # value DIRECT lets a 1-D store silently emit [old, 0, 0, ...].  Broadcast
+            # lid 0's old value through threadgroup memory before registering a layout.
+            scalar_result_shared = f"atomic_scalar_result_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(scalar_result_shared, dtype=result_dtype, size=1)
 
         # A 1-D atomic tensor smaller than the thread count must only execute on
         # the first shape[0] threads, NOT all of them. For a constant-offset
@@ -1179,8 +1189,18 @@ class _ControlFlowMixin:
         if has_guard:
             self.kb.raw_line(f"    }}")
 
+        if scalar_result_shared is not None:
+            self.kb.raw_line(f"    if (lid == 0) {scalar_result_shared}[0] = {result_var};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    {result_var} = ({result_msl_type}){scalar_result_shared}[0];")
+
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = result_dtype
+        # Tensor atomic: every thread's `old_N` is the old value at its own location.
+        # Scalar atomic: the threadgroup broadcast above makes the one per-program old
+        # value available identically to every thread.  Either is DIRECT for a later
+        # 1-D store; only register after that invariant is actually true.
+        self._register_1d_layout(ssa.id, "direct")
 
     def _lower_atomic_cas(self, ssa: SSAValue):
         """tt.atomic_cas → MSL atomic compare-and-swap.
