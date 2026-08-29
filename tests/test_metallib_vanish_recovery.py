@@ -140,6 +140,7 @@ def test_concurrent_compile_and_clear(tmp_path):
     """
     cache_dir = str(tmp_path / "stress_cache")
     os.makedirs(cache_dir, exist_ok=True)
+    inherited_cache_dir = os.environ.get("TRITON_MSL_CACHE_DIR")
     os.environ["TRITON_MSL_CACHE_DIR"] = cache_dir
     try:
         from triton_msl.backend.compiler import MetalBackend, MetalOptions
@@ -200,7 +201,10 @@ def test_concurrent_compile_and_clear(tmp_path):
                 f"  {type(e).__name__}: {e}" for e in errors[:5]
             )
     finally:
-        os.environ.pop("TRITON_MSL_CACHE_DIR", None)
+        if inherited_cache_dir is None:
+            os.environ.pop("TRITON_MSL_CACHE_DIR", None)
+        else:
+            os.environ["TRITON_MSL_CACHE_DIR"] = inherited_cache_dir
 
 
 @requires_metal_compiler

@@ -37,6 +37,21 @@ requires_metal = pytest.mark.skipif(
 )
 
 
+def pytest_configure(config):
+    """Give each pytest process a private Inductor cache before collection imports.
+
+    Separate project/baseline sessions may run concurrently.  If both use PyTorch's
+    default ``torchinductor_$USER`` directory, either session's startup cleanup can
+    delete generated wrappers while the other is compiling a model.  Set the cache
+    before test-module collection (which itself imports torch/Inductor), while honoring
+    an explicit caller-provided directory.
+    """
+    if not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = tempfile.mkdtemp(
+            prefix="triton_msl_pytest_inductor_"
+        )
+
+
 def pytest_collection_modifyitems(config, items):
     """Skip GPU tests on non-macOS platforms."""
     if platform.system() != "Darwin":
@@ -47,15 +62,16 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(scope="session", autouse=True)
 def _fresh_inductor_cache():
-    """Clear PyTorch Inductor's persistent kernel cache ONCE at session start.
+    """Clear this pytest process's private PyTorch Inductor cache once at startup.
 
-    Inductor caches compiled kernels in /var/folders/.../torchinductor_* keyed by ITS own
+    Inductor caches compiled kernels keyed by ITS own
     hash (Triton source + config) — NOT by triton-msl's CODEGEN_VERSION. So a triton-msl
     lowering change does NOT invalidate inductor's cache, and a torch.compile test can
     silently run kernels a PRIOR session compiled before the change. That masked a
     reduce-classifier regression (it refused inductor's NaN-propagating max -> broke
-    softmax/training) behind a green suite. Clearing once per session makes the
-    torch.compile tests exercise the CURRENT codegen rather than stale cached kernels.
+    softmax/training) behind a green suite. ``pytest_configure`` isolates concurrent
+    sessions before collection; clearing once here makes the torch.compile tests
+    exercise the CURRENT codegen rather than stale cached kernels.
     """
     try:
         import shutil
