@@ -1000,16 +1000,20 @@ class _ControlFlowMixin:
         # In Triton, a scalar atomic (ptr is !tt.ptr, not tensor<Nx!tt.ptr>)
         # is per-program, not per-thread. Guard with lid == 0.
         is_scalar = not ssa.is_tensor
-        scalar_result_shared = None
-        if is_scalar:
+        atom_shape = _extract_shape(ssa.type_str) if ssa.is_tensor else ()
+        atomic_result_shared = None
+        if is_scalar or atom_shape == (1,):
             # The scalar result is logically available to every thread after a later
             # tt.splat, but only lid 0 executes the device atomic below.  A plain local
             # therefore leaves every other thread holding result_zero; labelling that
             # value DIRECT lets a 1-D store silently emit [old, 0, 0, ...].  Broadcast
             # lid 0's old value through threadgroup memory before registering a layout.
-            scalar_result_shared = f"atomic_scalar_result_{self._shared_counter}"
+            # A tensor<1> has the same physical invariant: the 1-D underfill guard makes
+            # only lid 0 execute, and a later tt.broadcast is metadata-only in this
+            # lowering. Without the same repair it also emitted [old, 0, 0, ...].
+            atomic_result_shared = f"atomic_single_result_{self._shared_counter}"
             self._shared_counter += 1
-            self.kb.declare_threadgroup_array(scalar_result_shared, dtype=result_dtype, size=1)
+            self.kb.declare_threadgroup_array(atomic_result_shared, dtype=result_dtype, size=1)
 
         # A 1-D atomic tensor smaller than the thread count must only execute on
         # the first shape[0] threads, NOT all of them. For a constant-offset
@@ -1021,7 +1025,6 @@ class _ControlFlowMixin:
         # and under-fills the threadgroup. Re-audit 2026-06-27.
         atomic_1d_guard = None
         if ssa.is_tensor:
-            atom_shape = _extract_shape(ssa.type_str)
             if len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
                 atomic_1d_guard = atom_shape[0]
 
@@ -1189,17 +1192,17 @@ class _ControlFlowMixin:
         if has_guard:
             self.kb.raw_line(f"    }}")
 
-        if scalar_result_shared is not None:
-            self.kb.raw_line(f"    if (lid == 0) {scalar_result_shared}[0] = {result_var};")
+        if atomic_result_shared is not None:
+            self.kb.raw_line(f"    if (lid == 0) {atomic_result_shared}[0] = {result_var};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
-            self.kb.raw_line(f"    {result_var} = ({result_msl_type}){scalar_result_shared}[0];")
+            self.kb.raw_line(f"    {result_var} = ({result_msl_type}){atomic_result_shared}[0];")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = result_dtype
-        # Tensor atomic: every thread's `old_N` is the old value at its own location.
-        # Scalar atomic: the threadgroup broadcast above makes the one per-program old
-        # value available identically to every thread.  Either is DIRECT for a later
-        # 1-D store; only register after that invariant is actually true.
+        # Tensor atomic: every participating thread's `old_N` is the old value at its
+        # own location. Scalar/tensor<1>: the threadgroup broadcast above makes the one
+        # logical old value available identically to every thread. Either is DIRECT for
+        # a later 1-D store; only register after that invariant is actually true.
         self._register_1d_layout(ssa.id, "direct")
 
     def _lower_atomic_cas(self, ssa: SSAValue):
@@ -1248,8 +1251,9 @@ class _ControlFlowMixin:
                 op_name="tt.atomic_cas",
             )
 
-        # Scalar CAS: only thread 0 per threadgroup should execute
+        # Scalar CAS: only thread 0 per threadgroup should execute.
         is_scalar = not ssa.is_tensor
+        atom_shape = _extract_shape(ssa.type_str) if ssa.is_tensor else ()
 
         n = self._var_counter
         self._var_counter += 1
@@ -1265,6 +1269,24 @@ class _ControlFlowMixin:
             result_dtype = "i32"
 
         result_var = f"old_{n}"
+
+        # Scalar and tensor<1> CAS each have one logical old value. Only lid 0
+        # performs that CAS (the scalar guard or the 1-D underfill guard below),
+        # so distribute its return before any splat/broadcast consumer. A local
+        # initialized to zero on the other lanes previously produced [old,0,...]
+        # for scalar CAS and [old,new,new,...] for an unguarded tensor<1> CAS.
+        atomic_result_shared = None
+        if is_scalar or atom_shape == (1,):
+            atomic_result_shared = f"atomic_cas_single_result_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(atomic_result_shared, dtype=result_dtype, size=1)
+
+        # As for atomic_rmw, a 1-D CAS tensor smaller than the threadgroup must
+        # execute only on its logical lanes. Otherwise tensor<1> races every lane
+        # on one address and tensor<N> writes OOB for lid >= N.
+        atomic_1d_guard = None
+        if ssa.is_tensor and len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
+            atomic_1d_guard = atom_shape[0]
 
         # n>1 under-cover guard (mirrors _lower_store): a BLOCK-wide atomic the
         # base path emits as one element per thread (PTR[k+lid]) would silently
@@ -1294,10 +1316,15 @@ class _ControlFlowMixin:
 
         self.kb.raw_line(f"    {result_msl_type} {result_var} = {result_zero};")
 
-        # Scalar guard
-        indent = "    "
+        # Scalar / 1-D underfill guard.
+        guard = None
         if is_scalar:
-            self.kb.raw_line(f"    if (lid == 0) {{")
+            guard = "lid == 0"
+        elif atomic_1d_guard is not None:
+            guard = f"lid < {atomic_1d_guard}u"
+        indent = "    "
+        if guard is not None:
+            self.kb.raw_line(f"    if ({guard}) {{")
             indent = "        "
 
         if is_float:
@@ -1316,11 +1343,17 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"{indent}    memory_order_relaxed, memory_order_relaxed);")
             self.kb.raw_line(f"{indent}{result_var} = expected_{n};")
 
-        if is_scalar:
+        if guard is not None:
             self.kb.raw_line(f"    }}")
+
+        if atomic_result_shared is not None:
+            self.kb.raw_line(f"    if (lid == 0) {atomic_result_shared}[0] = {result_var};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    {result_var} = ({result_msl_type}){atomic_result_shared}[0];")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = result_dtype
+        self._register_1d_layout(ssa.id, "direct")
 
     # -- Noinline function calls (tt.call) --
 
