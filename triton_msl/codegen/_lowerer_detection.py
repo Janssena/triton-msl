@@ -188,7 +188,7 @@ class _DetectionMixin:
     def _acc_init_is_bias(self, init_id, by_id, dot_shape=None):
         """True iff a tt.dot accumulator init is CLEARLY a fused bias the inline matmul
         template would SILENTLY DROP: a loaded value (traced through
-        splat/broadcast/convert_layout/reshape/expand_dims) or a NON-ZERO constant.
+        splat/broadcast/layout/shape/dtype wrappers) or a NON-ZERO constant.
         ``tl.zeros`` and unrecognized inits return False — never over-refuse a normal
         matmul. When ``dot_shape`` is given (the strided-template path), only an init whose
         shape matches the dot-output tile (the accumulator) counts; a load/const of a
@@ -201,7 +201,23 @@ class _DetectionMixin:
         _seen = set()
         while _op is not None and _op.id not in _seen:
             _seen.add(_op.id)
-            if _op.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.reshape", "tt.expand_dims"):
+            if _op.op in (
+                "tt.splat",
+                "tt.broadcast",
+                "ttg.convert_layout",
+                "tt.reshape",
+                "tt.expand_dims",
+                # Triton inserts a widening cast when an fp16 accumulator load is
+                # passed to a float32-output dot.  The cast does not make the init
+                # zero: it is still the loaded bias the inline template drops.  Not
+                # seeing through arith.extf left all nine upstream fp16->fp32
+                # add-matrix/add-row/add-col cases executing silently wrong.
+                "arith.extf",
+                "arith.truncf",
+                "arith.sitofp",
+                "arith.uitofp",
+                "tt.fp_to_fp",
+            ):
                 _op = by_id.get(_op.operand_ids[0]) if _op.operand_ids else None
                 continue
             break
