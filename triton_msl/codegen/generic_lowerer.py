@@ -8441,9 +8441,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         V IS verifiable: it is BY DEFINITION the second operand of the earliest dot
         whose FIRST operand depends on dot 0's result (that is P@V). Trace that operand
         back to a kernel arg with the same tracer Q/K/Out use and require agreement.
-        Every leg is fail-safe: no second dot, no dot-0-dependent dot, or an
-        untraceable operand (e.g. a loop-carried V pointer) falls back to the
-        detector's answer. Only a POSITIVE structural trace that DISAGREES refuses.
+        Role-resolution legs are fail-safe: no second dot, no dot-0-dependent dot, or
+        an untraceable POINTER source (e.g. a loop-carried V pointer) falls back to the
+        detector's answer. The P@V DATA operand is stricter: every FA template reads raw
+        V and cannot reproduce arithmetic applied to V before the dot, so a non-direct
+        load must refuse. Otherwise both the detector and this verifier can follow
+        operand 0 through ``V + K``/``V * scale``, agree on V, and silently drop the
+        transformation.
 
         Called from ALL THREE FA template paths. The dense path also pins Q/K/V/Out to
         args 0-3 in order, so this is defense-in-depth there; the varlen and
@@ -8496,6 +8500,47 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         )
         if _dot_pv is None:
             return  # fail-safe: structure not recognized, detector's answer stands
+
+        # Verify the VALUE path independently from the pointer-role trace. The shared
+        # _trace_ptr_source helper deliberately follows operand 0 through arbitrary ops
+        # because it is used for ADDRESS discovery elsewhere. That is not enough here:
+        # ``dot(P, V + K)`` traced positively to V through the add, agreed with the
+        # detector, then the FA template loaded raw V (GPU-confirmed err 1.39). Only
+        # representation/layout wrappers are semantics-preserving for the template.
+        _v_passthrough = {
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.convert_layout",
+            # Widening preserves every source value exactly.  Do not admit truncf,
+            # fp_to_fp, bitcast, reshape, or transpose: those can change either the
+            # values or their matrix coordinates, and the template does not replay
+            # them when it reloads raw V.
+            "arith.extf",
+        }
+        _cur = _dot_pv.operand_ids[1]
+        _v_seen = set()
+        _direct_load = False
+        while _cur not in _v_seen and len(_v_seen) < 64:
+            _v_seen.add(_cur)
+            _op = _by_id.get(_cur)
+            if _op is None:
+                break
+            if _op.op == "tt.load":
+                _direct_load = True
+                break
+            if _op.op not in _v_passthrough or len(_op.operand_ids or []) != 1:
+                break
+            _cur = _op.operand_ids[0]
+        if not _direct_load:
+            raise MetalNonRecoverableError(
+                "FlashAttention P@V operand is not a direct V load through only "
+                "semantics-preserving layout/widening wrappers. The FA templates read "
+                "raw V and would silently drop transformations applied before the dot "
+                "(for example V + K, V * scale, a transpose, or a lossy cast). Refusing "
+                "rather than mis-compute.",
+                op_name="tt.dot",
+            )
+
         _v_arg = self._trace_ptr_source(_dot_pv.operand_ids[1])
         if _v_arg is not None and _v_arg.index != detected_v_index:
             raise MetalNonRecoverableError(
