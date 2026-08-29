@@ -5709,9 +5709,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "varlen FlashAttention arg list is not densely indexed; refusing."
                 )
         roles = info["roles"]
-        # V verification (issue #4 item 3): this path has NO first-four ordering gate,
-        # so the structural dot-1 check is the ONLY V cross-check here.
-        self._fa_verify_v_role(roles["v"])
+        info["scale"] *= self._fa_verify_value_paths(
+            detected_q_index=roles["q"],
+            detected_k_index=roles["k"],
+            detected_v_index=roles["v"],
+            detected_out_index=roles["o"],
+            k_transposes=1,
+        )
         role_of_idx = {
             roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
             roles["cuq"]: "CUQ", roles["cuk"]: "CUK",
@@ -6428,18 +6432,179 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if h_val is None:
             h_val = h_arg.index if h_arg is not None else C1
 
-        # --- causal: an arith.select of shape [block_m, block_n] whose operands
-        # include the QK dot result (the tl.where(mask, qk, -inf) causal mask). For MLA
-        # the mask is applied to the SUMMED score, i.e. the rope dot's result (the chain
-        # tail), so accept either QK dot id.
+        # --- score masks: classify the exact semantics, never "any select = causal".
+        # The old shortcut sent an ordinary ``where(k < N_CTX, score, -inf)`` through
+        # the triangular template and returned a GPU-confirmed wrong result (err 3.7).
+        # Dense templates replay two masks: the N_CTX tile boundary and the canonical
+        # within-sequence lower triangle.  Admit only those proofs; any other select on
+        # the score path refuses rather than being dropped or mislabeled.
         _qk_ids = {dot_qk.id} | ({dot_rope.id} if is_mla and dot_rope is not None else set())
         causal = False
+
+        def _mask_cone_has(start, predicate, limit=128):
+            seen2, stack2 = set(), [start]
+            while stack2 and len(seen2) < limit:
+                cur2 = stack2.pop()
+                if cur2 in seen2:
+                    continue
+                seen2.add(cur2)
+                op2 = op_by_id.get(cur2)
+                if op2 is not None:
+                    if predicate(op2):
+                        return True
+                    stack2.extend(op2.operand_ids or [])
+            return False
+
+        def _mask_depends_on_score(start):
+            return _mask_cone_has(start, lambda op: op.id in _qk_ids)
+
+        def _mask_is_exact_arg(start, arg_index):
+            target = next((a.id for a in self.graph.args if a.index == arg_index), None)
+            if target is None:
+                return False
+            cur2, seen2 = start, set()
+            wrappers = {
+                "tt.splat",
+                "tt.broadcast",
+                "tt.expand_dims",
+                "tt.reshape",
+                "ttg.convert_layout",
+                "arith.extsi",
+                "arith.extui",
+                "arith.index_cast",
+                "arith.index_castui",
+            }
+            while cur2 not in seen2:
+                if cur2 == target:
+                    return True
+                seen2.add(cur2)
+                op2 = op_by_id.get(cur2)
+                if op2 is None or op2.op not in wrappers or len(op2.operand_ids or []) != 1:
+                    return False
+                cur2 = op2.operand_ids[0]
+            return False
+
+        def _mask_core_id(start):
+            cur2, seen2 = start, set()
+            wrappers = {
+                "tt.splat",
+                "tt.broadcast",
+                "tt.expand_dims",
+                "tt.reshape",
+                "ttg.convert_layout",
+            }
+            while cur2 not in seen2:
+                seen2.add(cur2)
+                op2 = op_by_id.get(cur2)
+                if op2 is None or op2.op not in wrappers or len(op2.operand_ids or []) != 1:
+                    return cur2
+                cur2 = op2.operand_ids[0]
+            return None
+
+        def _mask_core(start):
+            return op_by_id.get(_mask_core_id(start))
+
+        def _mask_is_neg_inf(start):
+            op2 = _mask_core(start)
+            if op2 is None or op2.op != "arith.constant":
+                return False
+            value = (op2.attrs or {}).get("value")
+            if isinstance(value, float):
+                return value == float("-inf")
+            # TTGIR walkers expose floating -inf either as a float or its raw bit word.
+            return value in (0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000)
+
+        _loop_iv_ids = {
+            (s.attrs or {}).get("block_arg_ids", [None])[0]
+            for s in all_ops
+            if s.op == "scf.for" and (s.attrs or {}).get("block_arg_ids")
+        }
+
+        def _mask_constant(start):
+            op2 = _mask_core(start)
+            if op2 is None or op2.op != "arith.constant":
+                return None
+            value = (op2.attrs or {}).get("value")
+            return int(value) if isinstance(value, (int, float)) else None
+
+        def _mask_index_kind(start):
+            """Exact dense-template row/column index, or None.
+
+            Query rows are ``pid0*BLOCK_M + arange(0, BLOCK_M)``. Key columns are
+            ``loop_iv + arange(0, BLOCK_N)``.  Admitting a mere cone dependency would
+            also accept offsets such as ``arange+1`` that the template does not replay.
+            """
+            root = _mask_core(start)
+            if root is None or root.op != "arith.addi" or len(root.operand_ids or []) != 2:
+                return None
+            range_id = base_id = None
+            for oid in root.operand_ids:
+                atom = _mask_core(oid)
+                if atom is not None and atom.op == "tt.make_range":
+                    range_id = oid
+                else:
+                    base_id = oid
+            if range_id is None or base_id is None:
+                return None
+            range_op = _mask_core(range_id)
+            start_v = int((range_op.attrs or {}).get("start", -1))
+            end_v = int((range_op.attrs or {}).get("end", -1))
+            base = _mask_core(base_id)
+            if _mask_core_id(base_id) in _loop_iv_ids:
+                return "key" if start_v == 0 and end_v == block_n else None
+            if base is None or base.op != "arith.muli" or len(base.operand_ids or []) != 2:
+                return None
+            pid0 = any(
+                (atom := _mask_core(oid)) is not None
+                and atom.op == "tt.get_program_id"
+                and int((atom.attrs or {}).get("axis", 0)) == 0
+                for oid in base.operand_ids
+            )
+            block_factor = any(_mask_constant(oid) == block_m for oid in base.operand_ids)
+            if pid0 and block_factor and start_v == 0 and end_v == block_m:
+                return "query"
+            return None
+
         for s in all_ops:
-            if s.op == "arith.select":
-                sel_shape = _extract_shape(s.type_str or "")
-                if tuple(sel_shape) == (block_m, block_n) and _qk_ids & set(s.operand_ids or []):
-                    causal = True
-                    break
+            if s.op != "arith.select" or len(s.operand_ids or []) != 3:
+                continue
+            if tuple(_extract_shape(s.type_str or "")) != (block_m, block_n):
+                continue
+            cond_id, true_id, false_id = s.operand_ids
+            true_score = _mask_depends_on_score(true_id)
+            false_score = _mask_depends_on_score(false_id)
+            if not (true_score or false_score):
+                continue
+            if not (true_score and not false_score and _mask_is_neg_inf(false_id)):
+                _refuse("a score mask of where(proven_mask, score, -inf)")
+
+            cmp_op = _mask_core(cond_id)
+            if cmp_op is None or cmp_op.op != "arith.cmpi" or len(cmp_op.operand_ids or []) != 2:
+                _refuse("a directly provable comparison for the score mask")
+            lhs, rhs = cmp_op.operand_ids
+            pred = (cmp_op.attrs or {}).get("predicate_name")
+            lhs_kind = _mask_index_kind(lhs)
+            rhs_kind = _mask_index_kind(rhs)
+
+            is_bounds = (
+                pred in ("slt", "ult")
+                and lhs_kind in ("query", "key")
+                and _mask_is_exact_arg(rhs, n_ctx_index)
+            )
+            is_causal = (
+                pred in ("sge", "uge")
+                and lhs_kind == "query"
+                and rhs_kind == "key"
+            )
+            if is_bounds:
+                continue
+            if is_causal:
+                causal = True
+                continue
+            _refuse(
+                "a score mask equivalent to either the N_CTX boundary or the "
+                "canonical within-sequence lower triangle"
+            )
 
         # --- scale: the constant multiplied into Q before the first dot
         # (q * qk_scale, qk_scale = 1/sqrt(head_dim)). Find the arith.mulf
@@ -8225,10 +8390,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "partial-output mask in a separate elementwise kernel."
             )
 
-        # V verification (issue #4 item 3): the biased/triangle path is the one the
-        # reporter's kernel takes and has NO first-four ordering gate, so the
-        # structural dot-1 check is the ONLY V cross-check here.
-        self._fa_verify_v_role(info["v"])
+        self._fa_verify_value_paths(
+            detected_q_index=info["q"],
+            detected_k_index=info["k"],
+            detected_v_index=info["v"],
+            detected_out_index=info["out"],
+            q_scale_arg=info["scale_arg"],
+            k_transposes=0,
+        )
 
         has_mask = bool(info.get("has_mask", info.get("mask") is not None))
         role_name = {
@@ -8429,32 +8598,43 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self._prescan_stores()
         return msl
 
-    def _fa_verify_v_role(self, detected_v_index):
-        """Structurally verify the FA detector's V pointer role, or refuse.
+    def _fa_verify_value_paths(
+        self,
+        *,
+        detected_q_index,
+        detected_k_index,
+        detected_v_index,
+        detected_out_index,
+        q_scale_arg=None,
+        k_transposes=1,
+    ):
+        """Verify every value boundary a forward-FA template replaces.
 
-        V used to be the ONE unverified pointer role (issue #4 item 3, residual class):
-        Q, K and Out are cross-checked through dot 0 (QK^T) and the store, but V is the
-        second operand of dot 1 (P@V), invisible to that mechanism — so a detector
-        stride-chain trace that resolved V to a distinct-but-WRONG arg sailed past every
-        gate and the template read attention values from the wrong tensor.
+        The FA templates do not lower the accepted TTGIR operation by operation. They
+        reload raw Q/K/V and re-emit canonical attention plus a canonical normalized
+        Out store. Pointer/stride detection alone is therefore insufficient: a tracer
+        can correctly find Q through ``transpose(Q)``, for example, while the template
+        silently discards that transpose.
 
-        V IS verifiable: it is BY DEFINITION the second operand of the earliest dot
-        whose FIRST operand depends on dot 0's result (that is P@V). Trace that operand
-        back to a kernel arg with the same tracer Q/K/Out use and require agreement.
-        Role-resolution legs are fail-safe: no second dot, no dot-0-dependent dot, or
-        an untraceable POINTER source (e.g. a loop-carried V pointer) falls back to the
-        detector's answer. The P@V DATA operand is stricter: every FA template reads raw
-        V and cannot reproduce arithmetic applied to V before the dot, so a non-direct
-        load must refuse. Otherwise both the detector and this verifier can follow
-        operand 0 through ``V + K``/``V * scale``, agree on V, and silently drop the
-        transformation.
+        This verifier is deliberately allowlist-based.  It requires the two dot
+        operands and the output store to have exactly the transformations the selected
+        template replays:
 
-        Called from ALL THREE FA template paths. The dense path also pins Q/K/V/Out to
-        args 0-3 in order, so this is defense-in-depth there; the varlen and
-        biased/triangle (trifast) paths have NO ordering gate — this is their only V
-        verification, and the biased path is exactly where the reporter's silent-wrong
-        lived.
+        * Q: one scale multiply, no transpose, then a direct Q load;
+        * K: the route-specific canonical transpose count, then a direct K load;
+        * P: matching alpha/probability exponent chains whose combined base conversion
+          can be folded into the template's natural-exp score scale;
+        * V: representation/widening wrappers around a direct V load;
+        * Out: representation/output-cast wrappers around the canonical division.
+
+        Anything else refuses.  The return value is the positive factor by which the
+        detected Q scale must be multiplied when the template substitutes natural exp
+        (one for ``exp`` and ``exp2(x*log2e)``, ln(2) for bare ``exp2``).  In particular
+        this replaces the old V-only verifier's fail-open returns: once a specialized
+        FA route has been selected, an unprovable value path is not safe to template.
         """
+        import math as _math
+
         from triton_msl.errors import MetalNonRecoverableError
 
         def _walk(ops):
@@ -8468,25 +8648,58 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _all = list(_walk(self.graph.ops))
         _dots = [s for s in _all if s.op == "tt.dot"]
         if len(_dots) < 2:
-            return  # no P@V dot to verify against — fail-safe
+            raise MetalNonRecoverableError(
+                "FlashAttention value path has fewer than two dots; refusing an "
+                "unverifiable specialized route.",
+                op_name="tt.dot",
+            )
         _order = {s.id: i for i, s in enumerate(_all)}
         _dot_qk = min(_dots, key=lambda d: _order[d.id])
         _dot0_ids = {_dot_qk.id} | set(getattr(_dot_qk, "result_ids", None) or [])
-        _by_id = {s.id: s for s in _all}
+        _by_id = {}
+        for _s in _all:
+            _by_id[_s.id] = _s
+            for _rid in getattr(_s, "result_ids", None) or []:
+                _by_id[_rid] = _s
+        _arg_by_id = {a.id: a for a in self.graph.args}
+        _loop_sources = {}
+        for _s in _all:
+            if _s.op != "scf.for":
+                continue
+            _bids = (_s.attrs or {}).get("block_arg_ids", [])
+            _inits = list(_s.operand_ids or [])[3:]
+            _yields = [op for op in (_s.region_ops or []) if op.op == "scf.yield"]
+            for _i, _init in enumerate(_inits):
+                if _i + 1 < len(_bids):
+                    _loop_sources[_bids[_i + 1]] = [_init] + [
+                        y.operand_ids[_i]
+                        for y in _yields
+                        if _i < len(y.operand_ids or [])
+                    ]
 
-        def _depends_on_dot0(start_id, limit=256):
+        def _depends_on(start_id, targets, limit=256):
             seen, stack = set(), [start_id]
             while stack and len(seen) < limit:
                 cur = stack.pop()
                 if cur in seen:
                     continue
                 seen.add(cur)
-                if cur in _dot0_ids:
+                if cur in targets:
                     return True
                 _o = _by_id.get(cur)
                 if _o is not None:
                     stack.extend(_o.operand_ids or [])
+                    if _o.op == "scf.for":
+                        stack.extend(
+                            _oid
+                            for _nested in (_o.region_ops or [])
+                            if _nested.op == "scf.yield"
+                            for _oid in (_nested.operand_ids or [])
+                        )
             return False
+
+        def _depends_on_dot0(start_id, limit=256):
+            return _depends_on(start_id, _dot0_ids, limit)
 
         _dot_pv = next(
             (
@@ -8499,59 +8712,350 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             None,
         )
         if _dot_pv is None:
-            return  # fail-safe: structure not recognized, detector's answer stands
-
-        # Verify the VALUE path independently from the pointer-role trace. The shared
-        # _trace_ptr_source helper deliberately follows operand 0 through arbitrary ops
-        # because it is used for ADDRESS discovery elsewhere. That is not enough here:
-        # ``dot(P, V + K)`` traced positively to V through the add, agreed with the
-        # detector, then the FA template loaded raw V (GPU-confirmed err 1.39). Only
-        # representation/layout wrappers are semantics-preserving for the template.
-        _v_passthrough = {
-            "ttg.local_load",
-            "ttg.local_alloc",
-            "ttg.convert_layout",
-            # Widening preserves every source value exactly.  Do not admit truncf,
-            # fp_to_fp, bitcast, reshape, or transpose: those can change either the
-            # values or their matrix coordinates, and the template does not replay
-            # them when it reloads raw V.
-            "arith.extf",
-        }
-        _cur = _dot_pv.operand_ids[1]
-        _v_seen = set()
-        _direct_load = False
-        while _cur not in _v_seen and len(_v_seen) < 64:
-            _v_seen.add(_cur)
-            _op = _by_id.get(_cur)
-            if _op is None:
-                break
-            if _op.op == "tt.load":
-                _direct_load = True
-                break
-            if _op.op not in _v_passthrough or len(_op.operand_ids or []) != 1:
-                break
-            _cur = _op.operand_ids[0]
-        if not _direct_load:
             raise MetalNonRecoverableError(
-                "FlashAttention P@V operand is not a direct V load through only "
-                "semantics-preserving layout/widening wrappers. The FA templates read "
-                "raw V and would silently drop transformations applied before the dot "
-                "(for example V + K, V * scale, a transpose, or a lossy cast). Refusing "
-                "rather than mis-compute.",
+                "FlashAttention value path has no structurally verified P@V dot; "
+                "refusing rather than template an ambiguous dot graph.",
                 op_name="tt.dot",
             )
 
-        _v_arg = self._trace_ptr_source(_dot_pv.operand_ids[1])
-        if _v_arg is not None and _v_arg.index != detected_v_index:
+        _representation = {
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.convert_layout",
+            "arith.extf",
+        }
+        _transpose = {"tt.trans", "ttg.memdesc_trans"}
+        _scalar_wrappers = {
+            "tt.splat",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "ttg.convert_layout",
+            "arith.extf",
+            "arith.truncf",
+            "arith.fpext",
+            "arith.fptrunc",
+            "arith.sitofp",
+            "arith.uitofp",
+        }
+
+        def _refuse(role, detail):
+            legacy = ""
+            if role == "V":
+                legacy = (
+                    "V pointer role disagrees; "
+                    if "load resolves to arg" in detail
+                    else "P@V operand is not a direct V load; "
+                )
             raise MetalNonRecoverableError(
-                "FlashAttention V pointer role disagrees between the FA detector's "
-                f"stride-chain trace (arg {detected_v_index}) and the structural dot-1 "
-                f"operand trace (arg {_v_arg.index}, '{_v_arg.name}'). The dot-1 "
-                "trace follows P@V's actual operand, so a disagreement means the "
-                "detector mis-resolved V and the template would read attention "
-                "values from the WRONG tensor. Refusing rather than silently "
-                "mis-compute (issue #4 item 3)."
+                f"FlashAttention {legacy}{role} value path is not exactly reproduced by the "
+                f"selected template ({detail}). Refusing rather than silently drop "
+                "the transformation.",
+                op_name="tt.dot",
             )
+
+        def _cone_reaches_load(start_id, limit=128):
+            seen, stack = set(), [start_id]
+            while stack and len(seen) < limit:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    continue
+                if op.op == "tt.load":
+                    return True
+                stack.extend(op.operand_ids or [])
+            return False
+
+        def _pointer_base_indices(start_id, limit=256):
+            """Pointer bases of an address, crossing loop-carried init and yield.
+
+            Biased FA advances K/V tensor pointers as ``scf.for`` iter args, so their
+            load addresses begin at block arguments rather than at an ordinary SSA op.
+            Address *offsets* can themselves depend on metadata pointers (varlen CUQ/CUK),
+            so inspect the base leg of addptr/splat/layout operations rather than every
+            operand in the cone.  For a loop carry, union the initializer and every
+            yield source: a role swap after an iteration therefore produces two bases
+            and refuses instead of being hidden by the canonical initializer.
+            """
+            found = set()
+            seen = set()
+
+            def walk(cur):
+                if cur in seen or len(seen) >= limit:
+                    return
+                seen.add(cur)
+                arg = _arg_by_id.get(cur)
+                if arg is not None:
+                    if arg.is_ptr:
+                        found.add(arg.index)
+                    return
+                if cur in _loop_sources:
+                    for source in _loop_sources[cur]:
+                        walk(source)
+                    return
+                op = _by_id.get(cur)
+                if op is None or not op.operand_ids:
+                    return
+                if op.op == "arith.select" and len(op.operand_ids) >= 3:
+                    walk(op.operand_ids[1])
+                    walk(op.operand_ids[2])
+                    return
+                # Pointer-producing address/layout ops preserve their base in operand 0.
+                walk(op.operand_ids[0])
+
+            walk(start_id)
+            return found
+
+        def _constant_cone(start_id):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    return False
+                if op.op == "arith.constant":
+                    return True
+                if op.op not in _scalar_wrappers or len(op.operand_ids or []) != 1:
+                    return False
+                cur = op.operand_ids[0]
+            return False
+
+        def _scalar_arg_index(start_id):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                arg = _arg_by_id.get(cur)
+                if arg is not None:
+                    return arg.index if not arg.is_ptr else None
+                op = _by_id.get(cur)
+                if op is None or op.op not in _scalar_wrappers or len(op.operand_ids or []) != 1:
+                    return None
+                cur = op.operand_ids[0]
+            return None
+
+        def _scale_matches(start_id):
+            if q_scale_arg is None:
+                return _constant_cone(start_id)
+            return _scalar_arg_index(start_id) == q_scale_arg
+
+        def _peel_to_core(start_id, allowed, limit=64):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < limit:
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    return None
+                if op.op not in allowed:
+                    return op
+                if len(op.operand_ids or []) != 1:
+                    return None
+                cur = op.operand_ids[0]
+            return None
+
+        def _verify_load_path(start_id, role, expected_index, *, scale=False, transposes=0):
+            cur, seen = start_id, set()
+            n_scale = 0
+            n_transpose = 0
+            while cur not in seen and len(seen) < 64:
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    _refuse(role, "the path terminates at an unknown SSA value")
+                if op.op == "tt.load":
+                    if n_scale != int(scale):
+                        _refuse(role, f"expected {int(scale)} scale multiply, found {n_scale}")
+                    if n_transpose != transposes:
+                        _refuse(role, f"expected {transposes} transpose, found {n_transpose}")
+                    ptrs = _pointer_base_indices(op.operand_ids[0]) if op.operand_ids else set()
+                    if len(ptrs) != 1:
+                        _refuse(role, f"the backing load address contains pointer args {sorted(ptrs)}")
+                    ptr_index = next(iter(ptrs))
+                    if ptr_index != expected_index:
+                        _refuse(
+                            role,
+                            f"the load resolves to arg {ptr_index}, not detector arg {expected_index}",
+                        )
+                    return
+                if op.op in _representation and len(op.operand_ids or []) == 1:
+                    cur = op.operand_ids[0]
+                    continue
+                if op.op in _transpose and len(op.operand_ids or []) == 1:
+                    n_transpose += 1
+                    cur = op.operand_ids[0]
+                    continue
+                if scale and op.op == "arith.mulf" and len(op.operand_ids or []) == 2:
+                    if n_scale:
+                        _refuse(role, "more than one scale multiply appears before the dot")
+                    loaded = [oid for oid in op.operand_ids if _cone_reaches_load(oid)]
+                    if len(loaded) != 1:
+                        _refuse(role, "the scale multiply does not have one load-derived operand")
+                    other = next(oid for oid in op.operand_ids if oid != loaded[0])
+                    if not _scale_matches(other):
+                        _refuse(role, "the multiply's scale source disagrees with detection")
+                    n_scale += 1
+                    cur = loaded[0]
+                    continue
+                _refuse(role, f"unsupported operation {op.op} appears before the dot")
+            _refuse(role, "the path is cyclic or exceeds the verification bound")
+
+        _verify_load_path(
+            _dot_qk.operand_ids[0], "Q", detected_q_index, scale=True, transposes=0
+        )
+        _verify_load_path(
+            _dot_qk.operand_ids[1], "K", detected_k_index, transposes=k_transposes
+        )
+        _verify_load_path(
+            _dot_pv.operand_ids[1], "V", detected_v_index, transposes=0
+        )
+
+        # P and alpha are one score->probability function.  The template always emits
+        # natural exp, but equivalent source spellings may use exp2 with log2e either
+        # after ``score-max`` or folded into Q's scale.  Parse BOTH exponent chains,
+        # require their natural-exponent multipliers to agree, and return that multiplier
+        # so dense/varlen callers normalize the template's baked score scale.  Arithmetic
+        # after the accepted P exp remains forbidden.
+        _p_passthrough = _representation | {"arith.truncf", "tt.fp_to_fp"}
+        _cur = _dot_pv.operand_ids[0]
+        _seen = set()
+        _p_exp = None
+        while _cur not in _seen and len(_seen) < 64:
+            _seen.add(_cur)
+            _op = _by_id.get(_cur)
+            if _op is None:
+                _refuse("P", "the path terminates at an unknown SSA value")
+            if _op_is_exp(_op.op):
+                _p_exp = _op
+                break
+            if _op.op not in _p_passthrough or len(_op.operand_ids or []) != 1:
+                _refuse("P", f"unsupported operation {_op.op} appears after softmax")
+            _cur = _op.operand_ids[0]
+        else:
+            _refuse("P", "the path is cyclic or exceeds the verification bound")
+
+        _exp_input_passthrough = {"ttg.convert_layout", "arith.extf", "arith.truncf"}
+
+        def _constant_float(start_id):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    return None
+                if op.op == "arith.constant":
+                    value = (op.attrs or {}).get("value")
+                    return float(value) if isinstance(value, (int, float)) else None
+                if op.op not in _scalar_wrappers or len(op.operand_ids or []) != 1:
+                    return None
+                cur = op.operand_ids[0]
+            return None
+
+        def _parse_exp(exp_op, role):
+            if exp_op is None or len(exp_op.operand_ids or []) != 1:
+                _refuse(role, "the softmax exponential does not have one input")
+            core = _peel_to_core(exp_op.operand_ids[0], _exp_input_passthrough)
+            factor = 1.0
+            if core is not None and core.op == "arith.mulf":
+                if len(core.operand_ids or []) != 2:
+                    _refuse(role, "the exponential multiplier is not binary")
+                constants = [
+                    (oid, _constant_float(oid)) for oid in core.operand_ids
+                ]
+                constants = [(oid, value) for oid, value in constants if value is not None]
+                if len(constants) != 1:
+                    _refuse(
+                        role,
+                        "the exponential input does not have exactly one constant factor",
+                    )
+                const_id, factor = constants[0]
+                data_id = next(oid for oid in core.operand_ids if oid != const_id)
+                core = _peel_to_core(data_id, _exp_input_passthrough)
+            if not (_math.isfinite(factor) and factor > 0.0):
+                _refuse(role, f"the exponential factor {factor!r} is not positive finite")
+            if core is None or core.op != "arith.subf" or len(core.operand_ids or []) != 2:
+                _refuse(role, "the accepted exp is not the canonical value-minus-max form")
+            if exp_op.op == "math.exp2":
+                base_log = _math.log(2.0)
+            elif exp_op.op in ("math.exp", "tt.exp"):
+                base_log = 1.0
+            else:
+                _refuse(role, f"unsupported exponential operation {exp_op.op}")
+            return core, factor * base_log
+
+        _p_core, _p_multiplier = _parse_exp(_p_exp, "P")
+        if not _depends_on_dot0(_p_core.operand_ids[0]):
+            _refuse("P", "the probability score does not depend on the QK dot")
+        _p_shape = _extract_shape(_p_core.type_str or "")
+        if len(_p_shape) != 2:
+            _refuse("P", f"the probability core has non-matrix shape {_p_shape}")
+
+        # Any second P-side exp (the post-softmax-exp bite) appears here in addition to
+        # the one alpha exp and therefore refuses.  Conversely, requiring exactly one
+        # alpha prevents a template from silently inventing or discarding a recurrence.
+        _alpha_exps = [op for op in _all if _op_is_exp(op.op) and op is not _p_exp]
+        if len(_alpha_exps) != 1:
+            _refuse("P", f"expected one online-softmax alpha exp, found {len(_alpha_exps)}")
+        _alpha_core, _alpha_multiplier = _parse_exp(_alpha_exps[0], "P")
+        if not _depends_on_dot0(_alpha_core.operand_ids[1]):
+            _refuse("P", "the alpha max does not depend on the QK dot")
+        _alpha_shape = _extract_shape(_alpha_core.type_str or "")
+        if len(_alpha_shape) != 1:
+            _refuse("P", f"the alpha core has non-vector shape {_alpha_shape}")
+        _mult_tol = 1e-6 * max(1.0, abs(_p_multiplier), abs(_alpha_multiplier))
+        if abs(_p_multiplier - _alpha_multiplier) > _mult_tol:
+            _refuse(
+                "P",
+                "the probability and alpha exponent chains use different effective "
+                f"bases ({_p_multiplier:.9g} vs {_alpha_multiplier:.9g})",
+            )
+
+        # Biased FA also stores LSE, so select Out by its independently traced pointer.
+        _out_stores = []
+        for _store in (s for s in _all if s.op == "tt.store"):
+            if len(_store.operand_ids or []) < 2:
+                continue
+            _ptrs = _pointer_base_indices(_store.operand_ids[0])
+            if _ptrs == {detected_out_index}:
+                _out_stores.append(_store)
+        if len(_out_stores) != 1:
+            _refuse("Out", f"expected one store to detector arg {detected_out_index}, found {len(_out_stores)}")
+
+        _out_passthrough = _representation | {"arith.truncf", "tt.fp_to_fp"}
+        _cur = _out_stores[0].operand_ids[1]
+        _seen = set()
+        while _cur not in _seen and len(_seen) < 64:
+            _seen.add(_cur)
+            _op = _by_id.get(_cur)
+            if _op is None:
+                _refuse("Out", "the path terminates at an unknown SSA value")
+            if _op.op == "arith.divf":
+                if len(_op.operand_ids or []) != 2:
+                    _refuse("Out", "the normalization division does not have two inputs")
+                _num = _peel_to_core(_op.operand_ids[0], _representation)
+                _den = _peel_to_core(
+                    _op.operand_ids[1],
+                    _representation | {"tt.broadcast", "tt.expand_dims"},
+                )
+                if _num is None or _num.op != "scf.for" or _den is not _num:
+                    _refuse(
+                        "Out",
+                        "the division is not the canonical accumulator/denominator pair "
+                        "from one attention loop",
+                    )
+                _dot_pv_ids = {_dot_pv.id} | set(
+                    getattr(_dot_pv, "result_ids", None) or []
+                )
+                if not _depends_on(_num.id, _dot_pv_ids):
+                    _refuse("Out", "the attention loop does not yield the verified P@V dot")
+                break
+            if _op.op not in _out_passthrough or len(_op.operand_ids or []) != 1:
+                _refuse("Out", f"unsupported operation {_op.op} appears after normalization")
+            _cur = _op.operand_ids[0]
+        else:
+            _refuse("Out", "the path is cyclic or exceeds the verification bound")
+
+        return _p_multiplier
 
     def _lower_flash_attention_template(self, info: dict) -> str:
         """Emit the head-dim-tiled FA2 MSL (Task 1) for a detected FA kernel.
@@ -8653,11 +9157,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "Refusing rather than risk a mis-bound buffer."
                 )
 
-        # V verification (issue #4 item 3): see _fa_verify_v_role. On THIS dense path
-        # the first-four-in-order gate above already pins v == 2, so the structural
-        # check is defense-in-depth here; its live value is on the varlen and
-        # biased/triangle paths, which have no ordering gate and call it too.
-        self._fa_verify_v_role(info["v"])
+        info["scale"] *= self._fa_verify_value_paths(
+            detected_q_index=info["q"],
+            detected_k_index=info["k"],
+            detected_v_index=info["v"],
+            detected_out_index=info["out"],
+            k_transposes=1,
+        )
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the
         # binding order matches the launcher exactly: pointers as device buffers,
