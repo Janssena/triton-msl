@@ -948,16 +948,34 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                             return True
                 return False
 
-            if any(_dot_result_scaled(_d) for _d in _fa_dots):
+            def _refuse_dot_result_epilogue():
                 raise MetalNonRecoverableError(
                     "FlashAttention that applies an elementwise scale/bias to a tt.dot "
-                    "RESULT (e.g. scores scaled inside the loop: qk = tl.dot(q, kᵀ); "
-                    "qk = qk * (1/√d)) is not supported by the generic attention "
-                    "lowering — the fused op on the dot result is silently dropped / "
-                    "mis-applied. Refusing to emit silently-wrong output. Scale Q "
-                    "BEFORE the dot instead (q = q * (1/√d); qk = tl.dot(q, kᵀ)).",
+                    "RESULT is supported only when the complete QK-result-to-softmax "
+                    "path is a proven positive finite CONSTANT multiply/divide chain "
+                    "and a specialized dense/varlen template can replay it. Runtime "
+                    "scales, bias/addition, P-side scaling, and unrecognized chains "
+                    "would be silently dropped or mis-applied by the generic lowering; "
+                    "refusing to emit silently-wrong output.",
                     op_name="tt.dot",
                 )
+
+            _scaled_dots = [_d for _d in _fa_dots if _dot_result_scaled(_d)]
+            _constant_result_scale = None
+            if _scaled_dots:
+                # #6a is specifically the first (QK) dot's score scale.  Keep every
+                # P@V/result epilogue and multi-dot/MLA spelling under the old refusal.
+                # The varlen route already ran above; dense routing below must consume
+                # this proof, otherwise falling into generic lowering is still unsafe.
+                if len(_fa_dots) == 2 and _scaled_dots == [_fa_dots[0]]:
+                    _constant_result_scale = self._fa_analyze_constant_score_scale(
+                        _fa_dots[0], _fa_dots[1]
+                    )
+                if (
+                    _constant_result_scale is None
+                    or not _constant_result_scale["op_ids"]
+                ):
+                    _refuse_dot_result_epilogue()
             # Empirically mapped failure boundary (2026-06-17): the attention
             # lowering is validated only at BLOCK_M = BLOCK_N = 32, head_dim in
             # {32, 64}. Two distinct out-of-range failure modes — only ONE was
@@ -1029,10 +1047,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # gives fp16 hd64 a real GPU path for the first time. Unlike the hd128 branch
                 # (where a detect refusal is intentional -> the head_dim>64 refusal below), a
                 # refusal here is NOT a hard error: hd64 has a correct generic fallback.
-                try:
+                if _constant_result_scale is not None:
+                    # Once the generic-result guard is relaxed, detection/routing is
+                    # mandatory: generic lowering is the GPU-confirmed silent-wrong.
                     _info64 = self._detect_flash_attention()
-                except MetalNonRecoverableError:
-                    _info64 = None
+                else:
+                    try:
+                        _info64 = self._detect_flash_attention()
+                    except MetalNonRecoverableError:
+                        _info64 = None
                 if (
                     _info64 is not None
                     and _info64["block_m"] == 32
@@ -1042,6 +1065,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and _simd_fa_eligible(_info64)
                 ):
                     return self._lower_flash_attention_template(_info64)
+
+            if _constant_result_scale is not None:
+                # Exact constant algebra alone is insufficient when the template's
+                # supported shape/ABI gates did not claim the kernel.
+                _refuse_dot_result_epilogue()
 
             if _fa_maxdim > 64:
                 raise MetalNonRecoverableError(
@@ -5099,6 +5127,222 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if dst_shape:
             self.env_shapes[ssa.id] = dst_shape
 
+    def _fa_analyze_constant_score_scale(self, dot_qk, dot_pv):
+        """Return the exact constant scale between QK dot and softmax, or ``None``.
+
+        A specialized FA template reloads raw operands and rebuilds the score path, so
+        a multiply/divide after ``tt.dot`` is safe only when the complete path from the
+        probability exponential back to that dot is structural and constant-valued.
+        This helper is shared by detection and final value-path verification so the
+        routing guard cannot prove a weaker spelling than the verifier replays.
+
+        The result is ``{"factor": float, "op_ids": tuple}``.  ``factor == 1`` and an
+        empty tuple mean that no post-dot scale exists.  Runtime factors, addition,
+        asymmetric selects, or any other unreplayed operation return ``None``.
+        """
+        import math as _math
+
+        def _walk(ops):
+            for s in ops:
+                yield s
+                if getattr(s, "region_ops", None):
+                    yield from _walk(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    yield from _walk(s.else_ops)
+
+        ops = list(_walk(self.graph.ops))
+        by_id = {}
+        for op in ops:
+            by_id[op.id] = op
+            for result_id in getattr(op, "result_ids", None) or []:
+                by_id[result_id] = op
+
+        dot_ids = {dot_qk.id} | set(getattr(dot_qk, "result_ids", None) or [])
+
+        def _depends_on(start_id, targets, limit=256):
+            seen, stack = set(), [start_id]
+            while stack and len(seen) < limit:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                if cur in targets:
+                    return True
+                op = by_id.get(cur)
+                if op is not None:
+                    stack.extend(op.operand_ids or [])
+            return False
+
+        def _depends_on_dot(start_id, limit=256):
+            return _depends_on(start_id, dot_ids, limit)
+
+        scalar_wrappers = {
+            "tt.splat",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "tt.reshape",
+            "ttg.convert_layout",
+            "arith.extf",
+            "arith.truncf",
+            "arith.fpext",
+            "arith.fptrunc",
+        }
+        value_wrappers = {
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.convert_layout",
+            "arith.extf",
+            "arith.truncf",
+            "tt.fp_to_fp",
+        }
+
+        def _constant_float(start_id):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                op = by_id.get(cur)
+                if op is None:
+                    return None
+                if op.op == "arith.constant":
+                    value = (op.attrs or {}).get("value")
+                    return float(value) if isinstance(value, (int, float)) else None
+                if op.op not in scalar_wrappers or len(op.operand_ids or []) != 1:
+                    return None
+                cur = op.operand_ids[0]
+            return None
+
+        def _peel(start_id, allowed, limit=64):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < limit:
+                seen.add(cur)
+                op = by_id.get(cur)
+                if op is None or op.op not in allowed:
+                    return cur, op
+                if len(op.operand_ids or []) != 1:
+                    return cur, None
+                cur = op.operand_ids[0]
+            return cur, None
+
+        # Find the probability exp through the representation-only P@V operand.
+        cur = dot_pv.operand_ids[0]
+        seen = set()
+        p_exp = None
+        while cur not in seen and len(seen) < 64:
+            seen.add(cur)
+            op = by_id.get(cur)
+            if op is None:
+                return None
+            if _op_is_exp(op.op):
+                p_exp = op
+                break
+            if op.op not in value_wrappers or len(op.operand_ids or []) != 1:
+                return None
+            cur = op.operand_ids[0]
+        if p_exp is None or len(p_exp.operand_ids or []) != 1:
+            return None
+
+        # The exp-base conversion may be written as exp2((score-max)*log2e).
+        # It belongs to the probability transform, not to the post-dot score scale.
+        cur, core = _peel(
+            p_exp.operand_ids[0],
+            {"ttg.convert_layout", "arith.extf", "arith.truncf"},
+        )
+        if core is not None and core.op == "arith.mulf" and len(core.operand_ids or []) == 2:
+            constants = [
+                oid for oid in core.operand_ids if _constant_float(oid) is not None
+            ]
+            if len(constants) != 1:
+                return None
+            cur = next(oid for oid in core.operand_ids if oid != constants[0])
+            cur, core = _peel(
+                cur,
+                {"ttg.convert_layout", "arith.extf", "arith.truncf"},
+            )
+        if core is None or core.op != "arith.subf" or len(core.operand_ids or []) != 2:
+            return None
+
+        score_value_id = core.operand_ids[0]
+
+        # The online-softmax row maximum must consume the SAME score value as the
+        # probability subtraction. Scaling only after tl.max is not equivalent: it
+        # changes both the recurrence and normalization even though the P leg still
+        # looks like a constant chain from the dot.
+        score_core_id, _ = _peel(score_value_id, value_wrappers)
+        max_reductions = []
+        for candidate in ops:
+            if candidate.op != "tt.reduce" or not candidate.operand_ids:
+                continue
+            if not any(
+                "max" in (nested.op or "")
+                for nested in (candidate.region_ops or [])
+            ):
+                continue
+            input_core_id, _ = _peel(candidate.operand_ids[0], value_wrappers)
+            if input_core_id == score_core_id:
+                max_reductions.append(candidate)
+        max_result_ids = {
+            result_id
+            for reduction in max_reductions
+            for result_id in (
+                [reduction.id]
+                + list(getattr(reduction, "result_ids", None) or [])
+            )
+        }
+        if not max_result_ids or not _depends_on(core.operand_ids[1], max_result_ids):
+            return None
+
+        # Walk the value-minus-max score operand back to the QK dot.  Masks are
+        # admitted only as transparent value selectors here; their exact predicates
+        # are independently proven by the dense/varlen detectors before this result
+        # is used for routing.
+        cur = score_value_id
+        factor = 1.0
+        scale_ops = []
+        seen = set()
+        while cur not in seen and len(seen) < 128:
+            if cur in dot_ids:
+                if not (_math.isfinite(factor) and factor > 0.0):
+                    return None
+                return {"factor": factor, "op_ids": tuple(scale_ops)}
+            seen.add(cur)
+            op = by_id.get(cur)
+            if op is None:
+                return None
+            if op.op in value_wrappers and len(op.operand_ids or []) == 1:
+                cur = op.operand_ids[0]
+                continue
+            if op.op == "arith.select" and len(op.operand_ids or []) == 3:
+                branches = [oid for oid in op.operand_ids[1:] if _depends_on_dot(oid)]
+                if len(branches) != 1:
+                    return None
+                cur = branches[0]
+                continue
+            if op.op == "arith.mulf" and len(op.operand_ids or []) == 2:
+                data = [oid for oid in op.operand_ids if _depends_on_dot(oid)]
+                if len(data) != 1:
+                    return None
+                other = next(oid for oid in op.operand_ids if oid != data[0])
+                value = _constant_float(other)
+                if value is None:
+                    return None
+                factor *= value
+                scale_ops.append(op.id)
+                cur = data[0]
+                continue
+            if op.op == "arith.divf" and len(op.operand_ids or []) == 2:
+                numerator, denominator = op.operand_ids
+                if not _depends_on_dot(numerator) or _depends_on_dot(denominator):
+                    return None
+                value = _constant_float(denominator)
+                if value is None or value == 0.0:
+                    return None
+                factor /= value
+                scale_ops.append(op.id)
+                cur = numerator
+                continue
+            return None
+        return None
+
     def _detect_varlen_flash_attention(self):
         """Recognize a VARLEN (packed cu_seqlens) FlashAttention-2 forward kernel and
         resolve its ABI for the tiled varlen template. Returns None (correct-or-refuse)
@@ -5634,10 +5878,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             else:
                 return None
 
-        # softmax scale: the CONSTANT multiplied into Q before dot0 (q * qk_scale). The
-        # template BAKES this scale, so a kernel that scales differently (custom sm_scale,
-        # scale on the dot RESULT) must NOT route -> refuse when no constant Q-scale is
-        # found. Mirrors the dense FA detector's scale extraction (refuse-on-absent).
+        # Softmax scale: accept either the traditional single constant multiplied into
+        # Q before dot0, or a completely proven constant multiply/divide chain on the
+        # dot RESULT before softmax (#6a).  The template bakes their PRODUCT.  Runtime
+        # factors, score bias, P-side scaling, and any unrecognized value operation stay
+        # outside the detector and are refused by the common FA guard.
         _LAYOUT = ("ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
                    "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
                    "arith.truncf", "arith.extf", "tt.fp_to_fp")
@@ -5674,17 +5919,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _qf = _const_factors(d0.operand_ids[0])
         _kf = _const_factors(d0.operand_ids[1])
         _vf = _const_factors(d1.operand_ids[0]) + _const_factors(d1.operand_ids[1])
-        # Exactly ONE constant factor, on the Q side — the template bakes exactly that.
-        # A K-, V-, or P-side factor, or a second Q factor, would be silently dropped ->
-        # refuse (return None -> the dense path refuses loudly / generic computes correctly).
-        if len(_qf) != 1 or _kf or _vf:
+        _score_scale = self._fa_analyze_constant_score_scale(d0, d1)
+        # At most one Q-side constant; no K-, V-, or P-side factor.  A post-dot
+        # constant chain can supply all or part of the effective scale, but an entirely
+        # unscaled kernel remains outside the specialized template's contract.
+        if len(_qf) > 1 or _kf or _vf or _score_scale is None:
             return None
-        scale = _qf[0]
+        if not _qf and not _score_scale["op_ids"]:
+            return None
+        scale = (_qf[0] if _qf else 1.0) * _score_scale["factor"]
 
         return {
             "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
                       "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
             "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
+            "q_scale": bool(_qf), "score_scale": _score_scale,
             "max_seqlen": _ms_arg, "causal": causal, "q": q, "k": k, "v": v, "o": o,
         }
 
@@ -5714,7 +5963,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             detected_k_index=roles["k"],
             detected_v_index=roles["v"],
             detected_out_index=roles["o"],
+            q_scale_required=info.get("q_scale", True),
             k_transposes=1,
+            verify_score_path=True,
+            expected_score_scale=info.get("score_scale"),
         )
         role_of_idx = {
             roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
@@ -6606,43 +6858,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "canonical within-sequence lower triangle"
             )
 
-        # --- scale: the constant multiplied into Q before the first dot
-        # (q * qk_scale, qk_scale = 1/sqrt(head_dim)). Find the arith.mulf
-        # feeding dot 0's A operand whose other input is an arith.constant.
-        scale = None
-        scale_id = _skip_layout(dot_qk.operand_ids[0])
-        seen = set()
-        while scale_id in op_by_id and scale_id not in seen:
-            seen.add(scale_id)
-            op = op_by_id[scale_id]
-            if op.op == "arith.mulf":
-                for oid in op.operand_ids:
-                    sub = op_by_id.get(oid)
-                    if sub is not None and sub.op == "arith.constant":
-                        v = sub.attrs.get("value")
-                        if isinstance(v, (int, float)):
-                            scale = float(v)
-                break
-            if op.operand_ids and op.op in (
-                "ttg.local_load",
-                "ttg.local_alloc",
-                "ttg.memdesc_trans",
-                "tt.trans",
-                "tt.reshape",
-                "ttg.convert_layout",
-            ):
-                scale_id = op.operand_ids[0]
-                continue
-            break
-        if scale is None:
-            _refuse("the softmax scale constant")
-
-        # SPLIT-SCALE GUARD (re-review 2026-08-25): the template bakes ONLY the Q-side
-        # constant. A kernel that also multiplies a constant into K, V, or a second Q
-        # factor (e.g. the sqrt-split ``q *= a; k *= b``) otherwise routed with that
-        # factor silently DROPPED (confirmed err ~2.0 at hd128). Scan every dot-operand
-        # cone (through layout/cast ops and chained mulfs, stopping at loads) and refuse
-        # on any constant factor beyond the single baked Q-side one.
+        # SPLIT-SCALE GUARD (re-review 2026-08-25): scan every dot-operand cone
+        # (through layout/cast ops and chained mulfs, stopping at loads). The template
+        # may bake one Q-side factor plus a separately proven post-dot chain, but a K-,
+        # V-, P-side, or second Q factor would still be silently dropped.
         _SG_LAYOUT = (
             "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
             "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
@@ -6676,11 +6895,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _sg_q = _sg_const_factors(dot_qk.operand_ids[0])
         _sg_k = _sg_const_factors(dot_qk.operand_ids[1])
         _sg_pv = _sg_const_factors(dot_pv.operand_ids[0]) + _sg_const_factors(dot_pv.operand_ids[1])
-        if len(_sg_q) != 1 or _sg_k or _sg_pv:
+        # MLA has two chained QK dots and is outside #6a's two-dot score-chain
+        # proof. Preserve its already-verified no-result-scale contract unchanged.
+        _score_scale = (
+            {"factor": 1.0, "op_ids": ()}
+            if is_mla
+            else self._fa_analyze_constant_score_scale(dot_qk, dot_pv)
+        )
+        if len(_sg_q) > 1 or _sg_k or _sg_pv or _score_scale is None:
             _refuse(
-                "a single Q-side softmax scale (a K/V-side or second constant factor "
-                "would be silently dropped by the template)"
+                "at most one Q-side scale plus an exact constant score-result scale "
+                "(a runtime, K/V/P-side, bias, or second Q factor would be silently "
+                "dropped by the template)"
             )
+        if not _sg_q and not _score_scale["op_ids"]:
+            _refuse("the softmax scale constant")
+        scale = (_sg_q[0] if _sg_q else 1.0) * _score_scale["factor"]
 
         # --- out_dtype: the output pointer's element type --------------------
         out_arg = arg_by_id.get(self.graph.args[o_idx].id)
@@ -6708,6 +6938,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "v_head_dim": v_head_dim,
             "causal": causal,
             "scale": scale,
+            "q_scale": bool(_sg_q),
+            "score_scale": _score_scale,
+            "verify_score_path": not is_mla,
             "out_dtype": out_dtype,
             # MLA (nope/rope): the QK score is TWO chained dots over separate tensors.
             # is_mla=True carries the rope Q/K pointer roles + their strides so the
@@ -8606,7 +8839,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         detected_v_index,
         detected_out_index,
         q_scale_arg=None,
+        q_scale_required=True,
         k_transposes=1,
+        verify_score_path=False,
+        expected_score_scale=None,
     ):
         """Verify every value boundary a forward-FA template replaces.
 
@@ -8620,10 +8856,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         operands and the output store to have exactly the transformations the selected
         template replays:
 
-        * Q: one scale multiply, no transpose, then a direct Q load;
+        * Q: the detector-proven zero or one scale multiply, no transpose, then a
+          direct Q load;
         * K: the route-specific canonical transpose count, then a direct K load;
         * P: matching alpha/probability exponent chains whose combined base conversion
-          can be folded into the template's natural-exp score scale;
+          can be folded into the template's natural-exp score scale, plus (for the
+          dense/varlen routes) the exact detector-proven constant QK-result scale path;
         * V: representation/widening wrappers around a direct V load;
         * Out: representation/output-cast wrappers around the canonical division.
 
@@ -8901,7 +9139,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse(role, "the path is cyclic or exceeds the verification bound")
 
         _verify_load_path(
-            _dot_qk.operand_ids[0], "Q", detected_q_index, scale=True, transposes=0
+            _dot_qk.operand_ids[0],
+            "Q",
+            detected_q_index,
+            scale=q_scale_required,
+            transposes=0,
         )
         _verify_load_path(
             _dot_qk.operand_ids[1], "K", detected_k_index, transposes=k_transposes
@@ -8990,6 +9232,30 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if len(_p_shape) != 2:
             _refuse("P", f"the probability core has non-matrix shape {_p_shape}")
 
+        if verify_score_path:
+            _score_scale = self._fa_analyze_constant_score_scale(_dot_qk, _dot_pv)
+            if _score_scale is None:
+                _refuse(
+                    "P",
+                    "the QK-result-to-softmax path is not an exact constant scale chain",
+                )
+            if expected_score_scale is None:
+                _refuse("P", "the detector supplied no score-scale proof")
+            _factor_tol = 1e-7 * max(
+                1.0,
+                abs(_score_scale["factor"]),
+                abs(expected_score_scale["factor"]),
+            )
+            if (
+                _score_scale["op_ids"] != expected_score_scale["op_ids"]
+                or abs(_score_scale["factor"] - expected_score_scale["factor"])
+                > _factor_tol
+            ):
+                _refuse(
+                    "P",
+                    "the verified score-scale chain disagrees with detection",
+                )
+
         # Any second P-side exp (the post-softmax-exp bite) appears here in addition to
         # the one alpha exp and therefore refuses.  Conversely, requiring exactly one
         # alpha prevents a template from silently inventing or discarding a recurrence.
@@ -8999,6 +9265,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _alpha_core, _alpha_multiplier = _parse_exp(_alpha_exps[0], "P")
         if not _depends_on_dot0(_alpha_core.operand_ids[1]):
             _refuse("P", "the alpha max does not depend on the QK dot")
+        _max_passthrough = _representation | {"tt.broadcast", "tt.expand_dims"}
+        _p_max = _peel_to_core(_p_core.operand_ids[1], _max_passthrough)
+        _alpha_max = _peel_to_core(_alpha_core.operand_ids[1], _max_passthrough)
+        if _p_max is None or _alpha_max is not _p_max:
+            _refuse(
+                "P",
+                "the probability and alpha recurrences do not use the same score max",
+            )
         _alpha_shape = _extract_shape(_alpha_core.type_str or "")
         if len(_alpha_shape) != 1:
             _refuse("P", f"the alpha core has non-vector shape {_alpha_shape}")
@@ -9162,7 +9436,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             detected_k_index=info["k"],
             detected_v_index=info["v"],
             detected_out_index=info["out"],
+            q_scale_required=info.get("q_scale", True),
             k_transposes=1,
+            verify_score_path=info.get("verify_score_path", True),
+            expected_score_scale=info.get("score_scale"),
         )
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the

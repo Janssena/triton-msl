@@ -6,7 +6,8 @@ item is genuinely *made to work*, its test flips from "refuses" to a correctness
 Current behavior (2026-08-25, branch fix/trifast-issue4):
   #4  MEPT 2-D accumulator, fewer threads than tile -> FIXED: lowers via the per-element
       scalar carry inside the wrap loop (test below asserts correctness at all num_warps).
-  #6a scale applied to a tt.dot RESULT (not folded into Q) -> MetalNonRecoverableError.
+  #6a constant scale applied to the QK tt.dot RESULT -> FIXED: the complete proven
+      score chain is folded into the dense/varlen template's effective scale.
   #6b FA that also stores lse (1-D store of a loop-carried row reduce) ->
       MetalNonRecoverableError (the loop-carried-row-reduce LAYOUT guard, which protects a
       real "collapses every row to the first" silent-wrong -- so #6b is entangled with that
@@ -79,14 +80,31 @@ def _mept_2d_acc(inp, out, M: tl.constexpr, N: tl.constexpr, STEPS: tl.constexpr
 
 
 @requires_mps
-def test_6a_scale_on_dot_result_refuses():
+def test_6a_scale_on_dot_result_routes_and_computes(monkeypatch):
+    import triton_msl.autotuning._fa_dispatch as fa_dispatch
+
+    hits = []
+    real = fa_dispatch.dispatch_flash_attention
+
+    def spy(rt, descriptor, *args, **kwargs):
+        result = real(rt, descriptor, *args, **kwargs)
+        hits.append((descriptor[0], result))
+        return result
+
+    monkeypatch.setattr(fa_dispatch, "dispatch_flash_attention", spy)
     Z, H, N, D = 1, 2, 64, 64
     dev = "mps"
+    torch.manual_seed(20260829)
     q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
     v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
-    with pytest.raises(MetalNonRecoverableError):
-        _fa_scale_on_qk[(triton.cdiv(N, 32), Z*H)](q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
+    _fa_scale_on_qk[(triton.cdiv(N, 32), Z*H)](
+        q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D
+    )
+    torch.mps.synchronize()
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    assert hits == [("flash_attention", True)]
+    assert (o - ref).abs().max().item() < 1e-3
 
 
 @requires_mps

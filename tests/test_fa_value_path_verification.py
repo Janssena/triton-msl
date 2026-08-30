@@ -38,7 +38,7 @@ def _varlen_fa_value_path(
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
     stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr, MODE: tl.constexpr,
+    H, max_seqlen, RUNTIME_SCALE, SCALE: tl.constexpr, MODE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -64,6 +64,10 @@ def _varlen_fa_value_path(
         q = tl.trans(q) * SCALE
     elif MODE == 7:
         q = q * (SCALE * _LOG2E)
+    elif MODE == 10 or MODE == 11:
+        pass  # #6a spellings put the complete scale after the QK dot.
+    elif MODE == 13:
+        q = q * RUNTIME_SCALE
     else:
         q = q * SCALE
     if MODE == 1:
@@ -86,10 +90,16 @@ def _varlen_fa_value_path(
             # This cancels the canonical transpose below in square test tiles.
             k = tl.trans(k)
         qk = tl.dot(q, tl.trans(k).to(q.dtype))
+        if MODE == 10:
+            qk = qk * SCALE
+        elif MODE == 11:
+            qk = qk * RUNTIME_SCALE
+        elif MODE == 12 or MODE == 13:
+            qk = qk * _LOG2E
         qk = tl.where(kn[None, :] < seqlen_k, qk, float("-inf"))
         m_ij = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_ij)
-        if MODE == 7:
+        if MODE == 7 or MODE == 12 or MODE == 13:
             alpha = tl.exp2(m_i - m_new)
             p = tl.exp2(qk - m_new[:, None])
         elif MODE == 8:
@@ -184,7 +194,7 @@ def _run(mode, monkeypatch):
     _varlen_fa_value_path[(1, H)](
         q, k, v, out, cu, cu,
         *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        H, length, scale, mode, 32, 32, D,
+        H, length, scale, scale, mode, 32, 32, D,
     )
     torch.mps.synchronize()
     return q, k, v, out, hits, scale
@@ -217,12 +227,29 @@ def test_varlen_equivalent_exp_spelling_routes_and_computes(mode, label, monkeyp
 @pytest.mark.parametrize(
     ("mode", "label"),
     [
+        (10, "post-dot constexpr scale"),
+        (12, "Q scale plus post-dot log2e with exp2"),
+    ],
+)
+@requires_mps
+def test_varlen_dot_result_scale_routes_and_computes(mode, label, monkeypatch):
+    q, k, v, out, hits, scale = _run(mode, monkeypatch)
+    assert hits == [32], f"{label} did not reach the specialized varlen FA template"
+    err = (out - _reference(q, k, v, mode, scale)).abs().max().item()
+    assert err < 1e-3, f"varlen FA miscompiled {label}: err {err}"
+
+
+@pytest.mark.parametrize(
+    ("mode", "label"),
+    [
         (0, "Q transpose before scale"),
         (1, "Q transpose after scale"),
         (2, "K transpose"),
         (3, "output epilogue"),
         (5, "post-normalization division"),
         (6, "post-softmax exponential"),
+        (11, "post-dot runtime scale"),
+        (13, "runtime Q scale plus post-dot log2e with exp2"),
     ],
 )
 @requires_mps
@@ -230,7 +257,7 @@ def test_fa_unreplayed_value_path_is_correct_or_refuses(mode, label, monkeypatch
     try:
         q, k, v, out, _hits, scale = _run(mode, monkeypatch)
     except MetalNonRecoverableError as exc:
-        assert "value path" in str(exc)
+        assert "FlashAttention" in str(exc)
         return
 
     err = (out - _reference(q, k, v, mode, scale)).abs().max().item()
