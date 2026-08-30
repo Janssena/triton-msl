@@ -108,15 +108,45 @@ def test_6a_scale_on_dot_result_routes_and_computes(monkeypatch):
 
 
 @requires_mps
-def test_6b_fa_lse_store_refuses():
+def test_6b_fa_lse_store_computes():
+    """#6b CONVERTED from refuses to computes (2026-08-29). Two independent fixes:
+
+    * O was always computed correctly but NEVER COPIED BACK: `_prescan_stores`'
+      5-hop addptr/splat-only walk could not cross the 2-D output's tt.broadcast, so a
+      multi-output kernel emitted PARTIAL copy-back metadata and the host path obeyed
+      it (GPT packet 036 root cause; general, non-FA pin in
+      tests/test_multi_output_copyback.py).
+    * lse collapsed every row to row 0: `_lower_convert_layout`'s trace could not cross
+      the scf.for carry, so the loop-carried blocked value (`mi + log(li)`) fell to the
+      modular staging where threads 0..31 all hold ROW 0. The convert now resolves the
+      layout across carries (declared-layout resolver + carry-aware reduce provenance)
+      and refuses when it cannot prove a mapping.
+
+    Both O and lse must now match the reference. The loop-carry reduce guard remains
+    as a conservative loud backstop for its residual scope — a carried reduce reaching
+    a RAW 1-D store with no intervening convert_layout (Triton's layout assignment
+    inserts a convert in every spelling we could construct, so that scope has no
+    source-level pin; the guard is defense-in-depth, and over-refusal there is loud,
+    not silent-wrong).
+    """
+    torch.manual_seed(0)
     Z, H, N, D = 1, 2, 64, 64
     dev = "mps"
     q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
     v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
     lse = torch.zeros(Z, H, N, device=dev)
     st = lambda t: t.stride()
-    with pytest.raises(MetalNonRecoverableError):
-        _fa_with_lse[(triton.cdiv(N, 32), Z*H)](q, k, v, o, lse, *st(q), *st(k), *st(v), *st(o), *st(lse), Z, H, N, 32, 32, D)
+    _fa_with_lse[(triton.cdiv(N, 32), Z*H)](q, k, v, o, lse, *st(q), *st(k), *st(v), *st(o), *st(lse), Z, H, N, 32, 32, D)
+    torch.mps.synchronize()
+    import math as _math
+    scale = 1.0 / _math.sqrt(D)
+    sc = (q.float() * scale) @ k.float().transpose(-2, -1)
+    ref_o = torch.softmax(sc, -1) @ v.float()
+    ref_lse = torch.logsumexp(sc, dim=-1)
+    eo = (o - ref_o).abs().max().item()
+    el = (lse - ref_lse).abs().max().item()
+    assert eo == eo and eo < 2e-3, f"#6b O wrong: err {eo}"
+    assert el == el and el < 2e-3, f"#6b lse wrong: err {el}"
 
 
 @triton.jit

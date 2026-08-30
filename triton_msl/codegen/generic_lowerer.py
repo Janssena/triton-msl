@@ -3707,7 +3707,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if self._traces_to_converted_layout(val_id):
                 # THIS value was redistributed: thread i has element i. Simple guard.
                 clauses.append(f"{lid} < {store_1d_guard}u")
-            elif _rec_layout == "direct":
+            elif _rec_layout in ("direct", "any"):
+                # "any" = uniform across elements (constant/splat-derived): every
+                # thread holds the same value, so the direct store is correct.
                 # Thread i holds element i (axis=0 reduce broadcast as shared[lid % N],
                 # or a tt.split pair). Store from the first `size` threads, index by lid.
                 clauses.append(f"{lid} < {store_1d_guard}u")
@@ -10859,41 +10861,136 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self._value_1d_layout = {}
         self._value_1d_layout[value_id] = layout
 
-    def _value_1d_layout_of(self, val_id, depth=8):
-        """The recorded layout of a stored 1-D value, or None if not traceable.
+    # Elementwise ops that PRESERVE per-element layout: the result's element i is a
+    # function of each operand's element i, so if every tensor operand shares a layout,
+    # the result has that layout too.
+    _LAYOUT_ELEMENTWISE_OPS = (
+        "arith.addf",
+        "arith.subf",
+        "arith.mulf",
+        "arith.divf",
+        "arith.maxnumf",
+        "arith.minnumf",
+        "arith.maximumf",
+        "arith.minimumf",
+        "arith.addi",
+        "arith.subi",
+        "arith.muli",
+        "math.exp",
+        "math.exp2",
+        "math.log",
+        "math.log2",
+        "math.sqrt",
+        "math.absf",
+        "arith.negf",
+        "arith.select",
+    )
 
-        Only pass-through producers are followed. An op that COMBINES two values (say
-        ``tl.argmax(x,0) + tl.argmax(x,1)``) has no single layout, so this returns None
-        and the caller keeps its previous behaviour rather than guessing.
+    def _value_1d_layout_of(self, val_id, depth=24):
+        """The layout of a stored 1-D value: "direct", "blocked", "any", or None.
+
+        "any" means the value is UNIFORM across elements (constants, splats of a
+        scalar) — every layout reads it identically, so it combines with anything and
+        a consumer may treat it as direct. None means unresolvable: the caller keeps
+        its previous behaviour rather than guessing.
+
+        Resolution follows, recursively:
+          * the producer registry (_register_1d_layout);
+          * single-operand pass-through wrappers (_LAYOUT_PASSTHROUGH_OPS);
+          * elementwise ops (_LAYOUT_ELEMENTWISE_OPS): combine over the operands —
+            "any" yields to anything, agreement passes through, conflict -> None;
+          * constants and splats -> "any";
+          * ``scf.for`` results and block args: a carried value's layout is
+            combine(init[i], yield[i]) — the loop-carried lse case (`li = li*a +
+            tl.sum(p,1)`; store of `mi + log(li)` after the loop) resolves to
+            "blocked" because the in-loop reduce registered blocked and the
+            `tl.full`/`tl.zeros` inits are "any". Cycles (mi = f(mi_arg, ...))
+            resolve optimistically as "any" ON THE BACK-EDGE only, which is sound
+            because init and yield are ALWAYS combined: a carry that rotates two
+            different layouts conflicts at the combine and yields None.
         """
         rec = getattr(self, "_value_1d_layout", None)
         if not rec:
             return None
 
-        by_id = {}
+        by_id = self._layout_op_index()
 
-        def _walk(ops):
-            for _o in ops:
-                by_id[_o.id] = _o
-                if getattr(_o, "region_ops", None):
-                    _walk(_o.region_ops)
-                if getattr(_o, "else_ops", None):
-                    _walk(_o.else_ops)
+        # scf.for block-arg id -> (for_op, iter index); result id -> (for_op, index).
+        ba_of = {}
+        res_of = {}
+        for _o in by_id.values():
+            if _o.op != "scf.for":
+                continue
+            _bas = (_o.attrs.get("block_arg_ids", []) if _o.attrs else [])[1:]  # skip IV
+            for _i, _ba in enumerate(_bas):
+                ba_of[_ba] = (_o, _i)
+            # A SINGLE-result scf.for has result_ids == None and its result id IS the
+            # op's own id (mlir_walker keeps result_ids only for multi-result ops).
+            # Missing this is the historical single-iterarg trap: the carry edge never
+            # existed, the in-loop reduce was invisible, and a blocked value staged
+            # modular — the row-collapse silent-wrong, reintroduced.
+            _rids = _o.result_ids or ([_o.id] if len((_o.operand_ids or [])) > 3 else [])
+            for _i, _rid in enumerate(_rids):
+                res_of[_rid] = (_o, _i)
 
-        _walk(self.graph.ops)
+        def _yield_of(for_op):
+            for _b in for_op.region_ops or []:
+                if _b.op == "scf.yield":
+                    return _b
+            return None
 
-        cur = val_id
-        for _ in range(depth):
+        def _combine(a, b):
+            if a is None or b is None:
+                return None
+            if a == "any":
+                return b
+            if b == "any":
+                return a
+            return a if a == b else None
+
+        def _resolve(cur, visiting, d):
+            if d <= 0:
+                return None
+            if cur in visiting:
+                return "any"  # optimistic back-edge; init⊓yield combine keeps it sound
             if cur in rec:
                 return rec[cur]
+            # Carried values: combine init with yield, positionally.
+            hit = res_of.get(cur) or ba_of.get(cur)
+            if hit is not None:
+                for_op, i = hit
+                inits = (for_op.operand_ids or [])[3:]
+                y = _yield_of(for_op)
+                if y is None or i >= len(y.operand_ids or []) or i >= len(inits):
+                    return None
+                visiting = visiting | {cur}
+                return _combine(
+                    _resolve(inits[i], visiting, d - 1),
+                    _resolve(y.operand_ids[i], visiting, d - 1),
+                )
             op = by_id.get(cur)
-            if op is None or not op.operand_ids:
+            if op is None:
+                return None
+            if op.op == "arith.constant":
+                return "any"
+            if op.op == "tt.splat":
+                return "any"  # a splat of a scalar is uniform across elements
+            if not op.operand_ids:
                 return None
             if op.op in self._LAYOUT_PASSTHROUGH_OPS:
-                cur = op.operand_ids[0]
-                continue
+                return _resolve(op.operand_ids[0], visiting, d - 1)
+            if op.op in self._LAYOUT_ELEMENTWISE_OPS:
+                out = "any"
+                # arith.select's condition (operand 0) selects per element; it shares
+                # the layout requirement like any other operand, so combine all.
+                for _oid in op.operand_ids:
+                    out = _combine(out, _resolve(_oid, visiting, d - 1))
+                    if out is None:
+                        return None
+                return out
             return None
-        return None
+
+        return _resolve(val_id, frozenset(), depth)
 
     def _rebuild_staged_fill_mask(self, mask_id, op_by_id, M, N, kind="store"):
         """Structurally rebuild a cooperative over-threadgroup store's or load's
@@ -11935,53 +12032,123 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=N)
 
         # Determine the source write index.
-        # After a 2D reduce with broadcast, the thread-to-element mapping
-        # uses lid / N_reduced (blocked row indexing), where N_reduced is
-        # the inner dim of the reduce input (NOT the global 2D shape).
-        # Trace back to find the reduce that produced this value and get
-        # its input inner dim.
-        N_reduced = None
-        reduce_axis = None
+        #
+        # After a 2-D reduce with broadcast, the thread-to-element mapping uses
+        # lid / N_reduced (axis=1, blocked rows) or lid % N (axis=0), where N_reduced is
+        # the inner dim of the REDUCE INPUT (not the global 2-D shape). Two mechanisms
+        # decide, and both must agree with the emitted index:
+        #
+        #   * the declared-layout resolver (_value_1d_layout_of), which since 2026-08-29
+        #     crosses scf.for carries and elementwise ops — the loop-carried lse value
+        #     (`mi + log(li)` after the K-loop) resolves to "blocked" through the carry;
+        #   * a carry-aware reduce search below, which supplies the DIVISOR (the layout
+        #     registry records the kind, not the reduce-input inner dim).
+        #
+        # The old operand-0-only trace could not cross an scf.for (it walked into the
+        # loop bound), so a carried blocked value fell into the "standard modular"
+        # branch: threads 0..N-1 wrote shared[lid] — but in blocked layout those threads
+        # ALL hold row 0, so every output row silently became row 0 (trifast #6b's lse
+        # collapse, GPU-measured err 0.73). Unresolvable-but-reduce-derived now REFUSES
+        # instead of guessing.
         src_id = ssa.operand_ids[0]
-        # Trace through passthroughs (addf, etc.) to find the reduce
-        visited = set()
-        trace_id = src_id
-        while trace_id not in visited:
-            visited.add(trace_id)
-            for op in self.graph.ops:
-                if op.id == trace_id:
-                    if op.op == "tt.reduce":
-                        if op.operand_ids:
-                            inp_shape = self.env_shapes.get(op.operand_ids[0])
-                            if not inp_shape:
-                                inp_type = self._find_op_type_str(op.operand_ids[0])
-                                inp_shape = _extract_shape(inp_type) if inp_type else None
-                            if inp_shape and len(inp_shape) >= 2:
-                                reduce_axis = op.attrs.get("axis", 0)
-                                if reduce_axis == 1:
-                                    N_reduced = inp_shape[1]
-                                elif reduce_axis == 0:
-                                    N_reduced = inp_shape[0]
-                        break
-                    elif op.operand_ids:
-                        trace_id = op.operand_ids[0]
-                    break
+        _layout = self._value_1d_layout_of(src_id)
 
-        if N_reduced and N_reduced > 1:
-            if reduce_axis == 1:
-                # axis=1: broadcast used lid / N_reduced (blocked row)
-                src_idx = f"lid / {N_reduced}u"
-                self.kb.raw_line(f"    if (lid % {N_reduced}u == 0u && lid / {N_reduced}u < {N}u)")
-                self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
-            else:
-                # axis=0: broadcast used lid % N (modular column)
-                src_idx = f"lid % {N}u"
-                self.kb.raw_line(f"    if (lid < {N}u)")
-                self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
-        else:
-            # Standard modular mapping or no reduce found
+        # Carry-aware BFS over (operands + scf.for carry edges) for the producing
+        # 2-D reduce(s). Consistency required: conflicting (axis, inner-dim) pairs
+        # mean the value mixes reduces of different layouts -> unprovable.
+        by_id = self._layout_op_index()
+        _ba_edges = {}
+        for _o in by_id.values():
+            if _o.op != "scf.for":
+                continue
+            _bas = (_o.attrs.get("block_arg_ids", []) if _o.attrs else [])[1:]
+            _inits = (_o.operand_ids or [])[3:]
+            _yield = next((b for b in _o.region_ops or [] if b.op == "scf.yield"), None)
+            for _i, _ba in enumerate(_bas):
+                _dsts = []
+                if _i < len(_inits):
+                    _dsts.append(_inits[_i])
+                if _yield is not None and _i < len(_yield.operand_ids or []):
+                    _dsts.append(_yield.operand_ids[_i])
+                _ba_edges[_ba] = _dsts
+            # Single-result scf.for: result_ids is None and the result id IS _o.id
+            # (see the resolver's res_of for the same trap).
+            _rids = _o.result_ids or ([_o.id] if len(_inits) > 0 else [])
+            for _i, _rid in enumerate(_rids):
+                if _yield is not None and _i < len(_yield.operand_ids or []):
+                    _ba_edges[_rid] = [_yield.operand_ids[_i]]
+
+        _found = set()  # {(axis, inner_dim)}
+        _seen = set()
+        _queue = [src_id]
+        while _queue and len(_seen) < 256:
+            _cur = _queue.pop()
+            if _cur in _seen:
+                continue
+            _seen.add(_cur)
+            if _cur in _ba_edges:
+                _queue.extend(_ba_edges[_cur])
+                continue
+            _op = by_id.get(_cur)
+            if _op is None:
+                continue
+            if _op.op == "tt.reduce" and _op.operand_ids:
+                _ish = self.env_shapes.get(_op.operand_ids[0])
+                if not _ish:
+                    _it = self._find_op_type_str(_op.operand_ids[0])
+                    _ish = _extract_shape(_it) if _it else None
+                if _ish and len(_ish) >= 2:
+                    _ax = _op.attrs.get("axis", 0)
+                    _found.add((_ax, _ish[1] if _ax == 1 else _ish[0]))
+                continue  # do not walk past the reduce
+            if _op.op in ("arith.constant", "tt.splat", "tt.make_range"):
+                continue
+            _queue.extend(_op.operand_ids or [])
+
+        reduce_axis, N_reduced = (next(iter(_found)) if len(_found) == 1 else (None, None))
+
+        def _stage_modular():
             self.kb.raw_line(f"    if (lid < {N}u)")
             self.kb.raw_line(f"        {shared_name}[lid % {N}u] = {src_var};")
+
+        def _stage_blocked(div):
+            # thread lid holds row lid/div: one writer per row.
+            self.kb.raw_line(f"    if (lid % {div}u == 0u && lid / {div}u < {N}u)")
+            self.kb.raw_line(f"        {shared_name}[lid / {div}u] = {src_var};")
+
+        def _refuse(why):
+            raise MetalNonRecoverableError(
+                f"ttg.convert_layout cannot prove its source's thread-to-element "
+                f"mapping ({why}); staging it with a guessed mapping is the "
+                f"row-collapse silent-wrong (trifast #6b). Refusing "
+                f"(correct-or-refuse).",
+                op_name="ttg.convert_layout",
+            )
+
+        if _layout in ("direct", "any"):
+            # Resolver is decisive: thread i holds element i (or the value is
+            # uniform). Modular staging is exact regardless of provenance.
+            _stage_modular()
+        elif _layout == "blocked":
+            # Resolver proves blocked rows; the reduce search must supply ONE
+            # consistent axis=1 divisor or there is no valid mapping.
+            if reduce_axis == 1 and N_reduced and N_reduced > 1:
+                _stage_blocked(N_reduced)
+            else:
+                _refuse(f"declared blocked, but reduce provenance is {sorted(_found)}")
+        elif len(_found) == 1 and N_reduced and N_reduced > 1:
+            # Resolver undecided; a single consistent producing reduce decides —
+            # this is the old behaviour's correct half, now reachable across carries.
+            if reduce_axis == 1:
+                _stage_blocked(N_reduced)
+            else:
+                _stage_modular()  # axis=0 broadcast was lid % N: one elem per thread
+        elif _found:
+            _refuse(f"conflicting reduce provenance {sorted(_found)}")
+        else:
+            # No reduce anywhere in the provenance and nothing declared: the
+            # historical modular mapping for genuinely simple slice conversions.
+            _stage_modular()
 
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 

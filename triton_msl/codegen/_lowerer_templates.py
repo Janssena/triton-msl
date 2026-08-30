@@ -2622,7 +2622,10 @@ class _TemplateMixin:
         _comb = self.classify_reduce_combine(red)
         if _comb is None or _comb[0] != "sum":
             return None
-        if not self._reduce_result_reaches_1d_store(red.id):
+        if not self._reduce_result_reaches_1d_store(red.id, stop_at_convert=False):
+            # stop_at_convert=False: this is the structural "feeds a 1-D store"
+            # SIGNATURE question — a ttg.convert_layout on the way is a passthrough
+            # here (the guard semantics in _lowerer_reduce pass True instead).
             return None
 
         # --- reduce input = mulf(x_bc, mulf(subf(sitofp(NIBBLE), zero_bc), scale_bc)). ---
@@ -2843,7 +2846,10 @@ class _TemplateMixin:
         _combine = self.classify_reduce_combine(red)
         if _combine is None or _combine[0] != "sum":
             return None
-        if not self._reduce_result_reaches_1d_store(red.id):
+        if not self._reduce_result_reaches_1d_store(red.id, stop_at_convert=False):
+            # stop_at_convert=False: this is the structural "feeds a 1-D store"
+            # SIGNATURE question — a ttg.convert_layout on the way is a passthrough
+            # here (the guard semantics in _lowerer_reduce pass True instead).
             return None
 
         # reduce input = mulf(bcast(x), subf(sitofp(load w), bcast(zero))).

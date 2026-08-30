@@ -834,10 +834,17 @@ class _ReduceScanMixin:
             # Add this phase's ops to the preceding ops for future phases
             all_preceding_ops.extend(phase_ops)
 
-    def _reduce_result_reaches_1d_store(self, reduce_id):
+    def _reduce_result_reaches_1d_store(self, reduce_id, stop_at_convert=True):
         """True iff the 2-D→1-D reduce ``reduce_id`` reaches a 1-D ``tt.store`` as the
         stored VALUE — following forward uses and crossing ``scf.for`` loop-carries —
         without first being re-broadcast to ≥2-D.
+
+        ``stop_at_convert`` selects between the walk's two callers (2026-08-29,
+        trifast #6b): the loop-carry silent-wrong GUARD passes True — a value that
+        reaches the store through a ``ttg.convert_layout`` is correct-or-refuse at the
+        convert itself, so the guard must not double-refuse it. The quant-GEMV
+        descriptor MATCHERS pass False — they ask the structural question "does this
+        reduce feed a 1-D store at all", for which the convert is a passthrough.
 
         A 2-D→1-D axis reduce produces its result in the row-broadcast layout (thread
         ``lid`` holds row ``lid/N``). That layout is correct for a 2-D consumer but not
@@ -896,6 +903,17 @@ class _ReduceScanMixin:
             for user in uses.get(vid, []):
                 if user.op == "tt.expand_dims":
                     continue  # value becomes ≥2-D on this branch → safe, stop
+                if user.op == "ttg.convert_layout":
+                    if stop_at_convert:
+                        # Safe-stop (2026-08-29, trifast #6b): the convert now resolves
+                        # the source's thread-to-element mapping across scf.for carries
+                        # (declared-layout resolver + carry-aware reduce provenance) and
+                        # REFUSES when it cannot prove one — so a 1-D store fed through a
+                        # convert is correct-or-refuse there, and refusing here as well
+                        # would only forbid the now-working lse pattern.
+                        continue
+                    stack.append((user.id, crossed))
+                    continue
                 if user.op == "tt.store":
                     # operand[0] = pointer, operand[1] = stored value. Only a match on
                     # the VALUE operand of a store reached THROUGH a loop-carry is the
