@@ -2046,26 +2046,40 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """
         self._prescan_stores_recursive(self.graph.ops)
 
-        # Trace through tt.addptr → tt.splat → func_arg (or direct arg)
-        # to identify which func_arg pointers are outputs
+        # Resolve each store's pointer back to its func arg with the SAME cycle-safe
+        # tracer the FA role verification uses (_trace_ptr_source, depth 32, follows
+        # every operand-0 pass-through) — NOT a private addptr/splat-only walk.
+        #
+        # The old hand-rolled walk linked only tt.addptr/tt.splat and gave up after 5
+        # hops, so a 2-D output address (which crosses tt.broadcast and runs deeper)
+        # never resolved. In a MULTI-output kernel that produced a PARTIAL
+        # output_arg_indices, and the host dispatch path faithfully obeyed it: the 2-D
+        # output was computed correctly on the GPU and then simply never copied back —
+        # the caller saw stale memory (GPU-measured: a plain 2-output kernel returned
+        # its 1-D output at 1e-6 and its 2-D output UNTOUCHED). Single-output kernels
+        # were safe only by accident: total failure yields an empty set, which
+        # get_output_arg_indices maps to None = copy-everything.
+        #
+        # Two safety properties, both load-bearing:
+        #   * PARTIAL knowledge is treated as NO knowledge. If any store pointer fails
+        #     to trace to a pointer arg, fall back to copy-everything rather than emit
+        #     a list that omits a real output.
+        #   * The tracer is MORE permissive than the old walk, so a mis-trace could in
+        #     principle mark an INPUT as an output; that only widens copy-back to a
+        #     buffer the kernel didn't write, which the driver copies back unchanged.
+        #     The pin guarding this (input contents byte-identical after a host-path
+        #     launch) lives in tests/test_multi_output_copyback.py.
         self._output_arg_ids = set()
-        arg_ids = {a.id for a in self.graph.args if a.is_ptr}
-
-        # Build lookup: ssa_id -> first operand id (for addptr/splat chains)
-        first_operand = {}
-        self._build_first_operand_map(self.graph.ops, first_operand)
-
+        _unresolved = False
         for store_ptr_id in self._store_ptr_ids:
-            # Walk the chain: store_ptr → addptr → splat → arg (or shorter)
-            current = store_ptr_id
-            for _ in range(5):  # Max chain depth
-                if current in arg_ids:
-                    self._output_arg_ids.add(current)
-                    break
-                next_id = first_operand.get(current)
-                if next_id is None:
-                    break
-                current = next_id
+            _arg = self._trace_ptr_source(store_ptr_id)
+            if _arg is not None:
+                self._output_arg_ids.add(_arg.id)
+            else:
+                _unresolved = True
+        if _unresolved:
+            # Copy-everything fallback: correctness over the copy-back optimization.
+            self._output_arg_ids = set()
 
     def _prescan_stores_recursive(self, ops):
         """Recursively find all tt.store and tt.atomic_rmw ops including in nested regions."""
@@ -2082,16 +2096,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._prescan_stores_recursive(ssa.region_ops)
             if ssa.else_ops:
                 self._prescan_stores_recursive(ssa.else_ops)
-
-    def _build_first_operand_map(self, ops, first_operand):
-        """Recursively build first-operand lookup for addptr/splat chains."""
-        for ssa in ops:
-            if ssa.op in ("tt.addptr", "tt.splat") and ssa.operand_ids:
-                first_operand[ssa.id] = ssa.operand_ids[0]
-            if ssa.region_ops:
-                self._build_first_operand_map(ssa.region_ops, first_operand)
-            if ssa.else_ops:
-                self._build_first_operand_map(ssa.else_ops, first_operand)
 
     def _prescan_2d_info(self):
         """Detect 2D kernel patterns and compute make_range → dimension mappings.

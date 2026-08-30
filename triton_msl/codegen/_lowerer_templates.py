@@ -1971,6 +1971,18 @@ class _TemplateMixin:
         stride_xm = info["stride_xm"]
         stride_zm = info["stride_zm"]
         block_size = info["block_size"]
+        # Defense in depth (2026-08-29): stride names are interpolated verbatim into
+        # the MSL. A missing stride previously emitted Python `None` (invalid MSL,
+        # loud compile failure — but the refusal belongs here, before emission).
+        if stride_xm is None or stride_zm is None:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "row-wise sort template requires proven row strides (runtime scalar "
+                "args or baked constants); the detector supplied None. Refusing "
+                "rather than emit invalid MSL.",
+                op_name="tt.reduce",
+            )
 
         msl_type = triton_type_to_msl(elem_type)
         # Pick a compute type for comparisons (promote fp16/bf16 to float)

@@ -3157,6 +3157,77 @@ class _DetectionMixin:
                 return None  # more stride-like scalars than the 2 rows (xm, zm) -> ambiguous
             stride_xm_name = scalar_args[0].name
             stride_zm_name = scalar_args[1].name if len(scalar_args) >= 2 else scalar_args[0].name
+        else:
+            # Constexpr strides (no runtime stride scalars): the row stride is baked
+            # into the IR as an integer constant multiplying the M-range
+            # (row_off = expand(make_range(0,M)) * C). Extract C separately for the
+            # load (x) and store (z) pointer chains — a padded-row layout (C != N)
+            # must use the REAL C, not an assumed N. If either constant cannot be
+            # proven unambiguously, bail to the generic path (correct-or-refuse).
+            # (2026-08-29, trifast #6b fallout: this branch became reachable when
+            # _prescan_stores learned to resolve broadcast/expand store chains; the
+            # template previously interpolated Python `None` into the MSL here.)
+            def _baked_row_stride(root_id):
+                consts = set()
+                seen = set()
+                stack = [root_id]
+                while stack:
+                    cur = stack.pop()
+                    if cur is None or cur in seen:
+                        continue
+                    seen.add(cur)
+                    o = _obid.get(cur)
+                    if o is None:
+                        continue
+                    if o.op == "arith.muli" and len(o.operand_ids or []) == 2:
+                        for mr_side, c_side in ((0, 1), (1, 0)):
+                            # Peel shape wrappers locally (the shared tracer does not
+                            # follow expand_dims, and widening it would loosen every
+                            # other detection that relies on it).
+                            _mr_root = o.operand_ids[mr_side]
+                            for _ in range(6):
+                                _w = _obid.get(_mr_root)
+                                if _w is not None and _w.op in ("tt.expand_dims", "tt.broadcast", "ttg.convert_layout") and _w.operand_ids:
+                                    _mr_root = _w.operand_ids[0]
+                                    continue
+                                break
+                            mr_id = self._trace_to_make_range(_mr_root, _all_ops, _obid)
+                            if mr_id is None:
+                                continue
+                            mr_op = _obid.get(mr_id)
+                            try:
+                                extent = int(mr_op.attrs.get("end")) - int(mr_op.attrs.get("start", 0))
+                            except (TypeError, ValueError):
+                                continue
+                            if extent != M:
+                                continue
+                            # Other side must trace to an integer constant
+                            c_id = o.operand_ids[c_side]
+                            for _ in range(6):
+                                c_op = _obid.get(c_id)
+                                if c_op is None:
+                                    break
+                                if c_op.op == "arith.constant":
+                                    v = c_op.attrs.get("value")
+                                    if isinstance(v, int):
+                                        consts.add(v)
+                                    break
+                                if c_op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "arith.extsi") and c_op.operand_ids:
+                                    c_id = c_op.operand_ids[0]
+                                    continue
+                                break
+                    for opd in o.operand_ids or []:
+                        stack.append(opd)
+                if len(consts) == 1:
+                    return consts.pop()
+                return None  # none found, or ambiguous (e.g. M == N with an unfolded col muli)
+
+            _sx = _baked_row_stride(load_ssa.operand_ids[0]) if load_ssa.operand_ids else None
+            _sz = _baked_row_stride(store_ssa.operand_ids[0]) if store_ssa.operand_ids else None
+            if _sx is None or _sz is None or _sx < N or _sz < K_out:
+                return None  # can't prove the baked strides -> generic path handles it
+            stride_xm_name = f"{_sx}"
+            stride_zm_name = f"{_sz}"
 
         # Require M <= 1024 so each row fits in one thread within the tg
         if M > 1024:

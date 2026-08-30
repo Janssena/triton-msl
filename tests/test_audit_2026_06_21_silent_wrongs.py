@@ -1417,6 +1417,33 @@ def _sort_rows(a, o, M: tl.constexpr, N: tl.constexpr):
     tl.store(o + i[:, None] * N + j[None, :], tl.sort(tl.load(a + i[:, None] * N + j[None, :])))
 
 
+@triton.jit
+def _sort_rows_padded(a, o, M: tl.constexpr, N: tl.constexpr, S: tl.constexpr):
+    # Row stride S baked as a constexpr != N (padded rows).
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
+    tl.store(o + i[:, None] * S + j[None, :], tl.sort(tl.load(a + i[:, None] * S + j[None, :])))
+
+
+@requires
+def test_constexpr_stride_sort_uses_real_baked_stride():
+    # 2026-08-29 (trifast #6b fallout): the row-sort template's constexpr-stride
+    # case became reachable when _prescan_stores learned to resolve broadcast
+    # store chains — and it interpolated Python `None` into the MSL (loud exit-1
+    # compile failure). The detector now extracts the REAL baked row-stride
+    # constant from the IR. Padded rows (S=32 != N=16) are the discriminator: an
+    # assumed-N stride would sort/store the wrong elements (silent-wrong), and
+    # the padding must stay untouched.
+    torch.manual_seed(0)
+    M, N, S = 2, 16, 32
+    a = torch.randn(M, S, device="mps")
+    o = torch.full((M, S), float("nan"), device="mps")
+    _sort_rows_padded[(1,)](a, o, M=M, N=N, S=S)
+    torch.mps.synchronize()
+    torch.testing.assert_close(o[:, :N].cpu(), a[:, :N].cpu().sort(1).values, rtol=1e-5, atol=1e-5)
+    assert bool(o[:, N:].isnan().all()), "padding was written — row stride mis-derived"
+
+
 # --- #3 codegen fix (2026-06-24): multi-program 3D reduce computes (pid offset) -----
 @triton.jit
 def _reduce3d_multiprog(a, o, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
