@@ -1740,26 +1740,44 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # than the threadgroup with no mechanism covering it, refuse.
         #
         # Only the plain scalar path is checked. The wrapping, MEPT and multipass paths
-        # each carry their own multiplicity, and cooperative staging (tt.dot operands,
-        # scan/trans/gather/...) legitimately covers tiles wider than the threadgroup
-        # through its own strided loops -- none of those are truncation. A bare
-        # tt.reduce does NOT stage, so a reduce wider than the threadgroup with no wrap
-        # loop is exactly the truncation this catches.
-        _staging_ops = any(
-            ssa.op
-            in (
-                "tt.dot",
-                "ttg.local_alloc",
-                "tt.trans",
-                "tt.gather",
-                "tt.cat",
-                "tt.join",
-                "tt.split",
-                "tt.scan",
-                "tt.histogram",
-            )
-            for ssa in all_ops_iter
+        # each carry their own multiplicity. Cooperative staging (tt.dot operands,
+        # scan/trans/gather/...) covers wider tensors through strided loops only while
+        # its emitted stride equals the actual dispatch; the explicit >1024 check below
+        # enforces that precondition. A bare tt.reduce does NOT stage, so a reduce wider
+        # than the threadgroup with no wrap loop is exactly the truncation this catches.
+        _staging_op = next(
+            (
+                ssa.op
+                for ssa in all_ops_iter
+                if ssa.op
+                in (
+                    "tt.dot",
+                    "ttg.local_alloc",
+                    "tt.trans",
+                    "tt.gather",
+                    "tt.cat",
+                    "tt.join",
+                    "tt.split",
+                    "tt.scan",
+                    "tt.histogram",
+                )
+            ),
+            None,
         )
+        _staging_ops = _staging_op is not None
+        # Cooperative staging covers wide tiles only when its emitted loop stride
+        # equals the number of threads Metal actually dispatches.  Above 1024 the
+        # driver clamps the dispatch, but this unwrapped path still emits
+        # ``block_size`` as the stride.  GPU bite at 2048 elements: indices
+        # 1024..2047 remained NaN (exactly half the output), with no exception.
+        if _staging_ops and block_size > 1024:
+            raise MetalNonRecoverableError(
+                f"kernel requires cooperative shared-memory staging for {block_size} "
+                "elements, exceeding Metal's 1024-thread threadgroup cap: the "
+                f"emitted loops would stride by {block_size} while only 1024 threads "
+                "run, leaving the tail unwritten. Refusing (correct-or-refuse).",
+                op_name=_staging_op,
+            )
         if (
             not self._needs_wrapping
             and not getattr(self, "_mept_single_pass", False)
