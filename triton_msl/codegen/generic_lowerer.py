@@ -4521,7 +4521,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 )
                 self.kb.raw_line("    }")
                 self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
-                self.env[ssa.id] = _smem_name
+                # Expose a per-thread SCALAR as this value's SSA name — NOT the bare
+                # array name: flat consumers (a total<=block_size store, local_alloc
+                # staging) interpolate the env value into element expressions, and the
+                # array name there is invalid MSL (`static_cast<half>(smem_N)` /
+                # `smem_0[_sa] = smem_N` — dot-recovery recon 2026-08-30). Cooperative
+                # consumers keep using the smem desc registered below, exactly as they
+                # do for the dot result itself.
+                _tv = self._next_var("truncf")
+                self.kb.raw_line(f"    float {_tv} = (lid < {_smem_total}u) ? {_smem_name}[lid] : 0.0f;")
+                self.env[ssa.id] = _tv
                 self._shared_mem_descs[ssa.id] = (_smem_name, _smem_shape, "fp32")
             elif narrow is not None and _scalar_mode:
                 # SCALAR fp32->fp16/bf16: round-trip narrow->wide so the VALUE
@@ -11355,7 +11364,41 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 sel = f"({mask_expr} ? ({raw_expr}) : ({other_expr}))"
                 self.kb.raw_line(f"        {shared_name}[_sa] = {_apply_post_load(sel)};")
 
-        if total > bs and self._is_2d:
+        # SMEM-BACKED SOURCE (a dot result or an smem-quantized cast, possibly through
+        # a ttg.convert_layout): stage per element from the SOURCE ARRAY. The per-thread
+        # env value holds only element lid, so the value fallbacks below smear it across
+        # strided slots when total > block_size (silent-wrong) — and before 2026-08-30
+        # they interpolated the raw array name (invalid MSL, chain-dot fp16 recon).
+        _src_desc = getattr(self, "_shared_mem_descs", {}).get(ssa.operand_ids[0])
+        if _src_desc is None:
+            _cur_src = ssa.operand_ids[0]
+            for _ in range(6):
+                _o = op_by_id.get(_cur_src)
+                if _o is None or _o.op != "ttg.convert_layout" or not _o.operand_ids:
+                    break
+                _cur_src = _o.operand_ids[0]
+                _src_desc = getattr(self, "_shared_mem_descs", {}).get(_cur_src)
+                if _src_desc is not None:
+                    break
+        if _src_desc is not None and load_ptr_info is None:
+            _src_smem, _src_shape, _ = _src_desc
+            _src_total = 1
+            for _d in _src_shape:
+                _src_total *= _d
+            if _src_total != total:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"ttg.local_alloc of a shared-memory-backed value whose element "
+                    f"count ({_src_total}) differs from the alloc shape ({M}x{N}): the "
+                    f"element-wise copy has no proven index mapping. Refusing rather "
+                    f"than mis-stage.",
+                    op_name="ttg.local_alloc",
+                )
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            self.kb.raw_line(f"        {shared_name}[_sa] = {_src_smem}[_sa];")
+            self.kb.raw_line(f"    }}")
+        elif total > bs and self._is_2d:
             if load_ptr_info is not None:
                 base_ptr = load_ptr_info[0]
                 # Per-load structural rebuild of each staged element's global
@@ -11367,10 +11410,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 _emit_staged_fill(f"{base_ptr}[{new_offset}]")
                 self.kb.raw_line(f"    }}")
             else:
-                # Couldn't find load pointer — fall back to per-thread value
-                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
-                self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
-                self.kb.raw_line(f"    }}")
+                # No load pointer and not smem-backed: the per-thread scalar holds ONE
+                # element, and total > block_size here, so the strided copy would smear
+                # each thread's value across its slots — silent-wrong (dot-recovery
+                # hardening 2026-08-30; was the documented-but-unenforced assumption).
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"ttg.local_alloc staging of a computed (non-load, non-smem-backed) "
+                    f"{M}x{N} value with {total} elements > {bs} threads: each thread "
+                    f"holds one element, so the cooperative fill cannot reconstruct the "
+                    f"full tile. Refusing rather than smear per-thread values.",
+                    op_name="ttg.local_alloc",
+                )
         elif src_ptr_name:
             if self._is_2d and load_ptr_info is not None:
                 # 2-D tile staged for a tt.dot but small enough that
@@ -11405,8 +11457,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
                 self.kb.raw_line(f"    }}")
         else:
-            # Fallback: use the value from the wrapping loop (only correct
-            # when total == block_size or for a single element).
+            # Fallback: use the per-thread value. Correct ONLY when total <= block_size
+            # (each thread writes exactly its own element); a larger tile would smear
+            # each thread's single value across its strided slots — enforce the
+            # documented assumption instead of assuming it (dot-recovery 2026-08-30).
+            if total > bs:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"ttg.local_alloc staging of a per-thread value with {total} "
+                    f"elements > {bs} threads and no reconstructible source (no load "
+                    f"pointer, not shared-memory-backed). Refusing rather than smear "
+                    f"per-thread values across the tile.",
+                    op_name="ttg.local_alloc",
+                )
             self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
             self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
             self.kb.raw_line(f"    }}")
