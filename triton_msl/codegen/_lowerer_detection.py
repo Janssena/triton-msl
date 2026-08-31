@@ -80,6 +80,35 @@ class _DetectionMixin:
         # too, so a single recursive walk handles every step.
         return self._trace_ptr_source(op.operand_ids[0], op_by_id, depth + 1)
 
+    def _resolve_load_store_ptr_roles(self, load_ssa, store_ssa):
+        """Resolve one-load/one-store template roles from pointer dataflow.
+
+        Returns ``(input_arg, output_arg)`` only when the load address and store
+        address trace to two distinct pointer function arguments.  Fast templates
+        must never infer these roles from declaration order: output-first signatures
+        otherwise make the template read the output sentinel and overwrite the real
+        input (GPU-confirmed for flip and both transpose templates), while extra
+        pointer arguments create the same ambiguity at either end.
+        """
+        if not load_ssa.operand_ids or not store_ssa.operand_ids:
+            return None
+        op_by_id = {}
+
+        def _collect(ops):
+            for s in ops:
+                op_by_id[s.id] = s
+                if s.region_ops:
+                    _collect(s.region_ops)
+                if s.else_ops:
+                    _collect(s.else_ops)
+
+        _collect(self.graph.ops)
+        input_arg = self._trace_ptr_source(load_ssa.operand_ids[0], op_by_id)
+        output_arg = self._trace_ptr_source(store_ssa.operand_ids[0], op_by_id)
+        if input_arg is None or output_arg is None or input_arg.id == output_arg.id:
+            return None
+        return input_arg, output_arg
+
     def _norm_input_output_args(self, load_ssa, store_ssa, first_reduce_ssa):
         """For the softmax / layer-norm fast-template detectors: resolve the INPUT and
         OUTPUT pointer args from ACTUAL DATAFLOW, and validate the reduced tensor is the
@@ -1698,6 +1727,12 @@ class _DetectionMixin:
         store = _consumer_of(final_id, "tt.store")
         if store is None:
             return None
+        # The template emits exactly ONE store; a second store would be silently
+        # DROPPED, and _resolve_dot_ptr_roles below traces C from the first store —
+        # both require single-store (same guard _detect_matmul_epilogue already has;
+        # added 2026-08-30 with the dataflow role fix).
+        if sum(1 for _s in self.graph.ops if _s.op == "tt.store") != 1:
+            return None
 
         ptr_args = [a for a in self.graph.args if a.is_ptr]
         scalar_args = [a for a in self.graph.args if not a.is_ptr]
@@ -1711,9 +1746,19 @@ class _DetectionMixin:
         # weight (W) and the output (Z, stride_zm, stride_zn). The
         # softmax variant doesn\'t use W, so the store target is the
         # *last* pointer; everything else identifies positionally.
-        a_ptr = ptr_args[0]
-        b_ptr = ptr_args[1]
-        c_ptr = ptr_args[-1]
+        # DATAFLOW-resolved pointer roles (2026-08-30, dot-recovery recon): the old
+        # positional pick (`a=ptr[0], b=ptr[1], c=ptr[-1]`) silently READ/WROTE the
+        # WRONG BUFFERS for any arg order it didn't anticipate — a kernel with an
+        # extra pointer arg after the output stored its entire (numerically perfect)
+        # result into that unrelated buffer and left the real output untouched
+        # (GPU-verified: M32N64 softmax landed in the unused 4th arg at 5.6e-09).
+        # _resolve_dot_ptr_roles traces A/B from the dot operands and C from the
+        # tt.store target; a failed/ambiguous trace returns None -> decline, so the
+        # kernel falls to the loud #157 catch-all instead of a positional guess.
+        _roles = self._resolve_dot_ptr_roles(dot_ssa, ptr_args)
+        if _roles is None or len(_roles) < 3:
+            return None
+        a_ptr, b_ptr, c_ptr = _roles[0], _roles[1], _roles[2]
 
         # ADDRESS-TRACED strides ONLY (mechanism A — same contract as
         # _detect_matmul_epilogue, which already refuses on un-inferable strides).
@@ -1964,9 +2009,19 @@ class _DetectionMixin:
         ptr_args = [a for a in self.graph.args if a.is_ptr]
         if len(ptr_args) < 3:
             return None
-        a_ptr = ptr_args[0]
-        b_ptr = ptr_args[1]
-        c_ptr = ptr_args[-1]
+        # DATAFLOW-resolved pointer roles (2026-08-30, dot-recovery recon): the old
+        # positional pick (`a=ptr[0], b=ptr[1], c=ptr[-1]`) silently READ/WROTE the
+        # WRONG BUFFERS for any arg order it didn't anticipate — a kernel with an
+        # extra pointer arg after the output stored its entire (numerically perfect)
+        # result into that unrelated buffer and left the real output untouched
+        # (GPU-verified: M32N64 softmax landed in the unused 4th arg at 5.6e-09).
+        # _resolve_dot_ptr_roles traces A/B from the dot operands and C from the
+        # tt.store target; a failed/ambiguous trace returns None -> decline, so the
+        # kernel falls to the loud #157 catch-all instead of a positional guess.
+        _roles = self._resolve_dot_ptr_roles(dot_ssa, ptr_args)
+        if _roles is None or len(_roles) < 3:
+            return None
+        a_ptr, b_ptr, c_ptr = _roles[0], _roles[1], _roles[2]
 
         # ADDRESS-TRACED strides (not the old positional index+1/+2 read, which
         # landed on the M/N dim args for a `(a,b,c,M,N,K,sam,sak,...)` signature
@@ -2442,13 +2497,15 @@ class _DetectionMixin:
             flip_dim = red_axis
             num_steps = 1
 
-        # Identify pointer args
-        ptr_args = [a for a in self.graph.args if a.is_ptr]
-        if len(ptr_args) < 2:
+        # Pointer roles and the source element type come from DATAFLOW, never
+        # declaration order (packet 043 sibling audit, 2026-08-30).
+        roles = self._resolve_load_store_ptr_roles(load_ssa, store_ssa)
+        if roles is None:
             return None
-        x_ptr = ptr_args[0].name
-        z_ptr = ptr_args[1].name
-        elem_type = ptr_args[0].elem_type
+        input_arg, output_arg = roles
+        x_ptr = input_arg.name
+        z_ptr = output_arg.name
+        elem_type = input_arg.elem_type
 
         # Sanity: total elements
         total = M * N * K
@@ -2820,13 +2877,15 @@ class _DetectionMixin:
         if not second_reshape_shape or len(second_reshape_shape) != 1 or second_reshape_shape[0] != M * N:
             return None
 
-        # Identify ptr args (input and output).
-        ptr_args = [a for a in self.graph.args if a.is_ptr]
-        if len(ptr_args) < 2:
+        # Resolve input/output from the actual load/store address chains. The old
+        # positional pick swapped both buffers for output-first signatures.
+        roles = self._resolve_load_store_ptr_roles(load_ssa, store_ssa)
+        if roles is None:
             return None
-        input_arg = ptr_args[0].name
-        output_arg = ptr_args[1].name
-        elem_type = ptr_args[0].elem_type
+        input_ptr, output_ptr = roles
+        input_arg = input_ptr.name
+        output_arg = output_ptr.name
+        elem_type = input_ptr.elem_type
 
         return {
             "input_arg": input_arg,
@@ -2908,16 +2967,17 @@ class _DetectionMixin:
         order = self._parse_trans_order(trans_ssa, len(src_shape))
         if order is None or sorted(order) != list(range(len(src_shape))):
             return None
-        ptr_args = [a for a in self.graph.args if a.is_ptr]
-        if len(ptr_args) < 2:
+        roles = self._resolve_load_store_ptr_roles(load_ssa, store_ssa)
+        if roles is None:
             return None
+        input_ptr, output_ptr = roles
         total = 1
         for s in src_shape:
             total *= s
         return {
-            "input_arg": ptr_args[0].name,
-            "output_arg": ptr_args[1].name,
-            "elem_type": ptr_args[0].elem_type,
+            "input_arg": input_ptr.name,
+            "output_arg": output_ptr.name,
+            "elem_type": input_ptr.elem_type,
             "src_shape": list(src_shape),
             "order": list(order),
             "total": total,
@@ -3069,25 +3129,23 @@ class _DetectionMixin:
                 return None
 
         # Identify pointer args (X=input, Z=output) and stride scalars
-        ptr_args = [a for a in self.graph.args if a.is_ptr]
         scalar_args = [a for a in self.graph.args if not a.is_ptr]
-        if len(ptr_args) < 2:
-            return None
-        # Distinguish input vs output via prescan store chain
+        # Preserve the prescan side effect used for driver copy-back metadata, but
+        # resolve the template's input/output roles from this detector's exact load
+        # and store. `_output_arg_ids` alone cannot identify the input when unrelated
+        # pointer args are present.
         self._store_ptr_ids = set()
         self._prescan_stores()
-        x_ptr_name = None
-        z_ptr_name = None
-        for a in ptr_args:
-            if a.id in getattr(self, "_output_arg_ids", set()):
-                if z_ptr_name is None:
-                    z_ptr_name = a.name
-            else:
-                if x_ptr_name is None:
-                    x_ptr_name = a.name
-        if x_ptr_name is None or z_ptr_name is None:
+        roles = self._resolve_load_store_ptr_roles(load_ssa, store_ssa)
+        if roles is None:
             return None
-        elem_type = ptr_args[0].elem_type
+        input_arg, output_arg = roles
+        x_ptr_name = input_arg.name
+        z_ptr_name = output_arg.name
+        # Compute comparisons in the INPUT domain. A mixed-dtype output-first
+        # signature previously picked the output dtype from ptr_args[0], narrowing
+        # values BEFORE sorting (28/32 wrong stores in the i32->i8 discriminator).
+        elem_type = input_arg.elem_type
 
         # Detect descending by the presence of hypercube-sized `arith.constant
         # dense<1>` tensors at the start of the kernel. triton.language.sort
