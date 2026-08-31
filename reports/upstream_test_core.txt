@@ -3,8 +3,8 @@ Backend: metal
 ==================================================
 
 Total:   9342
-Passed:  5326 (57.0%)
-Failed:  198
+Passed:  5353 (57.3%)
+Failed:  171
 Skipped: 3818
 Errors:  0
 
@@ -12,51 +12,51 @@ Failure Categories:
   Other: 23
 
 Pytest summary (cross-check):
-  failed: 198
-  passed: 5326
+  failed: 171
+  passed: 5353
   skipped: 3818
-  warnings: 2487
+  warnings: 2467
 
 Sample passing tests:
-  unit/language/test_core.py::test_compare_op[1-int32-float32-!=-real-real]
-  unit/language/test_core.py::test_bitwise_op[1-int16-uint64-&0]
-  unit/language/test_core.py::test_bitwise_op[1-int8-float16-&1]
-  unit/language/test_core.py::test_bitwise_op[1-int32-float32-&3]
-  unit/language/test_core.py::test_compare_op[1-int32-float32-<-real-real]
-  unit/language/test_core.py::test_bitwise_op[1-int32-bfloat16-&0]
-  unit/language/test_core.py::test_compare_op[1-int16-float16-<-real-real]
-  unit/language/test_core.py::test_bin_op_constexpr[True-True->]
-  unit/language/test_core.py::test_bitwise_op[1-bfloat16-int16-|1]
-  unit/language/test_core.py::test_scan2d[cumprod-float32-shape805-0-False-16]
-  unit/language/test_core.py::test_value_specialization[2147483647-i32]
-  unit/language/test_core.py::test_bitwise_op[1-float16-uint8-^0]
-  unit/language/test_core.py::test_scan2d[roll-int32-shape545-1-True-16]
-  unit/language/test_core.py::test_masked_load[1-int16-128-4-1]
-  unit/language/test_core.py::test_scan2d[cummax-float32-shape328-0-False-4]
-  unit/language/test_core.py::test_reduce1d[1-max-int8-32]
-  unit/language/test_core.py::test_compare_op[1-int64-int8->-real-real]
-  unit/language/test_core.py::test_scan2d[roll-float32-shape293-0-True-4]
-  unit/language/test_core.py::test_bin_op[1-int16-uint32-/]
-  unit/language/test_core.py::test_bin_op[1-float32-int64-/]
+  unit/language/test_core.py::test_scalar_overflow
+  unit/language/test_core.py::test_dtype_codegen
+  unit/language/test_core.py::test_bin_op[1-int8-int8-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int64-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint8-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint64-+]
+  unit/language/test_core.py::test_bin_op[1-int8-float16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-float32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-bfloat16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int8-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int32-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int64-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint8-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint32-+]
 
 Sample failing tests:
-  unit/language/test_core.py::test_dot3d[8-4-32-32-32-32-32-int8-int8]
-  unit/language/test_core.py::test_dot3d[2-1-32-32-32-32-32-float16-float32]
-  unit/language/test_core.py::test_dot3d[1-4-32-32-32-32-32-float16-float16]
-  unit/language/test_core.py::test_dot3d[2-1-64-64-64-32-32-int8-int8]
-  unit/language/test_core.py::test_dot_multidim[False-False-2]
-  unit/language/test_core.py::test_dot3d[8-4-32-32-32-32-32-float16-float16]
-  unit/language/test_core.py::test_dot3d[2-4-64-64-64-32-32-float16-float32]
-  unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float16-float16]
-  unit/language/test_core.py::test_dot3d[2-2-32-32-32-32-32-float32-float32]
-  unit/language/test_core.py::test_dot_multidim[True-True-6]
-  unit/language/test_core.py::test_dot3d[1-16-32-32-32-32-32-float32-float32]
-  unit/language/test_core.py::test_dot3d[2-8-32-32-32-32-32-float32-float32]
-  unit/language/test_core.py::test_dot_multidim[False-True-5]
-  unit/language/test_core.py::test_dot3d[2-4-64-64-64-32-32-int8-int8]
-  unit/language/test_core.py::test_dot3d[1-8-64-64-64-32-32-int8-int8]
-  unit/language/test_core.py::test_dot[1-16-16-16-4-False-False-chain-dot-ieee-float32-float32-1-None]
-  unit/language/test_core.py::test_dot3d[8-1-32-32-32-32-32-int8-int8]
-  unit/language/test_core.py::test_dot[1-32-32-32-4-False-False-add-matrix-ieee-float16-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float16-float16-1-None]
   unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float16-float32-1-None]
-  unit/language/test_core.py::test_dot3d[1-2-64-64-64-32-32-int8-int8]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float32-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float16-float16-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float16-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float32-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float16-float16-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float16-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float32-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float16-float16-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float16-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float32-float32-1-None]
+  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-bfloat16-float32-1-None]
+  unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-int8-int8]
+  unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float16-float16]
+  unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float16-float32]
+  unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float32-float32]
+  unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-int8-int8]
+  unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-float16-float16]
+  unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-float16-float32]

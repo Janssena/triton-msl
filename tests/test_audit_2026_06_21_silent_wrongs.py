@@ -862,17 +862,26 @@ def _kloop_acc(a, b, c, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr,
 
 
 @requires
-def test_dot_nonzero_acc_init_refuses_both_forms():
-    # A non-zero accumulator init (fused bias / tl.full) is silently dropped by the
-    # inline simdgroup template. Both the NON-LOOPED (init is a dot operand) and the
-    # K-LOOP (init is an scf.for iter-arg) forms must refuse (re-audit #12 — twins; the
+def test_dot_nonzero_acc_init_nonlooped_computes_kloop_refuses():
+    # A non-zero accumulator init (fused bias / tl.full) used to be silently dropped by
+    # the inline simdgroup template; both the NON-LOOPED (init is a dot operand) and the
+    # K-LOOP (init is an scf.for iter-arg) forms refused (re-audit #12 — twins; the
     # K-loop one was an INEFFECTIVE #11 guard that missed the loop-carried init).
+    #
+    # CONVERTED 2026-08-30 (dot-recovery stage 1a): the NON-LOOPED single-tile 32x32x32
+    # form is inside the generic dot path's proven envelope, so it now COMPUTES (the
+    # generic lowerer seeds each element's accumulator from the init). The K-LOOP form
+    # carries an scf.for, is OUTSIDE the envelope, and must STILL refuse. The original
+    # silent-wrong (init dropped) is asserted against directly.
+    torch.manual_seed(5)
     a = torch.randn(32, 32, device="mps")
     b = torch.randn(32, 32, device="mps")
     c = torch.empty(32, 32, device="mps")
-    with pytest.raises(MetalNonRecoverableError):
-        _nonlooped_acc[(1,)](a, b, c, M=32, N=32, K=32)
-        torch.mps.synchronize()
+    _nonlooped_acc[(1,)](a, b, c, M=32, N=32, K=32)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c, a @ b + 5.0, rtol=1e-4, atol=1e-4)
+    assert (c - (a @ b)).abs().max().item() > 1.0, "tl.full init dropped — the silent-wrong is back"
+
     c2 = torch.empty(32, 32, device="mps")
     with pytest.raises(MetalNonRecoverableError):
         _kloop_acc[(1, 1)](a, b, c2, 32, 32, 32, *a.stride(), *b.stride(), *c2.stride(), BM=32, BN=32, BK=16)

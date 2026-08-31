@@ -224,15 +224,21 @@ def test_matmul_unaligned_N_rescue_byte_exact(N):
 
 
 @requires_metal
-def test_2d_accumulator_refuses_with_accurate_message():
-    # C = A@B + C with a FULL 2-D accumulator is refused with an ACCURATE message (was
-    # mislabeled a 'row bias'); the simdgroup epilogue only adds a 1-D bias.
+def test_2d_accumulator_computes_in_envelope():
+    # C = A@B + C with a FULL 2-D accumulator used to REFUSE with an accurate message
+    # (the simdgroup epilogue only adds a 1-D bias; it was previously mislabeled a
+    # 'row bias'). CONVERTED 2026-08-30 (dot-recovery stage 1a): this single-tile
+    # 32x32x32 non-looped kernel is inside the generic dot path's proven envelope, so
+    # the guard falls through and the per-element accumulator is applied correctly.
+    # Outside the envelope the refusal stands — see
+    # tests/test_dot_epilogue_generic.py::test_nonuniform_fused_accumulator_still_refuses.
+    torch.manual_seed(5)
     M = N = K = 32
-    a = torch.randn(M, K)
-    b = torch.randn(K, N)
-    c = torch.randn(M, N)
-    out = torch.zeros(M, N)
-    from triton_msl.errors import MetalNonRecoverableError
-
-    with pytest.raises(MetalNonRecoverableError, match="2-D accumulator"):
-        _mm_2dacc[(1,)](a, b, c, out, M=M, N=N, K=K)
+    a = torch.randn(M, K, device="mps")
+    b = torch.randn(K, N, device="mps")
+    c = torch.randn(M, N, device="mps")
+    out = torch.zeros(M, N, device="mps")
+    _mm_2dacc[(1,)](a, b, c, out, M=M, N=N, K=K)
+    torch.mps.synchronize()
+    torch.testing.assert_close(out, a @ b + c, rtol=1e-4, atol=1e-4)
+    assert (out - (a @ b)).abs().max().item() > 1e-2, "2-D accumulator dropped — silent-wrong"

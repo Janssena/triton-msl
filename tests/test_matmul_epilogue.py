@@ -129,18 +129,27 @@ def test_matmul_chained_pointwise():
 
 
 @requires_metal
-def test_matmul_rowreduce_epilogue_refuses():
+def test_matmul_rowreduce_epilogue_computes():
     # matmul + row-reduce-subtract epilogue (acc - sum(acc, axis=1)). The fused
-    # epilogue template can't represent the reduce, so it must REFUSE loudly. (Routing
-    # such matmul-with-epilogue kernels to the generic lowerer was tried and reverted:
-    # the combination fuzzer showed generic matmul+epilogue is correct at some shapes
-    # but grossly wrong at others — re-audit #6. The integrity boundary stands.)
-    from triton_msl.errors import MetalNonRecoverableError
-
-    a, b = _ab()
-    c = torch.zeros(M, N)
-    with pytest.raises(MetalNonRecoverableError):
-        _mm_rowreduce[(1,)](a, b, c, M=M, N=N, K=K)
+    # epilogue template can't represent the reduce, so this used to REFUSE loudly:
+    # routing matmul-with-epilogue kernels to the generic lowerer had been tried and
+    # reverted because the combination fuzzer showed it correct at some shapes and
+    # grossly wrong at others (re-audit #6).
+    #
+    # CONVERTED 2026-08-30 (dot-recovery stage 1a): re-audit #6's failures were
+    # re-measured and are NON-UNIFORM shapes (M32xN64 etc.). This kernel is uniform
+    # 32x32x32 and non-looped — inside the generic dot path's proven envelope — so it
+    # now computes, reduce epilogue included. The old boundary still holds outside the
+    # envelope (test_dot_epilogue_generic.py::test_nonuniform_fused_accumulator_still_refuses).
+    torch.manual_seed(5)
+    a = torch.randn(M, K, device="mps") * 0.3
+    b = torch.randn(K, N, device="mps") * 0.3
+    c = torch.zeros(M, N, device="mps")
+    _mm_rowreduce[(1,)](a, b, c, M=M, N=N, K=K)
+    torch.mps.synchronize()
+    base = a @ b
+    torch.testing.assert_close(c, base - base.sum(dim=1)[:, None], rtol=1e-4, atol=1e-4)
+    assert (c - base).abs().max().item() > 1e-2, "reduce epilogue dropped — silent-wrong"
 
 
 if HAS:
@@ -156,17 +165,21 @@ if HAS:
 
 
 @requires_metal
-def test_matmul_runtime_scalar_epilogue_refuses_not_silentwrong():
+def test_matmul_runtime_scalar_epilogue_computes():
     # An epilogue that scales by a RUNTIME scalar arg (a kernel-arg splat leaf) the
-    # fused template can't lower. Must REFUSE loudly, never silently resolve the scalar
-    # to 0 (-> wrong output). #158 integrity boundary (re-audit #6: generic routing was
-    # not reliable, so refusal stands).
-    from triton_msl.errors import MetalNonRecoverableError
-
-    a, b = _ab()
-    c = torch.zeros(M, N)
-    with pytest.raises(MetalNonRecoverableError):
-        _mm_scale_runtime_arg[(1,)](a, b, c, 2.5, M=M, N=N, K=K)
+    # fused template can't lower: it used to REFUSE loudly rather than silently resolve
+    # the scalar to 0 (-> wrong output). CONVERTED 2026-08-30 (dot-recovery stage 1a):
+    # inside the generic dot path's proven envelope the generic lowerer resolves the
+    # splat scalar natively, so the kernel computes. The alpha-as-zero silent-wrong the
+    # refusal guarded is asserted against explicitly.
+    torch.manual_seed(5)
+    a = torch.randn(M, K, device="mps") * 0.3
+    b = torch.randn(K, N, device="mps") * 0.3
+    c = torch.zeros(M, N, device="mps")
+    _mm_scale_runtime_arg[(1,)](a, b, c, 2.5, M=M, N=N, K=K)
+    torch.mps.synchronize()
+    torch.testing.assert_close(c, (a @ b) * 2.5, rtol=1e-4, atol=1e-4)
+    assert c.abs().max().item() > 1e-2, "alpha resolved to 0 — the silent-wrong is back"
 
 
 if HAS:

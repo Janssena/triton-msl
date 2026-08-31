@@ -1880,6 +1880,70 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 indices.append(i)
         return indices
 
+    def _dot_generic_eligible(self) -> bool:
+        """True iff every tt.dot sits inside the PROVEN envelope of the generic
+        per-thread dot path (dot-recovery stage 1a, 2026-08-30).
+
+        The matmul refusal sites consult this to FALL THROUGH to the generic
+        lowerer instead of refusing — recovering fused-accumulator adds
+        (add-matrix/rows/cols), compute epilogues (scale/relu/softmax
+        spellings the fused templates don't claim), and chain-dot. Envelope
+        (every bound below is probe-verified; outside it the sites keep
+        refusing):
+
+        - NO structured control flow (single-tile, non-looped kernels only —
+          the historical fuzzer runs that found generic matmul+epilogue
+          "grossly wrong" used K-loops);
+        - every dot is 2-D with M == N == K in {16, 32}: the 2026-08-30
+          shapes probe confirmed the generic mapping silently mis-tiles
+          NON-UNIFORM shapes (M32xN64 err 0.2..4.0), and 64 exceeds the
+          32 KB threadgroup budget (3 tiles x 16 KB -> loud OutOfResources);
+        - every tensor in the kernel is (S,S), (S,1), (1,S), (S,) or scalar
+          for that single S — the generic per-thread mapping assumes one
+          uniform 2-D tile shape per kernel.
+        """
+        S = None
+        dots = []
+        for o in self.graph.ops:
+            if o.op in ("scf.for", "scf.while", "scf.if"):
+                return False
+            if o.op == "tt.dot":
+                dots.append(o)
+        if not dots:
+            return False
+        for d in dots:
+            if len(d.operand_ids or []) < 2:
+                return False
+            a_t = self._find_op_type_str(d.operand_ids[0])
+            b_t = self._find_op_type_str(d.operand_ids[1])
+            a_s = _extract_shape(a_t) if a_t else None
+            b_s = _extract_shape(b_t) if b_t else None
+            if not a_s or not b_s or len(a_s) != 2 or len(b_s) != 2:
+                return False
+            _m, _k = a_s
+            _k2, _n = b_s
+            if not (_m == _k == _k2 == _n) or _m not in (16, 32):
+                return False
+            if S is None:
+                S = _m
+            elif S != _m:
+                return False
+        for o in self.graph.ops:
+            if not o.type_str:
+                continue
+            sh = _extract_shape(o.type_str)
+            if not sh:
+                continue
+            if len(sh) == 1:
+                if sh[0] not in (S, 1):
+                    return False
+            elif len(sh) == 2:
+                if tuple(sh) not in ((S, S), (S, 1), (1, S)):
+                    return False
+            else:
+                return False
+        return True
+
     def _requires_matmul_template(self) -> bool:
         """Check if the kernel is a pure matmul that needs the prebuilt template.
 
@@ -1920,9 +1984,36 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         # A single-dot matmul with a trailing compute epilogue the fused template
         # didn't claim (looped dot-in-K-loop, etc.) must REFUSE — the prebuilt template
-        # would silently DROP it and routing to generic mis-tiles (see the helper).
+        # would silently DROP it and routing to generic mis-tiles (see the helper) —
+        # UNLESS the kernel is inside the generic dot path's proven envelope
+        # (dot-recovery stage 1a): then fall through to the generic lowerer, which
+        # computes the epilogue correctly there.
         if self._has_unhandled_matmul_compute_epilogue():
+            if self._dot_generic_eligible():
+                return False
             raise MetalNonRecoverableError(_MATMUL_EPILOGUE_REFUSE_MSG)
+
+        # Shapes the prebuilt template mis-models (it emits ONE bare 2-D matmul):
+        # a multi-dot kernel (chain-dot) or a fused non-zero accumulator init.
+        # Inside the proven envelope these fall through to the generic lowerer
+        # (which lowers each dot and the accumulator correctly); outside it the
+        # template's own refusals fire as before (dot-recovery stage 1a).
+        if self._dot_generic_eligible():
+            _dots = []
+
+            def _collect(ops):
+                for _o in ops:
+                    if _o.op == "tt.dot":
+                        _dots.append(_o)
+                    if _o.region_ops:
+                        _collect(_o.region_ops)
+
+            _collect(self.graph.ops)
+            if len(_dots) > 1:
+                return False
+            _by = {o.id: o for o in self.graph.ops}
+            if _dots and len(_dots[0].operand_ids or []) >= 3 and self._acc_init_is_bias(_dots[0].operand_ids[2], _by):
+                return False
 
         return True
 

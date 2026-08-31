@@ -1191,6 +1191,11 @@ class _DetectionMixin:
         # _has_unhandled_matmul_compute_epilogue. (_detect_matmul_epilogue already
         # claimed the non-looped single-dot case the template CAN emit.)
         if self._has_unhandled_matmul_compute_epilogue():
+            # Dot-recovery stage 1a (2026-08-30): inside the generic dot path's proven
+            # envelope, decline instead of refusing — the generic lowerer computes the
+            # epilogue correctly there (probe-verified all tiers at S in {16, 32}).
+            if self._dot_generic_eligible():
+                return None
             from triton_msl.codegen.generic_lowerer import _MATMUL_EPILOGUE_REFUSE_MSG
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -1389,6 +1394,11 @@ class _DetectionMixin:
         _by0 = {s.id: s for s in self.graph.ops}
 
         if self._acc_init_is_bias(dot_ssa.operand_ids[2], _by0):
+            # Dot-recovery stage 1a (2026-08-30): inside the generic dot path's proven
+            # envelope, decline (the generic _lower_dot seeds its accumulator from the
+            # init value, probe-verified); outside it, keep refusing.
+            if self._dot_generic_eligible():
+                return None
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
@@ -1437,6 +1447,11 @@ class _DetectionMixin:
                 if _op.op in _passthrough:
                     _frontier.append(_op.id)  # follow representation change
                 else:
+                    # Dot-recovery stage 1a (2026-08-30): inside the generic dot
+                    # path's proven envelope, decline instead of refusing — the
+                    # generic lowerer computes the epilogue correctly there.
+                    if self._dot_generic_eligible():
+                        return None
                     from triton_msl.errors import MetalNonRecoverableError
 
                     raise MetalNonRecoverableError(
@@ -1930,6 +1945,12 @@ class _DetectionMixin:
                     if str(axis) in ("0",):
                         acc_bias_dim = "col"
                     elif str(axis) in ("1",):
+                        # Dot-recovery stage 1a (2026-08-30): inside the generic dot
+                        # path's proven envelope, decline instead of refusing — the
+                        # generic _lower_dot seeds each output element's accumulator
+                        # from the per-element init (probe-verified add-rows).
+                        if self._dot_generic_eligible():
+                            return None
                         raise MetalNonRecoverableError(
                             "fused ROW-bias matmul (per-row bias as the dot accumulator) "
                             "is mis-computed and not reliably lowerable. Refusing rather "
@@ -1938,6 +1959,9 @@ class _DetectionMixin:
                             op_name="tt.dot",
                         )
                     else:
+                        # Same envelope fall-through (probe-verified add-matrix).
+                        if self._dot_generic_eligible():
+                            return None
                         raise MetalNonRecoverableError(
                             "fused 2-D accumulator matmul (C = A@B + C, a full M×N tile as "
                             "the dot's 3rd operand) is not supported: the simdgroup matmul "
