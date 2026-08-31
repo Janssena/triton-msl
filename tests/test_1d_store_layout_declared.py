@@ -41,6 +41,8 @@ import torch
 import triton
 import triton.language as tl
 
+from triton_msl.errors import MetalNonRecoverableError
+
 requires_mps = pytest.mark.skipif(
     not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")),
     reason="needs MPS + compile_shader",
@@ -209,6 +211,71 @@ def test_undeclared_layout_default_raises_and_infer_opt_out_does_not():
             os.environ.pop("TRITON_MSL_INFER_LAYOUT", None)
         else:
             os.environ["TRITON_MSL_INFER_LAYOUT"] = prev
+
+
+@triton.jit
+def _mixed_direct_blocked_layout(pairs, matrix, out, N: tl.constexpr, K: tl.constexpr):
+    rn = tl.arange(0, N)
+    rk = tl.arange(0, K)
+    pair_cols = tl.arange(0, 2)
+    pair_values = tl.load(pairs + rn[:, None] * 2 + pair_cols[None, :])
+    direct, _ = tl.split(pair_values)
+    tile = tl.load(matrix + rn[:, None] * K + rk[None, :])
+    blocked = tl.sum(tile, axis=1)
+    tl.store(out + rn, direct + blocked)
+
+
+@requires_mps
+def test_mixed_direct_and_blocked_layout_refuses(strict_layout):
+    """A known DIRECT + BLOCKED elementwise result has no coherent mapping.
+
+    Pre-fix, the resolver returned None for the conflict but convert_layout overrode
+    that result from the one visible reduce provenance, staged the whole expression as
+    BLOCKED, and silently used pair row 0 for every output row (GPU err 1.8633).
+    """
+    torch.manual_seed(20260830)
+    N, K = 16, 32
+    pairs = torch.randn(N, 2, device="mps")
+    matrix = torch.randn(N, K, device="mps")
+    out = torch.zeros(N, device="mps")
+    with pytest.raises(MetalNonRecoverableError, match="source layout is unresolved"):
+        _mixed_direct_blocked_layout[(1,)](pairs, matrix, out, N=N, K=K)
+
+
+@triton.jit
+def _blocked_reduce_with_larger_2d_shape(
+    small,
+    wide,
+    reduced,
+    wide_out,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    W: tl.constexpr,
+):
+    rm = tl.arange(0, M)
+    rk = tl.arange(0, K)
+    rw = tl.arange(0, W)
+    blocked = tl.sum(tl.load(small + rm[:, None] * K + rk[None, :]), axis=1)
+    wide_values = tl.load(wide + rm[:, None] * W + rw[None, :])
+    tl.store(wide_out + rm[:, None] * W + rw[None, :], wide_values + 0.25)
+    tl.store(reduced + rm, blocked)
+
+
+@requires_mps
+def test_blocked_convert_uses_reduce_inner_dim_not_effective_shape(strict_layout):
+    """The blocked divisor comes from its reduce input, not the dominant 2-D tile."""
+    torch.manual_seed(20260830)
+    M, K, W = 16, 8, 32
+    small = torch.randn(M, K, device="mps")
+    wide = torch.randn(M, W, device="mps")
+    reduced = torch.zeros(M, device="mps")
+    wide_out = torch.zeros_like(wide)
+    _blocked_reduce_with_larger_2d_shape[(1,)](
+        small, wide, reduced, wide_out, M=M, K=K, W=W
+    )
+    torch.mps.synchronize()
+    torch.testing.assert_close(reduced, small.sum(dim=1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(wide_out, wide + 0.25, rtol=0, atol=0)
 
 
 @triton.jit

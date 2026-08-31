@@ -12136,15 +12136,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 _stage_blocked(N_reduced)
             else:
                 _refuse(f"declared blocked, but reduce provenance is {sorted(_found)}")
-        elif len(_found) == 1 and N_reduced and N_reduced > 1:
-            # Resolver undecided; a single consistent producing reduce decides —
-            # this is the old behaviour's correct half, now reachable across carries.
-            if reduce_axis == 1:
-                _stage_blocked(N_reduced)
-            else:
-                _stage_modular()  # axis=0 broadcast was lid % N: one elem per thread
         elif _found:
-            _refuse(f"conflicting reduce provenance {sorted(_found)}")
+            # The provenance search can identify reduce DIVISORS, but it cannot prove
+            # that every other elementwise operand shares that reduce's layout.  In
+            # particular, DIRECT tt.split + BLOCKED axis=1 reduce has one perfectly
+            # consistent reduce provenance while the resolver correctly returns None
+            # for the mixed mapping.  Letting provenance override that conflict stages
+            # the whole expression as BLOCKED and silently uses split row 0 for every
+            # output row.  A declared resolver result is therefore mandatory whenever
+            # reduce provenance exists; unresolved/conflicting means refuse.
+            _refuse(f"source layout is unresolved despite reduce provenance {sorted(_found)}")
         else:
             # No reduce anywhere in the provenance and nothing declared: the
             # historical modular mapping for genuinely simple slice conversions.
