@@ -19,7 +19,7 @@ try:
     import triton.language as tl
     from triton._C.libtriton import ir
 
-    from triton_msl.codegen.generic_lowerer import GenericLowerer
+    import triton_msl.codegen.generic_lowerer as generic_lowerer
     from triton_msl.codegen.mlir_walker import walk_ttgir
     from triton_msl.errors import MetalNonRecoverableError
 
@@ -96,14 +96,14 @@ def _generic_lowerer(m, n, k, fn=None):
     metadata = {}
     mod = backend.make_ttir(mod, metadata, options)
     mod = backend.make_ttgir(mod, metadata, options)
-    return GenericLowerer(walk_ttgir(mod, options), options)
+    return generic_lowerer.GenericLowerer(walk_ttgir(mod, options), options)
 
 
 def _force_generic_dot(monkeypatch):
     """Bypass production template detection to exercise the staging boundary."""
-    monkeypatch.setattr(GenericLowerer, "_detect_matmul_epilogue", lambda self: None)
-    monkeypatch.setattr(GenericLowerer, "_detect_simple_dot", lambda self: None)
-    monkeypatch.setattr(GenericLowerer, "_requires_matmul_template", lambda self: False)
+    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_detect_matmul_epilogue", lambda self: None)
+    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_detect_simple_dot", lambda self: None)
+    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_requires_matmul_template", lambda self: False)
 
 
 @requires
@@ -112,7 +112,7 @@ def _force_generic_dot(monkeypatch):
     [(1024, 1024), (1025, 1024), (2048, 1024), (4096, 1024)],
 )
 def test_cooperative_dispatch_boundary(logical_elements, expected_dispatch):
-    assert GenericLowerer._cooperative_dispatch_threads(logical_elements) == expected_dispatch
+    assert generic_lowerer.GenericLowerer._cooperative_dispatch_threads(logical_elements) == expected_dispatch
 
 
 @requires
@@ -180,20 +180,17 @@ def cold_gpu_caches(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("m", "n", "k"), [(64, 32, 16), (64, 64, 16)])
 def test_generic_dot_mept_gpu_covers_every_output(monkeypatch, cold_gpu_caches, m, n, k):
     _force_generic_dot(monkeypatch)
-    hits = []
-    original = GenericLowerer._lower_dot
-
-    def _spy(self, ssa):
-        hits.append(ssa.id)
-        return original(self, ssa)
-
-    monkeypatch.setattr(GenericLowerer, "_lower_dot", _spy)
+    # Prove the compile-time route without relying on a runtime executable
+    # cache populated earlier in a randomized session.
+    lowerer = _generic_lowerer(m, n, k)
+    msl = lowerer.lower()
+    assert f"_de < {m * n}u" in msl
+    assert f"_st < {m * n}u" in msl
     torch.manual_seed(51000 + m * 100 + n)
     x = torch.randn((m, k), dtype=torch.float32)
     y = torch.randn((k, n), dtype=torch.float32)
     out = torch.full((m, n), float("nan"), dtype=torch.float32)
     _dot_single_tile[(1,)](x, y, out, M=m, N=n, K=k)
-    assert len(hits) == 1
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, x @ y, atol=1e-4, rtol=1e-4)
 
@@ -211,19 +208,10 @@ def test_generic_dot_mept_transposed_operand_lowering_and_gpu(monkeypatch, cold_
     # A transposed B must index its physical [N,K] staging as [col*K + k].
     assert "[_dot_col * 16u + _dk]" in msl
 
-    hits = []
-    original = GenericLowerer._lower_dot
-
-    def _spy(self, ssa):
-        hits.append(ssa.id)
-        return original(self, ssa)
-
-    monkeypatch.setattr(GenericLowerer, "_lower_dot", _spy)
     torch.manual_seed(51064)
     x = torch.randn((64, 16), dtype=torch.float32)
     y_nk = torch.randn((32, 16), dtype=torch.float32)
     out = torch.full((64, 32), float("nan"), dtype=torch.float32)
     _dot_transposed_b[(1,)](x, y_nk, out, M=64, N=32, K=16)
-    assert len(hits) == 1
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, x @ y_nk.T, atol=1e-4, rtol=1e-4)
