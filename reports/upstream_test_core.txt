@@ -3,8 +3,8 @@ Backend: metal
 ==================================================
 
 Total:   9342
-Passed:  5353 (57.3%)
-Failed:  171
+Passed:  5366 (57.4%)
+Failed:  158
 Skipped: 3818
 Errors:  0
 
@@ -12,10 +12,10 @@ Failure Categories:
   Other: 23
 
 Pytest summary (cross-check):
-  failed: 171
-  passed: 5353
+  failed: 158
+  passed: 5366
   skipped: 3818
-  warnings: 2467
+  warnings: 2454
 
 Sample passing tests:
   unit/language/test_core.py::test_scalar_overflow
@@ -40,19 +40,6 @@ Sample passing tests:
   unit/language/test_core.py::test_bin_op[1-int16-uint32-+]
 
 Sample failing tests:
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float16-float16-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float16-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-matrix-ieee-float32-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float16-float16-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float16-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-rows-ieee-float32-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float16-float16-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float16-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-add-cols-ieee-float32-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float16-float16-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float16-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-float32-float32-1-None]
-  unit/language/test_core.py::test_dot[1-64-64-64-4-False-False-chain-dot-ieee-bfloat16-float32-1-None]
   unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-int8-int8]
   unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float16-float16]
   unit/language/test_core.py::test_dot3d[1-1-64-64-64-32-32-float16-float32]
@@ -60,3 +47,16 @@ Sample failing tests:
   unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-int8-int8]
   unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-float16-float16]
   unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-float16-float32]
+  unit/language/test_core.py::test_dot3d[1-1-32-32-32-32-32-float32-float32]
+  unit/language/test_core.py::test_dot3d[1-2-64-64-64-32-32-int8-int8]
+  unit/language/test_core.py::test_dot3d[1-2-64-64-64-32-32-float16-float16]
+  unit/language/test_core.py::test_dot3d[1-2-64-64-64-32-32-float16-float32]
+  unit/language/test_core.py::test_dot3d[1-2-64-64-64-32-32-float32-float32]
+  unit/language/test_core.py::test_dot3d[1-2-32-32-32-32-32-int8-int8]
+  unit/language/test_core.py::test_dot3d[1-2-32-32-32-32-32-float16-float16]
+  unit/language/test_core.py::test_dot3d[1-2-32-32-32-32-32-float16-float32]
+  unit/language/test_core.py::test_dot3d[1-2-32-32-32-32-32-float32-float32]
+  unit/language/test_core.py::test_dot3d[1-4-64-64-64-32-32-int8-int8]
+  unit/language/test_core.py::test_dot3d[1-4-64-64-64-32-32-float16-float16]
+  unit/language/test_core.py::test_dot3d[1-4-64-64-64-32-32-float16-float32]
+  unit/language/test_core.py::test_dot3d[1-4-64-64-64-32-32-float32-float32]

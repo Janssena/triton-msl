@@ -114,6 +114,7 @@ def _fa_half_accumulate(out_dtype) -> bool:
 
 
 from triton_msl.codegen._lowerer_detection import _DetectionMixin
+from triton_msl.codegen._lowerer_dot_kchunk import _DotKChunkMixin
 from triton_msl.codegen._lowerer_emission import _EmissionMixin
 from triton_msl.codegen._lowerer_reduce import _ReduceScanMixin
 from triton_msl.codegen._lowerer_control import _ControlFlowMixin
@@ -279,7 +280,14 @@ _MATMUL_EPILOGUE_REFUSE_MSG = (
 # ---------------------------------------------------------------------------
 
 
-class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _DetectionMixin, _TemplateMixin):
+class GenericLowerer(
+    _ControlFlowMixin,
+    _ReduceScanMixin,
+    _EmissionMixin,
+    _DetectionMixin,
+    _DotKChunkMixin,
+    _TemplateMixin,
+):
     """Lower an IRGraph to MSL source code via KernelBuilder."""
 
     def __init__(self, graph: IRGraph, options=None):
@@ -1946,6 +1954,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         narrow capability proof rather than a wholesale guard deletion.
         """
 
+        # Stage 1C's whole-graph proof owns its accumulator/chain value paths
+        # and K-sliced storage.  Consult it before the deliberately narrower
+        # stage-1B bare-dot proof below.
+        if self._dot_kchunk_plan() is not None:
+            return True
+
         def _all_ops(ops):
             for op in ops:
                 yield op
@@ -2075,14 +2089,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         - NO structured control flow (single-tile, non-looped kernels only —
           the historical fuzzer runs that found generic matmul+epilogue
           "grossly wrong" used K-loops);
-        - every dot is 2-D with M == N == K in {16, 32}: the 2026-08-30
+        - the stage-1A scalar path requires every dot to be 2-D with
+          M == N == K in {16, 32}: the 2026-08-30
           shapes probe confirmed the generic mapping silently mis-tiles
-          NON-UNIFORM shapes (M32xN64 err 0.2..4.0), and 64 exceeds the
-          32 KB threadgroup budget (3 tiles x 16 KB -> loud OutOfResources);
-        - every tensor in the kernel is (S,S), (S,1), (1,S), (S,) or scalar
-          for that single S — the generic per-thread mapping assumes one
-          uniform 2-D tile shape per kernel.
+          NON-UNIFORM shapes (M32xN64 err 0.2..4.0);
+        - an oversized dot is eligible only when ``_dot_kchunk_plan`` proves
+          the COMPLETE accumulator/chain graph and computes a KC=16 footprint
+          at least 4 KiB below the 32 KiB threadgroup limit;
+        - on the stage-1A scalar path, every tensor in the kernel is (S,S),
+          (S,1), (1,S), (S,) or scalar for that single S — its generic
+          per-thread mapping assumes one uniform 2-D tile shape per kernel.
         """
+        # The K-chunk plan is already a stronger whole-graph proof than the
+        # scalar shape checks below (including op/value-path and budget gates).
+        if self._dot_kchunk_plan() is not None:
+            return True
+
         S = None
         dots = []
         for o in self.graph.ops:
@@ -11360,7 +11382,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse()
         _refuse()
 
-    def _rebuild_staged_fill_offset(self, addptr_id, op_by_id, base_ptr, M, N):
+    def _rebuild_staged_fill_offset(self, addptr_id, op_by_id, base_ptr, M, N, axis_dim_hint=None):
         """Per-load structural rebuild of a shared-memory-staged tt.dot
         operand's global address as a function of (_fill_row, _fill_col).
 
@@ -11381,6 +11403,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         mis-stages a pre-transposed K operand
         (``K + offs_d[:,None] + offs_n[None,:]*HD``) whose bare stride-1 term
         is the row and whose strided term is the column.
+
+        ``axis_dim_hint`` is reserved for a proven 1-D broadcast source: the
+        consumer has already established whether its bare make_range is the row
+        (0) or column (1) coordinate.  Ordinary 2-D staged operands leave it
+        ``None`` and must carry their own expand_dims proof.
 
         Correct-or-refuse: if any term of a staged dot operand cannot be
         resolved to (dim, stride) | constant, raise ``MetalNonRecoverableError``
@@ -11436,7 +11463,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if op.op == "tt.addptr":
                 if len(op.operand_ids) < 2:
                     break
-                _add(self._staged_fill_terms(op.operand_ids[1], None, None, op_by_id))
+                _add(self._staged_fill_terms(op.operand_ids[1], None, axis_dim_hint, op_by_id))
                 cur = op.operand_ids[0]
                 continue
             if op.op == "tt.broadcast" and op.operand_ids:
@@ -11465,6 +11492,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """
         if not ssa.operand_ids:
             self._emit_passthrough(ssa)
+            return
+
+        # The proven oversized-dot plan declares K-slice buffers instead of
+        # full input tiles (and fuses a chain intermediate rather than
+        # materializing it).
+        if self._lower_dot_kchunk_alloc(ssa):
             return
 
         src_var = self._lookup(ssa.operand_ids[0])
@@ -11865,6 +11898,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """
         if len(ssa.operand_ids) < 3:
             self.kb.comment("UNSUPPORTED: tt.dot with < 3 operands")
+            return
+        if self._lower_dot_kchunk(ssa):
             return
 
         a_id = ssa.operand_ids[0]
