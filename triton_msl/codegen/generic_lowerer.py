@@ -1366,6 +1366,31 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     yield from _scan_all_ops(s.else_ops)
 
         all_ops_iter = list(_scan_all_ops(self.graph.ops))
+        # Identify cooperative staging once, before choosing the physical dispatch.
+        # ``_staging_op`` is retained for the fail-closed error's op_name; the narrow
+        # dot predicate below decides whether every >1024 value path is actually wired
+        # for multi-element-per-thread loops.
+        _staging_op = next(
+            (
+                ssa.op
+                for ssa in all_ops_iter
+                if ssa.op
+                in (
+                    "tt.dot",
+                    "ttg.local_alloc",
+                    "tt.trans",
+                    "tt.gather",
+                    "tt.cat",
+                    "tt.join",
+                    "tt.split",
+                    "tt.scan",
+                    "tt.histogram",
+                )
+            ),
+            None,
+        )
+        _staging_ops = _staging_op is not None
+        _dot_cooperative_mept = self._dot_cooperative_mept_eligible()
         has_reduce_ops = any(ssa.op == "tt.reduce" for ssa in all_ops_iter)
         has_barrier_ops = any(
             ssa.op
@@ -1688,6 +1713,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 use_multipass = True
                 self._total_elements = block_size
                 block_size = num_threads
+            elif _dot_cooperative_mept and block_size > 1024:
+                # Stage-1B generic dot: the logical output tile is wider than Metal's
+                # physical threadgroup, but every load/local_alloc/dot/store leg above
+                # has a cooperative strided loop.  Set the PHYSICAL dispatch here; the
+                # logical extent stays in _total_elements and is never used as a loop
+                # stride. Value-changing epilogues do not satisfy the predicate and
+                # continue to hit the fail-closed backstop below.
+                self._total_elements = block_size
+                block_size = self._cooperative_dispatch_threads(block_size)
             elif mept_kernel_safe and not has_barrier_ops and num_threads * size_per_thread == block_size:
                 # Phase 4c MEPT single-pass: each of ``num_threads`` threads
                 # owns ``size_per_thread`` contiguous elements via a register
@@ -1708,7 +1742,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._total_elements = block_size
                 block_size = num_threads
         elif block_size > 1024:
-            if has_reduce_ops:
+            if _dot_cooperative_mept:
+                self._total_elements = block_size
+                block_size = self._cooperative_dispatch_threads(block_size)
+            elif has_reduce_ops:
                 if _coop_staging_ops:
                     raise MetalNonRecoverableError(
                         "Kernel combines a reduce with a cooperative shared-memory "
@@ -1726,7 +1763,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._total_elements = block_size
                 block_size = 1024  # Cap dispatch to Metal max
 
-        self.effective_block_size = block_size
+        # From this point onward ``actual_dispatch_threads`` is the physical Metal
+        # threadgroup width.  Logical coverage remains in ``_total_elements``.  Generic
+        # cooperative emitters must use the former as their loop stride.
+        actual_dispatch_threads = block_size
+        self._actual_dispatch_threads = actual_dispatch_threads
+        self.effective_block_size = actual_dispatch_threads
 
         # COVERAGE BACKSTOP -- should be unreachable, and is kept because the thing it
         # guards already regressed once.
@@ -1745,36 +1787,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # its emitted stride equals the actual dispatch; the explicit >1024 check below
         # enforces that precondition. A bare tt.reduce does NOT stage, so a reduce wider
         # than the threadgroup with no wrap loop is exactly the truncation this catches.
-        _staging_op = next(
-            (
-                ssa.op
-                for ssa in all_ops_iter
-                if ssa.op
-                in (
-                    "tt.dot",
-                    "ttg.local_alloc",
-                    "tt.trans",
-                    "tt.gather",
-                    "tt.cat",
-                    "tt.join",
-                    "tt.split",
-                    "tt.scan",
-                    "tt.histogram",
-                )
-            ),
-            None,
-        )
-        _staging_ops = _staging_op is not None
         # Cooperative staging covers wide tiles only when its emitted loop stride
         # equals the number of threads Metal actually dispatches.  Above 1024 the
         # driver clamps the dispatch, but this unwrapped path still emits
         # ``block_size`` as the stride.  GPU bite at 2048 elements: indices
         # 1024..2047 remained NaN (exactly half the output), with no exception.
-        if _staging_ops and block_size > 1024:
+        if _staging_ops and actual_dispatch_threads > 1024:
             raise MetalNonRecoverableError(
-                f"kernel requires cooperative shared-memory staging for {block_size} "
+                f"kernel requires cooperative shared-memory staging for {actual_dispatch_threads} "
                 "elements, exceeding Metal's 1024-thread threadgroup cap: the "
-                f"emitted loops would stride by {block_size} while only 1024 threads "
+                f"emitted loops would stride by {actual_dispatch_threads} while only 1024 threads "
                 "run, leaving the tail unwritten. Refusing (correct-or-refuse).",
                 op_name=_staging_op,
             )
@@ -1794,12 +1816,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     _t *= _d
                 if _t > _widest:
                     _widest, _widest_op = _t, _ssa.op
-            if _widest > block_size:
+            if _widest > actual_dispatch_threads:
                 raise MetalNonRecoverableError(
                     f"kernel mixes tile widths: a {_widest}-element tensor (from "
-                    f"{_widest_op}) would be processed by only {block_size} threads with "
+                    f"{_widest_op}) would be processed by only {actual_dispatch_threads} threads with "
                     "no wrapping loop, silently truncating it to the first "
-                    f"{block_size} elements. Refusing (correct-or-refuse). Use a single "
+                    f"{actual_dispatch_threads} elements. Refusing (correct-or-refuse). Use a single "
                     "tile width, or split into separate kernels.",
                     op_name=_widest_op or "tt.load",
                 )
@@ -1808,12 +1830,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # with > 1024 total elements), emit a minimal kernel with UNSUPPORTED
         # so the legacy parser can handle it via prebuilt templates.
         if getattr(self, "_flash_too_large", False):
-            self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)
+            self.kb = KernelBuilder(self.graph.func_name, block_size=actual_dispatch_threads)
             self._register_args()
             self.kb.comment("UNSUPPORTED: 2D kernel with cooperative ops exceeds 1024 elements")
             return self.kb.build()
 
-        self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)
+        self.kb = KernelBuilder(self.graph.func_name, block_size=actual_dispatch_threads)
 
         # Generate device functions for noinline callees (must appear before kernel)
         if self.graph.called_funcs:
@@ -1829,12 +1851,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Multi-pass reduction: split kernel into phases separated by
             # reductions, wrap each phase in a per-element loop, emit
             # reductions between loops operating on thread-local accumulators.
-            self._lower_multipass_reduction(block_size)
+            self._lower_multipass_reduction(actual_dispatch_threads)
         else:
             # Standard path: single wrapping loop or no loop
             if self._needs_wrapping:
                 self.kb.raw_line(
-                    f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; _loop_e += {block_size}u) {{"
+                    f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; "
+                    f"_loop_e += {actual_dispatch_threads}u) {{"
                 )
 
             # Lower each op
@@ -1897,6 +1920,146 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if arg.id in self._output_arg_ids:
                 indices.append(i)
         return indices
+
+    @staticmethod
+    def _cooperative_dispatch_threads(logical_elements: int) -> int:
+        """Physical Metal threads for a cooperatively strided logical tile.
+
+        ``logical_elements`` is the number of tensor elements the emitted loops must
+        cover.  The return value is the ACTUAL threadgroup width and therefore the only
+        legal stride for those loops.  Keeping this conversion named and centralized
+        prevents the pre-1B defect where both quantities were called ``block_size`` and
+        a 2048/4096-element loop stepped by its logical size even though Metal launched
+        only 1024 threads.
+        """
+        return min(max(1, int(logical_elements)), 1024)
+
+    def _dot_cooperative_mept_eligible(self) -> bool:
+        """Whether the >1024 generic-dot graph is fully wired for strided staging.
+
+        Stage 1B deliberately admits only ONE bare 2-D dot whose two operands come from
+        load→local_alloc→local_load and whose result reaches exactly one store through
+        representation-only casts/layout conversions.  Value-changing epilogues,
+        non-zero per-element accumulator inits, chain dots, reductions, control flow,
+        and other cooperative operations remain behind the 1024-thread refusal until
+        their own per-element semantics are wired.  This makes the dispatch repair a
+        narrow capability proof rather than a wholesale guard deletion.
+        """
+
+        def _all_ops(ops):
+            for op in ops:
+                yield op
+                if op.region_ops:
+                    yield from _all_ops(op.region_ops)
+                if op.else_ops:
+                    yield from _all_ops(op.else_ops)
+
+        ops = list(_all_ops(self.graph.ops))
+        dots = [op for op in ops if op.op == "tt.dot"]
+        if len(dots) != 1:
+            return False
+        dot = dots[0]
+        if len(dot.operand_ids or []) < 3:
+            return False
+
+        dot_shape = _extract_shape(dot.type_str or self._find_op_type_str(dot.id) or "")
+        if not dot_shape or len(dot_shape) != 2:
+            return False
+        dot_total = dot_shape[0] * dot_shape[1]
+        if dot_total <= 1024:
+            return False
+
+        forbidden = {
+            "scf.for",
+            "scf.while",
+            "scf.if",
+            "tt.reduce",
+            "tt.scan",
+            "tt.trans",
+            "tt.gather",
+            "tt.cat",
+            "tt.join",
+            "tt.split",
+            "tt.histogram",
+        }
+        if any(op.op in forbidden for op in ops):
+            return False
+
+        op_by_id = {op.id: op for op in ops}
+
+        # This path reconstructs the full result tile in shared memory.  Accept only a
+        # literal zero accumulator, which is exactly the bare-matmul contract.  The
+        # broader detector helper intentionally treats UNKNOWN as "not a known bias";
+        # using that negative result here would be an unsafe proof and could admit an
+        # unrecognized per-element initializer that the cooperative loop cannot replay.
+        acc_init = op_by_id.get(dot.operand_ids[2])
+        if acc_init is None or acc_init.op != "arith.constant":
+            return False
+        try:
+            if float(acc_init.attrs.get("value")) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        def _is_staged_load(value_id):
+            local_load = op_by_id.get(value_id)
+            if local_load is None or local_load.op != "ttg.local_load" or not local_load.operand_ids:
+                return False
+            source = op_by_id.get(local_load.operand_ids[0])
+            if source is not None and source.op == "ttg.memdesc_trans" and source.operand_ids:
+                source = op_by_id.get(source.operand_ids[0])
+            if source is None or source.op != "ttg.local_alloc" or not source.operand_ids:
+                return False
+            load = op_by_id.get(source.operand_ids[0])
+            return load is not None and load.op == "tt.load"
+
+        if not _is_staged_load(dot.operand_ids[0]) or not _is_staged_load(dot.operand_ids[1]):
+            return False
+
+        if sum(1 for op in ops if op.op == "ttg.local_alloc") != 2:
+            return False
+        if sum(1 for op in ops if op.op == "tt.store") != 1:
+            return False
+
+        output_passthrough = {
+            "ttg.convert_layout",
+            "arith.truncf",
+            "arith.extf",
+            "tt.fp_to_fp",
+            "arith.sitofp",
+            "arith.uitofp",
+            "arith.fptosi",
+            "arith.fptoui",
+            "arith.trunci",
+            "arith.extsi",
+            "arith.extui",
+        }
+        seen = set()
+        frontier = [dot.id]
+        terminal_stores = set()
+        while frontier:
+            value_id = frontier.pop()
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+            consumers = [op for op in ops if value_id in (op.operand_ids or [])]
+            if not consumers:
+                return False
+            for consumer in consumers:
+                if consumer.op == "tt.store":
+                    if len(consumer.operand_ids) < 2 or consumer.operand_ids[1] != value_id:
+                        return False
+                    terminal_stores.add(consumer.id)
+                    continue
+                if (
+                    consumer.op not in output_passthrough
+                    or not consumer.operand_ids
+                    or consumer.operand_ids[0] != value_id
+                ):
+                    return False
+                frontier.append(consumer.id)
+
+        return len(terminal_stores) == 1
 
     def _dot_generic_eligible(self) -> bool:
         """True iff every tt.dot sits inside the PROVEN envelope of the generic
@@ -3597,13 +3760,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 val_smem = smem_descs.get(_cur)
                 if val_smem is not None:
                     break
-        bs = self.effective_block_size
+        dispatch_threads = getattr(self, "_actual_dispatch_threads", self.effective_block_size)
         if val_smem:
             val_shape = val_smem[1]
             val_total = 1
             for d in val_shape:
                 val_total *= d
-            if val_total > bs and len(val_shape) >= 2:
+            if val_total > dispatch_threads and len(val_shape) >= 2:
                 smem_name = val_smem[0]
                 M, N = val_shape[0], val_shape[1]
 
@@ -3650,7 +3813,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     if mask_id is not None:
                         mask_expr = self._rebuild_staged_fill_mask(mask_id, op_by_id, M, N)
 
-                    self.kb.raw_line(f"    for (uint _st = lid; _st < {val_total}u; _st += {bs}u) {{")
+                    self.kb.raw_line(
+                        f"    for (uint _st = lid; _st < {val_total}u; "
+                        f"_st += {dispatch_threads}u) {{"
+                    )
                     self.kb.raw_line(f"        uint _fill_row = _st / {N}u;")
                     self.kb.raw_line(f"        uint _fill_col = _st % {N}u;")
 
@@ -11328,8 +11494,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self._shared_counter += 1
         self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
 
-        # Close wrapping loop if active — the fill must be standalone
-        bs = self.effective_block_size
+        # Close wrapping loop if active — the fill must be standalone.  Cooperative
+        # loops stride by the PHYSICAL Metal dispatch, never by their logical tile.
+        dispatch_threads = getattr(self, "_actual_dispatch_threads", self.effective_block_size)
         in_loop = self._needs_wrapping
         if in_loop:
             self.kb.raw_line(f"    }}")  # close wrapping loop
@@ -11364,7 +11531,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # pre-transposed K operand -- which the old global-_make_range_dim
         # string heuristic silently mis-staged.
         #
-        #   for (_sa = lid; _sa < total; _sa += bs) {
+        #   for (_sa = lid; _sa < total; _sa += dispatch_threads) {
         #       row = _sa / N; col = _sa % N;
         #       shared[_sa] = ptr[<rebuilt offset(row, col)>];
         #   }
@@ -11504,16 +11671,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"than mis-stage.",
                     op_name="ttg.local_alloc",
                 )
-            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            self.kb.raw_line(
+                f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
+            )
             self.kb.raw_line(f"        {shared_name}[_sa] = {_src_smem}[_sa];")
             self.kb.raw_line(f"    }}")
-        elif total > bs and self._is_2d:
+        elif total > dispatch_threads and self._is_2d:
             if load_ptr_info is not None:
                 base_ptr = load_ptr_info[0]
                 # Per-load structural rebuild of each staged element's global
                 # address (correct-or-refuse for transposed/strided operands).
                 new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
-                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+                self.kb.raw_line(
+                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
+                )
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
                 _emit_staged_fill(f"{base_ptr}[{new_offset}]")
@@ -11527,7 +11698,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
                 raise MetalNonRecoverableError(
                     f"ttg.local_alloc staging of a computed (non-load, non-smem-backed) "
-                    f"{M}x{N} value with {total} elements > {bs} threads: each thread "
+                    f"{M}x{N} value with {total} elements > {dispatch_threads} threads: each thread "
                     f"holds one element, so the cooperative fill cannot reconstruct the "
                     f"full tile. Refusing rather than smear per-thread values.",
                     op_name="ttg.local_alloc",
@@ -11540,7 +11711,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # transposed/strided source stages correctly (or refuses).
                 base_ptr = load_ptr_info[0]
                 new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
-                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+                self.kb.raw_line(
+                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
+                )
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
                 _emit_staged_fill(f"{base_ptr}[{new_offset}]")
@@ -11562,7 +11735,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                                 "Refusing (correct-or-refuse).",
                                 op_name="tt.load",
                             )
-                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+                self.kb.raw_line(
+                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
+                )
                 self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
                 self.kb.raw_line(f"    }}")
         else:
@@ -11570,17 +11745,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # (each thread writes exactly its own element); a larger tile would smear
             # each thread's single value across its strided slots — enforce the
             # documented assumption instead of assuming it (dot-recovery 2026-08-30).
-            if total > bs:
+            if total > dispatch_threads:
                 from triton_msl.errors import MetalNonRecoverableError
 
                 raise MetalNonRecoverableError(
                     f"ttg.local_alloc staging of a per-thread value with {total} "
-                    f"elements > {bs} threads and no reconstructible source (no load "
+                    f"elements > {dispatch_threads} threads and no reconstructible source (no load "
                     f"pointer, not shared-memory-backed). Refusing rather than smear "
                     f"per-thread values across the tile.",
                     op_name="ttg.local_alloc",
                 )
-            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            self.kb.raw_line(
+                f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
+            )
             self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
             self.kb.raw_line(f"    }}")
 
@@ -11589,7 +11766,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Reopen wrapping loop if it was active
         if in_loop:
             total_elems = getattr(self, "_total_elements", self.effective_block_size)
-            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {bs}u) {{")
+            self.kb.raw_line(
+                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; "
+                f"_loop_e += {dispatch_threads}u) {{"
+            )
 
         # Store shared array name for local_load to reference
         self.env[ssa.id] = shared_name
@@ -11790,7 +11970,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             b_index = f"{b_smem}[_dk * {N}u + _dot_col]"
 
         total = M * N
-        bs = self.effective_block_size
+        dispatch_threads = getattr(self, "_actual_dispatch_threads", self.effective_block_size)
 
         # Close wrapping loop if active -- dot needs standalone computation
         in_loop = self._needs_wrapping
@@ -11808,7 +11988,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             acc_total = 1
             for d in acc_shape:
                 acc_total *= d
-            if acc_total > bs:
+            if acc_total > dispatch_threads:
                 acc_is_smem = True
 
         if acc_is_smem:
@@ -11821,7 +12001,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self.kb.declare_threadgroup_array(result_smem, dtype="fp32", size=total)
 
         # Each thread computes one or more elements of C via strided loop
-        self.kb.raw_line(f"    for (uint _de = lid; _de < {total}u; _de += {bs}u) {{")
+        self.kb.raw_line(
+            f"    for (uint _de = lid; _de < {total}u; _de += {dispatch_threads}u) {{"
+        )
         self.kb.raw_line(f"        uint _dot_row = _de / {N}u;")
         self.kb.raw_line(f"        uint _dot_col = _de % {N}u;")
         if acc_is_smem:
@@ -11839,7 +12021,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Reopen wrapping loop if it was active
         if in_loop:
             total_elems = getattr(self, "_total_elements", self.effective_block_size)
-            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {bs}u) {{")
+            self.kb.raw_line(
+                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; "
+                f"_loop_e += {dispatch_threads}u) {{"
+            )
 
         # The result for each thread's element comes from the shared result array
         result_var = self._next_var("dot")
