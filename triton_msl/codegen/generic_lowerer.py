@@ -2358,7 +2358,7 @@ class GenericLowerer(
             if len(_dots) > 1:
                 return False
             _by = {o.id: o for o in self.graph.ops}
-            if _dots and len(_dots[0].operand_ids or []) >= 3 and self._acc_init_is_bias(_dots[0].operand_ids[2], _by):
+            if _dots and len(_dots[0].operand_ids or []) >= 3 and not self._acc_init_is_literal_zero(_dots[0].operand_ids[2], _by):
                 return False
 
         return True

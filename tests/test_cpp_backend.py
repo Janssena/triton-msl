@@ -441,16 +441,20 @@ def test_cpp_dot_32x32():
             off_k = tl.arange(0, BLOCK_K)
             a = tl.load(a_ptr + off_m[:, None] * K + off_k[None, :])
             b = tl.load(b_ptr + off_k[:, None] * N + off_n[None, :])
-            c = tl.dot(a.to(tl.float16), b.to(tl.float16), acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+            c = tl.dot(a, b, acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
             tl.store(c_ptr + off_m[:, None] * N + off_n[None, :], c)
 
+        # Native fp16 buffers (packet 079): an in-kernel ``.to(tl.float16)`` of fp32
+        # loads is a value transform the Python matmul templates never replayed
+        # (silently staged the raw fp32 buffer) and now refuse — and the Python
+        # lowering always runs first as the C++ path's fallback source.
         M = N = K = 32
-        a = torch.randn(M, K)
-        b = torch.randn(K, N)
+        a = torch.randn(M, K).half()
+        b = torch.randn(K, N).half()
         c = torch.zeros(M, N)
         matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
 
-        expected = a @ b
+        expected = a.float() @ b.float()
         max_err = (c - expected).abs().max().item()
         # f16 tolerance (relaxed)
         assert max_err < 0.5, f"32x32 matmul: max error {max_err}"
@@ -530,17 +534,18 @@ def test_cpp_dot_k_loop():
                 off_k = k_off + tl.arange(0, BLOCK_K)
                 a = tl.load(a_ptr + off_m[:, None] * K + off_k[None, :])
                 b = tl.load(b_ptr + off_k[:, None] * N + off_n[None, :])
-                acc = tl.dot(a.to(tl.float16), b.to(tl.float16), acc)
+                acc = tl.dot(a, b, acc)
             tl.store(c_ptr + off_m[:, None] * N + off_n[None, :], acc)
 
+        # Native fp16 buffers (packet 079) — see test_cpp_dot_32x32.
         M = N = 16
         K = 32
-        a = torch.randn(M, K)
-        b = torch.randn(K, N)
+        a = torch.randn(M, K).half()
+        b = torch.randn(K, N).half()
         c = torch.zeros(M, N)
         matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
 
-        expected = a @ b
+        expected = a.float() @ b.float()
         max_err = (c - expected).abs().max().item()
         assert max_err < 0.5, f"k-loop matmul: max error {max_err}"
     finally:

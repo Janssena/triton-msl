@@ -184,6 +184,137 @@ class _TemplateMixin:
                 op_name="tt.dot",
             )
 
+    @staticmethod
+    def _pid_map_lines(info, block_m):
+        """The tile coordinates, replaying the PROVEN grid mapping (packet 080):
+        the 2-D form reads ``program_id(0)`` / ``program_id(1)``; the tutorial's 1-D form
+        splits ``program_id(0)`` by ``num_pid_m = cdiv(M, BLOCK_M)`` — rows are the
+        remainder, cols the quotient. Requires ``_M`` to be defined already."""
+        pid_map = info.get("pid_map")
+        if pid_map == "1d":
+            return [
+                f"    uint _npm = (_M + {block_m}u - 1u) / {block_m}u;  // cdiv(M, BLOCK_M), as in the IR",
+                "    uint pid_m = pid3.x % _npm;",
+                "    uint pid_n = pid3.x / _npm;",
+            ]
+        if pid_map == "2d":
+            return ["    uint pid_m = pid3.x;", "    uint pid_n = pid3.y;"]
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(  # no implicit 2-D fallback: the mapping must be PROVEN
+            f"pid-tiled matmul template reached without a proven grid mapping (pid_map={pid_map!r}). Refusing.",
+            op_name="tt.dot",
+        )
+
+    def _dot_template_ptr_roles(self):
+        """A/B/C pointer args for a single-dot matmul template, resolved from
+        DATAFLOW (dot operands + tt.store target via ``_resolve_dot_ptr_roles``),
+        never from argument position.
+
+        P0 (packet 065): every bare/K-loop/scalar/simple dot template picked
+        ``ptr_args[0/1/2]``. Any signature with an extra pointer before C —
+        e.g. ``(X, Y, P, C)`` — wrote X @ Y into P (an unrelated INPUT) and left C
+        untouched; GPU-verified, no exception. Refuses when roles cannot be proven.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        dots, stores, op_by_id = [], [], {}
+
+        def _walk(ops):
+            for o in ops:
+                op_by_id[o.id] = o
+                if o.op == "tt.dot":
+                    dots.append(o)
+                elif o.op == "tt.store":
+                    stores.append(o)
+                if o.region_ops:
+                    _walk(o.region_ops)
+                if o.else_ops:
+                    _walk(o.else_ops)
+
+        _walk(self.graph.ops)
+        # EXACTLY ONE STORE, whole graph (packet 067): every template here emits one
+        # store, so a second one is either mis-bound (a store of P before the dot's
+        # store made P the "first store" and the matmul overwrote it, C left NaN) or
+        # silently DROPPED (dot's store first, then a store of P never emitted).
+        # GPU-verified on both orders. Default-deny; the generic path handles
+        # multi-store graphs correctly, this template does not.
+        if len(dots) != 1 or len(stores) != 1:
+            raise MetalNonRecoverableError(
+                f"matmul template requires exactly one tt.dot and exactly one tt.store "
+                f"in the whole kernel (found {len(dots)} dot(s), {len(stores)} store(s)): "
+                f"a second store would be silently dropped or mis-bound as the output. "
+                f"Refusing (correct-or-refuse).",
+                op_name="tt.dot",
+            )
+        # PER-ROLE VALUE-PATH PROOF (packet 079): roles from dataflow (through loop
+        # iter-args), operand load -> layout ops -> dot with equal types, the store
+        # path carrying at most the ONE output cast the template replays, K-loop
+        # accumulator carry / pointer advances / load masks, and the grid mapping.
+        # Returns the cast ops it proved the template replays, admitted below by
+        # IDENTITY — an opcode allowlist cannot say WHERE a cast sits, and that was
+        # exactly the hole (fp16 operand casts dropped, GPU err vs raw = 0).
+        _reason, _proven, _roles, _pid_map = self._dot_template_value_paths()  # pid map consumed via info by the pid-tiled templates
+        if _reason:
+            raise MetalNonRecoverableError(
+                f"matmul template: {_reason}. Refusing (correct-or-refuse).",
+                op_name="tt.dot",
+            )
+        # POSITIVE EFFECT/OP ALLOWLIST, whole graph (packet 071): the bare templates
+        # re-emit exactly this vocabulary — staging loads, address arithmetic, layout
+        # ops, the dot, K-loop control, and the single terminal store — and NOTHING
+        # else. Any op outside it is either an externally observable effect the
+        # template never replays (tt.atomic_rmw / tt.atomic_cas: GPU-verified dropped,
+        # P stayed 0 with no exception) or compute on a value the template does not
+        # model. Enumerated denylists found this class one opcode at a time (two
+        # stores, then atomics); the allowlist is the censused union of every graph
+        # that reaches this gate in the passing project + upstream suites. Casts are
+        # NOT in it (packet 079): only the proven output cast is admitted, by id.
+        _REPLAYED = {
+            "arith.addi", "arith.andi", "arith.cmpi", "arith.constant", "arith.muli",
+            "scf.for", "scf.yield",
+            "tt.addptr", "tt.broadcast", "tt.dot", "tt.expand_dims", "tt.get_program_id",
+            "tt.get_num_programs", "tt.load", "tt.make_range", "tt.return", "tt.splat",
+            "tt.store", "ttg.convert_layout", "ttg.local_alloc", "ttg.local_load",
+            "ttg.memdesc_trans",
+        }
+        # INTEGER arith is address / index / mask math (grid `pid // n`, `n - k`,
+        # ceil-div, index casts): value-preserving and effect-free, and it cannot touch
+        # the (float) dot result. Admit it as a CLASS by result type rather than by name
+        # — enumerating divsi/subi/remsi/… one at a time is the same trap as enumerating
+        # effects. Float-typed arith (addf/mulf/…) stays foreign: that is result compute.
+        _INT_RESULT = re.compile(r"(?:^|[x<\s])i(?:1|8|16|32|64)(?![0-9])")
+
+        def _replayed(o):
+            if o.op in _REPLAYED or o.id in _proven:
+                return True
+            if o.op.startswith("arith.") and o.type_str:
+                return bool(_INT_RESULT.search(o.type_str.split(",")[0]))
+            return False
+
+        _foreign = sorted({o.op for o in op_by_id.values() if not _replayed(o)})
+        if _foreign:
+            raise MetalNonRecoverableError(
+                f"matmul template does not replay {_foreign}: only staging loads, address/"
+                f"layout ops, the dot, K-loop control and the single terminal store are "
+                f"re-emitted, so this op's effect or value would be silently dropped. "
+                f"Refusing (correct-or-refuse).",
+                op_name=_foreign[0],
+            )
+        # C must be THE single store's target, proven directly — not a first-store
+        # convention inherited from the shared resolver.
+        _c_from_store = (
+            self._trace_ptr_source(stores[0].operand_ids[0], op_by_id) if stores[0].operand_ids else None
+        )
+        if _c_from_store is None or _c_from_store.name != _roles[2].name:
+            raise MetalNonRecoverableError(
+                "matmul template could not resolve A/B/C pointer roles from dataflow "
+                "(dot operands + the single store's target); refusing rather than pick "
+                "them by argument position.",
+                op_name="tt.dot",
+            )
+        return _roles[0], _roles[1], _roles[2]
+
     def _lower_strided_scalar_matmul(self, info, descriptors):
         """Fully stride-aware scalar matmul for a NON-contiguous-inner operand.
 
@@ -202,12 +333,13 @@ class _TemplateMixin:
         """
         a_row, a_col, b_row, b_col, c_row, c_col = descriptors
         ptr_args = info["ptr_args"]
-        a_name = ptr_args[0].name
-        b_name = ptr_args[1].name
-        c_name = ptr_args[2].name
-        a_msl = triton_type_to_msl(ptr_args[0].elem_type)
-        b_msl = triton_type_to_msl(ptr_args[1].elem_type)
-        c_msl = triton_type_to_msl(ptr_args[2].elem_type)
+        a_arg, b_arg, c_arg = self._dot_template_ptr_roles()  # P0 (065): dataflow, not position
+        a_name = a_arg.name
+        b_name = b_arg.name
+        c_name = c_arg.name
+        a_msl = triton_type_to_msl(a_arg.elem_type)
+        b_msl = triton_type_to_msl(b_arg.elem_type)
+        c_msl = triton_type_to_msl(c_arg.elem_type)
 
         all_scalar_args = [a for a in self.graph.args if not a.is_ptr]
         scalar_names = {a.name for a in all_scalar_args}
@@ -268,9 +400,8 @@ class _TemplateMixin:
             lines.append("    uint3 pid3 [[threadgroup_position_in_grid]],")
             lines.append("    uint3 _lid3 [[thread_position_in_threadgroup]]")
             lines.append(") {")
-            lines.append("    uint pid_m = pid3.x;")
-            lines.append("    uint pid_n = pid3.y;")
             lines.append("    uint lid = _lid3.x;")
+            # pid_m / pid_n follow the extents (the proven 1-D mapping needs _M).
         else:
             lines.append("    uint pid [[threadgroup_position_in_grid]],")
             lines.append("    uint lid [[thread_position_in_threadgroup]]")
@@ -285,6 +416,8 @@ class _TemplateMixin:
         lines.append(f"    uint _M = {f'(uint){m_ext}' if m_ext else ('(uint)M' if has_M else f'{BLOCK_M}u')};")
         lines.append(f"    uint _N = {f'(uint){n_ext}' if n_ext else ('(uint)N' if has_N else f'{BLOCK_N}u')};")
         lines.append(self._k_extent_line(info, BLOCK_K, has_K))
+        if has_pid:
+            lines.extend(self._pid_map_lines(info, BLOCK_M))
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
         lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
         lines.append("")
@@ -414,19 +547,20 @@ class _TemplateMixin:
         # 128 threads = 4 SIMD groups x 32 threads
         self.effective_block_size = 128
 
-        a_name = ptr_args[0].name
-        b_name = ptr_args[1].name
-        c_name = ptr_args[2].name
+        a_arg, b_arg, c_arg = self._dot_template_ptr_roles()  # P0 (065): dataflow, not position
+        a_name = a_arg.name
+        b_name = b_arg.name
+        c_name = c_arg.name
 
         # Determine input element type from A pointer arg. ``triton_type_to_msl``
         # handles bf16 → bfloat, fp16 → half, fp64 → float (with warning), etc.;
         # the previous hand-rolled mapping silently misrouted bf16 as float
         # (4-byte stride over a 2-byte buffer → wrong loads, partial output).
-        a_elem = ptr_args[0].elem_type  # e.g. "f32", "f16", "bf16"
+        a_elem = a_arg.elem_type  # e.g. "f32", "f16", "bf16"
         input_msl_type = triton_type_to_msl(a_elem)
 
         # Determine output element type from C pointer arg.
-        c_elem = ptr_args[2].elem_type
+        c_elem = c_arg.elem_type
         output_msl_type = triton_type_to_msl(c_elem)
 
         # Genuine fp16 (WS1 Phase C): half INPUT fragments + float ACCUMULATOR;
@@ -449,9 +583,18 @@ class _TemplateMixin:
         lines.append("using namespace metal;")
         lines.append("")
         lines.append(f"kernel void {safe_name}(")
-        lines.append(f"    device const {input_msl_type}* {a_name} [[buffer(0)]],")
-        lines.append(f"    device const {input_msl_type}* {b_name} [[buffer(1)]],")
-        lines.append(f"    device {output_msl_type}* {c_name} [[buffer(2)]],")
+        # Declare EVERY kernel arg at its own positional slot ``buffer(i)`` (P0,
+        # packet 065). The old fixed ``buffer(0/1/2)`` for a/b/c only was a second
+        # positional mechanism: the launcher binds args by position, so with an
+        # extra pointer before C the slot named C received that pointer and the
+        # matmul was written into it. Same pattern the strided/K-loop siblings use.
+        for _i, _arg in enumerate(self.graph.args):
+            if _arg.is_ptr:
+                _m = triton_type_to_msl(_arg.elem_type)
+                _const = "const " if _arg.name != c_name else ""
+                lines.append(f"    device {_const}{_m}* {_arg.name} [[buffer({_i})]],")
+            else:
+                lines.append(f"    device int* {_arg.name}_buf [[buffer({_i})]],")
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
         lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
         lines.append(f") {{")
@@ -611,15 +754,16 @@ class _TemplateMixin:
         # Signal 2D grid dispatch (pid_m on axis 0, pid_n on axis 1)
         self._used_pid_axes = {0, 1}
 
-        a_name = ptr_args[0].name
-        b_name = ptr_args[1].name
-        c_name = ptr_args[2].name
+        a_arg, b_arg, c_arg = self._dot_template_ptr_roles()  # P0 (065): dataflow, not position
+        a_name = a_arg.name
+        b_name = b_arg.name
+        c_name = c_arg.name
 
         # Determine input/output element types via the shared mapping —
         # see the simple-dot variant for the bf16 stride bug this avoids.
-        a_elem = ptr_args[0].elem_type
+        a_elem = a_arg.elem_type
         input_msl_type = triton_type_to_msl(a_elem)
-        c_elem = ptr_args[2].elem_type
+        c_elem = c_arg.elem_type
         output_msl_type = triton_type_to_msl(c_elem)
 
         # Genuine fp16 (WS1 Phase C): half INPUT fragments + float ACCUMULATOR
@@ -679,8 +823,8 @@ class _TemplateMixin:
             lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
 
         lines.append(f"")
-        lines.append(f"    uint pid_m = pid3.x;")
-        lines.append(f"    uint pid_n = pid3.y;")
+        # pid_m / pid_n are defined AFTER the extents below: the proven 1-D grid mapping
+        # (``pid % cdiv(_M, BLOCK_M)`` / ``pid / cdiv(_M, BLOCK_M)``, packet 080) needs _M.
         lines.append(f"")
 
         # Determine M, N, K — use scalar args if available, else BLOCK dims
@@ -713,6 +857,7 @@ class _TemplateMixin:
         else:
             lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")
         lines.append(self._k_extent_line(info, BLOCK_K, has_K))
+        lines.extend(self._pid_map_lines(info, BLOCK_M))
 
         # Leading dims for the simdgroup loads/stores = each operand's ROW stride.
         # This path only handles contiguous-INNER operands (the stride-aware gate routed
@@ -2521,7 +2666,8 @@ class _TemplateMixin:
         # ``test_simple_matmul[…-float16-float32]``).
         out_dtype = dtype
         if len(ptr_args) >= 3:
-            out_dtype = _mlir_to_triton_dtype(ptr_args[2].elem_type)
+            a_arg, b_arg, c_arg = self._dot_template_ptr_roles()  # P0 (065): dataflow, not position
+            out_dtype = _mlir_to_triton_dtype(c_arg.elem_type)
 
         # Phase 4: record the runtime fast-matmul dispatch descriptor (additive;
         # the generic kernel below is still emitted + returned). The launcher only
@@ -2540,7 +2686,23 @@ class _TemplateMixin:
         msl = msl.replace("matmul_kernel", safe_name, 1)
 
         if len(ptr_args) >= 3:
-            a_name, b_name, c_name = ptr_args[0].name, ptr_args[1].name, ptr_args[2].name
+            # make_matmul_kernel hard-addresses A/B/C at buffers 0/1/2 (and M/N/K at
+            # 3/4/5); it cannot re-slot. The launcher binds by position, so the
+            # dataflow-resolved roles must sit EXACTLY at those indices and no other
+            # pointer may precede C — otherwise refuse (P0, packet 065).
+            _idx = tuple(a.index for a in (a_arg, b_arg, c_arg))
+            if _idx != (0, 1, 2) or len(ptr_args) != 3:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"simple matmul template requires the canonical (A, B, C, ...) "
+                    f"signature with the three pointers at argument slots 0/1/2 "
+                    f"(dataflow-resolved roles sit at {_idx}, {len(ptr_args)} pointer "
+                    f"args): make_matmul_kernel binds buffers by position and would "
+                    f"write the output into the wrong buffer. Refusing.",
+                    op_name="tt.dot",
+                )
+            a_name, b_name, c_name = a_arg.name, b_arg.name, c_arg.name
             # Replace parameter declarations -- use regex to match any MSL type (float, half, etc.)
             msl = re.sub(r"(device\s+const\s+\w+\*)\s+A\s", rf"\1 {a_name} ", msl)
             msl = re.sub(r"(device\s+const\s+\w+\*)\s+B\s", rf"\1 {b_name} ", msl)
