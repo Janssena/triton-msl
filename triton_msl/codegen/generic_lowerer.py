@@ -2147,6 +2147,142 @@ class GenericLowerer(
                 return False
         return True
 
+    def _masked_dot_generic_eligible(self) -> bool:
+        """Whether a masked, single-tile dot may fall through to generic lowering.
+
+        The inline and prebuilt matmul templates reconstruct raw pointer loads and do
+        not replay ``tt.load`` masks.  The generic local-allocation path *does* rebuild
+        each staged address, comparison, and scalar ``other`` structurally.  Route to
+        it only for this complete, budgeted graph; mask details that cannot be rebuilt
+        still refuse inside ``_rebuild_staged_fill_mask`` rather than being guessed.
+
+        This is intentionally separate from ``_dot_generic_eligible``: the latter
+        proves fused accumulator/epilogue and K-chunk forms, while this predicate proves
+        a bare masked dot whose output and both input tiles each fit one threadgroup.
+        """
+        if self.graph is None:
+            return False
+
+        def _all_ops(ops):
+            for op in ops:
+                yield op
+                if op.region_ops:
+                    yield from _all_ops(op.region_ops)
+                if op.else_ops:
+                    yield from _all_ops(op.else_ops)
+
+        ops = list(_all_ops(self.graph.ops))
+        if any(op.region_ops or op.else_ops for op in ops):
+            return False
+        if any(op.op in ("scf.for", "scf.while", "scf.if", "tt.reduce", "tt.scan") for op in ops):
+            return False
+
+        dots = [op for op in ops if op.op == "tt.dot"]
+        if len(dots) != 1:
+            return False
+        dot = dots[0]
+        if len(dot.operand_ids or []) < 3:
+            return False
+
+        op_by_id = {op.id: op for op in ops}
+        a_shape = _extract_shape(self._find_op_type_str(dot.operand_ids[0]) or "")
+        b_shape = _extract_shape(self._find_op_type_str(dot.operand_ids[1]) or "")
+        out_shape = _extract_shape(dot.type_str or self._find_op_type_str(dot.id) or "")
+        if not a_shape or not b_shape or not out_shape:
+            return False
+        if len(a_shape) != 2 or len(b_shape) != 2 or len(out_shape) != 2:
+            return False
+        M, K = a_shape
+        K2, N = b_shape
+        if K != K2 or tuple(out_shape) != (M, N):
+            return False
+        if min(M, N, K) <= 0 or max(M, N, K) > 64:
+            return False
+        tile_counts = (M * K, K * N, M * N)
+        if any(count > 1024 for count in tile_counts):
+            return False
+        # Generic local_alloc/result storage is fp32.  Keep 4 KiB headroom under
+        # the project's 32 KiB threadgroup policy rather than admitting at the cap.
+        if 4 * sum(tile_counts) > 28 * 1024:
+            return False
+
+        # The bare-dot path initializes once from a literal zero.  UNKNOWN is not
+        # evidence of zero and must not enlarge the route.
+        acc_init = op_by_id.get(dot.operand_ids[2])
+        if acc_init is None or acc_init.op != "arith.constant":
+            return False
+        try:
+            if float(acc_init.attrs.get("value")) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        def _masked_staged_load(value_id):
+            local_load = op_by_id.get(value_id)
+            if local_load is None or local_load.op != "ttg.local_load" or not local_load.operand_ids:
+                return None
+            source = op_by_id.get(local_load.operand_ids[0])
+            if source is not None and source.op == "ttg.memdesc_trans" and source.operand_ids:
+                source = op_by_id.get(source.operand_ids[0])
+            if source is None or source.op != "ttg.local_alloc" or len(source.operand_ids or []) != 1:
+                return None
+            load = op_by_id.get(source.operand_ids[0])
+            if load is None or load.op != "tt.load" or len(load.operand_ids or []) < 2:
+                return None
+            return load
+
+        a_load = _masked_staged_load(dot.operand_ids[0])
+        b_load = _masked_staged_load(dot.operand_ids[1])
+        if a_load is None or b_load is None:
+            return False
+        if sum(1 for op in ops if op.op == "tt.load") != 2:
+            return False
+        if sum(1 for op in ops if op.op == "ttg.local_alloc") != 2:
+            return False
+        if sum(1 for op in ops if op.op == "tt.store") != 1:
+            return False
+
+        # The scalar generic emitter is validated for floating dot operands and an
+        # fp32 dot result.  Storage may be narrowed by the terminal store.
+        for value_id in dot.operand_ids[:2]:
+            type_str = self._find_op_type_str(value_id) or ""
+            if not re.search(r"x(?:bf16|f16|f32)(?:,|>)", type_str):
+                return False
+        if not re.search(r"xf32(?:,|>)", dot.type_str or ""):
+            return False
+
+        passthrough = {
+            "ttg.convert_layout",
+            "arith.truncf",
+            "arith.extf",
+            "tt.fp_to_fp",
+        }
+        seen = set()
+        frontier = [dot.id]
+        terminal_stores = set()
+        while frontier:
+            value_id = frontier.pop()
+            if value_id in seen:
+                continue
+            seen.add(value_id)
+            consumers = [op for op in ops if value_id in (op.operand_ids or [])]
+            if not consumers:
+                return False
+            for consumer in consumers:
+                if consumer.op == "tt.store":
+                    if len(consumer.operand_ids or []) < 2 or consumer.operand_ids[1] != value_id:
+                        return False
+                    terminal_stores.add(consumer.id)
+                    continue
+                if (
+                    consumer.op not in passthrough
+                    or not consumer.operand_ids
+                    or consumer.operand_ids[0] != value_id
+                ):
+                    return False
+                frontier.append(consumer.id)
+        return len(terminal_stores) == 1
+
     def _requires_matmul_template(self) -> bool:
         """Check if the kernel is a pure matmul that needs the prebuilt template.
 
@@ -2177,6 +2313,13 @@ class GenericLowerer(
         _scan_ops(self.graph.ops)
 
         if not has_dot:
+            return False
+
+        # The matmul templates discard input-load masks.  A complete, budgeted
+        # masked-dot graph instead falls through to the generic staged-fill path,
+        # which structurally replays address + mask + scalar other and refuses any
+        # mask it cannot reconstruct.
+        if self._masked_dot_generic_eligible():
             return False
 
         # Pure matmul: dot without reductions or conditional masking.

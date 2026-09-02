@@ -1503,9 +1503,13 @@ class _DetectionMixin:
         # padded to a power of 2 with mask k<K, so the real A row stride is the runtime
         # K, not the BLOCK_K tile width the simple-dot template bakes in). The template
         # ignores the mask and strides by the tile width -> wrong. Refuse a masked
-        # simple-dot rather than mis-stride.
+        # simple-dot rather than mis-stride. A complete graph that the generic
+        # staged-fill path can replay declines this template instead; unresolvable
+        # masks still refuse at the structural rebuild boundary.
         for _lop in self.graph.ops:
             if _lop.op == "tt.load" and len(_lop.operand_ids or []) >= 2:
+                if self._masked_dot_generic_eligible():
+                    return None
                 from triton_msl.errors import MetalNonRecoverableError
 
                 raise MetalNonRecoverableError(

@@ -3,18 +3,18 @@
   "backend": "metal",
   "captured_date": "2026-09-01",
   "total": 9342,
-  "passed": 5366,
-  "failed": 158,
+  "passed": 5369,
+  "failed": 155,
   "skipped": 3818,
   "errors": 0,
-  "pass_rate": 57.4,
+  "pass_rate": 57.5,
   "failure_categories": {
-    "Other": 23
+    "Other": 20
   },
   "pytest_summary": {
-    "warnings": 2454,
-    "failed": 158,
-    "passed": 5366,
+    "warnings": 2451,
+    "failed": 155,
+    "passed": 5369,
     "skipped": 3818
   },
   "passed_tests": [
