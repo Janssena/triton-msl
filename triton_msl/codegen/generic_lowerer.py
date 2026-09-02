@@ -2075,7 +2075,45 @@ class GenericLowerer(
 
         return len(terminal_stores) == 1
 
-    def _dot_generic_eligible(self) -> bool:
+    def _dot_has_reshape_provenance(self) -> bool:
+        """True iff any tt.dot operand is staged from a ``tt.reshape`` (the
+        ``load(1-D) -> reshape -> local_alloc -> [memdesc_trans] -> local_load``
+        chain upstream test_dot_multidim emits). Such operands carry no 2-D
+        addptr arithmetic, so the template stride tracer can never resolve them;
+        detectors consult this together with ``_dot_generic_eligible`` to decline
+        to the generic path instead of refusing (dot-recovery 2B, 2026-09-01)."""
+        by_id = {}
+
+        def _index(ops):
+            for _o in ops:
+                by_id[_o.id] = _o
+                if _o.region_ops:
+                    _index(_o.region_ops)
+
+        _index(self.graph.ops)
+
+        def _reshape_fed(vid):
+            cur = vid
+            for _ in range(6):
+                _o = by_id.get(cur)
+                if _o is None or not _o.operand_ids:
+                    return False
+                if _o.op == "tt.reshape":
+                    return True
+                if _o.op in ("ttg.local_alloc", "ttg.local_load", "ttg.memdesc_trans", "ttg.convert_layout"):
+                    cur = _o.operand_ids[0]
+                    continue
+                return False
+            return False
+
+        return any(
+            _reshape_fed(opnd)
+            for d in by_id.values()
+            if d.op == "tt.dot"
+            for opnd in (d.operand_ids or [])[:2]
+        )
+
+    def _dot_generic_eligible(self, *, allow_flat: bool = False) -> bool:
         """True iff every tt.dot sits inside the PROVEN envelope of the generic
         per-thread dot path (dot-recovery stage 1a, 2026-08-30).
 
@@ -2138,7 +2176,19 @@ class GenericLowerer(
             if not sh:
                 continue
             if len(sh) == 1:
-                if sh[0] not in (S, 1):
+                # ``allow_flat`` admits the FLAT form of the same tile: a contiguous
+                # 1-D load reshaped to (S, S) for the dot, and the dot result
+                # reshaped back to 1-D for the store (upstream test_dot_multidim
+                # rank-2, dot-recovery 2B). Element count equals the tile's, so the
+                # per-thread mapping the envelope guarantees is unchanged; at S=32
+                # the flat tensor is exactly the 1024-thread cap the tile occupies.
+                # OPT-IN ONLY (protocol rule 8, packet 063): the two reshape-
+                # provenance routing sites pass True; every other caller of this
+                # shared predicate keeps the default and is byte-identical to the
+                # pre-2B envelope — a flat S*S tensor must not silently widen the
+                # accumulator/epilogue/detector decisions that also consult it.
+                _flat_ok = (S, 1, S * S) if allow_flat else (S, 1)
+                if sh[0] not in _flat_ok:
                     return False
             elif len(sh) == 2:
                 if tuple(sh) not in ((S, S), (S, 1), (1, S)):
@@ -2326,6 +2376,18 @@ class GenericLowerer(
         # Complex kernels (flash attention, fused matmul+softmax) have
         # reductions/masking alongside dot and must go through generic lowerer.
         if has_reduce or has_where:
+            return False
+
+        # RESHAPE-provenance operands (dot-recovery 2B, 2026-09-01): a dot operand
+        # staged from `tt.load(1-D) -> tt.reshape -> ttg.local_alloc` carries no 2-D
+        # addptr arithmetic, so the template's infer_dot_strides CANNOT resolve it and
+        # refuses ("operand stride could not be inferred"). The generic path stages
+        # exactly this chain correctly (probe-verified all four upstream
+        # test_dot_multidim rank-2 variants at err 0.0, bf16 + memdesc_trans included) —
+        # so inside the proven envelope, decline the template and fall through instead
+        # of refusing. Outside the envelope the template's loud refusal remains the
+        # authority (a reshape it cannot address must never be guessed at).
+        if self._dot_has_reshape_provenance() and self._dot_generic_eligible(allow_flat=True):
             return False
 
         # A single-dot matmul with a trailing compute epilogue the fused template

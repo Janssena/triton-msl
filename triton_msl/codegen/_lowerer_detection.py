@@ -1982,6 +1982,15 @@ class _DetectionMixin:
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.
 
+        RESHAPE-provenance decline (dot-recovery 2B, 2026-09-01): an operand
+        staged from ``load(1-D) -> tt.reshape -> local_alloc`` carries no 2-D
+        addptr arithmetic, so this route's stride decision can only refuse
+        ("operand stride could not be inferred"). Inside the generic envelope
+        the generic path stages that chain correctly (probe-verified: all four
+        upstream test_dot_multidim rank-2 variants, bf16 + memdesc_trans, err
+        0.0) — decline so lower() falls through. Outside the envelope the loud
+        refusal remains the authority.
+
         Returns dict with {M, N, K, ptr_args, dot_ssa} if detected, None otherwise.
 
         Handles two patterns:
@@ -2009,6 +2018,9 @@ class _DetectionMixin:
         a 3-D batched-via-strides dot (rank>=3 tt.dot result). Those are recognized
         below before any stride-based routing.
         """
+        if self._dot_has_reshape_provenance() and self._dot_generic_eligible(allow_flat=True):
+            return None
+
         scalar_args = [a for a in self.graph.args if not a.is_ptr]
 
         # A "simple dot" is exactly ONE 2-D tt.dot. A MULTI-dot kernel is NOT this
