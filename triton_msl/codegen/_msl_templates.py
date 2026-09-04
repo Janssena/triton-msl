@@ -1854,6 +1854,8 @@ def make_flash_attention_kernel_simdgroup(
     runtime_scale=False,
     grid_3d=False,
     mask_batch_div=None,
+    runtime_neg_inf=False,
+    neg_inf_unit=1.0,
 ):
     """simdgroup_matrix FlashAttention-2 (fp32/fp16, causal/non-causal, head_dim=128).
 
@@ -2005,6 +2007,13 @@ def make_flash_attention_kernel_simdgroup(
     scale_decl = (
         f"const float scale = {bindings['scale']};" if runtime_scale else f"const float scale = {SCALE!r}f;"
     )
+    if runtime_neg_inf:
+        if not bindings or "neg_inf" not in bindings:
+            raise ValueError("simd FA: runtime_neg_inf requires bindings['neg_inf']")
+        # packet 114: the source sentinel (its exp domain, after the c_eff multiply) in
+        # this template's natural units; every masked/tail cell holds it and counts in the sum.
+        scale_decl += f"\n    const float neg_inf = ({bindings['neg_inf']}) * {float(neg_inf_unit)!r}f;"
+    _NI = "neg_inf" if runtime_neg_inf else "-INFINITY"
     if grid_3d:
         grid_decode = "uint q_block = pid3.x, h = pid3.y, z = pid3.z;"
     else:
@@ -2019,6 +2028,11 @@ def make_flash_attention_kernel_simdgroup(
         _bb.append("    uint lse_base = z*lse_sz + h*lse_sh;")
     biased_base_lines = "\n".join(_bb)
     if lse:
+        _lse_value = (
+            "!isfinite(lv) ? NAN : ((lv > 0.0f) ? (tg_m[lid] + log(lv)) : -INFINITY)"
+            if runtime_neg_inf
+            else "(lv > 0.0f) ? (tg_m[lid] + log(lv)) : -INFINITY"
+        )
         lse_store = (
             "\n    // ---- per-query log-sum-exp: lse = m + log(l) (natural log) ----\n"
             "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -2026,7 +2040,7 @@ def make_flash_attention_kernel_simdgroup(
             "        uint qr = q_start + lid;\n"
             "        if (qr < N_CTX) {\n"
             "            float lv = tg_l[lid];\n"
-            "            Lse[lse_base + qr*lse_sm] = (lv > 0.0f) ? (tg_m[lid] + log(lv)) : -INFINITY;\n"
+            f"            Lse[lse_base + qr*lse_sm] = {_lse_value};\n"
             "        }\n"
             "    }"
         )
@@ -2035,14 +2049,47 @@ def make_flash_attention_kernel_simdgroup(
 
     # bias/mask cell fragments (guard-independent; combined with the guard in block()).
     _bias_add = "\n                    s += float(Bias[bias_base + qrow_b*b_sm + kvrow_b*b_sn]);" if bias else ""
-    _mask_apply = "\n                    if (Mask[mask_base + kvrow_b*mask_sn] != 0) s = -INFINITY;" if mask else ""
+    _mask_apply = "\n                    if (Mask[mask_base + kvrow_b*mask_sn] != 0) s = " + _NI + ";" if mask else ""
 
     if elem == "half":
         p_buffers = f"    threadgroup half tgP[{BM} * {BN}];\n    threadgroup {acc_buf} on_scratch[{n_groups} * 64];"
         p_write, p_src = "tgP[r*BN+cj] = half(p);", "tgP"
+        p_zero = "tgP[pr*BN+cj] = half(0.0f);"
     else:
         p_buffers = f"    threadgroup float on_scratch[{n_groups} * 64];"
         p_write, p_src = "tg_S[r*BN+cj] = p;", "tg_S"
+        p_zero = "tg_S[pr*BN+cj] = 0.0f;"
+    _score_store_update = (
+        "                tg_S[pr*BN+cj] = s;\n"
+        "                pm = (isnan(pm) || isnan(s)) ? NAN : max(pm, s);"
+        if runtime_neg_inf
+        else "                tg_S[pr*BN+cj] = s; pm = max(pm, s);"
+    )
+    _mnew_loop = (
+        "                for (uint j = 0u; j < 8u; j++) {\n"
+        "                    float pj = tg_pmax[r*8u+j];\n"
+        "                    m_new = (isnan(m_new) || isnan(pj)) ? NAN : max(m_new, pj);\n"
+        "                }"
+        if runtime_neg_inf
+        else "                for (uint j = 0u; j < 8u; j++) m_new = max(m_new, tg_pmax[r*8u+j]);"
+    )
+    # A nonfinite row is valid source data on every route, not only the biased
+    # runtime-sentinel spelling.  Never feed its P/alpha through the diagonal
+    # 8x8 MMA: IEEE 0*NaN contaminates the seven sibling rows.  Carry a finite
+    # internal zero for the bad row and restore its NaN at the final store.
+    _nonfinite_sanitize = (
+        "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        "            // Keep a nonfinite source row local across the 8x8 MMAs.\n"
+        "            if (!isfinite(tg_l[pr])) {\n"
+        f"                for (uint cj = cA; cj < cB; cj++) {{ {p_zero} }}\n"
+        "            }"
+    )
+    _alpha_diag = (
+        "if (lid < BM) {\n"
+        "            uint rb=lid/8u, ii=lid%8u; float a=tg_alpha[lid];\n"
+        "            adiag[rb*64u+ii*8u+ii]=isfinite(a) ? a : 0.0f;\n"
+        "        }"
+    )
 
     # ---- per-block body emitter (mode in {'full','tail'}) ----
     def guard_decls(mode):
@@ -2065,10 +2112,10 @@ def make_flash_attention_kernel_simdgroup(
                 "                float s;\n"
                 "                if (" + g + ") {\n"
                 "                    s = tg_S[pr*BN+cj]*scale;" + _bias_add + _mask_apply + "\n"
-                "                } else { s = -INFINITY; }"
+                "                } else { s = " + _NI + "; }"
             )
         else:
-            score_cell = "float s = " + g + " ? (tg_S[pr*BN+cj]*scale) : -INFINITY;"
+            score_cell = "float s = " + g + " ? (tg_S[pr*BN+cj]*scale) : " + _NI + ";"
         if mode == "full":
             kload = "            simdgroup_load(kf, K + k_base + (kv_start + sgitg*8u)*k_sn + kc*k_sk, k_sn, 0, true);"
         else:
@@ -2127,13 +2174,13 @@ def make_flash_attention_kernel_simdgroup(
             for (uint cj = cA; cj < cB; cj++) {
                 %(KD)s
                 %(SCORE_CELL)s
-                tg_S[pr*BN+cj] = s; pm = max(pm, s);
+%(SCORE_STORE_UPDATE)s
             }
             tg_pmax[pr*8u + pc] = pm;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lid < BM) {
                 uint r = lid; float m_prev = tg_m[r], l_prev = tg_l[r], m_new = m_prev;
-                for (uint j = 0u; j < 8u; j++) m_new = max(m_new, tg_pmax[r*8u+j]);
+%(MNEW_LOOP)s
                 tg_m[r] = m_new; tg_alpha[r] = exp(m_prev - m_new); tg_l[r] = l_prev * tg_alpha[r];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2148,11 +2195,11 @@ def make_flash_attention_kernel_simdgroup(
                 for (uint j = 0u; j < 8u; j++) l += tg_psum[r*8u+j];
                 tg_l[r] = l;
             }
-        }
+%(NONFINITE_SANITIZE)s        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i=lid;i<4u*64u;i+=NT) adiag[i]=0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < BM) { uint rb=lid/8u, ii=lid%%8u; adiag[rb*64u+ii*8u+ii]=tg_alpha[lid]; }
+        %(ALPHA_DIAG)s
         threadgroup_barrier(mem_flags::mem_threadgroup);
         %(ACC)s ad0, ad1, ad2, ad3, tmp;
         simdgroup_load(ad0, adiag + 0u*64u, 8); simdgroup_load(ad1, adiag + 1u*64u, 8);
@@ -2188,6 +2235,10 @@ def make_flash_attention_kernel_simdgroup(
             "SCORE_CELL": score_cell,
             "PWRITE": p_write,
             "PWRITE_PR": p_write.replace("[r*BN", "[pr*BN"),  # prob store for row = pr
+            "SCORE_STORE_UPDATE": _score_store_update,
+            "MNEW_LOOP": _mnew_loop,
+            "NONFINITE_SANITIZE": _nonfinite_sanitize,
+            "ALPHA_DIAG": _alpha_diag,
             "PLOADT": p_load_t,
             "BN": BN,
             "NG": n_groups,
@@ -2196,6 +2247,18 @@ def make_flash_attention_kernel_simdgroup(
         }
 
     block_full, block_tail = block("full"), block("tail")
+    # Route-lowered biased kernels always set runtime_neg_inf: their source
+    # recurrence distinguishes a nonfinite denominator from an empty row.  The
+    # standalone biased maker predates that source contract and deliberately
+    # maps a fully masked row to zero, so preserve it when no runtime sentinel
+    # is present.  Plain/MLA routes cannot form an empty masked row; a
+    # nonfinite denominator there necessarily came from source data.
+    _preserve_nonfinite = runtime_neg_inf or not bias
+    _final_value = (
+        "!isfinite(tg_l[rb*8u+dr]) ? NAN : on_scratch[sgitg*64u+e]"
+        if _preserve_nonfinite
+        else "on_scratch[sgitg*64u+e]"
+    )
     final_store = (
         "            simdgroup_store(on, on_scratch + sgitg*64u, 8u);\n"
         "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -2203,7 +2266,7 @@ def make_flash_attention_kernel_simdgroup(
         "                uint dr=e/8u, dc=e%8u;\n"
         "                uint qr2=(q_start+rb*8u+dr), dc2=(ct*8u+dc);\n"
         "                if (qr2 < N_CTX" + _ct_store_g + ")\n"
-        f"                    Out[o_base + qr2*o_sm + dc2*o_sk] = {store_cast('on_scratch[sgitg*64u+e]')};\n"
+        f"                    Out[o_base + qr2*o_sm + dc2*o_sk] = {store_cast(_final_value)};\n"
         "            }\n"
         "            threadgroup_barrier(mem_flags::mem_threadgroup);"
     )
@@ -3367,6 +3430,8 @@ def make_flash_attention_kernel_tiled(
     runtime_scale=False,
     grid_3d=False,
     mask_batch_div=None,
+    runtime_neg_inf=False,
+    neg_inf_unit=1.0,
 ):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
@@ -3480,6 +3545,10 @@ def make_flash_attention_kernel_tiled(
     else:
         score_guard = "(kv_row < N_CTX)"
         prob_guard = "(kv_row < N_CTX)"
+    if runtime_neg_inf:
+        # packet 114: every cell (masked, tail) holds the source's FINITE sentinel and
+        # contributes exp(sentinel - m) to the sum exactly as the source does.
+        prob_guard = "true"
     if head_dim % Dc != 0:
         raise ValueError(f"make_flash_attention_kernel_tiled: head_dim ({head_dim}) must be a multiple of Dc ({Dc})")
     if (arg_decls is None) != (bindings is None):
@@ -3565,6 +3634,8 @@ def make_flash_attention_kernel_tiled(
         raise ValueError(f"make_flash_attention_kernel_tiled: bindings missing {missing}")
     if runtime_scale and "scale" not in bindings:
         raise ValueError("make_flash_attention_kernel_tiled: runtime_scale requires bindings['scale']")
+    if runtime_neg_inf and "neg_inf" not in bindings:
+        raise ValueError("make_flash_attention_kernel_tiled: runtime_neg_inf requires bindings['neg_inf']")
     sig = ",\n".join(arg_decls)
     # Local aliases so the body references uniform names regardless of which
     # strides/dims are real buffer args vs baked constants.
@@ -3575,6 +3646,11 @@ def make_flash_attention_kernel_tiled(
     scale_decl = (
         f"const float scale = {bindings['scale']};" if runtime_scale else f"const float scale = {SCALE!r}f;"
     )
+    if runtime_neg_inf:
+        # the source sentinel lives in its exp domain (after the c_eff multiply); convert
+        # to this template's natural units: sentinel_nat = sentinel * (1 / c_eff)
+        scale_decl += f"\n    const float neg_inf = ({bindings['neg_inf']}) * {float(neg_inf_unit)!r}f;"
+    _NI = "neg_inf" if runtime_neg_inf else "-INFINITY"
     # Grid decode. 2-D (default): pid3.y = z*H + h -> z = zh/H, h = zh%H. 3-D
     # (grid_3d, trifast's pid_j/pid_i/pid_h): the two batch axes are SEPARATE grid
     # dims -> h = pid3.y (the triangle-i axis), z = pid3.z (batch*heads). H is unused.
@@ -3607,7 +3683,7 @@ def make_flash_attention_kernel_tiled(
             "\n                    s += float(Bias[bias_base + q_row * b_sm + kv_row * b_sn]);" if bias else ""
         )
         _mask_apply = (
-            "\n                    if (Mask[mask_base + kv_row * mask_sn] != 0) s = -INFINITY;" if mask else ""
+            "\n                    if (Mask[mask_base + kv_row * mask_sn] != 0) s = " + _NI + ";" if mask else ""
         )
         score_compute_block = (
             "float s;\n"
@@ -3615,17 +3691,22 @@ def make_flash_attention_kernel_tiled(
             "                    s = tg_S[r * BN + cj] * scale;"
             + _bias_add + _mask_apply + "\n"
             "                } else {\n"
-            "                    s = -INFINITY;\n"
+            "                    s = " + _NI + ";\n"
             "                }"
         )
     else:
         score_compute_block = (
             "float s = " + score_guard + " ? (tg_S[r * BN + cj] * scale)\n"
-            "                                           : -INFINITY;"
+            "                                           : " + _NI + ";"
         )
 
     # Log-sum-exp per query row (natural log): lse = running_max + log(running_sum).
     if lse:
+        _lse_value = (
+            "!isfinite(l_val) ? NAN : ((l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY)"
+            if runtime_neg_inf
+            else "(l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY"
+        )
         lse_store_block = (
             "\n    // ---- Log-sum-exp per query row (lse = m + log(l), natural log) ----\n"
             "    if (lid < BM) {\n"
@@ -3633,14 +3714,32 @@ def make_flash_attention_kernel_tiled(
             "        uint q_row = q_start + r;\n"
             "        if (q_row < N_CTX) {\n"
             "            float l_val = tg_l[r];\n"
-            "            // Fully-masked row (l==0): logsumexp of an empty set is -inf,\n"
-            "            // not nan (alpha = exp(-inf - -inf) = nan). Mirror the Out guard.\n"
-            "            Lse[lse_base + q_row * lse_sm] = (l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY;\n"
+            "            // Preserve a nonfinite source recurrence as NaN; only a genuine\n"
+            "            // finite empty denominator maps to logsumexp(empty) = -inf.\n"
+            f"            Lse[lse_base + q_row * lse_sm] = {_lse_value};\n"
             "        }\n"
             "    }"
         )
     else:
         lse_store_block = ""
+
+    _mnew_update = (
+        "m_new = (isnan(m_new) || isnan(s)) ? NAN : max(m_new, s);"
+        if runtime_neg_inf
+        else "m_new = max(m_new, s);"
+    )
+    # Route-lowered biased kernels always set runtime_neg_inf: their source
+    # recurrence distinguishes a nonfinite denominator from an empty row.  The
+    # standalone biased maker predates that source contract and deliberately
+    # maps a fully masked row to zero, so preserve it when no runtime sentinel
+    # is present.  Plain/MLA routes cannot form an empty masked row; a
+    # nonfinite denominator there necessarily came from source data.
+    _preserve_nonfinite = runtime_neg_inf or not bias
+    _out_value = (
+        "!isfinite(l_val) ? NAN : ((l_val > 0.0f) ? (acc[i] / l_val) : 0.0f)"
+        if _preserve_nonfinite
+        else "(l_val > 0.0f) ? (acc[i] / l_val) : 0.0f"
+    )
 
     return f"""#include <metal_stdlib>
 using namespace metal;
@@ -3747,7 +3846,7 @@ kernel void {kernel_name}(
                     uint kv_row = kv_start + cj;
                     {score_compute_block}
                     tg_S[r * BN + cj] = s;   // store scaled score in place
-                    m_new = max(m_new, s);
+                    {_mnew_update}
                 }}
 
                 // P = exp(S - m_new); rescale running sum.
@@ -3810,7 +3909,7 @@ kernel void {kernel_name}(
         uint q_row = q_start + r;
         if (q_row < N_CTX) {{
             float l_val = tg_l[r];
-            float o = (l_val > 0.0f) ? (acc[i] / l_val) : 0.0f;
+            float o = {_out_value};
             Out[o_base + q_row * o_sm + c * o_sk] = {store_cast("o")};
         }}
     }}
@@ -5150,7 +5249,13 @@ kernel void {kernel_name}(
             float alpha = exp(m_old - m_new), lsum = 0.0f;
             for (uint j = 0u; j < BN; j++) {{ float p = exp(tg_S[r*BN+j]-m_new); tg_P[r*BN+j]={TILE}(p); lsum += p; }}
             tg_l[r] = l_old*alpha + lsum; tg_m[r] = m_new;
-            for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? alpha : 0.0f;
+            bool finite_row = isfinite(tg_l[r]);
+            // Keep a nonfinite row out of both MMAs.  Even an off-diagonal
+            // zero contaminates sibling rows when multiplied by NaN.
+            if (!finite_row)
+                for (uint j = 0u; j < BN; j++) tg_P[r*BN+j] = {TILE}(0);
+            for (uint c = 0u; c < 8u; c++)
+                tg_diag[sg*64u + lane*8u + c] = (c==lane && finite_row) ? alpha : 0.0f;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -5172,8 +5277,11 @@ kernel void {kernel_name}(
 
     // normalize O = diag(1/l) @ O, then scalar-store each 8x8 tile through tg_S scratch
     if (lane < 8u) {{
-        uint r = sg*8u + lane; float inv = 1.0f/tg_l[r];  // l==0 (empty kv) -> inf -> NaN rows, matching the kernel's own 0/0 semantics
-        for (uint c = 0u; c < 8u; c++) tg_diag[sg*64u + lane*8u + c] = (c==lane) ? inv : 0.0f;
+        uint r = sg*8u + lane; float lv = tg_l[r];
+        bool finite_nonempty = isfinite(lv) && lv != 0.0f;
+        float inv = finite_nonempty ? (1.0f/lv) : 0.0f;
+        for (uint c = 0u; c < 8u; c++)
+            tg_diag[sg*64u + lane*8u + c] = (c==lane) ? inv : 0.0f;
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 ldiag; simdgroup_load(ldiag, tg_diag + sg*64u, 8);
@@ -5186,7 +5294,9 @@ kernel void {kernel_name}(
             uint r = sg*8u + lane; uint qrow = m_block*BM + r;
             if (qrow < seqlen_q)
                 for (uint c = 0u; c < 8u; c++)
-                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] = {TILE}(tg_S[sg*64u + lane*8u + c]);
+                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] =
+                        (!isfinite(tg_l[r]) || tg_l[r] == 0.0f)
+                            ? {TILE}(NAN) : {TILE}(tg_S[sg*64u + lane*8u + c]);
         }}
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }}

@@ -198,13 +198,17 @@ class _DetectionMixin:
         "pid", "bad"}``: counts of make_range / K-offset addends, the program_id axis
         (None if absent, -1 if mixed) and the first un-replayed construct (a runtime
         scalar offset, a constant addend, a scaled index, ...) or None."""
-        res = {"range": 0, "iv": 0, "pid": None, "bad": None, "mod": None, "pid_div": None}
+        res = {"range": 0, "iv": 0, "pid": None, "bad": None, "mod": None, "pid_div": None, "coef": None, "bounds": None}
 
-        def note_pid(axis, div):
+        def note_pid(axis, div, coef=1):
+            # packet 106: the pid's tile COEFFICIENT (``pid * BLOCK``) and the make_range
+            # BOUNDS are recorded so the templates can require the exact tile they replay
             if res["pid"] is None:
-                res["pid"], res["pid_div"] = axis, div
+                res["pid"], res["pid_div"], res["coef"] = axis, div, coef
             elif res["pid"] != axis or res["pid_div"] != div:
                 res["pid"] = -1  # mixed
+            else:
+                res["coef"] = -1  # a second pid term (duplicate)
 
         def walk(v, depth=0):
             if depth > 24 or res["bad"] is not None:
@@ -237,6 +241,11 @@ class _DetectionMixin:
                 return
             if o.op == "tt.make_range":
                 res["range"] += 1
+                try:
+                    b = (int(o.attrs.get("start", 0)), int(o.attrs.get("end")))
+                except (TypeError, ValueError):
+                    b = None
+                res["bounds"] = b if res["range"] == 1 else None
                 return
             if (o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") or o.op in self._IDX_CASTS) and o.operand_ids:
                 walk(o.operand_ids[0], depth + 1)
@@ -253,7 +262,7 @@ class _DetectionMixin:
                 if pe is None:
                     res["bad"] = "scaled index"
                     return
-                note_pid(*pe)
+                note_pid(*pe, coef=self._const_int(o.operand_ids[ci], op_by_id))
                 return
             res["bad"] = o.op
 
@@ -431,6 +440,76 @@ class _DetectionMixin:
                         return f"{role} load mask {kind} bound is not a runtime extent or a constant >= the tile"
         return None
 
+    def _dot_layout_walk(self, vid, stop, op_by_id, ops=None):
+        """Follow operand 0 through the templates' layout-only ops (``ops``, default
+        ``_DOT_LAYOUT_OPS``). Returns ``("op", o)`` at the first op in ``stop``,
+        ``("leaf", vid)`` at a block/func arg, ``("bad", opname)`` at anything the
+        templates do not replay."""
+        vocab = self._DOT_LAYOUT_OPS if ops is None else ops
+        seen = set()
+        while vid not in seen:
+            seen.add(vid)
+            o = op_by_id.get(vid)
+            if o is None:
+                return ("leaf", vid)
+            if o.op in stop:
+                return ("op", o)
+            if o.op in vocab and o.operand_ids:
+                vid = o.operand_ids[0]
+                continue
+            return ("bad", o.op)
+        return ("bad", "<cycle>")
+
+    def _dot_operand_paths_reason(self, dot, a_arg, b_arg, op_by_id, *, allow_masked=True, allow_trans=True):
+        """The ONE proof of a dot's A/B operand VALUE paths, shared by the bare-template
+        predicate and the fused matmul+softmax / matmul+epilogue detectors (Round 2.1 F1:
+        the fused template staged raw fp32 buffers when the kernel cast them to fp16 — the
+        079 class on a route P0 had not covered). Each operand must be its load through
+        layout-only ops, with ``load.elem_type == operand elem_type == buffer elem_type``,
+        both buffers the same type, and (``allow_masked=False``) an unmasked load.
+        ``allow_trans=False`` (packet 101/102): a ``ttg.memdesc_trans`` on the path is a
+        VALUE transform — the K-loop and fused templates never replay it (GPU: a square
+        in-tile ``tl.trans`` on A or B stored the raw product, err 41/49; the fused forms
+        produced neither the raw nor the intended result for the canonical [N,K] weight)
+        — only the single-tile templates' trans_a/trans_b replay is probe-proven, so only
+        they may admit it. Returns ``(reason | None, loads, a_operand_shape)``."""
+        vocab = self._DOT_LAYOUT_OPS if allow_trans else (self._DOT_LAYOUT_OPS - {"ttg.memdesc_trans"})
+        loads, opnd_shape = {}, None
+        for role, idx, arg in (("A", 0, a_arg), ("B", 1, b_arg)):
+            kind, x = self._dot_layout_walk(dot.operand_ids[idx], {"tt.load"}, op_by_id, vocab)
+            if kind != "op":
+                what = x if kind == "bad" else "a loop-carried value"
+                if kind == "bad" and x in ("ttg.memdesc_trans", "tt.trans"):
+                    return (
+                        f"dot operand {role} ({arg.name}) is transposed between its load and the dot; "
+                        f"this template does not replay transposes (it stages the raw {arg.elem_type} buffer)",
+                        loads,
+                        None,
+                    )
+                return (
+                    f"dot operand {role} ({arg.name}) is not its load: '{what}' sits between the load and "
+                    f"the dot and is not replayed (the template stages the raw {arg.elem_type} buffer)",
+                    loads,
+                    None,
+                )
+            load = x
+            opnd = op_by_id.get(dot.operand_ids[idx])
+            if load.elem_type != arg.elem_type or (opnd is not None and opnd.elem_type != load.elem_type):
+                return (
+                    f"dot operand {role} ({arg.name}) element type differs from its buffer "
+                    f"({arg.elem_type} buffer, {load.elem_type} loaded, {getattr(opnd, 'elem_type', '?')} at the dot)",
+                    loads,
+                    None,
+                )
+            if not allow_masked and len(load.operand_ids or []) >= 2:
+                return (f"dot operand {role} ({arg.name}) load is masked; the template ignores masks", loads, None)
+            if role == "A" and opnd is not None:
+                opnd_shape = _extract_shape(opnd.type_str or "")
+            loads[role] = load
+        if a_arg.elem_type != b_arg.elem_type:
+            return (f"A ({a_arg.elem_type}) and B ({b_arg.elem_type}) buffers differ in element type", loads, opnd_shape)
+        return (None, loads, opnd_shape)
+
     def _dot_template_value_paths(self):
         """P0 (packet 079): prove, PER ROLE, that every value path the single-dot
         matmul templates re-emit is exactly what they replay — nothing more.
@@ -538,19 +617,7 @@ class _DetectionMixin:
         strides, index_ids, addr_ids = traced
 
         def _layout_walk(vid, stop):
-            seen = set()
-            while vid not in seen:
-                seen.add(vid)
-                o = op_by_id.get(vid)
-                if o is None:
-                    return ("leaf", vid)
-                if o.op in stop:
-                    return ("op", o)
-                if o.op in self._DOT_LAYOUT_OPS and o.operand_ids:
-                    vid = o.operand_ids[0]
-                    continue
-                return ("bad", o.op)
-            return ("bad", "<cycle>")
+            return self._dot_layout_walk(vid, stop, op_by_id)
 
         iv = ((k_for.attrs or {}).get("block_arg_ids") or [None])[0] if k_for is not None else None
         ptr_wrap = ("ttg.convert_layout",)
@@ -566,34 +633,16 @@ class _DetectionMixin:
             elif _step != block_k_hint:
                 return (f"the K-loop step ({_step}) is neither BLOCK_K ({block_k_hint}) nor 1", set(), None, None)
 
-        # ---- A / B: load -> layout ops -> dot; types; traced address ----
-        loads, opnd_shape = {}, None
-        for role, idx, arg in (("A", 0, a_arg), ("B", 1, b_arg)):
-            kind, x = _layout_walk(dot.operand_ids[idx], {"tt.load"})
-            if kind != "op":
-                what = x if kind == "bad" else "a loop-carried value"
-                return (
-                    f"dot operand {role} ({arg.name}) is not its load: '{what}' sits between the load and "
-                    f"the dot and is not replayed (the template stages the raw {arg.elem_type} buffer)",
-                    set(),
-                    None,
-                    None,
-                )
-            load = x
-            opnd = op_by_id.get(dot.operand_ids[idx])
-            if load.elem_type != arg.elem_type or (opnd is not None and opnd.elem_type != load.elem_type):
-                return (
-                    f"dot operand {role} ({arg.name}) element type differs from its buffer "
-                    f"({arg.elem_type} buffer, {load.elem_type} loaded, {getattr(opnd, 'elem_type', '?')} at the dot)",
-                    set(),
-                    None,
-                    None,
-                )
-            if role == "A" and opnd is not None:
-                opnd_shape = _extract_shape(opnd.type_str or "")
-            loads[role] = load
-        if a_arg.elem_type != b_arg.elem_type:
-            return (f"A ({a_arg.elem_type}) and B ({b_arg.elem_type}) buffers differ in element type", set(), None, None)
+        # ---- A / B: load -> layout ops -> dot; types (the shared proof; masks are
+        # judged below per loop form, so allow them here) ----
+        # Transposes: only the single-tile templates replay them (trans_a/trans_b, probe-proven
+        # for in-tile square and canonical [N,K] forms); the K-loop templates refuse the
+        # canonical layouts already and silently dropped an in-tile transpose (packet 102).
+        _ab_reason, loads, opnd_shape = self._dot_operand_paths_reason(
+            dot, a_arg, b_arg, op_by_id, allow_masked=True, allow_trans=(k_for is None)
+        )
+        if _ab_reason:
+            return (_ab_reason, set(), None, None)
         block_k = opnd_shape[-1] if opnd_shape and len(opnd_shape) >= 2 else None
         if int_dot:
             # The templates stage int8 operands as float and accumulate in float, then
@@ -627,6 +676,18 @@ class _DetectionMixin:
         mn_names = (m_ext or ("M" if "M" in scalar_names else None), n_ext or ("N" if "N" in scalar_names else None))
 
         # ---- tile index shapes (grid mapping, no residual addends, K form) ----
+        # Packet 106 (the 103 class on the bare templates): each tile index must be EXACTLY
+        # the tile the template replays — ``make_range(0, BLOCK)`` of that role/axis's block,
+        # a pid coefficient equal to that block, and pid PRESENCE consistent per axis (an
+        # axis without a program_id is replayed as tile 0 in every program, never tiled).
+        # GPU on the P0 tree: no pid / ``pid * 2BM`` / ``range(BN, 2BN)`` / ``range(BK,
+        # 2BK)`` all stored the template's tiled result.
+        _b_shape = _extract_shape(op_by_id[dot.operand_ids[1]].type_str or "") if dot.operand_ids[1] in op_by_id else None
+        _blk = {}
+        if opnd_shape and len(opnd_shape) >= 2 and _b_shape and len(_b_shape) >= 2:
+            _bm_t, _bk_t, _bn_t = opnd_shape[-2], opnd_shape[-1], _b_shape[-1]
+            _blk = {("A", 0): _bm_t, ("A", 1): _bk_t, ("B", 0): _bk_t, ("B", 1): _bn_t, ("C", 0): _bm_t, ("C", 1): _bn_t}
+        _has_pid = {}
         k_form = {}
         for role, ax, want_pid, is_k in (
             ("A", 0, 0, False), ("A", 1, None, True), ("B", 0, None, True), ("B", 1, 1, False), ("C", 0, 0, False), ("C", 1, 1, False),
@@ -646,6 +707,23 @@ class _DetectionMixin:
                 return (f"{role} {axis_name} index contains {sh['bad']}, which the template does not replay", set(), None, None)
             if sh["range"] != 1:
                 return (f"{role} {axis_name} index is not a single tile range", set(), None, None)
+            _want_blk = _blk.get((role, ax))
+            if _want_blk is None or sh["bounds"] != (0, _want_blk):
+                return (
+                    f"{role} {axis_name} index range is not make_range(0, {_want_blk}) — the template replays exactly that tile",
+                    set(),
+                    None,
+                    None,
+                )
+            if sh["pid"] is not None and sh["coef"] != _want_blk:
+                return (
+                    f"{role} {axis_name} index tiles program_id with coefficient {sh['coef']}, not the tile size {_want_blk}",
+                    set(),
+                    None,
+                    None,
+                )
+            if not is_k:
+                _has_pid[(role, ax)] = sh["pid"] is not None
             if sh["mod"] is not None:
                 want = mn_names[0] if (role, ax) == ("A", 0) else (mn_names[1] if (role, ax) == ("B", 1) else None)
                 mod_arg = arg_by_id.get(self._strip_wrappers(sh["mod"], op_by_id, ("tt.splat",) + tuple(self._IDX_CASTS)))
@@ -673,6 +751,11 @@ class _DetectionMixin:
                     )
         if k_form["A"] != k_form["B"] and k_for is None:
             return ("A and B K indices disagree", set(), None, None)
+        # pid PRESENCE per axis must agree between the operand and the output (the template
+        # tiles both from ONE pid_m / pid_n); recorded for the templates and the dispatchers.
+        if _has_pid.get(("A", 0)) != _has_pid.get(("C", 0)) or _has_pid.get(("B", 1)) != _has_pid.get(("C", 1)):
+            return ("the operand and output tile indices disagree on which axes are program_id-tiled", set(), None, None)
+        pid_axes = (bool(_has_pid.get(("C", 0))), bool(_has_pid.get(("C", 1))))
 
         # ---- grid mapping: 2-D (program_id(0)/program_id(1)) or the tutorial's 1-D
         # ``pid % num_pid_m`` / ``pid // num_pid_m`` with ONE consistent divisor that is
@@ -878,7 +961,9 @@ class _DetectionMixin:
                     _pending.append(_c.id)
                     continue
                 return (f"the dot result is observed by '{_c.op}', which the template does not replay", set(), None, None)
-        return (None, proven, (a_arg, b_arg, c_arg), pid_map)
+        if pid_map == "1d" and pid_axes != (True, True):
+            return ("a 1-D grid split needs program_id on both tile axes", set(), None, None)
+        return (None, proven, (a_arg, b_arg, c_arg), pid_map, pid_axes)
 
     def _resolve_load_store_ptr_roles(self, load_ssa, store_ssa):
         """Resolve one-load/one-store template roles from pointer dataflow.
@@ -1171,6 +1256,30 @@ class _DetectionMixin:
                         base = _inner
                 cur = base
 
+        # Induction variables of the kernel's scf.for loops (``block_arg_ids[0]``): the
+        # ONLY scalar addend the in-loop K addressing ``(range + k)`` may carry.
+        _iv_ids = set()
+        for _lo in op_by_id.values():
+            if _lo.op == "scf.for":
+                _ba = list((_lo.attrs or {}).get("block_arg_ids") or [])
+                if _ba:
+                    _iv_ids.add(_ba[0])
+
+        def _iv_addi(o):
+            # ``(range + k)`` spelled in-loop lowers as addi(expand_dims(range), splat(k))
+            # (2-D; the row/col expand happens before the add). Return the expand_dims
+            # iff the other addend is a splat of a loop induction variable — the index
+            # proof then sees ``k + range``. A constant or runtime-scalar addend is NOT
+            # this form (it stays a residual and refuses). Packet 102: P0's strict tracer
+            # refused this mainstream spelling on the quantized route (base computed it).
+            o = _skip(o)
+            if o is None or o.op not in ("arith.addi", "arith.add") or len(o.operand_ids or []) != 2:
+                return None
+            parts = [_skip(op_by_id.get(x)) for x in o.operand_ids]
+            eds = [p for p in parts if p is not None and p.op == "tt.expand_dims"]
+            ivs = [p for p in parts if p is not None and p.op == "tt.splat" and p.operand_ids and p.operand_ids[0] in _iv_ids]
+            return eds[0] if (len(eds) == 1 and len(ivs) == 1) else None
+
         def _flatten_addi(o, acc):
             o = _skip(o)
             if o is None:
@@ -1181,7 +1290,7 @@ class _DetectionMixin:
                 # means the wrong slice is read or written).
                 acc.append(None)
                 return
-            if o.op in ("arith.addi", "arith.add"):
+            if o.op in ("arith.addi", "arith.add") and _iv_addi(o) is None:
                 for oid in o.operand_ids:
                     _flatten_addi(op_by_id.get(oid), acc)
             else:
@@ -1213,11 +1322,19 @@ class _DetectionMixin:
             if term is None:
                 return (None, None, None)
             stride = "1"
+            index_id = None  # the index the proof checks; the addi itself for ``range + k``
             if term.op in ("arith.muli", "arith.mul") and len(term.operand_ids) == 2:
                 o0 = _skip(op_by_id.get(term.operand_ids[0]))
                 o1 = _skip(op_by_id.get(term.operand_ids[1]))
                 ed = o0 if (o0 and o0.op == "tt.expand_dims") else (o1 if (o1 and o1.op == "tt.expand_dims") else None)
                 other = o1 if ed is o0 else o0
+                if ed is None:
+                    # in-loop ``(range + k) * stride``: the addi carries the index
+                    for cand, oth in ((o0, o1), (o1, o0)):
+                        _ed = _iv_addi(cand)
+                        if _ed is not None:
+                            ed, other, index_id = _ed, oth, cand.id
+                            break
                 if ed is None:
                     return (None, None, None)
                 sp = _skip(other)
@@ -1232,8 +1349,12 @@ class _DetectionMixin:
                 else:
                     stride = None
                 term = ed
+            elif _iv_addi(term) is not None:
+                # unit stride folded: the bare ``(range + k)`` addi is the term
+                index_id = term.id
+                term = _iv_addi(term)
             if term.op == "tt.expand_dims":
-                return (term.attrs.get("axis"), stride, (term.operand_ids or [None])[0])
+                return (term.attrs.get("axis"), stride, index_id if index_id is not None else (term.operand_ids or [None])[0])
             return (None, None, None)
 
         index_ids = {}
@@ -2240,7 +2361,9 @@ class _DetectionMixin:
             # proven per role (operand casts, the store cast, the accumulator carry,
             # loop-carried pointer advances, load masks, grid mapping). A K-loop is
             # never generic-eligible, so an unproven path refuses loudly here.
-            _reason, _, _, _pid_map = self._dot_template_value_paths()
+            _vp = self._dot_template_value_paths()
+            _reason, _pid_map = _vp[0], _vp[3]
+            _pid_axes = _vp[4] if len(_vp) > 4 else None  # packet 106: per-axis program_id presence
             if _reason:
                 from triton_msl.errors import MetalNonRecoverableError
 
@@ -2254,6 +2377,7 @@ class _DetectionMixin:
                 # verbatim by the pid-tiled templates (no default: a K-loop route without
                 # a proven mapping does not reach a template).
                 "pid_map": _pid_map,
+                "pid_axes": _pid_axes,
                 "BLOCK_M": BLOCK_M,
                 "BLOCK_N": BLOCK_N,
                 "BLOCK_K": BLOCK_K,
@@ -2513,7 +2637,9 @@ class _DetectionMixin:
         # decline to the generic path: unlike the stage-1a forms above, these have
         # not been probe-verified on the generic lowerer, and the prebuilt template
         # would claim and refuse them at its boundary regardless.
-        _reason, _, _, _pid_map = self._dot_template_value_paths()
+        _vp = self._dot_template_value_paths()
+        _reason, _pid_map = _vp[0], _vp[3]
+        _pid_axes = _vp[4] if len(_vp) > 4 else None  # packet 106: per-axis program_id presence
         if _reason:
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -2524,6 +2650,7 @@ class _DetectionMixin:
 
         return {
             "pid_map": _pid_map,
+            "pid_axes": _pid_axes,
             "M": M,
             "N": N,
             "K": K,
@@ -2689,6 +2816,32 @@ class _DetectionMixin:
         if _roles is None or len(_roles) < 3:
             return None
         a_ptr, b_ptr, c_ptr = _roles[0], _roles[1], _roles[2]
+        # Round 2.1 F1: the fused template stages A/B from their BUFFER types; a value
+        # transform between a load and the dot (an fp32 -> fp16 cast, GPU: raw result
+        # stored, err 1.8e-3 / 2e-4 vs the IR-ordered oracle on clean ba21e9d) was dropped.
+        # Same proof as the bare templates (shared method); inside the generic envelope
+        # decline to the op-by-op lowerer, outside it refuse.
+        _by_all = {}
+
+        def _collect_all(ops):
+            for _s in ops:
+                _by_all[_s.id] = _s
+                if _s.region_ops:
+                    _collect_all(_s.region_ops)
+                if _s.else_ops:
+                    _collect_all(_s.else_ops)
+
+        _collect_all(self.graph.ops)
+        _ab_reason = self._dot_operand_paths_reason(dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False)[0]
+        if _ab_reason:
+            if self._dot_generic_eligible():
+                return None
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"fused matmul template: {_ab_reason}. Refusing (correct-or-refuse).",
+                op_name="tt.dot",
+            )
 
         # ADDRESS-TRACED strides ONLY (mechanism A — same contract as
         # _detect_matmul_epilogue, which already refuses on un-inferable strides).
@@ -2961,6 +3114,32 @@ class _DetectionMixin:
         if _roles is None or len(_roles) < 3:
             return None
         a_ptr, b_ptr, c_ptr = _roles[0], _roles[1], _roles[2]
+        # Round 2.1 F1: the fused template stages A/B from their BUFFER types; a value
+        # transform between a load and the dot (an fp32 -> fp16 cast, GPU: raw result
+        # stored, err 1.8e-3 / 2e-4 vs the IR-ordered oracle on clean ba21e9d) was dropped.
+        # Same proof as the bare templates (shared method); inside the generic envelope
+        # decline to the op-by-op lowerer, outside it refuse.
+        _by_all = {}
+
+        def _collect_all(ops):
+            for _s in ops:
+                _by_all[_s.id] = _s
+                if _s.region_ops:
+                    _collect_all(_s.region_ops)
+                if _s.else_ops:
+                    _collect_all(_s.else_ops)
+
+        _collect_all(self.graph.ops)
+        _ab_reason = self._dot_operand_paths_reason(dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False)[0]
+        if _ab_reason:
+            if self._dot_generic_eligible():
+                return None
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"fused matmul template: {_ab_reason}. Refusing (correct-or-refuse).",
+                op_name="tt.dot",
+            )
 
         # ADDRESS-TRACED strides (not the old positional index+1/+2 read, which
         # landed on the M/N dim args for a `(a,b,c,M,N,K,sam,sak,...)` signature

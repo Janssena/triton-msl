@@ -573,7 +573,8 @@ class MetalLauncher:
                         from triton_msl.autotuning._quant_matmul_dispatch import dispatch_quant_matmul
 
                         if dispatch_quant_matmul(
-                            _rt, quant_matmul, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                            _rt, quant_matmul, kargs, grid=(gridX, gridY, gridZ),
+                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
                         ):
                             return
 
@@ -586,7 +587,8 @@ class MetalLauncher:
                         from triton_msl.autotuning._fast_matmul_dispatch import dispatch_fast_matmul
 
                         if dispatch_fast_matmul(
-                            _rt, fast_matmul, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                            _rt, fast_matmul, kargs, grid=(gridX, gridY, gridZ),
+                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
                         ):
                             return
 
@@ -666,9 +668,12 @@ class MetalLauncher:
                 "quantized weight-only matmul runs only on MPS tensors via "
                 "compile_shader, with dims M % 32 == 0, N % 16 == 0, K % 32 == 0 (the "
                 "fast dequant kernel has no edge handling). This launch is non-MPS, has "
-                "compile_shader disabled/unavailable, or has non-conforming dims. Pad "
-                "the dims, or dequantize the weight on the host and pass a float/half "
-                "weight to a normal matmul."
+                "compile_shader disabled/unavailable, has non-conforming dims, or its "
+                "launch grid differs from the kernel's program mapping (the quantized "
+                "template computes the FULL output, so it stands in only for a launch of "
+                "exactly cdiv(M, BM) x cdiv(N, BN) programs; a partial or padded grid is "
+                "refused). Pad the dims / launch the full grid, or dequantize the weight "
+                "on the host and pass a float/half weight to a normal matmul."
             )
 
         # MLA (nope/rope) attention is compile_shader-only: the 'mla' descriptor's

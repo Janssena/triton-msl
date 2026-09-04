@@ -198,7 +198,13 @@ class _TemplateMixin:
                 "    uint pid_n = pid3.x / _npm;",
             ]
         if pid_map == "2d":
-            return ["    uint pid_m = pid3.x;", "    uint pid_n = pid3.y;"]
+            # packet 106: an axis the kernel does NOT tile by program_id is tile 0 in every
+            # program (the kernel's semantics), never ``pid3.x`` / ``pid3.y``.
+            has_m, has_n = tuple(info.get("pid_axes") or (True, True))
+            return [
+                "    uint pid_m = pid3.x;" if has_m else "    uint pid_m = 0u;  // no program_id on rows in the source kernel",
+                "    uint pid_n = pid3.y;" if has_n else "    uint pid_n = 0u;  // no program_id on cols in the source kernel",
+            ]
         from triton_msl.errors import MetalNonRecoverableError
 
         raise MetalNonRecoverableError(  # no implicit 2-D fallback: the mapping must be PROVEN
@@ -254,7 +260,8 @@ class _TemplateMixin:
         # Returns the cast ops it proved the template replays, admitted below by
         # IDENTITY — an opcode allowlist cannot say WHERE a cast sits, and that was
         # exactly the hole (fp16 operand casts dropped, GPU err vs raw = 0).
-        _reason, _proven, _roles, _pid_map = self._dot_template_value_paths()  # pid map consumed via info by the pid-tiled templates
+        _vp = self._dot_template_value_paths()  # pid map / axes consumed via info by the pid-tiled templates
+        _reason, _proven, _roles, _pid_map = _vp[0], _vp[1], _vp[2], _vp[3]
         if _reason:
             raise MetalNonRecoverableError(
                 f"matmul template: {_reason}. Refusing (correct-or-refuse).",
@@ -1102,8 +1109,12 @@ class _TemplateMixin:
             lines.append(f") {{")
             for arg in all_scalar_args:
                 lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
-            lines.append(f"    uint pid_m = pid3.x, pid_n = pid3.y;")
             lines.append(f"    uint _M = (uint)M, _N = (uint)N, _K = (uint)K;")
+            # Packet 106: the direct variant replays the SAME proven grid mapping as the
+            # staged kernel (the tutorial's 1-D split, and tile 0 on an axis the source
+            # kernel does not tile) — it used to hard-code ``pid3.x / pid3.y``, so the
+            # host path's aligned-shape swap mis-mapped both forms.
+            lines.extend(self._pid_map_lines(info, BLOCK_M))
             lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
             lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
             lines.append(f"    {acc_frag} {', '.join(n + '(0)' for n in all_accs)};")
@@ -2714,6 +2725,559 @@ class _TemplateMixin:
 
         return msl
 
+    def _quant_plain_load(self, o):
+        """A load a quantized template may stage from its raw pointer: ``tt.load`` with NO
+        mask and NO ``other`` (packet 101/102: a mask on the input, weight, scale or zero
+        load was silently ignored on every quantized route — raw result stored)."""
+        return o is not None and getattr(o, "op", None) == "tt.load" and len(o.operand_ids or []) == 1
+
+    def _quant_find_load(self, oid, op_by_id, depth=0, seen=None):
+        """First ``tt.load`` in ``oid``'s cone (every operand, depth-limited)."""
+        if seen is None:
+            seen = set()
+        if oid in seen or depth > 40:
+            return None
+        seen.add(oid)
+        o = op_by_id.get(oid)
+        if o is None:
+            return None
+        if o.op == "tt.load":
+            return o
+        for x in o.operand_ids or []:
+            r = self._quant_find_load(x, op_by_id, depth + 1, seen)
+            if r is not None:
+                return r
+        return None
+
+    def _quant_legs_plain(self, legs, op_by_id):
+        """Every leg's load is plain (see ``_quant_plain_load``); a leg without a load fails."""
+        return all(self._quant_plain_load(self._quant_find_load(leg, op_by_id)) for leg in legs)
+
+    # ------------------------------------------------------------------ packet 102: the
+    # address grammar every quantized template replays, proven per staged role (input,
+    # weight, scale, zero). The descriptors used to READ a stride out of an address term
+    # and let anything else in it vanish; the runtime stride check then caught some of the
+    # malformed forms by luck (a ``+ 1`` on the scale index, an index-level offset on the
+    # weight), and none of the others (GPU: raw result stored). Now an address is admitted
+    # only when its terms are EXACTLY the tile indices the template re-emits.
+
+    def _quant_loop_ivs(self, op_by_id):
+        ivs = set()
+        for o in op_by_id.values():
+            if o.op == "scf.for":
+                ba = list((o.attrs or {}).get("block_arg_ids") or [])
+                if ba:
+                    ivs.add(ba[0])
+        return ivs
+
+    def _quant_term(self, tid, op_by_id):
+        """One additive address term -> ``(expand_axis | None, stride_arg_index | -1,
+        index_id)`` or None. Peels layout wrappers, one optional ``* splat(<stride arg>)``,
+        and reads the expand axis from ``expand_dims`` — also through the in-loop
+        ``addi(expand_dims(range), splat(k))`` spelling (the index is then the addi)."""
+        arg_idx = {getattr(a, "id", None): i for i, a in enumerate(self.graph.args)}
+
+        def _peel(oid):
+            o = op_by_id.get(oid)
+            while o is not None and o.op in ("ttg.convert_layout", "tt.broadcast") and o.operand_ids:
+                oid = o.operand_ids[0]
+                o = op_by_id.get(oid)
+            return oid, o
+
+        oid, o = _peel(tid)
+        stride = -1
+        if o is not None and o.op in ("arith.muli", "arith.mul") and len(o.operand_ids or []) == 2:
+            sides = [_peel(x) for x in o.operand_ids]
+            sp = next((i for i, (_sid, so) in enumerate(sides) if so is not None and so.op == "tt.splat" and so.operand_ids and so.operand_ids[0] in arg_idx), None)
+            if sp is None:
+                return None  # a stride that is not a runtime arg is not replayed
+            stride = arg_idx[sides[sp][1].operand_ids[0]]
+            oid, o = sides[1 - sp]
+        axis = None
+        if o is not None and o.op == "tt.expand_dims":
+            axis = int(str((o.attrs or {}).get("axis", "")).split(":")[0].strip() or -1)
+        elif o is not None and o.op in ("arith.addi", "arith.add") and len(o.operand_ids or []) == 2:
+            eds = [p for p in (_peel(x) for x in o.operand_ids) if p[1] is not None and p[1].op == "tt.expand_dims"]
+            if len(eds) == 1:
+                axis = int(str((eds[0][1].attrs or {}).get("axis", "")).split(":")[0].strip() or -1)
+        return (axis, stride, oid)
+
+    def _quant_index_shape(self, idx_id, op_by_id, *, allow_iv, allow_div=None):
+        """``_index_shape`` of a tile index after peeling layout wrappers and (``allow_div``)
+        one ``index // allow_div`` (the int4 GEMV's byte ``k // 2`` and group ``k // G``);
+        None when anything un-replayed appears (constant addend, runtime scalar, modulo,
+        scaled index, a pid split, or a divisor other than the allowed one)."""
+        arg_by_id = {getattr(a, "id", None): a for a in self.graph.args}
+        ivs = self._quant_loop_ivs(op_by_id)
+        iv = next(iter(ivs)) if len(ivs) == 1 else None
+        if allow_iv and iv is None:
+            return None
+        oid, o = idx_id, op_by_id.get(idx_id)
+        while o is not None and o.op in ("ttg.convert_layout", "tt.expand_dims", "tt.broadcast") and o.operand_ids:
+            oid = o.operand_ids[0]
+            o = op_by_id.get(oid)
+        if allow_div is not None and o is not None and o.op in ("arith.divsi", "arith.divui") and len(o.operand_ids or []) == 2:
+            if self._const_int(o.operand_ids[1], op_by_id) != allow_div:
+                return None
+            oid = o.operand_ids[0]
+        sh = self._index_shape(oid, op_by_id, arg_by_id, iv if allow_iv else None)
+        if sh["bad"] is not None or sh["mod"] is not None or sh["pid_div"] is not None or sh["pid"] == -1:
+            return None
+        return sh
+
+    def _quant_addr_ok(self, ptr_id, arg, op_by_id, *, row=None, col=None, vec=None):
+        """The load pointer is ``addptr(...addptr(splat(arg) | arg, t1)..., tn)`` whose terms,
+        flattened, are exactly the kinds given: ``vec`` (1-D), or ``row`` (expand axis 1) +
+        ``col`` (expand axis 0); each spec is ``dict(want_pid=, allow_iv=, allow_div=)``.
+        Per kind: exactly one ``range``, at most one induction-variable addend when allowed,
+        a program_id only on the wanted axis, at most one ``* splat(stride)``. The base is
+        the ARGUMENT itself (``x + 1`` is a link no template replays). Returns
+        ``(True, {kind: stride_arg_index | -1})`` or ``(False, None)``."""
+        specs = {"row": row, "col": col, "vec": vec}
+        ivs = self._quant_loop_ivs(op_by_id)
+
+        def _peel(oid):
+            o = op_by_id.get(oid)
+            while o is not None and o.op in ("ttg.convert_layout", "tt.broadcast") and o.operand_ids:
+                oid = o.operand_ids[0]
+                o = op_by_id.get(oid)
+            return oid, o
+
+        terms = []
+        base_id, cur = ptr_id, op_by_id.get(ptr_id)
+        depth = 0
+        while cur is not None and cur.op == "tt.addptr" and len(cur.operand_ids or []) == 2 and depth < 8:
+            depth += 1
+            terms.append(cur.operand_ids[1])
+            base_id, cur = _peel(cur.operand_ids[0])
+        if depth == 0:
+            return (False, None)
+        if cur is None:
+            if base_id != getattr(arg, "id", None):
+                return (False, None)
+        elif not (cur.op == "tt.splat" and cur.operand_ids and cur.operand_ids[0] == getattr(arg, "id", None)):
+            return (False, None)  # a scalar advance / another chain under the splat
+
+        atoms = []
+
+        def _flat(oid):
+            _oid, o = _peel(oid)
+            if o is not None and o.op in ("arith.addi", "arith.add") and len(o.operand_ids or []) == 2:
+                parts = [_peel(x) for x in o.operand_ids]
+                if not any(p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs for p in parts):
+                    for x in o.operand_ids:
+                        _flat(x)
+                    return
+            atoms.append(oid)
+
+        for t in terms:
+            _flat(t)
+        agg = {k: {"range": 0, "iv": 0, "pid": None, "strides": []} for k in specs}
+        for a in atoms:
+            tm = self._quant_term(a, op_by_id)
+            if tm is None:
+                return (False, None)
+            axis, stride, idx = tm
+            kind = "vec" if axis is None else ("row" if axis == 1 else "col")
+            spec = specs.get(kind)
+            if spec is None:
+                return (False, None)
+            sh = self._quant_index_shape(idx, op_by_id, allow_iv=spec.get("allow_iv", False), allow_div=spec.get("allow_div"))
+            if sh is None:
+                return (False, None)
+            if sh["pid"] is not None and sh["pid"] != spec.get("want_pid"):
+                return (False, None)
+            g = agg[kind]
+            g["range"] += sh["range"]
+            g["iv"] += sh["iv"]
+            if sh["pid"] is not None:
+                g["pid"] = sh["pid"]
+            if stride != -1:
+                g["strides"].append(stride)
+            if sh["range"] == 0 and sh["iv"] == 0 and sh["pid"] is None:
+                return (False, None)
+        strides = {}
+        for kind, spec in specs.items():
+            g = agg[kind]
+            if spec is None:
+                if g["range"] or g["iv"] or g["strides"]:
+                    return (False, None)
+                continue
+            if g["range"] != 1 or g["iv"] > (1 if spec.get("allow_iv") else 0) or len(g["strides"]) > 1:
+                return (False, None)
+            strides[kind] = g["strides"][0] if g["strides"] else -1
+        return (True, strides)
+
+    def _quant_1d_addr_ok(self, ptr_id, arg, op_by_id, *, allow_iv, want_pid=None):
+        """1-D convenience over ``_quant_addr_ok``: ``(ok, stride_arg_index | -1)``."""
+        ok, st = self._quant_addr_ok(ptr_id, arg, op_by_id, vec=dict(want_pid=want_pid, allow_iv=allow_iv))
+        return (ok, st["vec"] if ok else None)
+
+    # ------------------------------------------------------------------ packet 104: EXACT
+    # per-role contracts. Packet 102's grammar bounded each term from ABOVE ("at most one
+    # pid / iv / stride") and never required what the template always replays; nine GEMV
+    # forms (no pid, pid * 2BN, no K term, output base/index +1, masked store, make_range
+    # (BN, 2BN) / (BK, 2BK)) plus a wrong loop step / bound / a duplicate pid therefore ran
+    # the specialized route with the raw result (packet 103 §2). Now every role's address
+    # must contain EXACTLY the terms the template re-emits — pid required-or-forbidden with
+    # its axis and coefficient, the induction variable required-or-forbidden, exactly one
+    # make_range with its bounds read, a stride required / forbidden / bound — and the
+    # descriptor cross-checks the numbers across roles and against the K-loop.
+
+    def _quant_index_exact(self, idx_id, op_by_id, *, ivs, div=None):
+        """Exact decomposition of a 1-D tile index: ``{"pid": (axis, coef) | None,
+        "range": (start, end) | None, "iv": 0 | 1}`` or None on any foreign term or any
+        duplicated term. Peels layout wrappers and index casts; ``div`` admits one leading
+        ``index // div`` (the int4 GEMV's byte ``k // 2`` and group ``k // G``)."""
+        wrappers = ("ttg.convert_layout", "tt.expand_dims", "tt.broadcast", "tt.splat")
+
+        def _peel(v):
+            o = op_by_id.get(v)
+            while o is not None and (o.op in wrappers or o.op in self._IDX_CASTS) and o.operand_ids:
+                v = o.operand_ids[0]
+                o = op_by_id.get(v)
+            return v, o
+
+        v, o = _peel(idx_id)
+        if div is not None:
+            if o is None or o.op not in ("arith.divsi", "arith.divui") or len(o.operand_ids or []) != 2:
+                return None
+            if self._const_int(o.operand_ids[1], op_by_id) != div:
+                return None
+            v, o = _peel(o.operand_ids[0])
+        addends = []
+
+        def _flat(x):
+            x, xo = _peel(x)
+            if xo is not None and xo.op in ("arith.addi", "arith.add") and len(xo.operand_ids or []) == 2:
+                for y in xo.operand_ids:
+                    _flat(y)
+            else:
+                addends.append(x)
+
+        _flat(v)
+        res = {"pid": None, "range": None, "iv": 0}
+        for a in addends:
+            ao = op_by_id.get(a)
+            if ao is None:
+                if a in ivs:
+                    res["iv"] += 1
+                    continue
+                return None  # a runtime scalar / unknown block arg
+            if ao.op == "tt.make_range":
+                if res["range"] is not None:
+                    return None
+                try:
+                    res["range"] = (int(ao.attrs.get("start", 0)), int(ao.attrs.get("end")))
+                except (TypeError, ValueError):
+                    return None
+                continue
+            if ao.op in ("arith.muli", "arith.mul") and len(ao.operand_ids or []) == 2:
+                sides = [_peel(x)[0] for x in ao.operand_ids]
+                consts = [self._const_int(x, op_by_id) for x in sides]
+                ci = next((i for i, c in enumerate(consts) if c is not None), None)
+                pe = self._pid_expr(sides[1 - ci], op_by_id) if ci is not None else None
+                if ci is None or pe is None or pe[1] is not None or res["pid"] is not None:
+                    return None
+                res["pid"] = (pe[0], consts[ci])
+                continue
+            pe = self._pid_expr(a, op_by_id)
+            if pe is not None and pe[1] is None:
+                if res["pid"] is not None:
+                    return None
+                res["pid"] = (pe[0], 1)
+                continue
+            return None
+        if res["iv"] > 1:
+            return None
+        return res
+
+    def _quant_kloop(self, op_by_id, k_arg):
+        """The kernel's ONE ``scf.for`` is ``range(0, args[k_arg], STEP)`` with a constant
+        step: returns ``(induction_variable_id, step)`` or None."""
+        fors = [o for o in op_by_id.values() if o.op == "scf.for"]
+        if len(fors) != 1 or len(fors[0].operand_ids or []) < 3:
+            return None
+        f = fors[0]
+        arg_idx = {getattr(a, "id", None): i for i, a in enumerate(self.graph.args)}
+        lo = self._strip_wrappers(f.operand_ids[0], op_by_id, self._IDX_CASTS)
+        hi = self._strip_wrappers(f.operand_ids[1], op_by_id, self._IDX_CASTS)
+        st = self._strip_wrappers(f.operand_ids[2], op_by_id, self._IDX_CASTS)
+        if self._const_int(lo, op_by_id) != 0 or arg_idx.get(hi) != k_arg:
+            return None
+        step = self._const_int(st, op_by_id)
+        ba = list((f.attrs or {}).get("block_arg_ids") or [])
+        if step is None or step <= 0 or not ba:
+            return None
+        return (ba[0], step)
+
+    def _quant_role_addr(self, ptr_id, arg, op_by_id, *, ivs, kinds):
+        """EXACT address contract for one staged role. ``kinds`` maps ``"vec"`` (1-D) or
+        ``"row"`` / ``"col"`` (expand axis 1 / 0) to ``dict(pid=("required", axis) | None,
+        iv=0 | 1, stride="unit" | "required" | "bound", div=None | int)``. The pointer is
+        ``addptr*(splat(arg) | arg, terms)``; the flattened terms cover exactly the given
+        kinds, each with exactly one ``make_range``, the pid present iff required (on that
+        axis, once, with its coefficient read), exactly ``iv`` induction-variable addends,
+        and a stride term absent (unit) / present once (required) / at most once (bound).
+        Returns ``(True, {kind: {"pid": (axis, coef) | None, "range": (start, end),
+        "stride": arg_index | -1}})`` or ``(False, None)``. The caller cross-checks the
+        numbers (``coef == end``, ``start == 0``, equality across roles, ``end == step``)."""
+
+        def _peel(oid):
+            o = op_by_id.get(oid)
+            while o is not None and o.op in ("ttg.convert_layout", "tt.broadcast") and o.operand_ids:
+                oid = o.operand_ids[0]
+                o = op_by_id.get(oid)
+            return oid, o
+
+        terms = []
+        base_id, cur = ptr_id, op_by_id.get(ptr_id)
+        depth = 0
+        while cur is not None and cur.op == "tt.addptr" and len(cur.operand_ids or []) == 2 and depth < 8:
+            depth += 1
+            terms.append(cur.operand_ids[1])
+            base_id, cur = _peel(cur.operand_ids[0])
+        if depth == 0:
+            return (False, None)
+        if cur is None:
+            if base_id != getattr(arg, "id", None):
+                return (False, None)
+        elif not (cur.op == "tt.splat" and cur.operand_ids and cur.operand_ids[0] == getattr(arg, "id", None)):
+            return (False, None)
+
+        atoms = []
+
+        def _flat(oid):
+            _oid, o = _peel(oid)
+            if o is not None and o.op in ("arith.addi", "arith.add") and len(o.operand_ids or []) == 2:
+                parts = [_peel(x) for x in o.operand_ids]
+                if not any(p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs for p in parts):
+                    for x in o.operand_ids:
+                        _flat(x)
+                    return
+            atoms.append(oid)
+
+        for t in terms:
+            _flat(t)
+        acc = {k: {"pid": None, "range": None, "iv": 0, "strides": []} for k in kinds}
+        for a in atoms:
+            tm = self._quant_term(a, op_by_id)
+            if tm is None:
+                return (False, None)
+            axis, stride, idx = tm
+            kind = "vec" if axis is None else ("row" if axis == 1 else "col")
+            spec = kinds.get(kind)
+            if spec is None:
+                return (False, None)
+            ex = self._quant_index_exact(idx, op_by_id, ivs=ivs, div=spec.get("div"))
+            if ex is None:
+                return (False, None)
+            g = acc[kind]
+            if ex["pid"] is not None:
+                if g["pid"] is not None:
+                    return (False, None)
+                g["pid"] = ex["pid"]
+            if ex["range"] is not None:
+                if g["range"] is not None:
+                    return (False, None)
+                g["range"] = ex["range"]
+            g["iv"] += ex["iv"]
+            if stride != -1:
+                g["strides"].append(stride)
+        out = {}
+        for kind, spec in kinds.items():
+            g = acc[kind]
+            if g["range"] is None or g["iv"] != spec.get("iv", 0):
+                return (False, None)
+            want = spec.get("pid")
+            if want is None:
+                if g["pid"] is not None:
+                    return (False, None)
+            else:
+                if g["pid"] is None or g["pid"][0] != want[1]:
+                    return (False, None)
+            mode = spec.get("stride", "unit")
+            if (mode == "unit" and g["strides"]) or (mode == "required" and len(g["strides"]) != 1) or len(g["strides"]) > 1:
+                return (False, None)
+            out[kind] = {"pid": g["pid"], "range": g["range"], "stride": g["strides"][0] if g["strides"] else -1}
+        return (True, out)
+
+    def _quant_gemm_contract(self, op_by_id, *, k_arg, nk=False, b_kdiv=1):
+        """EXACT tile / loop / store contract of the quantized GEMM templates (per-group,
+        symmetric): A ``[pid(0)*BM + range(0,BM)] x [range(0,BK) (+ k)]``, B ``[range(0,BK)
+        (+ k)] x [pid(1)*BN + range(0,BN)]`` (``nk``: B loaded ``[n] x [k]``), C ``[pid(0)*BM
+        + range(0,BM)] x [pid(1)*BN + range(0,BN)]`` with a PLAIN store, the ONE K-loop
+        ``range(0, args[k_arg], BK)``, and each K operand either loop-carried (its pointer an
+        iter-arg advanced by exactly ``BK * K-stride``, no ``k`` in the index) or in-loop
+        (``range(0,BK) + k``, pointer not carried). Packet 103/104: a missing pid, ``pid *
+        2BM``, a missing K term, shifted ranges, a wrong loop step / bound, a duplicate pid
+        or swapped output axes all ran the template with the raw result. Returns
+        ``{"bm", "bn", "bk", "iv"}`` or None."""
+        traced = self.infer_dot_strides(with_index=True)
+        if traced is None:
+            return None
+        strides, index_ids, _addr_ids = traced
+        kl = self._quant_kloop(op_by_id, k_arg)
+        if kl is None:
+            return None
+        iv, step = kl
+        ivs = {iv}
+        arg_by_id = {getattr(a, "id", None): a for a in self.graph.args}
+        dots = [o for o in op_by_id.values() if o.op == "tt.dot"]
+        fors = [o for o in op_by_id.values() if o.op == "scf.for"]
+        if len(dots) != 1 or len(fors) != 1:
+            return None
+        dot, f = dots[0], fors[0]
+        bargs = list((f.attrs or {}).get("block_arg_ids") or [])
+        inits = list(f.operand_ids[3:]) if len(f.operand_ids or []) > 3 else []
+        ylds = [o for o in (f.region_ops or []) if o.op == "scf.yield"]
+        if len(ylds) != 1 or len(bargs) != len(inits) + 1 or len(ylds[0].operand_ids or []) != len(inits):
+            return None
+        yld = ylds[0]
+
+        def _advance_of(load):
+            ptr = self._strip_wrappers(load.operand_ids[0], op_by_id, ("ttg.convert_layout",))
+            if ptr in bargs[1:]:
+                y = op_by_id.get(yld.operand_ids[bargs.index(ptr) - 1])
+                if y is None or y.op != "tt.addptr" or len(y.operand_ids or []) < 2 or y.operand_ids[0] != ptr:
+                    return "bad"
+                return y.operand_ids[1]
+            return None
+
+        def _kdim(role, ix, kstride):
+            # ``b_kdiv`` (int4 GEMM): the packed weight's K index is ``(range(0,BK) + k) // 2``
+            # (a byte per nibble pair) and a carried pointer advances by BK // 2 bytes.
+            kdiv = b_kdiv if role == "B" else 1
+            load = self._quant_find_load(dot.operand_ids[0 if role == "A" else 1], op_by_id)
+            if load is None or not load.operand_ids or ix is None:
+                return None
+            adv = _advance_of(load)
+            if adv == "bad":
+                return None
+            ex = self._quant_index_exact(ix, op_by_id, ivs=ivs, div=(kdiv if kdiv != 1 else None))
+            if ex is None or ex["pid"] is not None:
+                return None
+            c = self._quant_tile_ok(ex, block=step)
+            if c is None:
+                return None
+            if adv is not None:
+                if ex["iv"] != 0 or not self._advance_matches(adv, step // kdiv, kstride, op_by_id, arg_by_id):
+                    return None
+            elif ex["iv"] != 1:
+                return None
+            return c
+
+        def _ndim(ix, axis):
+            if ix is None:
+                return None
+            ex = self._quant_index_exact(ix, op_by_id, ivs=ivs)
+            if ex is None or ex["iv"] != 0 or ex["pid"] is None or ex["pid"][0] != axis:
+                return None
+            return self._quant_tile_ok(ex)
+
+        a_row, a_col = index_ids.get("A", (None, None))
+        b_row, b_col = index_ids.get("B", (None, None))
+        c_row, c_col = index_ids.get("C", (None, None))
+        bm = _ndim(a_row, 0)
+        bk = _kdim("A", a_col, strides["A"][1])
+        if nk:
+            bn = _ndim(b_row, 1)
+            bk_b = _kdim("B", b_col, strides["B"][1])
+        else:
+            bk_b = _kdim("B", b_row, strides["B"][0])
+            bn = _ndim(b_col, 1)
+        cm = _ndim(c_row, 0)
+        cn = _ndim(c_col, 1)
+        if None in (bm, bk, bn, bk_b, cm, cn) or bk != bk_b or bm != cm or bn != cn:
+            return None
+        stores = [o for o in op_by_id.values() if o.op == "tt.store"]
+        if len(stores) != 1 or len(stores[0].operand_ids or []) != 2:
+            return None  # a masked store is not replayed
+        return {"bm": bm, "bn": bn, "bk": bk, "iv": iv}
+
+    @staticmethod
+    def _quant_tile_ok(info, *, block=None):
+        """An n-tile ``pid * C + range(0, C)`` (or a k-tile ``range(0, C)`` when no pid):
+        start 0, coefficient == end; returns C (or None). ``block`` pins C to a known value."""
+        if info is None or info["range"] is None or info["range"][0] != 0:
+            return None
+        c = info["range"][1]
+        if info["pid"] is not None and info["pid"][1] != c:
+            return None
+        if block is not None and c != block:
+            return None
+        return c
+
+    def _quant_input_path_ok(self, vid, arg_index, op_by_id, *, role="gemm"):
+        """Round 2.1 F3 + packet 102: the quantized templates stage the INPUT operand (A of a
+        GEMM, x of a GEMV) from its raw pointer, so its value path must be EXACTLY what the
+        template replays — replay-based, default-deny. GPU on clean ``ba21e9d``: a cast, a
+        mask, a square in-tile transpose, a wrong-axis expand, a base or index offset on
+        the input each stored the raw-pointer result on every route (err vs the IR-ordered
+        oracle 0.036 … 372).
+
+          gemm role: ``load -> {convert_layout, local_alloc, local_load}* -> dot``
+                     (no expand/broadcast/transpose — the template tiles A itself);
+          gemv role: ``load -> {convert_layout}* -> expand_dims(axis 0) -> {convert_layout}*
+                     -> broadcast([1,K] -> [N,K])`` (the ``x[None, :]`` the kernel spells;
+                     the template broadcasts x across rows itself — the wrong-axis
+                     ``x[:, None]`` at N == K computed a different contraction).
+
+        The load is PLAIN (no mask / other), its element type equals the buffer's and the
+        operand's, and its pointer is the argument itself: 2-D (gemm) through the strict
+        stride tracer's address proof (base offsets and residual terms refuse there), 1-D
+        (gemv) exactly ``addptr(splat(x), range [+ k])`` (``_quant_1d_addr_ok``)."""
+        from triton_msl.codegen.mlir_walker import _extract_shape
+
+        args = self.graph.args
+        if arg_index >= len(args):
+            return False
+        arg = args[arg_index]
+        opnd = op_by_id.get(vid)
+        identity = ("ttg.convert_layout", "ttg.local_alloc", "ttg.local_load")
+        state = "start"
+        seen = set()
+        cur = vid
+        while cur not in seen:
+            seen.add(cur)
+            o = op_by_id.get(cur)
+            if o is None or not o.operand_ids:
+                return False
+            if o.op in identity:
+                if role == "gemv" and o.op != "ttg.convert_layout":
+                    return False
+                cur = o.operand_ids[0]
+                continue
+            if role == "gemv" and o.op == "tt.broadcast" and state == "start":
+                src = op_by_id.get(o.operand_ids[0])
+                ss = _extract_shape((src.type_str if src is not None else "") or "")
+                rs = _extract_shape(o.type_str or "")
+                if not (ss and rs and len(ss) == 2 and len(rs) == 2 and ss[0] == 1 and ss[1] == rs[1]):
+                    return False
+                state = "bcast"
+                cur = o.operand_ids[0]
+                continue
+            if role == "gemv" and o.op == "tt.expand_dims" and state == "bcast":
+                if str((o.attrs or {}).get("axis")) != "0":
+                    return False
+                state = "expand"
+                cur = o.operand_ids[0]
+                continue
+            if o.op == "tt.load":
+                if role == "gemv" and state != "expand":
+                    return False
+                if not self._quant_plain_load(o):
+                    return False
+                if o.elem_type != arg.elem_type or (opnd is not None and opnd.elem_type != o.elem_type):
+                    return False
+                if role == "gemv":
+                    return True  # the address is proven EXACTLY by the descriptor (_quant_role_addr, packet 104)
+                iter_inits = self._scf_iter_inits(op_by_id)  # loop-carried A pointers trace to their inits
+                src = self._trace_ptr_source(o.operand_ids[0], op_by_id, iter_inits=iter_inits)
+                return src is not None and src.name == arg.name
+            return False
+        return False
+
     def _maybe_quant_gemv_int4_descriptor(self):
         """CANONICAL weight-only INT4 (GPTQ/AWQ per-group) decode GEMV, or None.
 
@@ -2816,6 +3380,8 @@ class _TemplateMixin:
         sitofp = _find(sub.operand_ids[0], ("arith.sitofp",))
         if sitofp is None or not sitofp.operand_ids:
             return None
+        if not self._quant_legs_plain((scale_bc, zero_bc), op_by_id):  # packet 102: masks never replayed
+            return None
 
         # --- NIBBLE unpack: andi(shrui(extui(load_w), shift), 0xF), shift=(k%2)*4. ---
         andi = op_by_id.get(sitofp.operand_ids[0])
@@ -2835,6 +3401,8 @@ class _TemplateMixin:
         if extui is None or not extui.operand_ids:
             return None
         w_load = _find(extui.operand_ids[0], ("tt.load",))
+        if not self._quant_plain_load(w_load):  # packet 102: a masked packed-weight load is never replayed
+            return None
         # shift = muli(remsi(kk, 2), 4)  → low nibble for even k, high for odd k.
         muli_op = _find(shr.operand_ids[1], ("arith.muli",))
         if muli_op is None or len(muli_op.operand_ids) != 2:
@@ -2883,6 +3451,12 @@ class _TemplateMixin:
         if g_s is None or g_s != g_z or g_s < 2:
             return None
         group_size = g_s
+        # Packet 105 A: make_int4_gemv dequantizes BOTH nibbles of a byte with ONE
+        # scale/zero group ((2b) // G); the kernel computes k // G per nibble. Equivalent
+        # only when group boundaries are byte-aligned -> G must be even (GPU: G = 3 stored
+        # the template's result, err 8.3 vs the kernel's semantics).
+        if group_size % 2 != 0:
+            return None
 
         # --- Canonical signature + arg bindings. ---
         args = self.graph.args
@@ -2905,6 +3479,8 @@ class _TemplateMixin:
                 return None
             return _to_arg(o.operand_ids[0], d + 1)
 
+        if not self._quant_input_path_ok(x_bc, 0, op_by_id, role="gemv"):  # F3/102: plain load, x[None, :], exact address
+            return None
         if _to_arg(x_bc) != 0 or _to_arg(w_load.operand_ids[0]) != 1:
             return None
         if _to_arg(scale_bc) != 3 or _to_arg(zero_bc) != 4:
@@ -2944,8 +3520,48 @@ class _TemplateMixin:
                     return idx
             return None
 
-        swn_idx = _row_stride_idx(w_load.operand_ids[0])
-        ssn_idx = _row_stride_idx(scale_bc)
+        # Packet 102/104: EXACT address contracts for every role make_int4_gemv replays —
+        # x ``+ range(0,BK) + k``; packed weight ``+ (pid(0)*BN + range(0,BN))[:,None]*swn +
+        # ((range(0,BK) + k) // 2)[None,:]``; scale/zero ``+ (pid(0)*BN + range(0,BN))[:,None]
+        # *ssn + ((range(0,BK) + k) // G)[None,:]``; output ``+ pid(0)*BN + range(0,BN)``
+        # (plain store); the ONE K-loop ``range(0, K, BK)``. The strides the template is
+        # given are the ones proven here (weight row, scale row == zero row).
+        _kl4 = self._quant_kloop(op_by_id, 6)
+        if _kl4 is None:
+            return None
+        _iv4, _step4 = _kl4
+        _ivs4 = {_iv4}
+        _xl4 = self._quant_find_load(x_bc, op_by_id)
+        _sl4 = self._quant_find_load(scale_bc, op_by_id)
+        _zl4 = self._quant_find_load(zero_bc, op_by_id)
+        if any(x is None or not x.operand_ids for x in (_xl4, _sl4, _zl4)):
+            return None
+        _N4 = dict(pid=("required", 0), iv=0, stride="required")
+        _KV4 = dict(pid=None, iv=1, stride="unit")
+        okx4, ix4 = self._quant_role_addr(_xl4.operand_ids[0], args[0], op_by_id, ivs=_ivs4, kinds={"vec": _KV4})
+        okw4, iw4 = self._quant_role_addr(w_load.operand_ids[0], args[1], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": dict(pid=None, iv=1, stride="unit", div=2)})
+        _CG4 = dict(pid=None, iv=1, stride="unit", div=group_size)
+        oks4, is4 = self._quant_role_addr(_sl4.operand_ids[0], args[3], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4})
+        okz4, iz4 = self._quant_role_addr(_zl4.operand_ids[0], args[4], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4})
+        if not (okx4 and okw4 and oks4 and okz4):
+            return None
+        _st4 = stores[0]
+        if len(_st4.operand_ids or []) != 2:
+            return None  # a masked store is not replayed
+        oko4, io4 = self._quant_role_addr(_st4.operand_ids[0], args[2], op_by_id, ivs=_ivs4, kinds={"vec": dict(pid=("required", 0), iv=0, stride="unit")})
+        if not oko4:
+            return None
+        _bn4 = self._quant_tile_ok(iw4["row"])
+        if _bn4 is None or any(self._quant_tile_ok(t, block=_bn4) is None for t in (is4["row"], iz4["row"], io4["vec"])):
+            return None
+        _bk4 = self._quant_tile_ok(ix4["vec"], block=_step4)
+        if _bk4 is None or any(self._quant_tile_ok(t, block=_bk4) is None for t in (iw4["col"], is4["col"], iz4["col"])):
+            return None
+        if is4["row"]["stride"] != iz4["row"]["stride"]:
+            return None  # the template applies ONE row stride to scale and zero
+
+        swn_idx = iw4["row"]["stride"]  # the strides the template is bound to are the proven ones
+        ssn_idx = is4["row"]["stride"]
         # ng arg: the per-group count (scales [N, ng]); it's the arg whose value == K/group.
         # Bound at dispatch by ng_idx if we can find it; otherwise omit (dispatch recomputes).
         ng_idx = None
@@ -2957,7 +3573,10 @@ class _TemplateMixin:
         from triton_msl.codegen._msl_templates import make_int4_gemv
 
         int4_msl = make_int4_gemv(group_size)
-        return ("gemv_int4", int4_msl, 0, 1, 2, 3, 4, 5, 6, swn_idx, ssn_idx, ng_idx, group_size)
+        # [13] = the SOURCE program mapping (BN; one program per BN outputs on program_id(0)):
+        # the dispatcher runs the template only for a launch of exactly cdiv(N, BN) programs
+        # (packet 105 B: a partial launch used to run the full output).
+        return ("gemv_int4", int4_msl, 0, 1, 2, 3, 4, 5, 6, swn_idx, ssn_idx, ng_idx, group_size, _bn4)
 
     def _maybe_quant_gemv_descriptor(self):
         """Build the runtime QUANTIZED-GEMV (decode / M=1) dispatch descriptor, or None.
@@ -3072,6 +3691,8 @@ class _TemplateMixin:
         if sitofp is None or not sitofp.operand_ids:
             return None
         w_load = sitofp.operand_ids[0]
+        if not self._quant_legs_plain((w_load, zero_bc), op_by_id):  # packet 102: masks never replayed
+            return None
 
         args = self.graph.args
         arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
@@ -3099,6 +3720,8 @@ class _TemplateMixin:
         # --- Trace every leg to its arg and require the canonical binding. ---
         if _trace_to_arg(x_bc) != 0:
             return None  # input vector
+        if not self._quant_input_path_ok(x_bc, 0, op_by_id, role="gemv"):  # F3/102: plain load, x[None, :], exact address
+            return None
         if _trace_to_arg(w_load) != 1:
             return None  # weight
         if _trace_to_arg(zero_bc) != 4:
@@ -3134,6 +3757,47 @@ class _TemplateMixin:
                     return None  # scale applied both in-reduce AND as epilogue -> refuse
         if _trace_to_arg(scale_bc) != 3:
             return None  # per-N scale (arg 3)
+        if not self._quant_legs_plain((scale_bc,), op_by_id):  # packet 102
+            return None
+        # Packet 102/104: EXACT address contracts for every role make_int8_gemv replays —
+        # x ``+ range(0,BK) + k``, scale/zero/output ``+ pid(0)*BN + range(0,BN)``, weight
+        # ``+ (pid(0)*BN + range(0,BN))[:,None]*swn + (range(0,BK) + k)[None,:]`` — the ONE
+        # K-loop ``range(0, K, BK)``, and a PLAIN output store. Packet 103: a missing pid, a
+        # ``pid * 2BN``, a missing K term, ``make_range(BN, 2BN)``, an output base / index
+        # shift, a masked store, a wrong loop step / bound all ran the specialized route with
+        # the raw result.
+        _kl = self._quant_kloop(op_by_id, 6)
+        if _kl is None:
+            return None
+        _iv, _step = _kl
+        _ivs = {_iv}
+        _xl = self._quant_find_load(x_bc, op_by_id)
+        _sl = self._quant_find_load(scale_bc, op_by_id)
+        _zl = self._quant_find_load(zero_bc, op_by_id)
+        _wl = self._quant_find_load(w_load, op_by_id)
+        if any(x is None or not x.operand_ids for x in (_xl, _sl, _zl, _wl)):
+            return None
+        _N = dict(pid=("required", 0), iv=0, stride="unit")
+        _KV = dict(pid=None, iv=1, stride="unit")
+        okx, ix = self._quant_role_addr(_xl.operand_ids[0], args[0], op_by_id, ivs=_ivs, kinds={"vec": _KV})
+        oks, isc = self._quant_role_addr(_sl.operand_ids[0], args[3], op_by_id, ivs=_ivs, kinds={"vec": _N})
+        okz, iz = self._quant_role_addr(_zl.operand_ids[0], args[4], op_by_id, ivs=_ivs, kinds={"vec": _N})
+        okw, iw = self._quant_role_addr(_wl.operand_ids[0], args[1], op_by_id, ivs=_ivs, kinds={"row": dict(pid=("required", 0), iv=0, stride="required"), "col": _KV})
+        if not (okx and oks and okz and okw):
+            return None
+        if len(store.operand_ids or []) != 2:
+            return None  # a masked store is not replayed
+        oko, io = self._quant_role_addr(store.operand_ids[0], args[2], op_by_id, ivs=_ivs, kinds={"vec": _N})
+        if not oko:
+            return None
+        _bn = self._quant_tile_ok(isc["vec"])
+        if _bn is None or any(self._quant_tile_ok(t, block=_bn) is None for t in (iz["vec"], iw["row"], io["vec"])):
+            return None
+        _bk = self._quant_tile_ok(ix["vec"], block=_step)
+        if _bk is None or self._quant_tile_ok(iw["col"], block=_bk) is None:
+            return None
+        if iw["row"]["stride"] != 7:
+            return None  # the weight row stride must be the signature's args[7]
 
         # --- dtypes: input fp32, output fp32, weight int8. ---
         if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
@@ -3157,7 +3821,8 @@ class _TemplateMixin:
         from triton_msl.codegen._msl_templates import make_int8_gemv
 
         gemv_msl = make_int8_gemv()
-        return ("gemv", gemv_msl, 0, 1, 2, 3, 4, 5, 6, stride_checks)
+        # [10] = the SOURCE program mapping (BN on program_id(0)) — packet 105 B.
+        return ("gemv", gemv_msl, 0, 1, 2, 3, 4, 5, 6, stride_checks, _bn)
 
     def _maybe_quant_matmul_descriptor(self):
         """Build the runtime QUANTIZED-matmul dispatch descriptor, or None.
@@ -3212,6 +3877,10 @@ class _TemplateMixin:
         if args[5].is_ptr or args[6].is_ptr or args[7].is_ptr:
             return None
         arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+        # F3: the A operand's VALUE path must be its load (both the fast and the scalar
+        # per-group routes behind this descriptor stage A from the pointer type).
+        if not self._quant_input_path_ok(dot.operand_ids[0], 0, op_by_id):
+            return None
 
         # --- Exact dequant tree: mulf(subf(<sitofp weight>, zero_bc), scale_bc).
         #     A leading tt.trans on B means the weight is stored [N,K] (GPTQ prefill,
@@ -3260,6 +3929,10 @@ class _TemplateMixin:
             return any(_has_int_to_float(x, seen, d + 1) for x in (o.operand_ids or []))
 
         if not _has_int_to_float(sub.operand_ids[0]):
+            return None
+        # Packet 102: the weight / scale / zero loads are staged from their raw pointers —
+        # a mask or ``other`` on any of them is never replayed (GPU: raw result stored).
+        if not self._quant_legs_plain((sub.operand_ids[0], scale_bc, zero_bc), op_by_id):
             return None
 
         # --- scale_bc -> args[3], zero_bc -> args[4] (walk operand[0]: bcast/expand/
@@ -3451,6 +4124,10 @@ class _TemplateMixin:
                 return None
             if not _sd or not all(_sd.get(x) for x in ("A", "B", "C")):
                 return None
+            _gc = self._quant_gemm_contract(op_by_id, k_arg=7, nk=_is_nk[0], b_kdiv=(2 if _is_int4 else 1))  # packet 104
+            if _gc is None:
+                return None
+            _bn_expect = _gc["bn"]
             # A stride can be a runtime ARG (its index) or a compile-time constant 1
             # (equal_to_1 specialization folds a contiguous stride out of the arg list;
             # infer_dot_strides then reports "1"). Encode const-1 as the sentinel -1 (the
@@ -3470,25 +4147,20 @@ class _TemplateMixin:
             ]
 
             def _vec_stride(tid):
-                # a `range * stride` offset tensor -> the arg index of `stride`; a bare
-                # `range` (stride folded to 1) -> -1.
-                o = op_by_id.get(tid)
-                if o is None:
+                # Packet 102/104: the per-N term must be EXACTLY ``offs_n [* splat(stride)]``
+                # with ``offs_n = program_id(1) * BN + range(0, BN)`` (the SAME BN as the dot's
+                # N tile) -> the stride's arg index (-1 when folded to 1). Reading the stride
+                # alone let ``(offs_n + 1) * ssn`` through; a missing pid, ``pid * 2BN`` or
+                # ``range(BN, 2BN)`` passed the "at most one" grammar (packet 103).
+                tm = self._quant_term(tid, op_by_id)
+                if tm is None or tm[0] is not None:
+                    return None  # not a 1-D term
+                ex = self._quant_index_exact(tm[2], op_by_id, ivs=set())
+                if ex is None or ex["iv"] != 0 or ex["pid"] is None or ex["pid"][0] != 1:
                     return None
-                if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.expand_dims") and o.operand_ids:
-                    return _vec_stride(o.operand_ids[0])
-                if o.op == "arith.muli":
-                    for oid in o.operand_ids:
-                        sub = op_by_id.get(oid)
-                        if sub is not None and sub.op in ("tt.splat", "tt.broadcast") and sub.operand_ids:
-                            ai = arg_id_to_idx.get(sub.operand_ids[0])
-                            if ai is not None:
-                                return ai
-                        ai = arg_id_to_idx.get(oid)
-                        if ai is not None:
-                            return ai
+                if self._quant_tile_ok(ex, block=_bn_expect) is None:
                     return None
-                return -1  # no stride multiply -> stride == 1
+                return tm[1]
 
             def _G_from_divsi(dv):
                 d = op_by_id.get(dv)
@@ -3568,13 +4240,13 @@ class _TemplateMixin:
                 )
                 _fast4 = make_int4_matmul_pergroup_fast(g_s, _rr, _rc, _bk) if (g_s % _bk == 0) else None
                 return ("pergroup_int4", make_int4_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx),
-                        _fast4, _rr, _rc, _bk, g_s)
+                        _fast4, _rr, _rc, _bk, g_s, (_gc["bm"], _gc["bn"]))  # [11] source (BM, BN), packet 105 B
             from triton_msl.codegen._msl_templates import (
                 make_int8_matmul_pergroup, make_int8_matmul_pergroup_fast,
             )
             _fast = make_int8_matmul_pergroup_fast(g_s, _rr, _rc, _bk) if (g_s % _bk == 0) else None
             return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx),
-                    _fast, _rr, _rc, _bk, g_s)
+                    _fast, _rr, _rc, _bk, g_s, (_gc["bm"], _gc["bn"]))  # [11] source (BM, BN), packet 105 B
 
         # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
         try:
@@ -3588,6 +4260,19 @@ class _TemplateMixin:
             return None
         if not (a_rc[1] == "1" and b_rc[1] == "1" and c_rc[1] == "1"):
             return None  # non-contiguous inner (some other transpose) -> refuse
+        _gc = self._quant_gemm_contract(op_by_id, k_arg=7, nk=_is_nk[0])  # packet 104: exact tiles / loop / store
+        if _gc is None:
+            return None
+        # per-N scale / zero: EXACTLY ``ptr + program_id(1) * BN + range(0, BN)`` — the fast
+        # kernel reads scale[n] / zero[n] contiguous (a runtime stride is not replayed).
+        _NN = dict(pid=("required", 1), iv=0, stride="unit")
+        for _bc, _ai in ((scale_bc, 3), (zero_bc, 4)):
+            _ld = self._quant_find_load(_bc, op_by_id)
+            if _ld is None or not _ld.operand_ids:
+                return None
+            _okn, _in = self._quant_role_addr(_ld.operand_ids[0], args[_ai], op_by_id, ivs={_gc["iv"]}, kinds={"vec": _NN})
+            if not _okn or self._quant_tile_ok(_in["vec"], block=_gc["bn"]) is None:
+                return None
 
         # --- K-loop bound anchors to args[7] (the reliable K binding; same net as
         #     the fast-matmul descriptor). A non-canonical dim binding -> refuse. ---
@@ -3643,7 +4328,8 @@ class _TemplateMixin:
         rr, rc = 4, 2
         layout = "nk" if _is_nk[0] else "kn"
         fast_msl = make_int8_matmul_fast(rr=rr, rc=rc, bk=32, layout=layout)
-        return (fast_msl, 5, 6, 7, 8 * rr, 8 * rc, tuple(stride_checks))
+        # [7] = the SOURCE program mapping (BM on program_id(0), BN on program_id(1)) — packet 105 B.
+        return (fast_msl, 5, 6, 7, 8 * rr, 8 * rc, tuple(stride_checks), (_gc["bm"], _gc["bn"]))
 
     def _maybe_quant_matmul_symmetric_descriptor(self):
         """SYMMETRIC weight-only int8 GEMM: out = a @ (w_i8.to(float) * scale), NO
@@ -3676,6 +4362,8 @@ class _TemplateMixin:
         if len(args) < 7 or args[4].is_ptr or args[5].is_ptr or args[6].is_ptr:
             return None
         arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+        if not self._quant_input_path_ok(dot.operand_ids[0], 0, op_by_id):  # F3
+            return None
 
         def _peel(oid):
             o = op_by_id.get(oid)
@@ -3715,6 +4403,8 @@ class _TemplateMixin:
                 break
         if w_side is None:
             return None
+        if not self._quant_legs_plain((w_side, scale_bc), op_by_id):  # packet 102: masks never replayed
+            return None
 
         def _trace_to_arg(oid, d=0):
             if d > 32:
@@ -3744,6 +4434,9 @@ class _TemplateMixin:
         except Exception:  # noqa: BLE001
             return None
         if not sd or not all(sd.get(x) for x in ("A", "B", "C")):
+            return None
+        _gc = self._quant_gemm_contract(op_by_id, k_arg=6, nk=False)  # packet 104: exact tiles / loop / store
+        if _gc is None:
             return None
         _nti = {a.name: i for i, a in enumerate(args)}
 
@@ -3783,12 +4476,16 @@ class _TemplateMixin:
         sld = _find_load(scale_bc)
         if sld is None or not sld.operand_ids:
             return None
-        saddr = op_by_id.get(sld.operand_ids[0])
-        if saddr is None or saddr.op != "tt.addptr" or len(saddr.operand_ids) < 2:
+        # Packet 102: the scale address must be EXACTLY ``scale_ptr + offs_n [* ssn]`` with
+        # ``offs_n = program_id(1) * BN + range`` — ``_vec_stride`` read the stride and let a
+        # ``+ 1`` on the index vanish (GPU: raw result stored, err 0 vs raw).
+        _ok, _isym = self._quant_role_addr(
+            sld.operand_ids[0], args[3], op_by_id, ivs={_gc["iv"]},
+            kinds={"vec": dict(pid=("required", 1), iv=0, stride="bound")},
+        )
+        if not _ok or self._quant_tile_ok(_isym["vec"], block=_gc["bn"]) is None:
             return None
-        if _trace_to_arg(saddr.operand_ids[0]) != 3:
-            return None  # base must be scale_ptr (per-N: no inner g-addptr)
-        ssn = _vec_stride(saddr.operand_ids[1])
+        ssn = _isym["vec"]["stride"]
 
         idxs = [
             _sidx(sd["A"][0]), _sidx(sd["A"][1]),   # isr, isc
@@ -3799,7 +4496,8 @@ class _TemplateMixin:
         if any(i is None for i in idxs):
             return None
         from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
-        return ("sym_int8", make_int8_matmul_pergroup(32), 4, 5, 6, tuple(idxs))
+        # [6] = the SOURCE program mapping (BM on program_id(0), BN on program_id(1)) — packet 105 B.
+        return ("sym_int8", make_int8_matmul_pergroup(32), 4, 5, 6, tuple(idxs), (_gc["bm"], _gc["bn"]))
 
     def _maybe_fast_matmul_descriptor(self):
         """Build the runtime fast-matmul dispatch descriptor, or None.
@@ -3978,4 +4676,18 @@ class _TemplateMixin:
         # The driver builds alternative (rr,rc) variants for per-shape autotuning;
         # stride_checks are verified at dispatch (skip fast path if a runtime
         # stride doesn't match the assumed row-major layout).
-        return (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out, tuple(stride_checks))
+        # Packet 105 B: the SOURCE program mapping, proven by the value-path predicate
+        # (grid map + per-axis pid presence) and the dot operand tiles:
+        # ("2d", BM, BN, pid_on_rows, pid_on_cols) | ("1d", BM, BN). The dispatcher runs the
+        # fast template only for exactly that program grid.
+        _vp = self._dot_template_value_paths()
+        if _vp[0] is not None or len(_vp) < 5:
+            return None
+        _ops = {o.id: o for o in _all(self.graph.ops)}
+        _ash = _extract_shape(_ops[dot_ssa.operand_ids[0]].type_str or "") if dot_ssa.operand_ids[0] in _ops else None
+        _bsh = _extract_shape(_ops[dot_ssa.operand_ids[1]].type_str or "") if dot_ssa.operand_ids[1] in _ops else None
+        if not (_ash and _bsh and len(_ash) == 2 and len(_bsh) == 2):
+            return None
+        _bm, _bn = int(_ash[0]), int(_bsh[1])
+        _grid_spec = ("1d", _bm, _bn) if _vp[3] == "1d" else ("2d", _bm, _bn, bool(_vp[4][0]), bool(_vp[4][1]))
+        return (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out, tuple(stride_checks), _grid_spec)

@@ -114,7 +114,13 @@ def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None, mon
         monkeypatch.setattr(_tuner_mod, "best_rrrc", lambda *a, **kw: best_rrrc_override)
 
     kargs = [None, None, None, M, N, K]
-    dispatch_fast_matmul(rt, descriptor, kargs)
+    # Packet 105 B: a replacement dispatch needs the source program mapping in the
+    # descriptor ([9]) and the caller's launch grid; the synthetic descriptors here model
+    # a canonical 2-D 32x32-tiled kernel launched with its full grid.
+    if len(descriptor) < 10:
+        descriptor = tuple(descriptor) + ((),) * (9 - len(descriptor)) + (("2d", 32, 32, True, True),)
+    grid = ((M + 31) // 32, (N + 31) // 32, 1)
+    dispatch_fast_matmul(rt, descriptor, kargs, grid=grid)
     return rt
 
 

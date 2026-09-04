@@ -24,7 +24,52 @@ import math as _math
 _BK = 32
 
 
-def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _cdiv(a, b):
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def _launch_grid_ok(grid, expected):
+    """Packet 105 B: every quantized template computes the FULL output from M/N/K; it may
+    stand in for the compiled kernel only when the caller launched EXACTLY the program grid
+    the kernel maps (``cdiv(M, BM) x cdiv(N, BN)`` on program_id(0)/(1), or ``cdiv(N, BN)``
+    for a GEMV; unused axes 1). A partial launch used to run the whole output (GPU: N = 64,
+    BN = 32, ``grid=(1,)`` filled outputs 32..63 the kernel never wrote). No grid or no
+    contract in the descriptor -> not provably equivalent -> False (the driver refuses)."""
+    if grid is None or expected is None:
+        return False
+    try:
+        g = tuple(int(x) for x in grid)
+        e = tuple(int(x) for x in expected)
+    except (TypeError, ValueError):
+        return False
+    return len(g) == 3 and len(e) == 3 and g == e
+
+
+def _gemm_grid_ok(grid, bmbn, M, N):
+    """2-D quantized GEMM: the exact program grid ``(cdiv(M, BM), cdiv(N, BN), 1)`` the
+    kernel maps. (Tail tiles of a non-aligned extent: the unmasked kernel's own semantics
+    there is an out-of-bounds write — undefined — and the template's clip at M/N is the only
+    defined refinement; the program COUNT is still required to be the kernel's.)"""
+    try:
+        bm, bn = int(bmbn[0]), int(bmbn[1])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if bm <= 0 or bn <= 0:
+        return False
+    return _launch_grid_ok(grid, (_cdiv(M, bm), _cdiv(N, bn), 1))
+
+
+def _gemv_grid_ok(grid, bn, N):
+    try:
+        bn = int(bn)
+    except (TypeError, ValueError):
+        return False
+    if bn <= 0:
+        return False
+    return _launch_grid_ok(grid, (_cdiv(N, bn), 1, 1))
+
+
+def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Attempt to dispatch the fast quantized-matmul kernel.
 
     Parameters
@@ -47,19 +92,19 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     if isinstance(descriptor, (tuple, list)) and len(descriptor):
         if descriptor[0] == "gemv_int4":
             return _dispatch_int4_gemv(
-                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
         if descriptor[0] == "gemv":
             return _dispatch_gemv(
-                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
         if descriptor[0] in ("pergroup_int8", "pergroup_int4"):
             return _dispatch_pergroup_int8(
-                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
         if descriptor[0] == "sym_int8":
             return _dispatch_sym_int8(
-                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
             )
 
     try:
@@ -92,6 +137,9 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
         # is skipped (the driver then refuses -> never silent-wrong).
         if not (M > 0 and N > 0 and K > 0 and M % tile_m == 0 and N % tile_n == 0 and K % _BK == 0):
             return False
+        # LAUNCH CONTRACT (packet 105 B): descriptor[7] = the source (BM, BN).
+        if not _gemm_grid_ok(grid, descriptor[7] if len(descriptor) > 7 else None, M, N):
+            return False
 
         n_groups = _math.ceil(M / tile_m) * _math.ceil(N / tile_n)
         lib = rt.get_library(fast_msl)
@@ -110,7 +158,7 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
         return False
 
 
-def _dispatch_int4_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Dispatch make_int4_gemv (weight-only int4 per-group decode GEMV).
 
     descriptor = ("gemv_int4", int4_msl, in, w, out, scale, zero, n_idx, k_idx,
@@ -138,6 +186,12 @@ def _dispatch_int4_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_
             return False
         if not (N > 0 and K > 0 and K % 4 == 0 and K % group == 0):
             return False
+        # Packet 105 A: the template dequantizes both nibbles of a byte with ONE group ->
+        # the group must be byte-aligned (even). B: exact launch grid (descriptor[13] = BN).
+        if int(group) % 2 != 0:
+            return False
+        if not _gemv_grid_ok(grid, descriptor[13] if len(descriptor) > 13 else None, N):
+            return False
         gsz = 256
         threads = ((N * 32 + gsz - 1) // gsz) * gsz
         buffers = [kargs[in_idx], kargs[w_idx], kargs[out_idx], kargs[scale_idx], kargs[zero_idx], K, N]
@@ -154,7 +208,7 @@ def _dispatch_int4_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_
         return False
 
 
-def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Dispatch a SYMMETRIC int8 GEMM (no zero-point) via make_int8_matmul_pergroup.
 
     descriptor = ("sym_int8", pg_msl, m_idx, n_idx, k_idx,
@@ -176,6 +230,8 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_m
 
         M, N, K = int(kargs[m_idx]), int(kargs[n_idx]), int(kargs[k_idx])
         if not (M > 0 and N > 0 and K > 0):
+            return False
+        if not _gemm_grid_ok(grid, descriptor[6] if len(descriptor) > 6 else None, M, N):  # packet 105 B
             return False
         _s = lambda i: (int(kargs[i]) if i >= 0 else 1)
         scale = kargs[3]
@@ -212,7 +268,7 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_m
         return False
 
 
-def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Dispatch the scalar per-group int8 GEMM (make_int8_matmul_pergroup).
 
     descriptor = ("pergroup_int8"|"pergroup_int4", pg_msl, m_idx, n_idx, k_idx,
@@ -234,6 +290,9 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
     try:
         M, N, K = int(kargs[m_idx]), int(kargs[n_idx]), int(kargs[k_idx])
         if not (M > 0 and N > 0 and K > 0):
+            return False
+        # LAUNCH CONTRACT (packet 105 B) — checked BEFORE the fast sub-path selection below.
+        if not _gemm_grid_ok(grid, descriptor[11] if len(descriptor) > 11 else None, M, N):
             return False
         # a stride index of -1 means the stride was folded to a compile-time 1.
         strides = [(int(kargs[i]) if i >= 0 else 1) for i in sidx]
@@ -310,7 +369,7 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, launch_exit_hook=None, lau
         return False
 
 
-def _dispatch_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Dispatch the dedicated make_int8_gemv kernel (weight-only int8 decode GEMV).
 
     descriptor = ("gemv", gemv_msl, in_idx, w_idx, out_idx, scale_idx, zero_idx,
@@ -343,6 +402,9 @@ def _dispatch_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metad
 
         # SIZE CONTRACT: the kernel strides K in char4/float4, so K % 4 == 0.
         if not (N > 0 and K > 0 and K % 4 == 0):
+            return False
+        # LAUNCH CONTRACT (packet 105 B): descriptor[10] = the source BN.
+        if not _gemv_grid_ok(grid, descriptor[10] if len(descriptor) > 10 else None, N):
             return False
 
         group = 256

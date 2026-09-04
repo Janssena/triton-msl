@@ -261,7 +261,7 @@ def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
     assert (lse[fin] - lse_ref[fin]).abs().max().item() < 1e-3
 
 
-def _build_biased_lowerer(**constexpr_overrides):
+def _build_biased_lowerer(*, signature_overrides=None, **constexpr_overrides):
     """Compile _biased_fa to TTGIR and wrap in a GenericLowerer (no MSL emission)."""
     from triton._C.libtriton import ir
     from triton.compiler import ASTSource
@@ -286,6 +286,7 @@ def _build_biased_lowerer(**constexpr_overrides):
     add("b_ptr", ptr); add("b_sz b_sh b_sm b_sn", "i32")
     add("mask_ptr", "*i8"); add("m_sz m_sh m_sn", "i32")
     add("sm_scale", "fp32"); add("neg_inf", "fp32"); add("Z H N", "i32")
+    sig.update(signature_overrides or {})
     constexprs = {"DIM": 32, "BLOCK_M": 32, "BLOCK_N": 32, "BAD_TEMP": False, "I3D": False}
     constexprs.update(constexpr_overrides)
     s = ASTSource(fn=_biased_fa, signature=sig, constexprs=constexprs)
@@ -303,6 +304,20 @@ def test_biased_fa_2d_grid_detects():
     low = _build_biased_lowerer(I3D=False)
     info = low._detect_biased_flash_attention()
     assert info is not None and info["biased"] is True and info["grid_3d"] is False
+
+
+@pytest.mark.parametrize("arg_name", ["neg_inf", "sm_scale"])
+def test_biased_fa_fp16_runtime_float_refuses_at_lowering_boundary(arg_name):
+    """The replacement ABI transports scalar bits in uint slots and decodes its
+    runtime floats as fp32.  A source fp16 scale OR sentinel therefore has no
+    proven bit-exact ABI; it must refuse before an executable can be cached or
+    dispatched.  Pin the shared ABI mechanism, not only the reported sentinel.
+    """
+    from triton_msl.errors import MetalNonRecoverableError
+
+    low = _build_biased_lowerer(signature_overrides={arg_name: "fp16"})
+    with pytest.raises(MetalNonRecoverableError, match=rf"runtime .*{arg_name}.*fp32"):
+        low.lower()
 
 
 def test_biased_fa_over_3_program_ids_refuses():

@@ -90,7 +90,35 @@ def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata
 # ---------------------------------------------------------------------------
 
 
-def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+def _fast_grid_ok(grid, spec, M, N):
+    """Packet 105 B: the fast template (and split-K) computes the FULL output; it may replace
+    the compiled kernel only for the exact program grid the kernel maps. ``spec`` (descriptor
+    [9], proven at compile time) is ``("2d", BM, BN, pid_on_rows, pid_on_cols)`` — expected
+    ``(cdiv(M, BM) if pid_on_rows else 1, cdiv(N, BN) if pid_on_cols else 1, 1)`` with an
+    un-tiled axis covering its extent in one tile — or ``("1d", BM, BN)`` for the tutorial's
+    ``pid % num_pid_m`` split: ``(cdiv(M, BM) * cdiv(N, BN), 1, 1)``. No grid / no spec ->
+    False (the caller's compiled kernel then runs with the caller's grid)."""
+    if grid is None or not spec:
+        return False
+    try:
+        g = tuple(int(x) for x in grid)
+        kind, bm, bn = spec[0], int(spec[1]), int(spec[2])
+        if len(g) != 3 or bm <= 0 or bn <= 0:
+            return False
+        cm, cn = (M + bm - 1) // bm, (N + bn - 1) // bn
+        if kind == "1d":
+            return g == (cm * cn, 1, 1)
+        if kind == "2d":
+            pm, pn = bool(spec[3]), bool(spec[4])
+            if (not pm and M > bm) or (not pn and N > bn):
+                return False  # an un-tiled axis the kernel covers with ONE tile
+            return g == (cm if pm else 1, cn if pn else 1, 1)
+    except (TypeError, ValueError, IndexError):
+        return False
+    return False
+
+
+def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
     """Attempt to dispatch via the simdgroup fast-matmul template.
 
     Parameters
@@ -122,6 +150,7 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch
         msl_dtype = descriptor[6] if len(descriptor) > 6 else None
         msl_out = descriptor[7] if len(descriptor) > 7 else None
         stride_checks = descriptor[8] if len(descriptor) > 8 else ()
+        grid_spec = descriptor[9] if len(descriptor) > 9 else None
     except (TypeError, ValueError, IndexError):
         return False  # malformed descriptor -> skip
 
@@ -134,6 +163,11 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch
         M = int(kargs[m_idx])
         N = int(kargs[n_idx])
         K = int(kargs[k_idx])
+
+        # LAUNCH CONTRACT (packet 105 B) — first, so it also gates split-K and the tuned
+        # tile selection below (both are replacement launches).
+        if not _fast_grid_ok(grid, grid_spec, M, N):
+            return False
 
         # RUNTIME STRIDE CONTRACT: the fast template assumes a ROW-MAJOR layout
         # (leading dims = M/N/K, inner stride 1). When the kernel passes explicit

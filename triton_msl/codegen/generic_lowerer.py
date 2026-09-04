@@ -5644,7 +5644,7 @@ class GenericLowerer(
         if dst_shape:
             self.env_shapes[ssa.id] = dst_shape
 
-    def _fa_analyze_constant_score_scale(self, dot_qk, dot_pv):
+    def _fa_analyze_constant_score_scale(self, dot_qk, dot_pv, certified_selects=None):
         """Return the exact constant scale between QK dot and softmax, or ``None``.
 
         A specialized FA template reloads raw operands and rebuilds the score path, so
@@ -5829,6 +5829,10 @@ class GenericLowerer(
                 cur = op.operand_ids[0]
                 continue
             if op.op == "arith.select" and len(op.operand_ids or []) == 3:
+                # Packet 114: on a route that supplies its proof object, ONLY the selects that
+                # proof certified (predicate, polarity, sentinel) are transparent here.
+                if certified_selects is not None and op.id not in certified_selects:
+                    return None
                 branches = [oid for oid in op.operand_ids[1:] if _depends_on_dot(oid)]
                 if len(branches) != 1:
                     return None
@@ -6446,12 +6450,18 @@ class GenericLowerer(
             return None
         scale = (_qf[0] if _qf else 1.0) * _score_scale["factor"]
 
+        # the verified per-batch seqlen values (the cu_seqlens subi results) — the ONLY
+        # bounds the varlen template clips with (packet 112 load/store mask proof)
+        _seqlen_id_of = {p.index: s.id for s, p in seqlen_subis}
+        if cuq_idx not in _seqlen_id_of or cuk_idx not in _seqlen_id_of:
+            return None
         return {
             "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
                       "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
             "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
             "q_scale": bool(_qf), "score_scale": _score_scale,
             "max_seqlen": _ms_arg, "causal": causal, "q": q, "k": k, "v": v, "o": o,
+            "seqlen_q_id": _seqlen_id_of[cuq_idx], "seqlen_k_id": _seqlen_id_of[cuk_idx],
         }
 
     def _lower_varlen_flash_attention(self, info: dict) -> str:
@@ -6475,6 +6485,10 @@ class GenericLowerer(
                     "varlen FlashAttention arg list is not densely indexed; refusing."
                 )
         roles = info["roles"]
+        # Packet 112: varlen loads are plain or exactly ``pid*32 + range(0,32) < seqlen_q``
+        # (Q) / ``iv + range(0,32) < seqlen_k`` (K, V) on the detector's verified seqlen
+        # values; the Out store MUST carry exactly the seqlen_q boundary (the template stores
+        # only inside the sequence; an unmasked or tighter source store is not equivalent).
         info["scale"] *= self._fa_verify_value_paths(
             detected_q_index=roles["q"],
             detected_k_index=roles["k"],
@@ -6484,6 +6498,11 @@ class GenericLowerer(
             k_transposes=1,
             verify_score_path=True,
             expected_score_scale=info.get("score_scale"),
+            load_mask_policy="varlen",
+            varlen_bounds=(info["seqlen_q_id"], info["seqlen_k_id"]),
+            q_rows=32,
+            kv_cols=32,
+            extra_stores=[(roles["o"], "Out", ("Q",), True)],
         )
         role_of_idx = {
             roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
@@ -7972,6 +7991,7 @@ class GenericLowerer(
             "N_CTX": n_ctx_arg, "H": h_arg, "mask_div": mask_div,
             "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
             "out_dtype": out_dtype, "causal": False,
+            "c_eff": c_eff,  # the constant score scale before the exp (packet 114: sentinel units)
         }
 
     def _detect_biased_fa_backward(self):
@@ -9140,6 +9160,11 @@ class GenericLowerer(
                 "partial-output mask in a separate elementwise kernel."
             )
 
+        has_mask = bool(info.get("has_mask", info.get("mask") is not None))
+        # Packet 112: every memory boundary the biased template reconstructs — Q/K/V loads,
+        # the Bias load (row AND col boundary), the Mask load (col boundary), the Lse store
+        # (row boundary) — must be plain or exactly the template's boundary; the Out store
+        # is guarded above (_template_output_mask_nontrivial).
         self._fa_verify_value_paths(
             detected_q_index=info["q"],
             detected_k_index=info["k"],
@@ -9147,9 +9172,17 @@ class GenericLowerer(
             detected_out_index=info["out"],
             q_scale_arg=info["scale_arg"],
             k_transposes=0,
+            detected_n_ctx_index=info.get("N_CTX"),
+            load_mask_policy="boundary",
+            q_rows=block_m,
+            kv_cols=block_n,
+            extra_loads=[(info["bias"], "Bias", ("Q", "K"))] + ([(info["mask"], "Mask", ("K",))] if has_mask else []),
+            extra_stores=[(info["lse"], "Lse", ("Q",), False)],
+            # Packet 114: the VALUES — Bias as the dot accumulator, Mask as the select
+            # predicate, both selects with ONE sentinel (reported in _bout), the Lse value.
+            biased={"bias": info["bias"], "mask": (info["mask"] if has_mask else None), "lse": info["lse"], "c_eff": info.get("c_eff", 1.0)},
+            biased_out=(_bout := {}),
         )
-
-        has_mask = bool(info.get("has_mask", info.get("mask") is not None))
         role_name = {
             info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
             info["bias"]: "Bias", info["lse"]: "Lse",
@@ -9215,11 +9248,27 @@ class GenericLowerer(
                 "biased FlashAttention stride/dim could not be mapped to a kernel arg; refusing."
             )
 
-        def _scale_expr(entry):
-            """The runtime scale is a FLOAT scalar -> reinterpret the packed bits."""
+        def _scale_expr(entry, role):
+            """A runtime float -> reinterpret its packed/individual uint slot.
+
+            The replacement ABI stores one uint-sized slot per scalar and this
+            template decodes the slot with ``as_type<float>``.  Only a source
+            fp32 value has that bit-exact representation.  In particular, a
+            source fp16 scale/sentinel cannot be widened *after* its 16 bits
+            have already been packed into the slot.
+            """
             if isinstance(entry, int) and entry in scalar_pos:
+                source_type = args[entry].elem_type
+                if source_type not in ("f32", "fp32", "float"):
+                    raise MetalNonRecoverableError(
+                        f"biased FlashAttention runtime {role} arg {args[entry].name} "
+                        f"must be fp32 for the replacement scalar ABI (got {source_type}); "
+                        "refusing rather than reinterpret non-fp32 bits as float."
+                    )
                 return f"as_type<float>(_bpk[{scalar_pos[entry]}])" if packed else f"as_type<float>(bsc_{entry})"
-            raise MetalNonRecoverableError("biased FlashAttention runtime scale arg unmapped; refusing.")
+            raise MetalNonRecoverableError(
+                f"biased FlashAttention runtime {role} arg unmapped; refusing."
+            )
 
         qs, ks, vs = info["q_strides"], info["k_strides"], info["v_strides"]
         os_, bs, ls = info["o_strides"], info["b_strides"], info["lse_strides"]
@@ -9238,8 +9287,19 @@ class GenericLowerer(
             "lse_sz": _uint_expr(ls[0]), "lse_sh": _uint_expr(ls[1]), "lse_sm": _uint_expr(ls[2]),
             "Z": "1u",  # unused in the tiled template body (z = zh / H computed locally)
             "H": _uint_expr(info["H"]), "N_CTX": _uint_expr(info["N_CTX"]),
-            "scale": _scale_expr(info["scale_arg"]),
+            "scale": _scale_expr(info["scale_arg"], "scale"),
         }
+        # Packet 114: the source's sentinel, forwarded (runtime float arg, reinterpreted
+        # from the packed scalar bits) or baked (finite literal); the template converts it
+        # from the source's exp domain (after the c_eff multiply) to natural units.
+        if "sentinel_arg" in _bout:
+            bindings["neg_inf"] = _scale_expr(_bout["sentinel_arg"], "sentinel")
+        elif "sentinel_const" in _bout:
+            _sc = float(_bout["sentinel_const"])
+            bindings["neg_inf"] = "(-INFINITY)" if _sc == float("-inf") else f"({_sc!r}f)"
+        else:
+            raise MetalNonRecoverableError("biased FlashAttention: the score sentinel was not proven; refusing.")
+        _ni_unit = 1.0 / float(info.get("c_eff", 1.0))
 
         # 3-D grid (trifast): h = pid3.y (triangle-i), z = pid3.z (batch*heads). When
         # the mask's batch offset is divui(pid_h, H_heads) (cross-head-shared mask,
@@ -9280,6 +9340,7 @@ class GenericLowerer(
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True, neg_inf_unit=_ni_unit,
             )
             self.effective_block_size = 256
         else:
@@ -9291,6 +9352,7 @@ class GenericLowerer(
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True, neg_inf_unit=_ni_unit,
             )
             self.effective_block_size = block_m * block_n
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
@@ -9313,6 +9375,58 @@ class GenericLowerer(
         from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup
 
         name = _sanitize_msl_name(self.graph.func_name)
+        # Packet 107 §4: the emitted MLA template is FIXED at BLOCK_M = 32; the replacement
+        # launch (cdiv(N_CTX, 32) x Z*H) is the source kernel's program grid only when the
+        # source q-block is 32 too. Bound at the producer AND re-checked by the dispatcher.
+        if info.get("block_m") != 32:
+            raise MetalNonRecoverableError(
+                f"MLA attention: the source kernel tiles {info.get('block_m')} query rows per program but the "
+                "emitted template is fixed at 32; refusing rather than launch a different program grid.",
+                op_name="tt.dot",
+            )
+        # Packet 109 A: the emitted template declares ONE pointer type for Q, K, V and Out
+        # (from out_dtype). Every source role must have exactly that element type; a
+        # bf16 role behind an fp16 template (or any mixed ABI) is silently wrong.
+        _norm = {"f16": "f16", "fp16": "f16", "half": "f16", "f32": "f32", "fp32": "f32", "float": "f32", "bf16": "bf16", "bfloat16": "bf16"}
+        _role_types = {
+            _norm.get(str(self.graph.args[i].elem_type), str(self.graph.args[i].elem_type))
+            for i in (info["q"], info["q_rope"], info["k"], info["k_rope"], info["v"], info["out"])
+        }
+        if len(_role_types) != 1 or next(iter(_role_types)) not in ("f16", "f32"):
+            raise MetalNonRecoverableError(
+                f"MLA attention: the source roles have element types {sorted(_role_types)} but the emitted "
+                "template declares one pointer type for Q/K/V/Out (f16 or f32); refusing a mixed or "
+                "unsupported ABI rather than reinterpret buffers.",
+                op_name="tt.dot",
+            )
+        # Packet 109 B: the WHOLE value path the template replaces — both QK dots (nope and
+        # rope, same single scale, replayed transposes/casts only), plain or boundary-masked
+        # loads, the exact nope + rope score into the softmax, the exact P and P@V path, the
+        # canonical normalized Out — verified like the symmetric routes.
+        info["scale"] *= self._fa_verify_value_paths(
+            detected_q_index=info["q"],
+            detected_k_index=info["k"],
+            detected_v_index=info["v"],
+            detected_out_index=info["out"],
+            q_scale_required=info.get("q_scale", True),
+            k_transposes=1,
+            verify_score_path=True,
+            expected_score_scale=info.get("score_scale"),
+            mla_rope=(info["q_rope"], info["k_rope"]),
+            detected_n_ctx_index=info.get("N_CTX"),
+            load_mask_policy="boundary",
+            q_rows=info.get("block_m"),
+            kv_cols=info.get("block_n"),
+        )
+        # The template computes the FULL output tile and gates writes only at N_CTX: a
+        # tighter store mask would be silently dropped (packet 109 mode 6).
+        if self._template_output_mask_nontrivial(is_fa=True, fa_ctx_index=info.get("N_CTX")):
+            raise MetalNonRecoverableError(
+                "MLA attention with a non-tile-boundary output store mask is not supported: the template "
+                "computes the FULL output tile and gates writes only on the N_CTX boundary, silently "
+                "DROPPING any tighter store mask. Refusing to emit silently-wrong output.",
+                op_name="tt.store",
+            )
         # DEFAULT ABI (Q,K,V,Out + strides) — the dispatch supplies the concatenated
         # contiguous Q/K, so no @jit arg_decls/bindings. scale = 1/sqrt(qk_head_dim) as
         # detected (the user's per-part pre-scale is bypassed; the kernel scales Q).
@@ -9344,6 +9458,25 @@ class GenericLowerer(
             info["Z"],
             info["H"],
             info["N_CTX"],
+            info.get("block_m"),  # [13] source q-block: the dispatcher requires the launch grid
+            #                        (cdiv(N_CTX, block_m), Z*H, 1) exactly (packet 105 B)
+            # Packet 107: the SOURCE ABI the dispatcher must reproduce — the kernel's
+            # logical widths, its explicit stride args per role (arg index or the folded
+            # "c1"), and each role's element type. The dispatcher builds exact logical
+            # views from these; it never reads a host tensor's shape or .stride().
+            (int(info["nope_dim"]), int(info["rope_dim"]), int(info["v_head_dim"])),  # [14]
+            {  # [15]
+                "q": tuple(info["strides"]["q"]),
+                "q_rope": tuple(info["mla_strides"]["q_rope"]),
+                "k": tuple(info["strides"]["k"]),
+                "k_rope": tuple(info["mla_strides"]["k_rope"]),
+                "v": tuple(info["strides"]["v"]),
+                "out": tuple(info["strides"]["o"]),
+            },
+            tuple(  # [16] element types of (q_nope, q_rope, k_nope, k_rope, v, out)
+                self.graph.args[i].elem_type
+                for i in (info["q"], info["q_rope"], info["k"], info["k_rope"], info["v"], info["out"])
+            ),
         )
         self._prescan_stores()
         return msl
@@ -9360,8 +9493,57 @@ class GenericLowerer(
         k_transposes=1,
         verify_score_path=False,
         expected_score_scale=None,
+        mla_rope=None,
+        detected_n_ctx_index=None,
+        load_mask_policy=None,
+        q_rows=None,
+        kv_cols=None,
+        varlen_bounds=None,
+        extra_loads=(),
+        extra_stores=(),
+        biased=None,
+        biased_out=None,
     ):
         """Verify every value boundary a forward-FA template replaces.
+
+        Packet 114 (113 HOLD): ``biased={"bias": i, "mask": j|None, "lse": k, "c_eff": c}``
+        adds the biased-route WHOLE-VALUE proof — the QK dot's accumulator IS the unique
+        Bias load (casts/layout only); the score chain is exactly dot -> [mulf c] ->
+        [select(Mask-load != 0, sentinel, score)] -> select(row&col boundary, score,
+        sentinel) -> softmax, both selects sharing ONE sentinel SSA value (a float kernel
+        arg, or a finite literal) which is reported in ``biased_out`` for the template;
+        only those selects are transparent to the score-scale walker; the sole Lse store's
+        value is exactly ``max * (1/c) + log(denominator)`` on the verified loop results.
+
+        Packet 112 (111 HOLD): the mask proof is ROLE-EXACT and numeric. BM / BN are read
+        from the VERIFIED dot operand shapes (Q = [BM, D], V = [BN, D]); a caller may pass
+        ``q_rows`` / ``kv_cols`` and they must agree. A row-coordinate mask (Q, Q-rope, Out,
+        Lse) must be exactly ``program_id(0) * BM + make_range(0, BM)``; a column-coordinate
+        mask (K, K-rope, V, Mask) exactly ``<K-loop iv> + make_range(0, BN)``; every ``andi``
+        leaf independently. ``load_mask_policy="varlen"`` keys the bound to the detector's
+        ``seqlen_q`` / ``seqlen_k`` SSA values (``varlen_bounds``) instead of N_CTX.
+        ``extra_loads`` = ``(arg_index, role, leaf_roles)`` for template-reconstructed loads
+        beyond Q/K/V (Bias, Mask): plain, or masked with exactly those leaf roles;
+        ``extra_stores`` = ``(arg_index, role, leaf_roles, mask_required)`` (Out, Lse).
+        A masked load's ``other`` must be absent (this compiler's generic path substitutes
+        zero — ``_lower_load``) or the literal zero.
+
+        Packet 109/110 extensions:
+
+        * ``mla_rope=(q_rope_index, k_rope_index)``: the MLA chain — the FIRST dot is the
+          nope QK dot (its accumulator a literal zero), exactly one further dot accumulates
+          onto it (the rope QK dot); its A/B operands are verified like Q/K with the SAME
+          single scale constant as Q-nope, and the score path (softmax input, constant
+          score-scale chain, alpha) is verified from the ROPE dot's result — the score the
+          template replays is nope + rope with nothing in between.
+        * ``load_mask_policy="boundary"``: every Q/K/V load the template re-reads must be
+          plain, or carry exactly the sequence-boundary mask the template applies itself
+          (``<tile row | tile col index> < N_CTX`` as ``slt``/``ult``, possibly two such
+          compares joined by ``andi``, ``other`` absent or literal zero). A tighter or
+          value mask, a different bound or a nonzero ``other`` refuses (GPU: ``mask=m < 16,
+          other=0`` on Q stored the template's full result). ``None`` keeps the route's
+          previous behaviour (routes whose templates replay their own masks — varlen,
+          biased — are not covered by this rule; see packet 110 §7).
 
         The FA templates do not lower the accepted TTGIR operation by operation. They
         reload raw Q/K/V and re-emit canonical attention plus a canonical normalized
@@ -9472,6 +9654,34 @@ class GenericLowerer(
                 "refusing rather than template an ambiguous dot graph.",
                 op_name="tt.dot",
             )
+
+        # ---- MLA chain (packet 110): nope dot (acc = 0) -> rope dot accumulating onto it ----
+        _dot_rope = None
+        _score_dot = _dot_qk
+        if mla_rope is not None:
+            _ropes = [
+                d
+                for d in _dots
+                if d.id not in _dot0_ids
+                and d is not _dot_pv
+                and len(d.operand_ids or []) > 2
+                and _by_id.get(d.operand_ids[2]) is _dot_qk
+            ]
+            if len(_ropes) != 1 or len(_dots) != 3:
+                raise MetalNonRecoverableError(
+                    "MLA attention value path: expected exactly one rope QK dot accumulating onto the "
+                    f"nope QK dot's result (found {len(_ropes)} of {len(_dots)} dots). Refusing.",
+                    op_name="tt.dot",
+                )
+            _dot_rope = _ropes[0]
+            if len(_dot_qk.operand_ids or []) < 3 or not self._acc_init_is_literal_zero(_dot_qk.operand_ids[2], _by_id):
+                raise MetalNonRecoverableError(
+                    "MLA attention value path: the nope QK dot's accumulator is not a literal zero "
+                    "(a fused value would be silently dropped by the template). Refusing.",
+                    op_name="tt.dot",
+                )
+            _score_dot = _dot_rope
+            _dot0_ids = _dot0_ids | {_dot_rope.id} | set(getattr(_dot_rope, "result_ids", None) or [])
 
         _representation = {
             "ttg.local_load",
@@ -9609,10 +9819,117 @@ class GenericLowerer(
                 cur = op.operand_ids[0]
             return None
 
+        # ---- load masks (packet 110): plain, or exactly the template's sequence-boundary mask ----
+        _mask_wrappers = {"tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout"}
+        _fors = [s for s in _all if s.op == "scf.for"]
+        _kv_iv = ((_fors[0].attrs or {}).get("block_arg_ids") or [None])[0] if len(_fors) == 1 else None
+
+        def _const_value(start_id):
+            cur, seen = start_id, set()
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                op = _by_id.get(cur)
+                if op is None:
+                    return None
+                if op.op == "arith.constant":
+                    value = (op.attrs or {}).get("value")
+                    return float(value) if isinstance(value, (int, float)) else None
+                if op.op not in _scalar_wrappers or len(op.operand_ids or []) != 1:
+                    return None
+                cur = op.operand_ids[0]
+            return None
+
+        # BM / BN from the VERIFIED dot operand shapes — never from whatever the mask says.
+        def _shape_of(oid):
+            o = _by_id.get(oid)
+            t = getattr(o, "type_str", None) if o is not None else None
+            return _extract_shape(t) if t else ()
+
+        _q_shape, _v_shape = _shape_of(_dot_qk.operand_ids[0]), _shape_of(_dot_pv.operand_ids[1])
+        _BM = int(_q_shape[0]) if len(_q_shape) == 2 else None
+        _BN = int(_v_shape[0]) if len(_v_shape) == 2 else None
+        if load_mask_policy is not None:
+            if _BM is None or _BN is None:
+                _refuse("Q/K/V", "the tile shapes could not be read from the verified dot operands")
+            if q_rows is not None and int(q_rows) != _BM:
+                _refuse("Q", f"the verified Q tile has {_BM} rows but the route expects {q_rows}")
+            if kv_cols is not None and int(kv_cols) != _BN:
+                _refuse("K/V", f"the verified K/V tile has {_BN} rows but the route expects {kv_cols}")
+            if load_mask_policy == "varlen" and (varlen_bounds is None or len(varlen_bounds) != 2):
+                _refuse("Q/K/V", "the varlen route did not supply its seqlen_q / seqlen_k values")
+        _ROW_ROLES = {"Q", "Q-rope", "Out", "Lse"}  # program_id(0)*BM + range(0,BM)
+        _COL_ROLES = {"K", "K-rope", "V", "Mask"}  # iv + range(0,BN)
+
+        def _bound_ok(rhs, role):
+            if load_mask_policy == "boundary":
+                return detected_n_ctx_index is not None and _scalar_arg_index(rhs) == detected_n_ctx_index
+            if load_mask_policy == "varlen":
+                core = _peel_to_core(rhs, _mask_wrappers)
+                want = varlen_bounds[0] if role in _ROW_ROLES else varlen_bounds[1]
+                return core is not None and core.id == want
+            return False
+
+        def _coord_ok(lhs, role):
+            sh = self._index_shape(lhs, _by_id, _arg_by_id, _kv_iv, 1)
+            if sh["bad"] is not None or sh["mod"] is not None or sh["range"] != 1 or sh["bounds"] is None:
+                return False
+            if role in _ROW_ROLES:
+                return (
+                    sh["bounds"] == (0, _BM) and sh["iv"] == 0 and sh["pid"] == 0
+                    and sh["pid_div"] is None and sh["coef"] == _BM
+                )
+            return sh["bounds"] == (0, _BN) and sh["iv"] == 1 and sh["pid"] is None and _kv_iv is not None
+
+        def _boundary_leaf(cid, role, allowed_roles):
+            """One comparison leaf; returns the leaf role it is EXACTLY the boundary of."""
+            cmp_op = _peel_to_core(cid, _mask_wrappers)
+            if cmp_op is None or cmp_op.op != "arith.cmpi" or len(cmp_op.operand_ids or []) != 2:
+                _refuse(role, "the mask is not a sequence-boundary comparison")
+            if (cmp_op.attrs or {}).get("predicate_name") not in ("slt", "ult"):
+                _refuse(role, "the mask is not a strict less-than boundary")
+            lhs, rhs = cmp_op.operand_ids
+            for r in allowed_roles:
+                if _bound_ok(rhs, r) and _coord_ok(lhs, r):
+                    return r
+            _refuse(
+                role,
+                "the mask is not exactly the template's boundary for this role "
+                f"(expected {'program_id(0)*BM + range(0,BM)' if role in _ROW_ROLES else 'iv + range(0,BN)'} "
+                f"< {'seqlen' if load_mask_policy == 'varlen' else 'N_CTX'}, BM={_BM}, BN={_BN})",
+            )
+
+        def _mask_leaf_roles(mid, role, allowed_roles):
+            core = _peel_to_core(mid, _mask_wrappers)
+            if core is not None and core.op == "arith.andi" and len(core.operand_ids or []) == 2:
+                return [_boundary_leaf(x, role, allowed_roles) for x in core.operand_ids]
+            return [_boundary_leaf(mid, role, allowed_roles)]
+
+        def _check_load_mask(load, role, allowed_roles=None, exact_leaves=None):
+            if load_mask_policy is None or len(load.operand_ids or []) < 2:
+                return
+            leaves = _mask_leaf_roles(load.operand_ids[1], role, allowed_roles or (role,))
+            if exact_leaves is not None and sorted(leaves) != sorted(exact_leaves):
+                _refuse(role, f"the mask leaves {leaves} are not exactly the template's {list(exact_leaves)} boundary")
+            if len(load.operand_ids) >= 3 and _const_value(load.operand_ids[2]) != 0.0:
+                _refuse(role, "the load's 'other' value is not zero (the template supplies zero beyond the boundary)")
+
+        def _check_store_mask(store, role, leaf_roles, mask_required):
+            if load_mask_policy is None:
+                return
+            if len(store.operand_ids or []) < 3:
+                if mask_required:
+                    _refuse(role, "the store is unmasked but the template stores only inside the sequence boundary")
+                return
+            leaves = _mask_leaf_roles(store.operand_ids[2], role, tuple(leaf_roles))
+            if sorted(leaves) != sorted(leaf_roles):
+                _refuse(role, f"the store mask leaves {leaves} are not exactly the template's {list(leaf_roles)} boundary")
+
         def _verify_load_path(start_id, role, expected_index, *, scale=False, transposes=0):
+            """Returns the scale constant applied on this path (None when arg-based or absent)."""
             cur, seen = start_id, set()
             n_scale = 0
             n_transpose = 0
+            scale_value = None
             while cur not in seen and len(seen) < 64:
                 seen.add(cur)
                 op = _by_id.get(cur)
@@ -9632,7 +9949,8 @@ class GenericLowerer(
                             role,
                             f"the load resolves to arg {ptr_index}, not detector arg {expected_index}",
                         )
-                    return
+                    _check_load_mask(op, role)
+                    return scale_value
                 if op.op in _representation and len(op.operand_ids or []) == 1:
                     cur = op.operand_ids[0]
                     continue
@@ -9649,13 +9967,14 @@ class GenericLowerer(
                     other = next(oid for oid in op.operand_ids if oid != loaded[0])
                     if not _scale_matches(other):
                         _refuse(role, "the multiply's scale source disagrees with detection")
+                    scale_value = _const_value(other)
                     n_scale += 1
                     cur = loaded[0]
                     continue
                 _refuse(role, f"unsupported operation {op.op} appears before the dot")
             _refuse(role, "the path is cyclic or exceeds the verification bound")
 
-        _verify_load_path(
+        _q_scale_value = _verify_load_path(
             _dot_qk.operand_ids[0],
             "Q",
             detected_q_index,
@@ -9668,6 +9987,17 @@ class GenericLowerer(
         _verify_load_path(
             _dot_pv.operand_ids[1], "V", detected_v_index, transposes=0
         )
+        if _dot_rope is not None:
+            _qr_scale_value = _verify_load_path(
+                _dot_rope.operand_ids[0], "Q-rope", mla_rope[0], scale=q_scale_required, transposes=0
+            )
+            _verify_load_path(_dot_rope.operand_ids[1], "K-rope", mla_rope[1], transposes=k_transposes)
+            if q_scale_required and (
+                _q_scale_value is None
+                or _qr_scale_value is None
+                or abs(_q_scale_value - _qr_scale_value) > 1e-7 * max(1.0, abs(_q_scale_value))
+            ):
+                _refuse("Q-rope", "the rope scale is not the same single constant as the nope scale (the template bakes ONE Q scale)")
 
         # P and alpha are one score->probability function.  The template always emits
         # natural exp, but equivalent source spellings may use exp2 with log2e either
@@ -9749,8 +10079,147 @@ class GenericLowerer(
         if len(_p_shape) != 2:
             _refuse("P", f"the probability core has non-matrix shape {_p_shape}")
 
+        # ---- template-reconstructed loads / stores beyond Q/K/V (packet 112) ----
+        if load_mask_policy is not None:
+            for _idx, _role, _leaf_roles in extra_loads:
+                _lds = [
+                    o for o in _all
+                    if o.op == "tt.load" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {_idx}
+                ]
+                if not _lds:
+                    _refuse(_role, f"no load of arg {_idx} was found to verify")
+                for _ld in _lds:
+                    _check_load_mask(_ld, _role, tuple(_leaf_roles), exact_leaves=tuple(_leaf_roles))
+            for _idx, _role, _leaf_roles, _req in extra_stores:
+                _sts = [
+                    o for o in _all
+                    if o.op == "tt.store" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {_idx}
+                ]
+                if len(_sts) != 1:
+                    _refuse(_role, f"expected exactly one store of arg {_idx}, found {len(_sts)}")
+                _check_store_mask(_sts[0], _role, tuple(_leaf_roles), _req)
+
+        # ---- biased route (packet 114): Bias value, Mask value, both score selects, sentinel ----
+        _certified_selects = None
+        _biased_S2_id = None
+        _b_wr = {"arith.extf", "arith.truncf", "ttg.convert_layout", "tt.reshape", "ttg.local_load", "ttg.local_alloc", "tt.fp_to_fp"}
+        _b_bcast = _b_wr | {"tt.splat", "tt.broadcast", "tt.expand_dims"}
+
+        def _peel_id(start, allowed):
+            cur, seen = start, set()
+            while cur not in seen and len(seen) < 64:
+                seen.add(cur)
+                o = _by_id.get(cur)
+                if o is None or o.op not in allowed or len(o.operand_ids or []) != 1:
+                    return cur
+                cur = o.operand_ids[0]
+            return cur
+
+        if biased is not None:
+            _dot_ids_all = {_dot_qk.id} | set(getattr(_dot_qk, "result_ids", None) or [])
+
+            def _unique_load_of(idx, role):
+                lds = [
+                    o for o in _all
+                    if o.op == "tt.load" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {idx}
+                ]
+                if len(lds) != 1:
+                    _refuse(role, f"expected exactly one load of arg {idx}, found {len(lds)}")
+                return lds[0]
+
+            # (1) Bias value: the accumulator operand IS the Bias load (no arithmetic, no select)
+            _bias_ld = _unique_load_of(biased["bias"], "Bias")
+            if len(_dot_qk.operand_ids or []) < 3 or _peel_id(_dot_qk.operand_ids[2], _b_wr) != _bias_ld.id:
+                _refuse("Bias", "the QK dot's accumulator is not the Bias load itself (a transform of the bias is not replayed)")
+
+            # (2)+(3) the score chain, walked from the softmax input back to the dot
+            _S2 = _by_id.get(_peel_id(_p_core.operand_ids[0], _b_wr))
+            if _S2 is None or _S2.op != "arith.select" or len(_S2.operand_ids or []) != 3:
+                _refuse("Score", "the softmax input is not the tile-boundary select the template replays")
+            _leaves = _mask_leaf_roles(_S2.operand_ids[0], "Score", ("Q", "K"))
+            if sorted(_leaves) != ["K", "Q"]:
+                _refuse("Score", f"the boundary select's predicate leaves {_leaves} are not exactly the row & col N_CTX boundary")
+            _sentinel_id = _peel_id(_S2.operand_ids[2], _b_bcast)
+            _chain = _peel_id(_S2.operand_ids[1], _b_wr)
+            _S1 = None
+            if biased.get("mask") is not None:
+                _mask_ld = _unique_load_of(biased["mask"], "Mask")
+                _S1 = _by_id.get(_chain)
+                if _S1 is None or _S1.op != "arith.select" or len(_S1.operand_ids or []) != 3:
+                    _refuse("Mask", "the loaded-mask select is not where the template replays it (between the scale and the boundary select)")
+                _cmp = _by_id.get(_peel_id(_S1.operand_ids[0], _b_bcast))
+                if _cmp is None or _cmp.op != "arith.cmpi" or (_cmp.attrs or {}).get("predicate_name") != "ne" or len(_cmp.operand_ids or []) != 2:
+                    _refuse("Mask", "the loaded-mask select's predicate is not `Mask != 0`")
+                _cmp_src = [_peel_id(x, _b_bcast) for x in _cmp.operand_ids]
+                if not ((_cmp_src[0] == _mask_ld.id and _const_value(_cmp.operand_ids[1]) == 0.0)
+                        or (_cmp_src[1] == _mask_ld.id and _const_value(_cmp.operand_ids[0]) == 0.0)):
+                    _refuse("Mask", "the loaded-mask select's predicate is not the Mask load compared with zero")
+                if _peel_id(_S1.operand_ids[1], _b_bcast) != _sentinel_id:
+                    _refuse("Mask", "the loaded-mask select's masked branch is not the same sentinel value as the boundary select's")
+                _chain = _peel_id(_S1.operand_ids[2], _b_wr)
+            # the constant score scale (c_eff) sits between the dot and the selects
+            _c_eff = float(biased.get("c_eff", 1.0))
+            _M = _by_id.get(_chain)
+            if abs(_c_eff - 1.0) > 1e-9:
+                if _M is None or _M.op != "arith.mulf" or len(_M.operand_ids or []) != 2:
+                    _refuse("Score", "the score scale multiply is not between the dot and the selects (the sentinel units would differ)")
+                _cs = [(_const_value(x), x) for x in _M.operand_ids]
+                _consts = [(v, x) for v, x in _cs if v is not None]
+                if len(_consts) != 1 or abs(_consts[0][0] - _c_eff) > 1e-6 * abs(_c_eff):
+                    _refuse("Score", "the score scale multiply's constant disagrees with the detector's proof")
+                _data = next(x for v, x in _cs if v is None)
+                if _peel_id(_data, _b_wr) not in _dot_ids_all:
+                    _refuse("Score", "the score scale multiply does not consume the QK dot directly")
+                _biased_expected = {"factor": _consts[0][0], "op_ids": (_M.id,)}
+            else:
+                if _chain not in _dot_ids_all:
+                    _refuse("Score", "the selects do not consume the QK dot directly")
+                _biased_expected = {"factor": 1.0, "op_ids": ()}
+            # (4) the sentinel: one SSA scalar — an ABI-proven fp32 kernel arg
+            # (forwarded) or a literal (baked).
+            _snt_op = _by_id.get(_sentinel_id)
+            if _snt_op is None and _sentinel_id in _arg_by_id:
+                _a = _arg_by_id[_sentinel_id]
+                if _a.is_ptr or str(_a.elem_type) not in ("f32", "fp32", "float"):
+                    _refuse(
+                        "Score",
+                        f"runtime sentinel arg {_a.name} must be fp32 for the replacement scalar ABI",
+                    )
+                _biased_snt = {"sentinel_arg": _a.index}
+            elif _snt_op is not None and _snt_op.op == "arith.constant":
+                # TTGIR walkers expose a floating literal as a float, or as its RAW BIT WORD
+                # (±inf / NaN): decode exactly; any other integer word is ambiguous -> refuse.
+                _raw = (_snt_op.attrs or {}).get("value")
+                if isinstance(_raw, bool) or _raw is None:
+                    _refuse("Score", "the literal sentinel has no value")
+                if isinstance(_raw, int):
+                    if _raw in (0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000):
+                        _v = float("-inf")
+                    elif _raw in (0x7C00, 0x7F80, 0x7F800000, 0x7FF0000000000000):
+                        _v = float("inf")
+                    elif _raw == 0:
+                        _v = 0.0
+                    else:
+                        _refuse("Score", f"the literal sentinel's raw word {_raw:#x} is not a decodable float")
+                else:
+                    _v = float(_raw)
+                if _v != _v or _v == float("inf"):
+                    _refuse("Score", "a NaN / +inf literal sentinel is not replayed")
+                _biased_snt = {"sentinel_const": _v}
+            else:
+                _refuse("Score", "the sentinel is neither a kernel argument nor a literal constant")
+            _certified_selects = {_S2.id} | ({_S1.id} if _S1 is not None else set())
+            _biased_S2_id = _S2.id
+            expected_score_scale = _biased_expected
+            verify_score_path = True
+            if biased_out is not None:
+                biased_out.update(_biased_snt)
+                biased_out["certified_selects"] = tuple(sorted(_certified_selects))
+
         if verify_score_path:
-            _score_scale = self._fa_analyze_constant_score_scale(_dot_qk, _dot_pv)
+            _score_scale = self._fa_analyze_constant_score_scale(
+                _score_dot, _dot_pv, certified_selects=_certified_selects
+            )  # MLA: from the rope dot
             if _score_scale is None:
                 _refuse(
                     "P",
@@ -9813,6 +10282,7 @@ class GenericLowerer(
             _refuse("Out", f"expected one store to detector arg {detected_out_index}, found {len(_out_stores)}")
 
         _out_passthrough = _representation | {"arith.truncf", "tt.fp_to_fp"}
+        _out_loop, _out_den_id = None, None
         _cur = _out_stores[0].operand_ids[1]
         _seen = set()
         while _cur not in _seen and len(_seen) < 64:
@@ -9839,12 +10309,83 @@ class GenericLowerer(
                 )
                 if not _depends_on(_num.id, _dot_pv_ids):
                     _refuse("Out", "the attention loop does not yield the verified P@V dot")
+                _out_loop = _num
+                _out_den_id = _peel_id(_op.operand_ids[1], _b_bcast)
                 break
             if _op.op not in _out_passthrough or len(_op.operand_ids or []) != 1:
                 _refuse("Out", f"unsupported operation {_op.op} appears after normalization")
             _cur = _op.operand_ids[0]
         else:
             _refuse("Out", "the path is cyclic or exceeds the verification bound")
+
+        # ---- biased route (packet 114): the max reduce reads the certified select; the Lse value ----
+        if biased is not None:
+            # the row max the softmax subtracts is the max over the SAME boundary-select result
+            _reds = [
+                _by_id.get(_peel_id(x, _b_bcast)) for x in (_p_max.operand_ids or [])
+            ]
+            _reds = [r for r in _reds if r is not None and r.op == "tt.reduce"]
+            if len(_reds) != 1 or _peel_id(_reds[0].operand_ids[0], _b_wr) != _biased_S2_id:
+                _refuse("Score", "the online-softmax row max is not reduced from the certified boundary select")
+            if _out_loop is None or _out_den_id is None:
+                _refuse("Lse", "the attention loop was not identified by the Out trace")
+            _lse_st = [
+                s for s in _all
+                if s.op == "tt.store" and s.operand_ids and _pointer_base_indices(s.operand_ids[0]) == {biased["lse"]}
+            ]
+            if len(_lse_st) != 1:
+                _refuse("Lse", f"expected exactly one store of arg {biased['lse']}, found {len(_lse_st)}")
+            _lv = _by_id.get(_peel_id(_lse_st[0].operand_ids[1], _b_wr))
+            if _lv is None or _lv.op != "arith.addf" or len(_lv.operand_ids or []) != 2:
+                _refuse("Lse", "the stored value is not `max * ln(base) + log(denominator)` (an epilogue is not replayed)")
+            _parts = [(x, _by_id.get(_peel_id(x, _b_wr))) for x in _lv.operand_ids]
+            _logs = [(x, o) for x, o in _parts if o is not None and o.op == "math.log"]
+            if len(_logs) != 1 or len(_logs[0][1].operand_ids or []) != 1:
+                _refuse("Lse", "the stored value does not add exactly one natural log")
+            _R_l = _peel_id(_logs[0][1].operand_ids[0], _b_wr)
+            _other = next(x for x, o in _parts if (x, o) != _logs[0])
+            _c_eff = float(biased.get("c_eff", 1.0))
+            if abs(_c_eff - 1.0) > 1e-9:
+                _mo = _by_id.get(_peel_id(_other, _b_wr))
+                if _mo is None or _mo.op != "arith.mulf" or len(_mo.operand_ids or []) != 2:
+                    _refuse("Lse", "the max term is not converted by a constant multiply")
+                _cs = [(_const_value(x), x) for x in _mo.operand_ids]
+                _consts = [(v, x) for v, x in _cs if v is not None]
+                _want = 1.0 / _c_eff
+                if len(_consts) != 1 or abs(_consts[0][0] - _want) > 1e-6 * abs(_want):
+                    _refuse("Lse", "the max conversion constant is not 1/c (the base conversion the template applies)")
+                _R_m = _peel_id(next(x for v, x in _cs if v is None), _b_wr)
+            else:
+                _R_m = _peel_id(_other, _b_wr)
+            _rids = list(getattr(_out_loop, "result_ids", None) or [])
+            if _R_l not in _rids or _R_m not in _rids or _R_l == _R_m:
+                _refuse("Lse", "its operands are not two distinct results of the verified attention loop")
+            if _R_l != _out_den_id:
+                _refuse("Lse", "the log operand is not the Out normalization denominator")
+            _i_m, _i_l = _rids.index(_R_m), _rids.index(_R_l)
+            _ys = [y for y in (_out_loop.region_ops or []) if y.op == "scf.yield"]
+            if len(_ys) != 1 or max(_i_m, _i_l) >= len(_ys[0].operand_ids or []):
+                _refuse("Lse", "the attention loop does not have one yield covering its results")
+            if _peel_id(_ys[0].operand_ids[_i_m], _b_wr) != _p_max.id:
+                _refuse("Lse", "the max result is not the verified online-softmax maximum")
+            _bids = list((_out_loop.attrs or {}).get("block_arg_ids") or [])
+            _barg_l = _bids[_i_l + 1] if _i_l + 1 < len(_bids) else None
+            _yl = _by_id.get(_peel_id(_ys[0].operand_ids[_i_l], _b_wr))
+            if _yl is None or _yl.op != "arith.addf" or len(_yl.operand_ids or []) != 2:
+                _refuse("Lse", "the denominator recurrence is not `l * alpha + sum(P)`")
+            _yparts = [_by_id.get(_peel_id(x, _b_wr)) for x in _yl.operand_ids]
+            _mul = [o for o in _yparts if o is not None and o.op == "arith.mulf"]
+            _red = [o for o in _yparts if o is not None and o.op == "tt.reduce"]
+            if len(_mul) != 1 or len(_red) != 1:
+                _refuse("Lse", "the denominator recurrence is not `l * alpha + sum(P)`")
+            _alpha_ids = {_alpha_exps[0].id} | set(getattr(_alpha_exps[0], "result_ids", None) or [])
+            _mul_src = {_peel_id(x, _b_bcast) for x in _mul[0].operand_ids}
+            if _barg_l is None or _barg_l not in _mul_src or not (_mul_src & _alpha_ids) or len(_mul_src) != 2:
+                _refuse("Lse", "the denominator rescale is not the carried denominator times the verified alpha")
+            _p_ids = {_p_exp.id} | set(getattr(_p_exp, "result_ids", None) or [])
+            _red_is_sum = any(o.op == "arith.addf" for o in (_red[0].region_ops or []))
+            if not _red_is_sum or _peel_id(_red[0].operand_ids[0], _b_wr) not in _p_ids:
+                _refuse("Lse", "the denominator sum is not the sum of the verified probabilities")
 
         return _p_multiplier
 
@@ -9957,6 +10498,10 @@ class GenericLowerer(
             k_transposes=1,
             verify_score_path=info.get("verify_score_path", True),
             expected_score_scale=info.get("score_scale"),
+            detected_n_ctx_index=info.get("N_CTX"),
+            load_mask_policy="boundary",  # packet 110: the simd template gates at N_CTX itself
+            q_rows=info["block_m"],
+            kv_cols=info["block_n"],
         )
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the
