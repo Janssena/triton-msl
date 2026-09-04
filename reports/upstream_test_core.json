@@ -1,20 +1,20 @@
 {
   "test_file": "test_core.py",
   "backend": "metal",
-  "captured_date": "2026-09-01",
+  "captured_date": "2026-09-03",
   "total": 9342,
-  "passed": 5369,
-  "failed": 155,
+  "passed": 5373,
+  "failed": 151,
   "skipped": 3818,
   "errors": 0,
   "pass_rate": 57.5,
   "failure_categories": {
-    "Other": 20
+    "Other": 16
   },
   "pytest_summary": {
-    "warnings": 2451,
-    "failed": 155,
-    "passed": 5369,
+    "warnings": 2447,
+    "failed": 151,
+    "passed": 5373,
     "skipped": 3818
   },
   "passed_tests": [

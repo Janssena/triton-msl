@@ -3,19 +3,19 @@ Backend: metal
 ==================================================
 
 Total:   9342
-Passed:  5369 (57.5%)
-Failed:  155
+Passed:  5373 (57.5%)
+Failed:  151
 Skipped: 3818
 Errors:  0
 
 Failure Categories:
-  Other: 20
+  Other: 16
 
 Pytest summary (cross-check):
-  failed: 155
-  passed: 5369
+  failed: 151
+  passed: 5373
   skipped: 3818
-  warnings: 2451
+  warnings: 2447
 
 Sample passing tests:
   unit/language/test_core.py::test_scalar_overflow
