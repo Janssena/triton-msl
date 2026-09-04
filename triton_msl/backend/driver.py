@@ -70,6 +70,78 @@ def _strided_storage_reach(t):
             return 0
 
 
+def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
+    """Return why a batched-dot address escapes its host mirror, else ``None``.
+
+    The host-roundtrip path binds every tensor buffer at the tensor view's
+    ``storage_offset`` and mirrors ``_strided_storage_reach(view)`` elements
+    forward from there. A runtime stride may legally address elsewhere in the
+    underlying allocation, but those bytes are absent from this mirror. The
+    compile-time descriptor supplies the exact affine A/B/C address contracts;
+    evaluate their extrema with the runtime strides before host dispatch.
+    """
+
+    try:
+        if not (
+            isinstance(descriptor, (tuple, list))
+            and len(descriptor) == 12
+            and descriptor[0] == "batched_dot_host_bounds_v1"
+        ):
+            return "the batched-dot host-bounds descriptor is missing or malformed"
+        batch, m, n, k = (int(value) for value in descriptor[1:5])
+        pid_tiled = bool(descriptor[5])
+        tensor_indices = tuple(int(value) for value in descriptor[6:9])
+        stride_specs = descriptor[9:12]
+        gx, gy, gz = (int(value) for value in grid)
+        if min(batch, m, n, k, gx, gy, gz) <= 0:
+            return "the batched-dot launch has a non-positive extent or grid dimension"
+        row_extent = m * gx if pid_tiled else m
+        col_extent = n * gy if pid_tiled else n
+
+        def _runtime_stride(spec):
+            if not isinstance(spec, (tuple, list)) or len(spec) != 2:
+                raise ValueError("malformed stride reference")
+            if spec[0] == "arg":
+                return int(kargs[int(spec[1])])
+            if spec[0] == "literal":
+                return int(spec[1])
+            raise ValueError("unknown stride reference")
+
+        roles = (
+            ("A", tensor_indices[0], stride_specs[0], (batch, row_extent, k)),
+            ("B", tensor_indices[1], stride_specs[1], (batch, k, col_extent)),
+            ("C", tensor_indices[2], stride_specs[2], (batch, row_extent, col_extent)),
+        )
+        for role, tensor_index, specs, extents in roles:
+            tensor = kargs[tensor_index]
+            layout = tensor if hasattr(tensor, "stride") else getattr(tensor, "base", None)
+            if layout is None or not hasattr(layout, "shape") or not hasattr(layout, "element_size"):
+                return f"batched-dot {role} tensor layout cannot be inspected safely"
+            strides = tuple(_runtime_stride(spec) for spec in specs)
+            if len(strides) != 3:
+                return f"batched-dot {role} stride descriptor is malformed"
+            lower = 0
+            upper = 0
+            for extent, stride in zip(extents, strides):
+                delta = (extent - 1) * stride
+                lower += min(0, delta)
+                upper += max(0, delta)
+            reach = int(_strided_storage_reach(layout))
+            if lower < 0:
+                return (
+                    f"batched-dot {role} forms offset {lower} before the mirrored view base; "
+                    "the host-roundtrip path cannot preserve this runtime stride"
+                )
+            if upper >= reach:
+                return (
+                    f"batched-dot {role} forms offset {upper} past the mirrored view extent "
+                    f"of {reach} elements; the host-roundtrip path cannot preserve this runtime stride"
+                )
+        return None
+    except (IndexError, TypeError, ValueError, OverflowError):
+        return "the batched-dot runtime address bounds could not be proven"
+
+
 class MetalUtils:
     """Manages Metal device, command queue, and kernel dispatch.
 
@@ -540,6 +612,7 @@ class MetalLauncher:
         fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
         quant_matmul = kernel_metadata[8] if (kernel_metadata and len(kernel_metadata) > 8) else None
         flash_attention = kernel_metadata[9] if (kernel_metadata and len(kernel_metadata) > 9) else None
+        batched_dot_bounds = kernel_metadata[10] if (kernel_metadata and len(kernel_metadata) > 10) else None
         # FAIL-CLOSED for quantized: the compiled kernel IS the fast dequant kernel,
         # which the host-roundtrip path below cannot dispatch correctly. So a quantized
         # launch must be handled by dispatch_quant_matmul (compile_shader) or REFUSED —
@@ -656,6 +729,28 @@ class MetalLauncher:
                         _get_compile_shader_runtime().mark_unsupported(self._msl)
                 except Exception:
                     pass
+
+        # A batched-dot descriptor that did not return through zero-copy
+        # compile_shader is about to use the host-roundtrip mirror. Prove that
+        # every affine A/B/C offset formed by the runtime grid and strides lies
+        # inside the mirrored extent at/after each tensor view's base. Negative
+        # in-storage offsets are legal Triton but cannot be represented by this
+        # host mirror; past-view offsets have the same problem. Refuse rather
+        # than dispatch against absent/uninitialized bytes.
+        if batched_dot_bounds is not None:
+            _batched_kargs = [a for i, a in enumerate(args) if i not in self.constexpr_indices]
+            _bounds_reason = _batched_dot_host_bounds_reason(
+                batched_dot_bounds,
+                _batched_kargs,
+                (gridX, gridY, gridZ),
+            )
+            if _bounds_reason is not None:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "Refusing batched dot on the host-roundtrip launch path: " + _bounds_reason,
+                    op_name="tt.dot",
+                )
 
         # Quantized matmul is compile_shader-only: if it wasn't dispatched above
         # (non-MPS, compile_shader unavailable, opt-out, or a shape the edge-free

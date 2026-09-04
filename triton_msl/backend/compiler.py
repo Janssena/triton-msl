@@ -348,6 +348,8 @@ class MetalBackend(BaseBackend):
         quant_matmul = getattr(metadata, "quant_matmul", None)
         # FlashAttention zero-copy-dispatch descriptor; None for other kernels.
         flash_attention = getattr(metadata, "flash_attention", None)
+        # Batched-dot host-roundtrip address-bounds descriptor; None otherwise.
+        batched_dot_bounds = getattr(metadata, "batched_dot_bounds", None)
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -359,6 +361,7 @@ class MetalBackend(BaseBackend):
             fast_matmul,
             quant_matmul,
             flash_attention,
+            batched_dot_bounds,
         )
 
     def get_codegen_implementation(self, options):

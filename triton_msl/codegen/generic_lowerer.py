@@ -114,6 +114,7 @@ def _fa_half_accumulate(out_dtype) -> bool:
 
 
 from triton_msl.codegen._lowerer_detection import _DetectionMixin
+from triton_msl.codegen._lowerer_batched_dot import _BatchedDotMixin
 from triton_msl.codegen._lowerer_dot_kchunk import _DotKChunkMixin
 from triton_msl.codegen._lowerer_emission import _EmissionMixin
 from triton_msl.codegen._lowerer_reduce import _ReduceScanMixin
@@ -285,6 +286,7 @@ class GenericLowerer(
     _ReduceScanMixin,
     _EmissionMixin,
     _DetectionMixin,
+    _BatchedDotMixin,
     _DotKChunkMixin,
     _TemplateMixin,
 ):
@@ -1190,6 +1192,13 @@ class GenericLowerer(
 
             _gname = _sanitize_msl_name(self.graph.func_name)
             return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_gname}(", _gemv[1], count=1)
+
+        # Round 3: a rank-3 dot is admitted only when the dedicated detector
+        # proves the complete load/address/dot/store graph.  Every near miss
+        # continues to the established rank>=3 refusal below.
+        batched_dot = self._detect_batched_dot()
+        if batched_dot:
+            return self._lower_batched_dot_template(batched_dot)
 
         # Check for simple dot (no stride args, no scf.for) — use inline
         # scalar matmul that loads from global into shared memory, then
