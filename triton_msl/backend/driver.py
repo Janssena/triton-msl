@@ -71,14 +71,13 @@ def _strided_storage_reach(t):
 
 
 def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
-    """Return why a batched-dot address escapes its host mirror, else ``None``.
+    """Return why a batched-dot address escapes its backing storage, else ``None``.
 
-    The host-roundtrip path binds every tensor buffer at the tensor view's
-    ``storage_offset`` and mirrors ``_strided_storage_reach(view)`` elements
-    forward from there. A runtime stride may legally address elsewhere in the
-    underlying allocation, but those bytes are absent from this mirror. The
-    compile-time descriptor supplies the exact affine A/B/C address contracts;
-    evaluate their extrema with the runtime strides before host dispatch.
+    The compile-time descriptor supplies the exact affine A/B/C address
+    contracts.  Evaluate their extrema with the runtime strides and each
+    argument's storage offset before host dispatch.  The storage-faithful host
+    marshaller can replay addresses outside the logical view, but never outside
+    the allocation that it mirrors.
     """
 
     try:
@@ -115,7 +114,13 @@ def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
         for role, tensor_index, specs, extents in roles:
             tensor = kargs[tensor_index]
             layout = tensor if hasattr(tensor, "stride") else getattr(tensor, "base", None)
-            if layout is None or not hasattr(layout, "shape") or not hasattr(layout, "element_size"):
+            if (
+                layout is None
+                or not hasattr(layout, "shape")
+                or not hasattr(layout, "element_size")
+                or not hasattr(layout, "storage_offset")
+                or not hasattr(layout, "untyped_storage")
+            ):
                 return f"batched-dot {role} tensor layout cannot be inspected safely"
             strides = tuple(_runtime_stride(spec) for spec in specs)
             if len(strides) != 3:
@@ -126,19 +131,27 @@ def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
                 delta = (extent - 1) * stride
                 lower += min(0, delta)
                 upper += max(0, delta)
-            reach = int(_strided_storage_reach(layout))
-            if lower < 0:
+
+            elem_size = int(layout.element_size())
+            storage_nbytes = int(layout.untyped_storage().nbytes())
+            base_byte = int(layout.storage_offset()) * elem_size
+            lower_byte = base_byte + lower * elem_size
+            upper_byte_exclusive = base_byte + (upper + 1) * elem_size
+            if elem_size <= 0 or storage_nbytes <= 0:
+                return f"batched-dot {role} backing storage is empty or malformed"
+            if lower_byte < 0:
                 return (
-                    f"batched-dot {role} forms offset {lower} before the mirrored view base; "
+                    f"batched-dot {role} forms byte offset {lower_byte} before its backing storage; "
                     "the host-roundtrip path cannot preserve this runtime stride"
                 )
-            if upper >= reach:
+            if upper_byte_exclusive > storage_nbytes:
                 return (
-                    f"batched-dot {role} forms offset {upper} past the mirrored view extent "
-                    f"of {reach} elements; the host-roundtrip path cannot preserve this runtime stride"
+                    f"batched-dot {role} reaches byte {upper_byte_exclusive - 1} past its "
+                    f"{storage_nbytes}-byte backing storage; the host-roundtrip path cannot "
+                    "preserve this runtime stride"
                 )
         return None
-    except (IndexError, TypeError, ValueError, OverflowError):
+    except Exception:
         return "the batched-dot runtime address bounds could not be proven"
 
 
@@ -484,6 +497,7 @@ def _compile_shader_scalars_ok(launcher, kargs) -> bool:
 
 
 _MAX_METAL_BUFFERS = 31
+_HOST_MIRROR_MAX_BYTES = 1 << 30
 
 
 def _pack_overflow_scalars(kargs):
@@ -733,10 +747,9 @@ class MetalLauncher:
         # A batched-dot descriptor that did not return through zero-copy
         # compile_shader is about to use the host-roundtrip mirror. Prove that
         # every affine A/B/C offset formed by the runtime grid and strides lies
-        # inside the mirrored extent at/after each tensor view's base. Negative
-        # in-storage offsets are legal Triton but cannot be represented by this
-        # host mirror; past-view offsets have the same problem. Refuse rather
-        # than dispatch against absent/uninitialized bytes.
+        # inside the complete backing allocation the storage-faithful marshaller
+        # will mirror below.  Offsets outside the logical view are valid; offsets
+        # outside the allocation still refuse before any unsafe dispatch.
         if batched_dot_bounds is not None:
             _batched_kargs = [a for i, a in enumerate(args) if i not in self.constexpr_indices]
             _bounds_reason = _batched_dot_host_bounds_reason(
@@ -866,6 +879,199 @@ class MetalLauncher:
                 if ti < len(flat_args):
                     output_arg_indices.add(ti)
 
+        # Preserve STORAGE identity on the host-roundtrip path.  A tensor view's
+        # data_ptr starts at its storage_offset, but a Triton kernel may legally
+        # use a runtime stride to reach other elements of the SAME allocation.
+        # Mirroring only [view_base, view_base + reach(view)) therefore drops
+        # before-base / past-view bytes.  Packing each argument independently
+        # also destroys aliases, so store/load ordering and multiple-output
+        # semantics can change even when every address lies inside a view.
+        #
+        # Group ordinary tensors and TensorWrapper.base objects by their actual
+        # backing storage.  Each group gets ONE full-storage Metal mirror, and
+        # each argument binds that buffer at its own byte storage_offset.  One
+        # group-level copy-back then preserves aliases and kernel store order.
+        # Float64 remains on its established conversion path below: Metal has no
+        # double, so its device buffer has a different element width and cannot
+        # share this raw-byte mirror.
+        storage_groups = {}
+        storage_bindings = {}
+        float64_storage_owners = set()
+        from triton_msl.errors import MetalNonRecoverableError
+
+        def _storage_refusal(reason):
+            raise MetalNonRecoverableError(
+                "Refusing host-roundtrip tensor marshalling: " + reason,
+                op_name="kernel",
+            )
+
+        for arg_idx, arg in enumerate(flat_args):
+            if flat_sigs[arg_idx] == "constexpr" or not hasattr(arg, "data_ptr"):
+                continue
+            import torch as _torch
+
+            if hasattr(arg, "dtype") and arg.dtype == _torch.float64:
+                # The established fp64 compatibility path converts a dense
+                # argument to a separate fp32 buffer.  It cannot preserve an
+                # offset/non-contiguous backing span or aliases because element
+                # widths differ.  Keep the supported full-contiguous case, but
+                # fail closed on shapes that would otherwise silently lose
+                # before-base bytes or storage identity.
+                layout = arg if hasattr(arg, "untyped_storage") else getattr(arg, "base", None)
+                try:
+                    storage = layout.untyped_storage()
+                    storage_nbytes = int(storage.nbytes())
+                    storage_ptr = int(storage.data_ptr())
+                    logical_nbytes = int(arg.nelement()) * int(arg.element_size())
+                    full_contiguous = (
+                        bool(arg.is_contiguous())
+                        and int(arg.storage_offset()) == 0
+                        and logical_nbytes == storage_nbytes
+                    )
+                except Exception:
+                    full_contiguous = False
+                    storage_ptr = 0
+                    storage_nbytes = 0
+                if not full_contiguous:
+                    _storage_refusal(
+                        f"float64 tensor argument {arg_idx} must cover one complete contiguous storage; "
+                        "Metal's fp32 conversion path cannot preserve a partial or strided fp64 backing span"
+                    )
+                f64_key = (storage_ptr, storage_nbytes)
+                if f64_key in float64_storage_owners:
+                    _storage_refusal(
+                        "aliased float64 arguments cannot preserve storage identity through separate fp32 conversions"
+                    )
+                float64_storage_owners.add(f64_key)
+                continue
+            layout = arg if hasattr(arg, "untyped_storage") else getattr(arg, "base", None)
+            if layout is None or not hasattr(layout, "untyped_storage") or not hasattr(layout, "storage_offset"):
+                _storage_refusal(
+                    f"tensor argument {arg_idx} exposes no inspectable backing storage; "
+                    "the host path cannot preserve view bounds or aliases"
+                )
+            try:
+                storage = layout.untyped_storage()
+                storage_nbytes = int(storage.nbytes())
+                storage_ptr = int(storage.data_ptr())
+                elem_size = int(layout.element_size())
+                byte_offset = int(layout.storage_offset()) * elem_size
+                is_mps = hasattr(layout, "device") and str(layout.device).startswith("mps")
+                full_storage_view = (
+                    byte_offset == 0
+                    and hasattr(layout, "is_contiguous")
+                    and bool(layout.is_contiguous())
+                    and hasattr(layout, "numel")
+                    and int(layout.numel()) * elem_size == storage_nbytes
+                )
+                if storage_nbytes <= 0 or elem_size <= 0:
+                    continue
+                if byte_offset < 0 or byte_offset >= storage_nbytes:
+                    _storage_refusal(
+                        f"tensor argument {arg_idx} has byte offset {byte_offset} outside "
+                        f"its {storage_nbytes}-byte backing storage"
+                    )
+            except MetalNonRecoverableError:
+                raise
+            except Exception as error:
+                _storage_refusal(f"tensor argument {arg_idx}'s backing storage cannot be inspected ({error})")
+            key = ("mps" if is_mps else "host", storage_ptr, storage_nbytes)
+            group = storage_groups.setdefault(
+                key,
+                {
+                    "layout": layout,
+                    "storage_nbytes": storage_nbytes,
+                    "storage_ptr": storage_ptr,
+                    "elem_size": elem_size,
+                    "is_mps": is_mps,
+                    "members": [],
+                    "is_output": False,
+                },
+            )
+            # One backing storage can be observed through dtype reinterpretation.
+            # The full mirror is raw bytes, so different element sizes are fine;
+            # each binding offset is calculated in that view's own element units.
+            group["members"].append((arg_idx, byte_offset, full_storage_view))
+            if output_arg_indices is None or arg_idx in output_arg_indices:
+                group["is_output"] = True
+
+        for group in storage_groups.values():
+            layout = group["layout"]
+            storage_nbytes = group["storage_nbytes"]
+            storage_ptr = group["storage_ptr"]
+            elem_size = group["elem_size"]
+            single_complete_view = len(group["members"]) == 1 and group["members"][0][2]
+            if storage_nbytes > _HOST_MIRROR_MAX_BYTES and not single_complete_view:
+                _storage_refusal(
+                    f"a tensor alias group needs its full {storage_nbytes}-byte backing storage, "
+                    f"exceeding the {_HOST_MIRROR_MAX_BYTES}-byte safety limit"
+                )
+            if storage_nbytes % elem_size != 0:
+                _storage_refusal(
+                    f"a {storage_nbytes}-byte backing storage is not divisible by its "
+                    f"{elem_size}-byte representative element size"
+                )
+
+            if group["is_mps"]:
+                # Copy the COMPLETE MPS allocation to a CPU byte-faithful mirror.
+                # as_strided(..., storage_offset=0) deliberately ignores the
+                # representative view's base and exposes the whole typed storage.
+                try:
+                    import torch as _torch
+
+                    _torch.mps.synchronize()
+                    storage_elems = storage_nbytes // elem_size
+                    flat_storage = layout.as_strided((storage_elems,), (1,), 0)
+                    source = flat_storage.cpu().contiguous()
+                    if source.numel() * source.element_size() != storage_nbytes:
+                        _storage_refusal("the complete MPS backing storage could not be mirrored byte-for-byte")
+                except MetalNonRecoverableError:
+                    raise
+                except Exception as error:
+                    _storage_refusal(f"the complete MPS backing storage could not be mirrored ({error})")
+                metal_buf, aligned_mem, size_class = pool.acquire(storage_nbytes)
+                src = (ctypes.c_char * storage_nbytes).from_address(source.data_ptr())
+                dst_view = metal_buf.contents().as_buffer(storage_nbytes)
+                dst = (ctypes.c_char * storage_nbytes).from_buffer(dst_view)
+                ctypes.memmove(dst, src, storage_nbytes)
+                pool_releases.append((metal_buf, aligned_mem, size_class))
+                if group["is_output"]:
+                    tensor_copies.append(
+                        (
+                            metal_buf,
+                            layout,
+                            storage_nbytes,
+                            None,
+                            ("whole_storage_mps", elem_size),
+                        )
+                    )
+            else:
+                # CPU tensors can expose their complete storage directly when it
+                # satisfies Metal's page-wrapping contract; otherwise use one
+                # pooled raw-byte mirror for the whole alias group.
+                page_aligned = (storage_ptr % PAGE_SIZE == 0) and (storage_nbytes % PAGE_SIZE == 0)
+                if page_aligned and storage_nbytes >= PAGE_SIZE:
+                    metal_buf = utils.make_buffer_from_ptr(storage_ptr, storage_nbytes)
+                else:
+                    metal_buf, aligned_mem, size_class = pool.acquire(storage_nbytes)
+                    src = (ctypes.c_char * storage_nbytes).from_address(storage_ptr)
+                    dst_view = metal_buf.contents().as_buffer(storage_nbytes)
+                    dst = (ctypes.c_char * storage_nbytes).from_buffer(dst_view)
+                    ctypes.memmove(dst, src, storage_nbytes)
+                    pool_releases.append((metal_buf, aligned_mem, size_class))
+                    if group["is_output"]:
+                        tensor_copies.append(
+                            (
+                                metal_buf,
+                                layout,
+                                storage_nbytes,
+                                None,
+                                ("whole_storage_host", storage_ptr),
+                            )
+                        )
+            for arg_idx, byte_offset, _full_storage_view in group["members"]:
+                storage_bindings[arg_idx] = (metal_buf, byte_offset)
+
         for arg_idx, arg in enumerate(flat_args):
             # Per-leaf constexpr entries (e.g. constexpr element inside a
             # mixed tuple) are already compiled into the kernel — skip.
@@ -877,6 +1083,9 @@ class MetalLauncher:
                 is_mps = hasattr(arg, "device") and str(arg.device).startswith("mps")
                 # Metal has no float64 — downcast to float32 transparently.
                 is_f64 = hasattr(arg, "dtype") and arg.dtype == _torch.float64
+                if not is_f64 and arg_idx in storage_bindings:
+                    buffers.append(storage_bindings[arg_idx])
+                    continue
                 if is_f64:
                     arg_f32 = arg.float()  # float64 → float32
                     nbytes = arg_f32.nelement() * arg_f32.element_size()
@@ -1133,6 +1342,33 @@ class MetalLauncher:
             _marker = entry[4] if len(entry) > 4 else None
 
             import torch as _torch
+
+            if isinstance(_marker, tuple) and _marker[0] == "whole_storage_mps":
+                _esz = _marker[1]
+                if nbytes % _esz != 0:
+                    raise RuntimeError("host-roundtrip whole-storage copy-back has a partial element")
+                _count = nbytes // _esz
+                src_view = metal_buf.contents().as_buffer(nbytes)
+                flat_cpu = _torch.empty(_count, dtype=tensor.dtype)
+                ctypes.memmove(
+                    (ctypes.c_char * nbytes).from_address(flat_cpu.data_ptr()),
+                    (ctypes.c_char * nbytes).from_buffer(src_view),
+                    nbytes,
+                )
+                flat_device = tensor.as_strided((_count,), (1,), 0)
+                flat_device.copy_(flat_cpu.to(tensor.device))
+                _torch.mps.synchronize()
+                continue
+
+            if isinstance(_marker, tuple) and _marker[0] == "whole_storage_host":
+                _storage_ptr = _marker[1]
+                src_view = metal_buf.contents().as_buffer(nbytes)
+                ctypes.memmove(
+                    (ctypes.c_char * nbytes).from_address(_storage_ptr),
+                    (ctypes.c_char * nbytes).from_buffer(src_view),
+                    nbytes,
+                )
+                continue
 
             # Faithful strided round-trip: the device buffer mirrors the full
             # strided storage (reach >= numel). Read it ALL back into a flat CPU

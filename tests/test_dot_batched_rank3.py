@@ -432,8 +432,8 @@ def test_host_bounds_descriptor_checks_every_pointer_role(role, stride_index):
     kargs[stride_index] = -abs(int(kargs[stride_index]))
     reason = _batched_dot_host_bounds_reason(lowerer._batched_dot_bounds, kargs, (1, 1, 1))
     assert reason is not None
-    assert f"batched-dot {role} forms offset" in reason
-    assert "before the mirrored view base" in reason
+    assert f"batched-dot {role} forms byte offset" in reason
+    assert "before its backing storage" in reason
 
 
 @requires
@@ -651,17 +651,12 @@ def test_batched_gpu_replays_nontrivial_runtime_strides_and_broadcast(
 
 @requires_gpu
 @pytest.mark.parametrize("address_case", ["negative-batch", "negative-row", "past-batch"])
-def test_batched_host_roundtrip_refuses_offsets_outside_view_mirror(
+def test_batched_host_roundtrip_replays_offsets_outside_view_inside_storage(
     monkeypatch,
     cold_gpu_caches,
     address_case,
 ):
-    """The 2-D host launcher mirrors storage only at/after the view base.
-
-    A negative runtime stride can remain inside the underlying allocation while
-    stepping before that mirrored base.  The Round-3 descriptor must refuse at
-    launch rather than dispatch the template against uninitialized mirror bytes.
-    """
+    """The 2-D host launcher preserves valid addresses outside a logical view."""
     import triton_msl.backend.driver as driver
     import triton_msl.codegen.generic_lowerer as generic_lowerer
 
@@ -691,39 +686,38 @@ def test_batched_host_roundtrip_refuses_offsets_outside_view_mirror(
     if address_case == "negative-batch":
         a = a_storage[1:]
         a_strides = (-a_storage.stride(0), a_storage.stride(1), a_storage.stride(2))
-        error = "before the mirrored view base"
+        ref_a = torch.stack((a_storage[1], a_storage[0]))
     elif address_case == "negative-row":
         a = a_storage[:, 31:, :]
         a_strides = (a_storage.stride(0), -a_storage.stride(1), a_storage.stride(2))
-        error = "before the mirrored view base"
+        ref_a = torch.flip(a_storage, (1,))
     else:
         # The second logical batch reads storage batch 2: valid in the
-        # underlying allocation, but outside the mirror of the [:2] view.
+        # underlying allocation, but outside the logical [:2] view.
         a = a_storage[:batch]
         a_strides = (2 * a_storage.stride(0), a_storage.stride(1), a_storage.stride(2))
-        error = "past the mirrored view extent"
+        ref_a = torch.stack((a_storage[0], a_storage[2]))
     b = torch.randn((batch, 32, 32), device="mps")
     sentinel = 12345.0
     c = torch.full((batch, 32, 32), sentinel, device="mps")
 
-    with pytest.raises(MetalNonRecoverableError, match=error):
-        _dot3d_batched[(1, 1)](
-            a,
-            b,
-            c,
-            *a_strides,
-            *b.stride(),
-            *c.stride(),
-            BATCH=batch,
-            BLOCK_M=32,
-            BLOCK_N=32,
-            BLOCK_K=32,
-            num_warps=4,
-        )
+    _dot3d_batched[(1, 1)](
+        a,
+        b,
+        c,
+        *a_strides,
+        *b.stride(),
+        *c.stride(),
+        BATCH=batch,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+    )
     torch.mps.synchronize()
     assert route_hits == [(batch,)]
-    assert launches == []
-    assert torch.all(c == sentinel)
+    assert launches == [True]
+    torch.testing.assert_close(c, ref_a @ b, rtol=1e-3, atol=1e-3)
 
 
 @requires_gpu
@@ -820,30 +814,31 @@ def test_batched_host_bounds_rechecks_runtime_strides_after_warm_compile(
     assert launches == [True]
 
     # Same specialization and cached launcher, but this call's stride reaches
-    # before the mirrored view base.  The descriptor must retain runtime stride
-    # references rather than freezing the safe first call's values.
+    # before the logical view base while remaining in the backing allocation.
+    # The descriptor must retain runtime stride references rather than freezing
+    # the safe first call's values, and the marshaller must bind the offset base.
     a_storage = torch.randn((batch + 1, 32, 32), device="mps")
     a_unsafe = a_storage[1:]
     a_strides = (-a_storage.stride(0), a_storage.stride(1), a_storage.stride(2))
     sentinel = 12345.0
     c_unsafe = torch.full((batch, 32, 32), sentinel, device="mps")
-    with pytest.raises(MetalNonRecoverableError, match="before the mirrored view base"):
-        _dot3d_batched[(1, 1)](
-            a_unsafe,
-            b,
-            c_unsafe,
-            *a_strides,
-            *b.stride(),
-            *c_unsafe.stride(),
-            BATCH=batch,
-            BLOCK_M=32,
-            BLOCK_N=32,
-            BLOCK_K=32,
-            num_warps=4,
-        )
+    _dot3d_batched[(1, 1)](
+        a_unsafe,
+        b,
+        c_unsafe,
+        *a_strides,
+        *b.stride(),
+        *c_unsafe.stride(),
+        BATCH=batch,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=32,
+        num_warps=4,
+    )
     torch.mps.synchronize()
-    assert launches == [True]
-    assert torch.all(c_unsafe == sentinel)
+    assert launches == [True, True]
+    ref_a = torch.stack((a_storage[1], a_storage[0]))
+    torch.testing.assert_close(c_unsafe, ref_a @ b, rtol=1e-3, atol=1e-3)
 
 
 @requires_gpu
