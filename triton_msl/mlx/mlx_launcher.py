@@ -68,6 +68,14 @@ class MLXLauncher:
         Returns:
             List of output MLX arrays, in output_names order.
         """
+        # The extracted signature retains source runtime positions. MSL/MLX
+        # groups pointers and scalars for dispatch; Triton source need not.
+        # Never infer source argument kind from its position in that group.
+        if self.ext.arg_positions is not None:
+            if len(args) != len(self.ext.arg_positions):
+                raise ValueError("MLX route: runtime argument count differs from the proved binding map")
+            args = tuple(args[i] for i in self.ext.arg_positions)
+
         if self._kernel is None:
             self._build_kernel()
 

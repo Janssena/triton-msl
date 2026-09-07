@@ -15,12 +15,17 @@ import re
 from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
 
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
+from triton_msl.codegen._normalization_proof import prove_normalization
 
 
 # Epilogue ops that don't compute a new value — they only reshape the layout or
 # round the representation. In the per-element fused-epilogue loop they resolve
 # to their operand's expression (no emitted statement). Output dtype casts are
 # absorbed by the final store's cast. #158.
+# packet 162 (160 F-b): layout ops ONLY. The matmul+epilogue emitter substitutes a passthrough op
+# with its operand's expression, so a conversion listed here would be dropped, not replayed
+# (`z.to(int32).to(f32)` would emit as `z`). Conversions inside an epilogue now make
+# `_detect_matmul_epilogue` decline; the K-chunk path claims those kernels and replays the casts.
 _EPI_PASSTHROUGH = frozenset(
     {
         "tt.splat",
@@ -28,10 +33,6 @@ _EPI_PASSTHROUGH = frozenset(
         "tt.expand_dims",
         "tt.reshape",
         "ttg.convert_layout",
-        "arith.truncf",
-        "arith.extf",
-        "arith.sitofp",
-        "arith.fptosi",
     }
 )
 
@@ -112,7 +113,10 @@ class _DetectionMixin:
             "arith.index_castui",
             "arith.extsi",
             "arith.extui",
-            "arith.trunci",
+            # packet 139/140: ``arith.trunci`` is NOT transparent — a narrowed tile index
+            # (``k.to(tl.int8).to(tl.int32)``) is a different value; MLIR folds the
+            # identity ``trunci(extsi(x))`` before we see it, so a surviving trunci is
+            # a real narrowing and the decomposer must refuse it by name.
             "builtin.unrealized_conversion_cast",
         }
     )
@@ -2908,10 +2912,7 @@ class _DetectionMixin:
             "math.ceil",
             "math.fma",
             "math.absf",
-            "arith.truncf",
-            "arith.extf",
-            "arith.sitofp",
-            "arith.fptosi",
+            # packet 162: no conversions — see _EPI_PASSTHROUGH
             "tt.splat",
             "tt.broadcast",
             "tt.expand_dims",
@@ -3671,6 +3672,53 @@ class _DetectionMixin:
                             return True
         return False
 
+    def _stored_value_roots_at(self, store_ssa, root_pred, what):
+        """Packet 162 (160 F-h): the value a template's single store writes must BE the
+        computation the template replays, through layout ops only — plus at most ONE
+        ``arith.truncf`` whose result element type equals the store pointer's element type
+        (exactly what the template's own store cast replays). Anything else between the
+        computation and the store (a round trip, an integer cast, arithmetic) is not replayed:
+        the softmax template stored the raw division for ``(y*4).to(int32).to(f32)`` (GPU err
+        2.24) and for ``y.to(f16).to(f32)`` (err 1.4e-4). Returns the root op or None."""
+        by_id = {o.id: o for o in self.graph.ops}
+        args = {a.id: a for a in self.graph.args}
+        if store_ssa is None or len(store_ssa.operand_ids or []) < 2:
+            return None
+        ptr_op = by_id.get(store_ssa.operand_ids[0])
+        # the store pointer's element type: walk addptr/splat/broadcast to the pointer arg
+        cur, seen = store_ssa.operand_ids[0], set()
+        ptr_elem = None
+        while cur not in seen:
+            seen.add(cur)
+            if cur in args:
+                ptr_elem = str(args[cur].elem_type)
+                break
+            o = by_id.get(cur)
+            if o is None or not (o.operand_ids or []):
+                break
+            cur = o.operand_ids[0]
+        cur, seen, casts = store_ssa.operand_ids[1], set(), 0
+        while cur not in seen:
+            seen.add(cur)
+            o = by_id.get(cur)
+            if o is None:
+                return None
+            if o.op in ("ttg.convert_layout", "tt.reshape") and o.operand_ids:
+                cur = o.operand_ids[0]
+                continue
+            if o.op == "arith.truncf" and o.operand_ids and casts == 0:
+                t = (o.type_str or "")
+                el = t.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in t else t.strip()
+                norm = {"f16": ("f16", "fp16", "half"), "bf16": ("bf16", "bfloat16"), "f32": ("f32", "fp32", "float")}
+                ok = ptr_elem is not None and any(el in v and ptr_elem in v for v in norm.values())
+                if not ok:
+                    return None
+                casts += 1
+                cur = o.operand_ids[0]
+                continue
+            return o if root_pred(o, by_id) else None
+        return None
+
     def _detect_softmax(self):
         """Detect a row-wise softmax kernel:
             x = tl.load(x_ptr + row * n + offsets, mask, other=-inf)
@@ -3735,6 +3783,17 @@ class _DetectionMixin:
             return None
         input_arg, output_arg = io
 
+        # packet 162 (160 F-h): the STORED value must be the division itself (exp / sum),
+        # through layout ops and at most one output cast the template's store replays.
+        def _is_softmax_div(o, by_id):
+            if o.op != "arith.divf" or len(o.operand_ids or []) != 2:
+                return False
+            a, b = (by_id.get(x) for x in o.operand_ids)
+            return a is not None and a.op in ("math.exp", "math.exp2") and b is not None and b.op in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat")
+
+        if self._stored_value_roots_at(store_ssa, _is_softmax_div, "softmax") is None:
+            return None
+
         # Row length / stride: the kernel's single scalar arg. The template
         # uses ONE scalar for BOTH the row stride (row_start = pid * n) and the
         # per-row element count (the stride-loop bound), so it is correct only
@@ -3764,12 +3823,14 @@ class _DetectionMixin:
             # TG buffer + more iterations. Skip for safety.
             return None
 
-        return {
+        info = {
             "input_arg": input_arg,
             "output_arg": output_arg,
             "n_arg": n_arg,
             "block_size": block_size,
         }
+        prove_normalization(self.graph, info, "softmax")
+        return info
 
     def _detect_layer_norm(self):
         """Detect a row-wise layer-norm kernel:
@@ -3851,6 +3912,30 @@ class _DetectionMixin:
             return None
         input_arg, output_arg = io
 
+        # packet 162 (160 F-h): the STORED value must be the normalisation itself —
+        # mulf(centred x, broadcast(rsqrt(var + eps))) — through layout ops and at most one
+        # output cast the template's store replays.
+        def _peel_b(x, by_id):
+            seen = set()
+            while x not in seen:
+                seen.add(x)
+                o = by_id.get(x)
+                if o is None or o.op not in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat") or not o.operand_ids:
+                    return o
+                x = o.operand_ids[0]
+            return None
+
+        def _is_ln_norm(o, by_id):
+            if o.op != "arith.mulf" or len(o.operand_ids or []) != 2:
+                return False
+            sides = [_peel_b(x, by_id) for x in o.operand_ids]
+            has_rsqrt = any(x is not None and x.op in ("math.rsqrt",) for x in sides)
+            has_centred = any(x is not None and x.op in ("arith.subf", "arith.select") for x in sides)
+            return has_rsqrt and has_centred
+
+        if self._stored_value_roots_at(store_ssa, _is_ln_norm, "layer norm") is None:
+            return None
+
         # The row length is the SOLE scalar arg (BLOCK_SIZE is constexpr, not in args).
         # Without this guard the first non-ptr arg was grabbed as the row length, so a
         # layernorm kernel passing BOTH M and N (or eps) as runtime args used the wrong
@@ -3904,13 +3989,15 @@ class _DetectionMixin:
         if eps_val is None:
             return None
 
-        return {
+        info = {
             "input_arg": input_arg,
             "output_arg": output_arg,
             "n_arg": n_arg,
             "block_size": block_size,
             "eps": eps_val,
         }
+        prove_normalization(self.graph, info, "layer_norm")
+        return info
 
     def _detect_transpose_via_reshape(self):
         """Detect the ``test_trans_reshape``-style transpose kernel:

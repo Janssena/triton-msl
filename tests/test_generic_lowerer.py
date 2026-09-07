@@ -3303,7 +3303,9 @@ def test_mept_reduce_uses_fold_when_operand_is_array():
         lowerer.env_types[50] = "fp32"
 
         # tt.reduce with a sum body: the combine returns addf(a, b) of the two block args
-        # (60, 61) — the structural classifier matches the yielded op against block_arg_ids.
+        # (60, 61) — the structural classifier matches the yielded op against block_arg_ids,
+        # and (packet 192) requires the region to RETURN that op: the walker records the
+        # returned ids as attrs["return_ids"] (packet 154), so the hand-built graph carries it.
         add_body = SSAValue(
             id=51,
             name="b51",
@@ -3319,7 +3321,7 @@ def test_mept_reduce_uses_fold_when_operand_is_array():
             name="r52",
             op="tt.reduce",
             operand_ids=[50],
-            attrs={"axis": 0, "block_arg_ids": [60, 61]},
+            attrs={"axis": 0, "block_arg_ids": [60, 61], "return_ids": [51]},
             type_str="f32",
             elem_type="f32",
             is_tensor=False,

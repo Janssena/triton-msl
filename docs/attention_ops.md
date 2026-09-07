@@ -47,3 +47,24 @@ o.backward(dO)                              # dQ/dK/dV computed on Metal
 - The forward computes `O` (torch SDPA, which routes to the backend's simdgroup FA) and the
   log-sum-exp the backward needs via a dedicated Metal flash kernel (`make_fa_logsumexp_kernel`,
   tiled/online), so it never materializes the N×N score matrix.
+
+
+## Biased / triangle attention (trifast's shape) — forward and backward templates
+
+The `@triton.jit` kernels of the trifast / AlphaFold triangle-attention family are recognised and
+routed to hand-written Metal templates without source changes: the forward
+(`scores = q·kᵀ·scale + bias`, a boolean column mask selecting a score sentinel, `exp2` online
+softmax, `lse` stored) and the three backward kernels (dK / dV, dQ + delta, dbias). Each route
+*proves* the source against the template's algebra before emitting anything — which pointer plays
+which role, along which axis every broadcast lies, the whole downstream gradient graph by
+orientation, the exact loop recurrences, the reduce combiner's returned value — and refuses by name
+on any difference. Configurations, dtypes and the refusals are listed in `SUPPORTED_OPS.md`
+(the two "biased / triangle attention" rows and catalog entry 21).
+
+Narrow dtypes: the templates compute in fp32 and **replay the source's rounding points** rather
+than approximate them — the scaled operand (`x * tl.full([1], scale, dtype)`), `P.to(dtype)` where
+the source rounds it (per kv block in the forward, before the dV dot in the backward),
+`dS.to(dtype)` before the dK / dQ dots, and the output casts. The one rounding no template can
+replay is a reduction *accumulated* in the narrow dtype (trifast's unmodified `_bwd_q` computes
+`delta = tl.sum(o * do)` that way): it refuses, and the message names the one-line change
+(`tl.sum((o * do).to(tl.float32), 1)`) that makes it computable.

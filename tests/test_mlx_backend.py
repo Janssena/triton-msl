@@ -116,7 +116,10 @@ kernel void kernel_2d(
         assert "__pid_y" in ext.body
 
     def test_extract_all_outputs(self):
-        """When no output_arg_indices, all ptr args become outputs."""
+        """When no output_arg_indices, all ptr args become outputs — and a kernel that READS
+        one of them refuses (packet 176): that pointer would be a fresh, uninitialised MLX array.
+        Here `b` is read, so the extraction refuses instead of classifying b as an output."""
+        from triton_msl.errors import MetalNonRecoverableError
         msl = """
 #include <metal_stdlib>
 using namespace metal;
@@ -131,9 +134,8 @@ kernel void k(
     a[tid] = b[tid];
 }
 """
-        ext = extract_msl_for_mlx(msl, output_arg_indices=None)
-        assert ext.input_names == []
-        assert ext.output_names == ["a", "b"]
+        with pytest.raises(MetalNonRecoverableError, match="reads .* output pointer 'b'"):
+            extract_msl_for_mlx(msl, output_arg_indices=None)
 
     def test_header_excludes_metal_stdlib(self):
         """Header should not include metal_stdlib (MLX provides it)."""

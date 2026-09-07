@@ -200,6 +200,16 @@ out = mx.zeros((n,))
 results = triton_call(add_kernel, x, y, out, n, grid=(4,), BLOCK=256)
 ```
 
+The MLX route re-launches the *same* emitted MSL through `mx.fast.metal_kernel`, so it inherits
+every kernel-level guarantee of the torch path. Its own contract is narrower and enforced
+(`MetalNonRecoverableError` before any dispatch): one kernel per launch with no template dispatch
+descriptor (attention / matmul templates take the torch.mps path); outputs are **fresh** arrays, so a
+kernel that reads or atomically updates an output pointer refuses; array dtypes must be in the
+signature map and integer arguments must fit int32. One thing the route cannot check with MLX 0.32
+(`mx.array` exposes neither strides nor contiguity): MLX hands the kernel a **row-contiguous copy** of
+every input, so the stride arguments you pass must describe the row-contiguous layout of the array's
+shape, not the strides of a transposed or sliced view.
+
 ### MPS tensors: zero-copy
 
 The same `@triton.jit` kernel runs **zero-copy** on `torch` MPS tensors: the driver

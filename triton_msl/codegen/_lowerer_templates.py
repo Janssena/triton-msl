@@ -1303,6 +1303,7 @@ class _TemplateMixin:
         lines.append(f"    threadgroup float row_cache[{block_size}];")
         lines.append(f"    threadgroup float reduce_buf[{n_simd}];")
         lines.append(f"    int row_start = pid * {n_arg};")
+        lines.append(f"    int _norm_cols = clamp(int({n_arg}), 0, {block_size});")
         lines.append("    float local_max = -INFINITY;")
         lines.append("")
 
@@ -1310,7 +1311,7 @@ class _TemplateMixin:
         if vectorize:
             lines.append(f"    bool use_vec = (({n_arg} & 3) == 0);")
             lines.append("    if (use_vec) {")
-            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        int n_v = _norm_cols / 4;")
             lines.append(f"        device float4* x4 = (device float4*)({input_arg} + row_start);")
             lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
             lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
@@ -1319,14 +1320,14 @@ class _TemplateMixin:
             lines.append("            local_max = max(local_max, max(max(v.x, v.y), max(v.z, v.w)));")
             lines.append("        }")
             lines.append("    } else {")
-            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"            float v = static_cast<float>({input_arg}[row_start + i]);")
             lines.append("            row_cache[i] = v;")
             lines.append("            local_max = max(local_max, v);")
             lines.append("        }")
             lines.append("    }")
         else:
-            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"        float v = static_cast<float>({input_arg}[row_start + i]);")
             lines.append("        row_cache[i] = v;")
             lines.append("        local_max = max(local_max, v);")
@@ -1344,7 +1345,7 @@ class _TemplateMixin:
         # ----- Phase 2: exp(x - max) → row_cache, reduce local sum -----
         if vectorize:
             lines.append("    if (use_vec) {")
-            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        int n_v = _norm_cols / 4;")
             lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
             lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
             lines.append("            float4 v = row4[i];")
@@ -1355,14 +1356,14 @@ class _TemplateMixin:
             lines.append("            local_sum += e.x + e.y + e.z + e.w;")
             lines.append("        }")
             lines.append("    } else {")
-            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append("            float e = exp(row_cache[i] - row_max);")
             lines.append("            row_cache[i] = e;")
             lines.append("            local_sum += e;")
             lines.append("        }")
             lines.append("    }")
         else:
-            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append("        float e = exp(row_cache[i] - row_max);")
             lines.append("        row_cache[i] = e;")
             lines.append("        local_sum += e;")
@@ -1380,19 +1381,19 @@ class _TemplateMixin:
         # ----- Phase 3: write normalized exp to global memory -----
         if vectorize:
             lines.append("    if (use_vec) {")
-            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        int n_v = _norm_cols / 4;")
             lines.append(f"        device float4* o4 = (device float4*)({output_arg} + row_start);")
             lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
             lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
             lines.append("            o4[i] = row4[i] * inv_sum;")
             lines.append("        }")
             lines.append("    } else {")
-            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"            {output_arg}[row_start + i] = {_store_cast}(row_cache[i] * inv_sum);")
             lines.append("        }")
             lines.append("    }")
         else:
-            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"        {output_arg}[row_start + i] = {_store_cast}(row_cache[i] * inv_sum);")
             lines.append("    }")
         lines.append("}")
@@ -1403,8 +1404,8 @@ class _TemplateMixin:
         """Emit a TG-cached row-wise layer-norm kernel.
 
         Mirrors ``_lower_softmax_template``\\'s structure with a row_cache TG
-        buffer; differs only in the math (single-pass ``sum`` and ``sum_sq``
-        in phase 1, instead of ``max`` + delayed ``exp``).
+        buffer; differs only in the math (``sum`` followed by centered-square
+        variance, instead of ``max`` followed by ``exp``).
 
         Memory traffic vs the generic 3-phase lowering:
           - global x_ptr reads: 3 → 1 (cached in TG memory)
@@ -1475,62 +1476,65 @@ class _TemplateMixin:
         lines.append(f"    threadgroup float row_cache[{block_size}];")
         lines.append(f"    threadgroup float reduce_buf[{n_simd}];")
         lines.append(f"    int row_start = pid * {n_arg};")
+        lines.append(f"    int _norm_cols = clamp(int({n_arg}), 0, {block_size});")
         lines.append("    float local_sum = 0.0f;")
-        lines.append("    float local_sumsq = 0.0f;")
         lines.append("")
 
-        # Phase 1: load → row_cache, single-pass mean + variance
+        # Phase 1: load -> row_cache, reduce the source mean
         if vectorize:
             lines.append(f"    bool use_vec = (({n_arg} & 3) == 0);")
             lines.append("    if (use_vec) {")
-            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        int n_v = _norm_cols / 4;")
             lines.append(f"        device float4* x4 = (device float4*)({input_arg} + row_start);")
             lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
             lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
             lines.append("            float4 v = x4[i];")
             lines.append("            row4[i] = v;")
             lines.append("            local_sum += v.x + v.y + v.z + v.w;")
-            lines.append("            local_sumsq += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;")
             lines.append("        }")
             lines.append("    } else {")
-            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"            float v = static_cast<float>({input_arg}[row_start + i]);")
             lines.append("            row_cache[i] = v;")
             lines.append("            local_sum += v;")
-            lines.append("            local_sumsq += v * v;")
             lines.append("        }")
             lines.append("    }")
         else:
-            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"        float v = static_cast<float>({input_arg}[row_start + i]);")
             lines.append("        row_cache[i] = v;")
             lines.append("        local_sum += v;")
-            lines.append("        local_sumsq += v * v;")
             lines.append("    }")
 
-        # Reduce sum and sum-of-squares across threadgroup
+        # Reduce the mean, then the centered-square variance across the threadgroup
         lines.append("    float simd_sum_v = simd_sum(local_sum);")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_sum_v;")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    float row_sum = simd_sum((tiisg < {n_simd}u) ? reduce_buf[tiisg] : 0.0f);")
         lines.append("")
+        # Match the source's centered-square variance. Difference-of-moments
+        # loses small deviations around a large mean (1000 +/- 0.125 -> var=0).
+        lines.append(f"    float mean = row_sum / float({n_arg});")
+        lines.append("    float local_sumsq = 0.0f;")
+        lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
+        lines.append("        float centered = row_cache[i] - mean;")
+        lines.append("        local_sumsq += centered * centered;")
+        lines.append("    }")
         lines.append("    float simd_sumsq_v = simd_sum(local_sumsq);")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_sumsq_v;")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    float row_sumsq = simd_sum((tiisg < {n_simd}u) ? reduce_buf[tiisg] : 0.0f);")
         lines.append("")
-        lines.append(f"    float inv_n = 1.0f / float({n_arg});")
-        lines.append("    float mean = row_sum * inv_n;")
-        lines.append("    float var = row_sumsq * inv_n - mean * mean;")
+        lines.append(f"    float var = row_sumsq / float({n_arg});")
         lines.append(f"    float inv_std = rsqrt(var + {eps_literal});")
         lines.append("")
 
         # Phase 2: write (x - mean) * inv_std to global memory
         if vectorize:
             lines.append("    if (use_vec) {")
-            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        int n_v = _norm_cols / 4;")
             lines.append(f"        device float4* o4 = (device float4*)({output_arg} + row_start);")
             lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
             lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
@@ -1539,12 +1543,12 @@ class _TemplateMixin:
             lines.append("            o4[i] = (v - m) * inv_std;")
             lines.append("        }")
             lines.append("    } else {")
-            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"            {output_arg}[row_start + i] = {_store_cast}((row_cache[i] - mean) * inv_std);")
             lines.append("        }")
             lines.append("    }")
         else:
-            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"    for (uint i = lid; i < (uint)_norm_cols; i += {threads}u) {{")
             lines.append(f"        {output_arg}[row_start + i] = {_store_cast}((row_cache[i] - mean) * inv_std);")
             lines.append("    }")
         lines.append("}")

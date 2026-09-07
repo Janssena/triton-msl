@@ -341,6 +341,13 @@ class _ReduceScanMixin:
         a, b = ba[0], ba[1]
         bargs = {a, b}
         top = ops[-1]  # yielded op (the reduce.return terminator is parsed out)
+        # Packet 192 (188 §4): the region's LAST op is not necessarily what the reduction RETURNS —
+        # a legal region can compute `%s = addf %a, %b` and `tt.reduce.return %a` (a projection,
+        # the add dead), which this classifier used to lower as a sum. The walker records the
+        # returned ids (packet 154); the returned value must BE the classified op, else refuse.
+        rets = (ssa.attrs or {}).get("return_ids")
+        if rets != [top.id]:
+            return None
         nm = top.op or ""
         # (1) a DIRECT binary op of exactly the two block args.
         if set(top.operand_ids or []) == bargs:

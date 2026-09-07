@@ -255,8 +255,8 @@ class _ModuleTextIndex:
         }
         """
         result = {}
-        for m in re.finditer(r"tt\.func\s+(public|private)\s+@(\S+)\s*\(", self.text):
-            visibility = m.group(1)
+        for m in re.finditer(r"(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?@(\S+)\s*\(", self.text):
+            visibility = m.group(1) or "public"   # MLIR default visibility is public
             func_name = m.group(2)
 
             # Parse args (balanced paren matching)
@@ -506,12 +506,6 @@ class MLIRWalker:
         self._predicates_in_order = self._get_predicates_in_order()
         self._predicate_walk_index = 0
 
-        # Atomic op matching: same approach
-        self._atomic_rmw_names_in_order = self._get_atomic_rmw_ssa_names_in_order()
-        self._atomic_rmw_walk_index = 0
-        self._atomic_cas_names_in_order = self._get_atomic_cas_ssa_names_in_order()
-        self._atomic_cas_walk_index = 0
-
         # Call target matching: map walk order -> callee name
         self._call_targets_in_order = self._get_call_targets_in_order()
         self._call_walk_index = 0
@@ -543,10 +537,6 @@ class MLIRWalker:
         regex as the name list so the two stay index-aligned."""
         return [m.group(2) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", self._mod_text)]
 
-    def _get_atomic_rmw_ssa_names_in_order(self) -> List[str]:
-        """Get tt.atomic_rmw SSA names in text order."""
-        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_rmw", self._mod_text)]
-
     def _get_call_targets_in_order(self) -> List[str]:
         """Get tt.call callee names in text order.
 
@@ -558,10 +548,6 @@ class MLIRWalker:
         for m in re.finditer(r"tt\.call\s+@(\S+)\(", self._mod_text):
             targets.append(m.group(1))
         return targets
-
-    def _get_atomic_cas_ssa_names_in_order(self) -> List[str]:
-        """Get tt.atomic_cas SSA names in text order."""
-        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_cas", self._mod_text)]
 
     def _next_var(self) -> str:
         name = f"v{self._var_counter}"
@@ -593,6 +579,18 @@ class MLIRWalker:
             mod_text=self._mod_text,
         )
 
+    def _record_reduce_return(self, op, block_id):
+        """Packet 154: remember the operand ids of a ``tt.reduce.return`` for its block, so the
+        reduce op can carry ``attrs["return_ids"]`` (which value the region returns)."""
+        if not hasattr(self, "_reduce_return_map"):
+            self._reduce_return_map = {}
+        try:
+            ids = [op.get_operand(i).id() for i in range(op.get_num_operands())]
+        except Exception:
+            ids = []
+        if block_id is not None:
+            self._reduce_return_map[block_id] = ids
+
     def _attach_nested_ops(self, ops, nested_ops, block_args_map):
         """Recursively attach nested ops to parent ops and extract block args."""
         for ssa in ops:
@@ -613,6 +611,10 @@ class MLIRWalker:
                         args = block_args_map.get(bid, [])
                         if args:
                             ssa.attrs["block_arg_ids"] = args
+                            if ssa.op == "tt.reduce":
+                                # packet 154: the SSA ids the region RETURNS (from its
+                                # tt.reduce.return); consumers must not infer them from the body
+                                ssa.attrs["return_ids"] = list(getattr(self, "_reduce_return_map", {}).get(bid, []))
                             break
 
                 # For scf.if: separate ops into then_ops and else_ops
@@ -717,14 +719,75 @@ class MLIRWalker:
         callee_block_first_seen = [{}]  # block_id -> walk order
         callee_block_parent_region = [{}]  # block_id -> parent region id
 
+        def _is_function_body_block(block):
+            """True iff BLOCK's parent region is a function body: region depth 2 counted from the
+            block's own parent region (module body = 1, function body = 2, nested op bodies >= 3).
+            The bindings expose no owner-op accessor, so depth is the structural identity; any
+            binding failure propagates (a loud emit_msl fallback, never a guessed entry block)."""
+            r = block.get_parent()
+            depth = 0
+            while r is not None and depth < 64:
+                depth += 1
+                r = r.get_parent_region()
+            return depth == 2
+
+        # Packet 166, third site: the function a body belongs to is decided by the text-order index
+        # of the function being collected and THAT function's visibility, not by "the first
+        # function visited is the public entry" (a private function before the public one in the
+        # module text swapped the two bodies). Post-order visits sibling functions in text order;
+        # each function op is cross-checked by name and visibility against the text table.
+        func_order = [(n.strip('"'), info) for n, info in self._text_index.func_defs.items()]
+        func_k = [0]
+        refusal = [None]  # set inside the walk, raised after it (see the tt.func handler)
+        func_body_blocks = [set()]  # function-body block ids seen for the function being collected
+
+        def _collecting_entry():
+            k = func_k[0]
+            return k < len(func_order) and func_order[k][1]["is_public"]
+
         def walk_fn(op):
+            if refusal[0] is not None:
+                return
             name = op.get_name()
 
             # Handle tt.func/func.func: marks the end of a function's body
             # (post-order: body ops come before the func op itself)
             if name in ("tt.func", "func.func"):
-                if not entry_func_done[0]:
-                    # This is the entry function (public kernel)
+                k = func_k[0]
+                func_k[0] = k + 1
+                try:
+                    op_fname = op.get_str_attr("sym_name")
+                    op_vis = op.get_str_attr("sym_visibility") or "public"
+                except Exception:
+                    op_fname, op_vis = None, None
+                if (
+                    k >= len(func_order)
+                    or (op_fname is not None and op_fname != func_order[k][0])
+                    or (op_vis is not None and (op_vis == "public") != func_order[k][1]["is_public"])
+                ):
+                    # Recorded, not raised: a Python exception cannot cross the pybind walk
+                    # callback (it aborts the process). Raised right after the walk returns.
+                    refusal[0] = (
+                        f"walker: function #{k} in walk order ({op_fname!r}, {op_vis}) does not match the "
+                        f"module text's function table {[n for n, _ in func_order]}; refusing rather than "
+                        f"filing its body under another function"
+                    )
+                    return
+                n_blocks = len(func_body_blocks[0])
+                func_body_blocks[0] = set()
+                if n_blocks > 1:
+                    # The walker models single-block function bodies (Triton's TTGIR uses scf
+                    # regions, never cf-style block chains); a second body block's ops were
+                    # silently filed as "nested" and dropped. Refuse instead.
+                    refusal[0] = (
+                        f"walker: function {op_fname!r} has {n_blocks} body blocks (cf-style control "
+                        f"flow); the walker models single-block bodies; refusing"
+                    )
+                    return
+                if func_order[k][1]["is_public"]:
+                    if entry_func_done[0]:
+                        refusal[0] = "walker: more than one public function in the module; refusing"
+                        return
                     entry_func_done[0] = True
                 else:
                     # This is a callee function — collect its accumulated ops
@@ -738,6 +801,9 @@ class MLIRWalker:
                             "ops": callee_ops,
                             "block_ids": callee_block_ids,
                             "nested": callee_nested_copy,
+                            # The function-body block (packet 166): the callee's arguments are
+                            # read from THIS block, never from "any block with arguments".
+                            "entry_block_id": callee_entry_block_id[0],
                         }
                     )
 
@@ -757,21 +823,34 @@ class MLIRWalker:
 
             block = op.get_block()
             block_id = block.id() if block is not None else None
+            if block is not None and _is_function_body_block(block):
+                func_body_blocks[0].add(block_id)
 
-            # Detect entry block from first op
-            if entry_block_id[0] is None and block is not None:
+            # Detect the entry block: the FIRST op visited whose block is a FUNCTION-BODY block
+            # (packet 166 / 155 §2). The walk is post-order, so when a function's first op owns a
+            # region (a reduction as the first statement) the first visited op lies in that nested
+            # body; taking its block as the entry misfiled the function's own ops as nested and
+            # dropped the region-owning op (`CalledFunc.ops` held only the inner addf).
+            if (
+                entry_block_id[0] is None
+                and block is not None
+                and _collecting_entry()
+                and _is_function_body_block(block)
+            ):
                 entry_block_id[0] = block_id
                 entry_block_ref[0] = block
                 entry_func_block_ids.add(block_id)
 
-            # Determine if this op belongs to the entry function or a callee
-            if entry_func_done[0]:
-                # We're past the entry function — this op belongs to a callee
+            # Determine if this op belongs to the entry function or a callee: by the visibility of
+            # the function whose body is being collected (packet 166), not by walk position
+            if not _collecting_entry():
+                # This op belongs to a callee (private function), wherever it sits in the module
                 if block_id is not None:
                     current_callee_block_ids[0].add(block_id)
 
-                    # Detect callee's entry block from first op
-                    if callee_entry_block_id[0] is None:
+                    # Detect the callee's entry block: the first FUNCTION-BODY block seen for this
+                    # callee, not the first visited block (packet 166 / 155 §2 — see above).
+                    if callee_entry_block_id[0] is None and _is_function_body_block(block):
                         callee_entry_block_id[0] = block_id
 
                     # Track block first-seen order and parent region for callee
@@ -797,6 +876,9 @@ class MLIRWalker:
 
                 # Build SSA value for callee ops
                 if name in ("tt.reduce.return",):
+                    # packet 154: keep WHICH values the reduction region returns (the
+                    # terminator itself stays out of region_ops so body censuses are unchanged)
+                    self._record_reduce_return(op, block_id)
                     walk_counter[0] += 1
                     return
 
@@ -890,8 +972,9 @@ class MLIRWalker:
                 except Exception:
                     block_args_map[block_id] = []
 
-            # Skip reduce return (terminator in reduce body)
+            # Skip reduce return (terminator in reduce body) — but keep its operands (packet 154)
             if name in ("tt.reduce.return",):
+                self._record_reduce_return(op, block_id)
                 walk_counter[0] += 1
                 return
 
@@ -962,6 +1045,11 @@ class MLIRWalker:
 
         self.module.walk(walk_fn)
 
+        if refusal[0] is not None:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(refusal[0])
+
         return entry_block_ref[0], top_level, nested, block_args_map, callee_funcs_raw
 
     def _build_called_funcs(self, callee_funcs_raw, nested_ops, block_args_map):
@@ -993,8 +1081,12 @@ class MLIRWalker:
             arg_names = func_info.get("arg_names", [])
             arg_types = func_info.get("arg_types", [])
 
-            # Find the callee's entry block (the one with block args)
-            for bid in callee_block_ids:
+            # The callee's arguments are the block arguments of its FUNCTION-BODY block
+            # (packet 166). `callee_block_ids` is an unordered set and a loop's condition /
+            # body blocks carry block arguments too (the loop-carried values), so scanning for
+            # "a block with arguments" bound a callee's signature to its loop on some walks.
+            entry_bid = raw.get("entry_block_id")
+            for bid in ([entry_bid] if entry_bid is not None else []):
                 if bid in block_args_map and block_args_map[bid]:
                     arg_ids = block_args_map[bid]
                     for j, arg_id in enumerate(arg_ids):
@@ -1260,27 +1352,18 @@ class MLIRWalker:
             if rounding is not None:
                 attrs["rounding"] = "rtz" if rounding == 0 else "rtne"
 
-        elif name == "tt.atomic_rmw":
-            # Look up rmw_op and sem from pre-parsed module text by walk order
-            idx = self._atomic_rmw_walk_index
-            if idx < len(self._atomic_rmw_names_in_order):
-                ssa_name = self._atomic_rmw_names_in_order[idx]
-                info = self._text_index.atomic_ops.get(ssa_name, {})
-                if "rmw_op" in info:
-                    attrs["rmw_op"] = info["rmw_op"]
-                if "sem" in info:
-                    attrs["sem"] = info["sem"]
-            self._atomic_rmw_walk_index += 1
-
-        elif name == "tt.atomic_cas":
-            # Look up sem from pre-parsed module text by walk order
-            idx = self._atomic_cas_walk_index
-            if idx < len(self._atomic_cas_names_in_order):
-                ssa_name = self._atomic_cas_names_in_order[idx]
-                info = self._text_index.atomic_ops.get(ssa_name, {})
-                if "sem" in info:
-                    attrs["sem"] = info["sem"]
-            self._atomic_cas_walk_index += 1
+        elif name in ("tt.atomic_rmw", "tt.atomic_cas"):
+            # Read enums on the OWNING operation: text SSA names can collide across
+            # regions/functions. Closed tables from TritonAttrDefs.td; None preserves
+            # missing/unknown metadata for a loud consumer refusal, never a default.
+            # Do not throw from the pybind walk callback (it can abort the process).
+            attrs["sem"] = {1: "relaxed", 2: "acquire", 3: "release", 4: "acq_rel"}.get(op.get_int_attr("sem"))
+            attrs["scope"] = {1: "gpu", 2: "cta", 3: "sys"}.get(op.get_int_attr("scope"))
+            if name == "tt.atomic_rmw":
+                attrs["rmw_op"] = {
+                    1: "and", 2: "or", 3: "xor", 4: "add", 5: "fadd",
+                    6: "max", 7: "min", 8: "umax", 9: "umin", 10: "exch",
+                }.get(op.get_int_attr("atomic_rmw_op"))
 
         elif name == "tt.call":
             # Look up callee name from pre-parsed module text by walk order

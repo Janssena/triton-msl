@@ -249,7 +249,14 @@ def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
         bias, *st(bias), mask, *st(mask), sm, -1e9, N, Hh, DIM, 32, 32)
     torch.mps.synchronize()
     qf, kf, vf, bf = q.float(), k.float(), v.float(), bias.float()
-    qk = torch.einsum("hijd,hikd->hijk", qf, kf) * sm
+    if dtype == torch.float32:
+        qk = torch.einsum("hijd,hikd->hijk", qf, kf) * sm
+    else:
+        # packet 164: the SOURCE scales Q in its own dtype (`q * tl.full([1], sm, dtype)`): the scale
+        # is rounded to dtype and so is each product; the template now replays that, so the
+        # reference must too (the old fp32-scaled reference was 3e-3 off in the lse).
+        qs = (qf * torch.tensor(sm, dtype=dtype).float()).to(dtype).float()
+        qk = torch.einsum("hijd,hikd->hijk", qs, kf)
     raw = qk + bf[:, None, :, :]
     mh = mask[torch.arange(Hc, device=dev) // Hh]
     raw = raw.masked_fill(mh[:, :, None, :].bool(), float("-inf"))

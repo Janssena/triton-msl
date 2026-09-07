@@ -39,6 +39,12 @@ __all__ = ["triton_call", "mlx_available"]
 # Cache: (fn_hash, sig_hash, constexpr_hash) → (MSLExtraction, metadata)
 _compile_cache = {}
 
+# packet 176: dispatch descriptors the compile_shader / torch.mps driver honours and this launcher
+# does NOT — a route-only template ABI (packed scalar buffer, template-ordered arguments), a
+# two-kernel split, a runtime-dispatch matmul descriptor, host-side address-bounds checks. Binding
+# the Triton arguments positionally against such a kernel is silently wrong, so the route refuses.
+_UNSUPPORTED_DESCRIPTORS = ("flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds")
+
 
 def mlx_available():
     """Check if MLX is available for metal_kernel dispatch."""
@@ -67,7 +73,16 @@ def _mlx_dtype_to_triton_sig(dtype):
         mx.uint8: "*u8",
         mx.bool_: "*i1",
     }
-    return mapping.get(dtype, "*fp32")
+    if dtype not in mapping:
+        # packet 176: an unknown dtype (int64, uint64, float64, complex, ...) used to become a
+        # *fp32 pointer silently — the kernel would then read the bytes as floats.
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(
+            f"MLX route: array dtype {dtype} has no Triton signature mapping; refusing rather than "
+            f"binding it as *fp32. Supported: float32/float16/bfloat16, int8/16/32, uint8/16/32, bool."
+        )
+    return mapping[dtype]
 
 
 def _scalar_to_triton_sig(val):
@@ -75,6 +90,14 @@ def _scalar_to_triton_sig(val):
     if isinstance(val, bool):
         return "i1"
     elif isinstance(val, int):
+        if not (-(2 ** 31) <= val < 2 ** 31):
+            # packet 176: the launcher passes Python ints as int32 scalars; a stride / element count
+            # beyond int32 was truncated silently.
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"MLX route: integer argument {val} does not fit int32 (the launcher's scalar width); refusing."
+            )
         return "i32"
     elif isinstance(val, float):
         return "fp32"
@@ -147,7 +170,8 @@ def triton_call(kernel_fn, *args, grid, num_warps=4, **constexpr_kwargs):
             MLX arrays for pointer args, Python int/float for scalars.
             Output args should be MLX arrays (shape/dtype used for allocation).
         grid: Tuple of threadgroup counts, e.g. (4,) or (4, 2) or (4, 2, 1).
-        num_warps: Warps (SIMD groups) per threadgroup. Default 4.
+        num_warps: Accepted for API symmetry; the threadgroup size comes from the
+            compiled kernel's metadata (block_size), not from this value.
         **constexpr_kwargs: Compile-time constants (e.g. BLOCK_SIZE=256).
 
     Returns:
@@ -173,11 +197,29 @@ def triton_call(kernel_fn, *args, grid, num_warps=4, **constexpr_kwargs):
     else:
         msl_source, metadata, compiled = _compile_kernel(jit_fn, signature, constexprs)
 
+        # packet 176: fail closed on every dispatch descriptor this launcher does not honour.
+        for _name in _UNSUPPORTED_DESCRIPTORS:
+            if getattr(metadata, _name, None) is not None:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"MLX route: this kernel's lowering set the '{_name}' dispatch descriptor (a "
+                    f"route-only template ABI, a two-kernel split, a runtime-dispatch matmul or "
+                    f"host-side bounds checks), which mx.fast.metal_kernel dispatch does not implement; "
+                    f"the positional binding would be silently wrong. Use the torch.mps path for this kernel."
+                )
+
         block_size = getattr(metadata, "block_size", num_warps * 32)
         output_arg_indices = getattr(metadata, "output_arg_indices", None)
         needs_2d_grid = getattr(metadata, "needs_2d_grid", False)
 
-        extraction = extract_msl_for_mlx(msl_source, output_arg_indices)
+        # packet 176: the parsed MSL signature must carry exactly the Triton signature's runtime
+        # arguments — a packed or reordered ABI would otherwise be bound positionally.
+        n_runtime = sum(1 for v in signature.values() if v != "constexpr")
+        extraction = extract_msl_for_mlx(
+            msl_source, output_arg_indices, expected_args=n_runtime,
+            expected_signature=[(name, ty) for name, ty in signature.items() if ty != "constexpr"],
+        )
         _compile_cache[key] = (extraction, block_size, needs_2d_grid)
 
     launcher = MLXLauncher(extraction, block_size=block_size, needs_2d_grid=needs_2d_grid)

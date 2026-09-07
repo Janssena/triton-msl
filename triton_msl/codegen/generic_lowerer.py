@@ -5217,6 +5217,21 @@ class GenericLowerer(
         """
         if len(ssa.operand_ids) < 3:
             return
+        if "!tt.ptr<" in (ssa.type_str or ""):
+            # _lookup on a tracked pointer produces a dereferenced value, not
+            # its address. The numeric select path below would therefore select
+            # loaded data and lose pointer provenance. A subsequent atomic can
+            # even cast that DATA back to a device address and execute it.
+            # Require an explicit address-preserving implementation before
+            # admitting scalar or tensor pointer selections to any consumer.
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "pointer-valued arith.select requires address-preserving lowering; "
+                "the numeric select path dereferences its operands and cannot "
+                "preserve the selected address. Refusing before memory access.",
+                op_name="arith.select",
+            )
         cond = self._lookup(ssa.operand_ids[0])
         true_val = self._lookup(ssa.operand_ids[1])
         false_val = self._lookup(ssa.operand_ids[2])
@@ -8348,6 +8363,8 @@ class GenericLowerer(
         # refuse. Only once the (scores - lse) shape is confirmed do we resolve exact-or-
         # refuse: a pattern present but a pointer unresolvable IS a broken backward.
         lse_res = lse_addr = None
+        lse_sub_op = None  # the (scores - lse) subf (packet 134 sentinel proof)
+        lse_exp_op = lse_exp_inp = None  # the exp2 and its input (packet 136 constant proof)
         lse_pattern_found = False
         exp2_ops = [s for s in allops if s.op == "math.exp2"]
         for e in exp2_ops:
@@ -8368,6 +8385,8 @@ class GenericLowerer(
                         if r is not None:
                             lse_res = r
                             lse_addr = la
+                            lse_sub_op = cop
+                            lse_exp_op, lse_exp_inp = e, inp
         if not lse_pattern_found:
             return None  # not a (scores - lse) softmax recompute -> not a biased-FA backward
         if lse_res is None:
@@ -8384,6 +8403,788 @@ class GenericLowerer(
         m_res = resolve_1d(mask_addr)
         if m_res is None:
             _refuse("the mask pointer")
+
+        # ---- packet 134: the score sentinel the P recompute applies (both selects, one value) ----
+        # Source: scores -> where(bounds, scores, SNT) / where(Mask != 0, SNT, scores) in either
+        # order -> subf(., lse) -> mulf(., inv_ln2) -> exp2. The template replays SNT on
+        # in-bounds masked cells; it must be ONE SSA scalar (a float arg or a literal).
+        _bcast = ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout")
+        def _peel_ids(vid, allowed):
+            seen = set()
+            while vid not in seen:
+                seen.add(vid); o = op_by_id.get(vid)
+                if o is None or o.op not in allowed or len(o.operand_ids or []) != 1:
+                    return vid
+                vid = o.operand_ids[0]
+            return vid
+        def _const_val(o):
+            v = (o.attrs or {}).get("value")
+            if isinstance(v, bool) or v is None: return None
+            if isinstance(v, int):
+                if v in (0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000): return float("-inf")
+                if v in (0x7C00, 0x7F80, 0x7F800000, 0x7FF0000000000000): return float("inf")
+                return float(v) if v == 0 else None
+            return float(v)
+        sentinel_ref = None
+        # packet 139/140: the N_CTX operand of a boundary compare may peel ONLY value-preserving
+        # wrappers — broadcast-family ops and sign-extension (both compare operands are then
+        # sign-extended, which preserves slt AND ult). A narrowing (`trunci`), zero-extension
+        # or index cast changes the compared value (N=160 -> N.to(int8).to(int32) == -96).
+        _IDXW = _bcast + ("arith.extsi",)
+        _VALW = ("arith.extf", "arith.truncf", "ttg.convert_layout", "tt.reshape", "ttg.local_load", "ttg.local_alloc", "tt.fp_to_fp")
+        # packet 141/144: VALUE identity (not provenance) admits only wrappers that cannot change
+        # a single element: layout changes and the shared-memory round trip. A float conversion
+        # (`truncf`/`extf`/`fp_to_fp`) is a different value — `scores.to(f16).to(f32)` rounds, and
+        # the template never replays that rounding — so it must refuse before any maker.
+        _VALX = ("ttg.convert_layout", "ttg.local_load", "ttg.local_alloc")
+
+        def _elem_is_f32(o):
+            t = (getattr(o, "type_str", None) or "")
+            # "tensor<32x32xf32, #mma>" / "f32"; NOT "bf16" (and no wider/narrower float)
+            return re.search(r"(?<!b)f32(?![0-9])", t) is not None
+        _ivs = [((s_.attrs or {}).get("block_arg_ids") or [None])[0] for s_ in allops if s_.op == "scf.for"]
+        _LOG2E = 1.4426950408889634
+
+        def _arg_index(vid):
+            a_ = arg_by_id.get(_peel_ids(vid, _IDXW))
+            return None if (a_ is None or a_.is_ptr) else a_.index
+
+        def _leaf_extent(cid, n_ctx_arg, extents):
+            """One boundary leaf: cmpi slt|ult(<tile index>, N_CTX). Returns the tile extent."""
+            c_ = op_by_id.get(_peel_ids(cid, _bcast))
+            if c_ is None or c_.op != "arith.cmpi" or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult") or len(c_.operand_ids or []) != 2:
+                _refuse("a strict less-than N_CTX boundary leaf in the bounds select")
+            lhs, rhs = c_.operand_ids
+            if n_ctx_arg is None or _arg_index(rhs) != n_ctx_arg:
+                _refuse("the bounds select comparing the tile index with the kernel's N_CTX argument")
+            for iv_ in [None] + [v for v in _ivs if v is not None]:
+                sh = self._index_shape(lhs, op_by_id, arg_by_id, iv_, 1)
+                if sh["bad"] is not None or sh["mod"] is not None or sh["pid_div"] is not None or sh["range"] != 1 or not sh["bounds"]:
+                    continue
+                ext = sh["bounds"][1]
+                if sh["bounds"][0] != 0 or ext not in extents:
+                    continue
+                if (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == ext) or (sh["pid"] is None and sh["iv"] == 1):
+                    return ext
+            _refuse("a bounds-select index that is exactly one tile of the source's row/col coordinate")
+
+        def _leaf_sig(cid, n_ctx_arg, extents):
+            """The full coordinate signature of one boundary leaf (structural, remat-proof)."""
+            c_ = op_by_id.get(_peel_ids(cid, _bcast))
+            if c_ is None or c_.op != "arith.cmpi" or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult") or len(c_.operand_ids or []) != 2:
+                _refuse("a strict less-than N_CTX boundary leaf")
+            lhs, rhs = c_.operand_ids
+            if n_ctx_arg is None or _arg_index(rhs) != n_ctx_arg:
+                _refuse("a boundary leaf comparing the tile index with the kernel's N_CTX argument")
+            for iv_ in [None] + [v for v in _ivs if v is not None]:
+                sh = self._index_shape(lhs, op_by_id, arg_by_id, iv_, 1)
+                if sh["bad"] is not None or sh["mod"] is not None or sh["range"] != 1 or not sh["bounds"] or sh["bounds"][0] != 0 or sh["bounds"][1] not in extents:
+                    continue
+                if (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == sh["bounds"][1]) or (sh["pid"] is None and sh["iv"] == 1):
+                    return (n_ctx_arg, sh["pid"], sh["pid_div"], sh["coef"], sh["bounds"], sh["iv"], iv_ if sh["iv"] else None)
+            _refuse("a boundary leaf index that is exactly one tile of a row/col coordinate")
+
+        _OPW = _VALW + ("tt.trans", "ttg.memdesc_trans")
+
+        def _load_op_of(vid):
+            """The tt.load a dot operand comes from, through casts / layout / transpose and
+            the scale multiply (the constant side is skipped); None if anything else appears."""
+            cur, seen = vid, set()
+            while cur not in seen and len(seen) < 64:
+                seen.add(cur); o_ = op_by_id.get(cur)
+                if o_ is None:
+                    return None
+                if o_.op == "tt.load":
+                    return o_
+                if o_.op in _OPW and len(o_.operand_ids or []) == 1:
+                    cur = o_.operand_ids[0]; continue
+                if o_.op == "arith.mulf" and len(o_.operand_ids or []) == 2:
+                    def _is_scalar(x):
+                        pid_ = _peel_ids(x, _bcast); a_ = arg_by_id.get(pid_); c_ = op_by_id.get(pid_)
+                        if c_ is not None and c_.op == "arith.truncf" and len(c_.operand_ids or []) == 1:
+                            # packet 174: `tl.full([1], sm_scale, dtype)` = splat(truncf(scalar arg))
+                            a2_ = arg_by_id.get(_peel_ids(c_.operand_ids[0], _bcast))
+                            return a2_ is not None and not a2_.is_ptr
+                        return (a_ is not None and not a_.is_ptr) or (c_ is not None and c_.op == "arith.constant")
+                    data = [x for x in o_.operand_ids if not _is_scalar(x)]
+                    if len(data) != 1:
+                        return None
+                    cur = data[0]; continue
+                return None
+            return None
+
+        def _single_mask_leaf(load, role):
+            if load is None or len(load.operand_ids or []) < 2:
+                _refuse(f"a masked {role} load (the bounds select must reuse its mask)")
+            leaf = _peel_ids(load.operand_ids[1], _bcast)
+            lo = op_by_id.get(leaf)
+            if lo is None or lo.op != "arith.cmpi":
+                _refuse(f"the {role} load mask being one boundary comparison")
+            return leaf
+
+        def _q_mask_leaf():
+            return _single_mask_leaf(_load_op_of(scores_dot.operand_ids[0]), "Q")
+
+        def _k_mask_leaf():
+            return _single_mask_leaf(_load_op_of(scores_dot.operand_ids[1]), "K")
+
+        def _axis_of(vid, limit=24):
+            """Packet 145/146: the score axis a broadcast operand VARIES along when consumed at
+            [j, k] — 'row' (expand_dims axis=1: one value per query row j), 'col' (axis=0: one
+            value per key k), 'uniform' (a splat), or None (no / unknown projection: a transpose,
+            a reshape, a double expansion). Walks broadcast / convert_layout / expand_dims and,
+            through a compare against a uniform operand, its varying operand. The element proofs
+            (which load, which index) say WHAT vector arrives; this says along WHICH axis."""
+            cur, axis, seen = vid, None, set()
+            while cur not in seen and len(seen) < limit:
+                seen.add(cur)
+                o = op_by_id.get(cur)
+                if o is None:
+                    # a kernel argument (scalar) is uniform; anything else unresolved is unknown
+                    return (axis if axis is not None else "uniform") if cur in arg_by_id else axis
+                if o.op == "arith.constant":
+                    return axis if axis is not None else "uniform"   # splat or dense constant
+                if not (o.operand_ids or []):
+                    break
+                if o.op in ("tt.broadcast", "ttg.convert_layout", "arith.extui", "arith.extsi", "arith.extf"):
+                    cur = o.operand_ids[0]   # layout / widening: the projection is unchanged
+                    continue
+                if o.op == "tt.splat":
+                    return axis if axis is not None else "uniform"
+                if o.op == "tt.expand_dims":
+                    try:
+                        a = int((o.attrs or {}).get("axis"))
+                    except (TypeError, ValueError):
+                        return None
+                    if axis is not None or a not in (0, 1):
+                        return None
+                    axis = "row" if a == 1 else "col"
+                    cur = o.operand_ids[0]
+                    continue
+                if o.op == "arith.cmpi" and len(o.operand_ids) == 2:
+                    if axis is not None:
+                        return axis
+                    _var = [x for x in o.operand_ids if _axis_of(x, limit) != "uniform"]
+                    if len(_var) != 1:
+                        return None
+                    cur = _var[0]
+                    continue
+                break
+            return axis
+
+        def _prove(n_ctx_arg, block_j, block_k):
+            """Packet 136: the WHOLE score path the backward templates replay —
+            exp2((S2 - lse) * log2(e)), S2/S1 = the two selects (either order) on ONE
+            sentinel with role-exact predicates, and the value under them = the recognised
+            scores dot (Q@Kᵀ with the Bias load as accumulator). Anything else refuses."""
+            if lse_sub_op is None or len(lse_sub_op.operand_ids or []) != 2:
+                _refuse("the (scores - lse) subtraction")
+            # packet 141/144: the subtrahend must BE the lse load's value through layout-only
+            # wrappers — `load_addr` is provenance (it peels float casts and walks through
+            # multiplies) and admitted `tl.load(l_ptrs).to(f16).to(f32)`; the template subtracts
+            # the raw fp32 load, so anything between the load and the subtraction refuses.
+            _lo = op_by_id.get(_peel_ids(lse_sub_op.operand_ids[1], _bcast))
+            if _lo is None or _lo.op != "tt.load" or not _lo.operand_ids or _lo.operand_ids[0] != lse_addr:
+                _refuse("the lse on the right-hand side of the (scores - lse) subtraction being the loaded lse VALUE itself (no conversion or arithmetic between the load and the subtraction)")
+            if not _elem_is_f32(_lo):
+                _refuse("an fp32 lse load (the template subtracts the raw fp32 value)")
+            if _axis_of(lse_sub_op.operand_ids[1]) != "row":
+                _refuse("the lse broadcast along the score ROWS (lse[:, None]: one value per query row j)")
+            if lse_exp_op is None or lse_exp_op.op != "math.exp2":
+                _refuse("an exp2 softmax recompute")
+            if lse_exp_inp is None or lse_exp_inp.op != "arith.mulf" or len(lse_exp_inp.operand_ids or []) != 2:
+                _refuse("the log2(e) multiply between (scores - lse) and exp2")
+            _sides = [_peel_ids(x, _bcast) for x in lse_exp_inp.operand_ids]
+            if lse_sub_op.id not in _sides:
+                _refuse("the exp2 input being (scores - lse) times a constant")
+            _c = op_by_id.get(next(x for x in _sides if x != lse_sub_op.id))
+            _cv = _const_val(_c) if (_c is not None and _c.op == "arith.constant") else None
+            if _cv is None or abs(_cv - _LOG2E) > 1e-6 * _LOG2E:
+                _refuse("the exp2 coefficient being exactly log2(e) (the template's inv_ln2)")
+            _cur = _peel_ids(lse_sub_op.operand_ids[0], _bcast)
+            _kinds, _snts = [], []
+            for _ in range(2):
+                _sel = op_by_id.get(_cur)
+                if _sel is None or _sel.op != "arith.select" or len(_sel.operand_ids or []) != 3:
+                    _refuse("the two score sentinel selects (where(bounds, s, SNT) and where(Mask != 0, SNT, s))")
+                _pred = op_by_id.get(_peel_ids(_sel.operand_ids[0], _bcast))
+                if _pred is not None and _pred.op == "arith.cmpi" and (_pred.attrs or {}).get("predicate_name") == "ne":
+                    # packet 148 (147 §5): the explicit `m != 0` spelling widens the uint8 mask to
+                    # i32 (`extui`) before the compare; zero- or sign-extension preserves the
+                    # "is nonzero" test exactly, so it is peeled here. A truncation is NOT (it
+                    # keeps the low bit: 2 -> 0) and stays refused.
+                    _src = [_peel_ids(x, _bcast + ("arith.extui", "arith.extsi")) for x in _pred.operand_ids]
+                    _zero = [op_by_id.get(x) for x in _src if x != mask_loads[0].id]
+                    if mask_loads[0].id not in _src or len(_zero) != 1 or _zero[0] is None or _zero[0].op != "arith.constant" or _const_val(_zero[0]) != 0.0:
+                        _refuse("the loaded-mask select predicate (must be Mask != literal 0)")
+                    if _axis_of(_sel.operand_ids[0]) != "col":
+                        _refuse("the loaded Mask broadcast along the score COLUMNS (Mask[None, :]: one value per key k)")
+                    _kinds.append("mask"); _snts.append(_peel_ids(_sel.operand_ids[1], _bcast)); _cur = _peel_ids(_sel.operand_ids[2], _bcast)
+                elif _pred is not None and _pred.op == "arith.andi" and len(_pred.operand_ids or []) == 2:
+                    _exts = sorted(_leaf_extent(x, n_ctx_arg, {block_j, block_k}) for x in _pred.operand_ids)
+                    if _exts != sorted([block_j, block_k]):
+                        _refuse("the bounds select covering BOTH the row and the column N_CTX boundary")
+                    # packet 138 (137 P0): a leaf that merely LOOKS like a tile index (any program
+                    # id times the tile) is not the coordinate; the leaves must BE the mask values
+                    # the recognised Q load (row) and K load (column) are guarded with.
+                    # The compiler rematerialises comparisons per layout, so SSA identity is not
+                    # the test; the leaf must have the SAME coordinate signature (N_CTX arg, pid
+                    # axis + divisor + coefficient, range bounds, loop-IV identity) as the mask on
+                    # the recognised Q load (row) / K load (column).
+                    # packet 146 (145 HOLD): the SAME leaf laid along the wrong axis is a different
+                    # bound, so each leaf is a (signature, axis) pair: the Q-load mask must vary
+                    # along the rows and the K-load mask along the columns. Commuting the AND
+                    # is harmless and stays admitted.
+                    _qs, _ks = _leaf_sig(_q_mask_leaf(), n_ctx_arg, {block_j, block_k}), _leaf_sig(_k_mask_leaf(), n_ctx_arg, {block_j, block_k})
+                    _pairs = {(_leaf_sig(x, n_ctx_arg, {block_j, block_k}), _axis_of(x)) for x in _pred.operand_ids}
+                    if _qs == _ks or len(_pred.operand_ids) != 2 or _pairs != {(_qs, "row"), (_ks, "col")}:
+                        _refuse("the bounds select's leaves being exactly the Q-load mask along the score ROWS and the K-load mask along the COLUMNS — a lookalike coordinate or a swapped broadcast axis is not the source's bound")
+                    _kinds.append("bounds"); _snts.append(_peel_ids(_sel.operand_ids[2], _bcast)); _cur = _peel_ids(_sel.operand_ids[1], _bcast)
+                else:
+                    _refuse("a recognizable predicate on a score sentinel select")
+            if sorted(_kinds) != ["bounds", "mask"] or len(set(_snts)) != 1:
+                _refuse("exactly one loaded-mask select and one bounds select sharing ONE sentinel value")
+            _under = _peel_ids(_cur, _VALX)
+            if _under != scores_dot.id and _under not in (getattr(scores_dot, "result_ids", None) or []):
+                _refuse("the value under the two selects being exactly the recognised Q@Kᵀ + Bias dot value (a conversion, third select or epilogue is not replayed)")
+            if not _elem_is_f32(scores_dot):
+                _refuse("an fp32 score dot (the template accumulates Q@Kᵀ + Bias in fp32)")
+            _snt = _snts[0]; _snt_op = op_by_id.get(_snt)
+            if _snt_op is None and _snt in arg_by_id:
+                _a = arg_by_id[_snt]
+                if _a.is_ptr or str(_a.elem_type) not in ("f32", "fp32", "float"):
+                    _refuse("an fp32 runtime sentinel argument (the packed scalar ABI reinterprets 32-bit words)")
+                return ("arg", _a.index)
+            if _snt_op is not None and _snt_op.op == "arith.constant":
+                _v = _const_val(_snt_op)
+                if _v is None or _v != _v or _v == float("inf"):
+                    _refuse("a decodable finite-or-minus-infinity literal sentinel")
+                return ("const", _v)
+            _refuse("a sentinel that is a kernel argument or a literal")
+
+        def _prove_downstream(kind, n_ctx_arg, block_j, block_k, head_dim, do_addr, v_addr, dlt_addr,
+                              out_stores, reduce_op=None, scale_arg=None, o_addr=None):
+            """Packet 148 (147 HOLD): the WHOLE downstream graph each backward template re-emits,
+            proved by ORIENTATION and VALUE, not by pointer role. Every 2-D value gets a pair of
+            logical coordinates (row, col) in {j = query row, k = key, d = head dim}; 1-D values
+            get (coord,); a broadcast 1-D operand carries ('row'|'col', coord); splats and
+            constants are 'uniform'; a zero-initialised loop accumulator is the wildcard 'acc'.
+            Rules: layout ops and the shared-memory round trip are transparent; a transpose
+            swaps; a load is oriented by its MASK (leaf signature -> j / k via the Q / K load
+            masks, expand axis -> which side; the unmasked side is d iff its extent is the head
+            dim); the recognised P is (j, k); a dot contracts A.col == B.row and its C is the bias
+            (scores), a zero constant, or a zero-initialised accumulator; elementwise ops require
+            equal full orientations and projections that match the axis they lie along; a reduce
+            over addf keeps the surviving axis; ANY dtype conversion refuses (fp32 interior).
+            Then per kind: dP = dO(j,d) @ V(d,k); dS = P * (dP - delta[j]); kv: dV = Pᵀ(k,j) @ dO,
+            dK = dSᵀ(k,j) @ Q, stored (k,d) under the K mask, dK scaled; q: dQ = dS @ K(k,d)
+            stored (j,d) under the Q mask, delta = rowsum(O*dO) over d stored under the Q mask;
+            b: dbias += dS stored (j,k) under both masks. Returns the raw K / V load
+            orientations so the lowering derives its stride swaps from the proof."""
+            _qs = _leaf_sig(_q_mask_leaf(), n_ctx_arg, {block_j, block_k})
+            _ks = _leaf_sig(_k_mask_leaf(), n_ctx_arg, {block_j, block_k})
+            if _qs == _ks:
+                _refuse("distinct row (Q) and column (K) coordinates")
+            P_id = lse_exp_op.id
+            _TRANS = ("tt.trans", "ttg.memdesc_trans")
+            _LAY = ("ttg.convert_layout", "ttg.local_load", "ttg.local_alloc")
+            # packet 174 (158 row 6): the source's rounding points for narrow dtypes, recorded
+            # here and replayed by the makers (`round_k` / `round_q` at the scale product,
+            # `round_p` before the dV dot, `round_ds` before the dK / dQ dots). Output casts
+            # are peeled at the stores (the makers' store_cast replays them). Reset per proof.
+            _rounding = {}
+            _rounded_truncf = {}
+            _dS_holder = [None]
+            _ELEM = {"f16": "half", "bf16": "bfloat"}
+
+            def _elem_of(type_str):
+                t = (type_str or "")
+                el = t.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in t else t.strip()
+                return el
+
+            def _classify_truncf(o):
+                """A `truncf` on the backward value path is admitted ONLY as one of the source's
+                own rounding points: P (the exp) before the dV dot (kv), or dS before the dK / dQ
+                dots (kv, q). Its target type is recorded once; anything else refuses."""
+                if o.id in _rounded_truncf:
+                    return _rounded_truncf[o.id]
+                el = _ELEM.get(_elem_of(o.type_str))
+                src = _root(o.operand_ids[0]) if o.operand_ids else None
+                if el is None:
+                    _refuse(f"no conversion to {_elem_of(o.type_str) or '?'} on the backward value path (the templates replay fp16 / bf16 rounding only)")
+                if src == P_id and kind == "kv":
+                    key = "round_p"
+                elif _dS_holder[0] is not None and src == _dS_holder[0].id and kind in ("kv", "q"):
+                    key = "round_ds"
+                else:
+                    _refuse("no dtype conversion on the backward value path except the source's own rounding of P before the dV dot (kv) and of dS before the dK / dQ dots (kv, q): the template replays exactly those and computes everything else in fp32")
+                if _rounding.get(key, el) != el:
+                    _refuse(f"one target type per rounding point ({key})")
+                _rounding[key] = el
+                _rounded_truncf[o.id] = key
+                return key
+
+            # ---- loop plumbing: block arg / result / yield positions ----
+            ba_pos, res_pos, yields, inits_of, bids_of = {}, {}, {}, {}, {}
+            for L in allops:
+                if L.op != "scf.for":
+                    continue
+                bids = (L.attrs or {}).get("block_arg_ids") or []
+                bids_of[L.id] = bids
+                inits = list(L.operand_ids or [])[3:]
+                results = list(L.result_ids or [L.id])
+                y = next((o for o in reversed(L.region_ops or []) if o.op == "scf.yield"), None)
+                yields[L.id] = y
+                for i in range(len(inits)):
+                    inits_of[(L.id, i)] = inits[i]
+                    if i + 1 < len(bids):
+                        ba_pos[bids[i + 1]] = (L.id, i)
+                    if i < len(results):
+                        res_pos[results[i]] = (L.id, i)
+
+            def _yielded(lid, i):
+                y = yields.get(lid)
+                return y.operand_ids[i] if (y is not None and i < len(y.operand_ids or [])) else None
+
+            def _is_zero_const(vid):
+                o = op_by_id.get(_peel_ids(vid, _bcast))
+                if o is None or o.op != "arith.constant":
+                    return False
+                v = _const_val(o)
+                if v is not None:
+                    return v == 0.0
+                sv = str((o.attrs or {}).get("value", ""))
+                return ("dense<0" in sv) or sv.strip() in ("0", "0.0", "0.000000e+00")
+
+            def _leaf_coord(cid):
+                try:
+                    sig = _leaf_sig(cid, n_ctx_arg, {block_j, block_k})
+                except MetalNonRecoverableError:
+                    return None
+                return "j" if sig == _qs else "k" if sig == _ks else None
+
+            def _mask_orient(mask_vid, shape):
+                m = op_by_id.get(_peel_ids(mask_vid, _bcast))
+                if m is not None and m.op == "arith.andi" and len(m.operand_ids or []) == 2:
+                    pairs = {}
+                    for x in m.operand_ids:
+                        ax, co = _axis_of(x), _leaf_coord(x)
+                        if ax not in ("row", "col") or co is None or ax in pairs:
+                            return None
+                        pairs[ax] = co
+                    return (pairs.get("row"), pairs.get("col"))
+                ax, co = _axis_of(mask_vid), _leaf_coord(mask_vid)
+                if co is None or not shape or len(shape) != 2:
+                    return None
+                if ax == "row":
+                    return (co, "d") if shape[1] == head_dim else None
+                if ax == "col":
+                    return ("d", co) if shape[0] == head_dim else None
+                return None
+
+            def _plain_sum_reduce(o):
+                """Packet 152 (151 F2): the reduction region is EXACTLY one `addf` of its two block
+                arguments — the template's sum. "Contains an addf" admitted `a + b + 1.0`."""
+                bids = (o.attrs or {}).get("block_arg_ids") or []
+                body = [b for b in (o.region_ops or [])]
+                if len(bids) != 2 or len(body) != 1:
+                    return False
+                b = body[0]
+                if not (b.op == "arith.addf" and sorted(b.operand_ids or []) == sorted(bids)):
+                    return False
+                # packet 154 (153): the region must RETURN that addition — a dead add with a
+                # projection returned (`return %a`) is legal TTGIR and was indistinguishable;
+                # missing return information must not imply a sum.
+                rets = (o.attrs or {}).get("return_ids")
+                return rets == [b.id]
+
+            def _bcast_source(vid):
+                cur, seen = vid, set()
+                while cur not in seen:
+                    seen.add(cur)
+                    o = op_by_id.get(cur)
+                    if o is None or not (o.operand_ids or []):
+                        return None
+                    if o.op in ("tt.broadcast", "ttg.convert_layout", "arith.extui", "arith.extsi", "arith.extf"):
+                        cur = o.operand_ids[0]
+                        continue
+                    if o.op == "tt.expand_dims":
+                        return o.operand_ids[0]
+                    return None
+                return None
+
+            memo, stack = {}, set()
+
+            def _orient(vid):
+                if vid in memo:
+                    return memo[vid]
+                if vid in stack:
+                    return None
+                stack.add(vid)
+                try:
+                    r = _orient_(vid)
+                finally:
+                    stack.discard(vid)
+                memo[vid] = r
+                return r
+
+            def _full(x):
+                return isinstance(x, tuple) and len(x) == 2 and x[0] not in ("row", "col")
+
+            def _orient_(vid):
+                if vid in ba_pos:
+                    lid, i = ba_pos[vid]
+                    if _is_zero_const(inits_of[(lid, i)]):
+                        return "acc"
+                    return None
+                if vid in res_pos:
+                    lid, i = res_pos[vid]
+                    y = _yielded(lid, i)
+                    return _orient(y) if y is not None else None
+                o = op_by_id.get(vid)
+                if o is None:
+                    a = arg_by_id.get(vid)
+                    return "uniform" if (a is not None and not a.is_ptr) else None
+                if o.op == "tt.fp_to_fp":
+                    _refuse("no fp8 conversion on the backward value path (P, dP, dS, dK/dV/dQ/dbias)")
+                if o.op == "arith.extf" and o.operand_ids:
+                    return _orient(o.operand_ids[0])   # exact widening (packet 174)
+                if o.op == "arith.truncf" and o.operand_ids:
+                    _classify_truncf(o)                # a recorded rounding point or a refusal (packet 174)
+                    return _orient(o.operand_ids[0])
+                if o.op in _LAY and o.operand_ids:
+                    return _orient(o.operand_ids[0])
+                if o.op in _TRANS and o.operand_ids:
+                    inner = _orient(o.operand_ids[0])
+                    return (inner[1], inner[0]) if _full(inner) else None
+                if o.op in ("tt.splat", "arith.constant"):
+                    return "uniform"
+                if o.op in ("tt.broadcast", "tt.expand_dims"):
+                    ax = _axis_of(vid)
+                    if ax == "uniform":
+                        return "uniform"
+                    if ax not in ("row", "col"):
+                        return None
+                    src = _bcast_source(vid)
+                    c1 = _orient(src) if src is not None else None
+                    if not (isinstance(c1, tuple) and len(c1) == 1):
+                        return None
+                    return (ax, c1[0])
+                if o.op == "math.exp2":
+                    return ("j", "k") if o.id == P_id else None
+                if o.op == "tt.load":
+                    shape = _extract_shape(o.type_str or "")
+                    if not shape or len(o.operand_ids or []) < 2:
+                        return None   # an unmasked tile load is not oriented
+                    if len(shape) == 2:
+                        return _mask_orient(o.operand_ids[1], shape)
+                    if len(shape) == 1:
+                        co = _leaf_coord(o.operand_ids[1])
+                        return (co,) if co else None
+                    return None
+                if o.op == "tt.reduce" and o.operand_ids:
+                    inner = _orient(o.operand_ids[0])
+                    ax = (o.attrs or {}).get("axis")
+                    if not _full(inner) or not _plain_sum_reduce(o) or ax not in (0, 1):
+                        return None
+                    return (inner[0],) if ax == 1 else (inner[1],)
+                if o.op in ("arith.mulf", "arith.subf", "arith.addf") and len(o.operand_ids or []) == 2:
+                    parts = [_orient(x) for x in o.operand_ids]
+                    if any(p is None for p in parts):
+                        return None
+                    fulls = [p for p in parts if _full(p)]
+                    if not fulls or any(f != fulls[0] for f in fulls):
+                        return None
+                    r, c = fulls[0]
+                    for pp in parts:
+                        if isinstance(pp, tuple) and len(pp) == 2 and pp[0] in ("row", "col"):
+                            if (pp[0] == "row" and pp[1] != r) or (pp[0] == "col" and pp[1] != c):
+                                return None
+                        elif isinstance(pp, tuple) and len(pp) == 1:
+                            return None   # an un-projected 1-D operand in a tile op
+                    return (r, c)
+                if o.op == "tt.dot" and len(o.operand_ids or []) >= 2:
+                    a, b = _orient(o.operand_ids[0]), _orient(o.operand_ids[1])
+                    if not (_full(a) and _full(b)) or a[1] is None or a[1] != b[0]:
+                        return None
+                    if len(o.operand_ids) > 2 and o.id != scores_dot.id:
+                        cid = o.operand_ids[2]
+                        if cid in ba_pos:
+                            lid, i = ba_pos[cid]
+                            if not _is_zero_const(inits_of[(lid, i)]):
+                                return None
+                        elif not _is_zero_const(cid):
+                            return None
+                    return (a[0], b[1])
+                return None
+
+            def _root(vid):
+                return _peel_ids(vid, _LAY + _TRANS)
+
+            def _root_rd(vid):
+                """`_root` that also peels a `truncf` IF it is one of the source's recorded rounding
+                points (classified on the way). Used only where the template replays that rounding:
+                the A operand of the dV / dK / dQ accumulation dots. Everywhere else the strict
+                root applies, so a rounded P feeding dS, or a rounded dS feeding dbias, still refuses."""
+                cur, seen = vid, set()
+                while cur not in seen:
+                    seen.add(cur)
+                    cur = _peel_ids(cur, _LAY + _TRANS)
+                    o = op_by_id.get(cur)
+                    if o is not None and o.op == "arith.truncf" and o.operand_ids:
+                        _classify_truncf(o)
+                        cur = o.operand_ids[0]
+                        continue
+                    return cur
+                return cur
+
+            def _need(vid, want, what):
+                got = _orient(vid)
+                if got != want:
+                    _refuse(f"{what} oriented as {want} (proved {got})")
+
+            def _load_of(vid):
+                o = _load_op_of(vid)
+                if o is None or o.op != "tt.load":
+                    _refuse("a load under the dot operand")
+                return o
+
+            # ---- packet 150 (149 F1): VALUE identity per role. `load_addr` walks through a
+            # multiply and is provenance only; an operand IS a load only if it peels through
+            # layout / shared-memory / transpose ops to that load. The one arithmetic the
+            # templates replay is the scale: `x * splat(scale_arg)` at the K operand (kv, q) or
+            # the Q operand (b) of the score dot, and the same scaled K value into dQ (q).
+            def _raw_load(vid, addr, what):
+                o = op_by_id.get(_root(vid))
+                if o is None or o.op != "tt.load" or load_addr(o.id) != addr:
+                    _refuse(f"{what} being the recognised load VALUE itself (no arithmetic between the load and the dot)")
+                return o
+
+            def _scaled_load(vid, addr, what):
+                m = op_by_id.get(_root(vid))
+                if m is None or m.op != "arith.mulf" or len(m.operand_ids or []) != 2:
+                    _refuse(f"{what} being exactly load * splat(sm_scale)")
+                sides = [(_root(x), _peel_ids(x, _bcast)) for x in m.operand_ids]
+                ld = [op_by_id.get(r) for r, _ in sides]
+                li = next((i for i, o in enumerate(ld) if o is not None and o.op == "tt.load" and load_addr(o.id) == addr), None)
+                if li is None:
+                    _refuse(f"{what} being exactly the recognised load * splat(sm_scale)")
+                _mel = _elem_of(m.type_str)
+                _sid = sides[1 - li][1]
+                _so = op_by_id.get(_sid)
+                if _so is not None and _so.op == "arith.truncf" and len(_so.operand_ids or []) == 1:
+                    # packet 174: `tl.full([1], sm_scale, dtype)` rounds the fp32 scale argument to
+                    # the input dtype before the splat — admitted only to the product's own dtype.
+                    if _elem_of(_so.type_str) != _mel:
+                        _refuse(f"{what} scaled by sm_scale rounded to the product's own dtype")
+                    _sid = _peel_ids(_so.operand_ids[0], _bcast)
+                sc = arg_by_id.get(_sid)
+                if sc is None or sc.is_ptr or scale_arg is None or sc.index != scale_arg:
+                    _refuse(f"{what} scaled by exactly the sm_scale argument the template binds")
+                # packet 174: the product's element type IS a rounding point when narrower than
+                # fp32 (the source computes x * full(scale, dtype) in that dtype: the scale rounded,
+                # each product rounded). Recorded for the makers; any other type refuses.
+                if _mel in _ELEM:
+                    _rounding["round_q" if kind == "b" else "round_k"] = _ELEM[_mel]
+                elif _mel not in ("f32", ""):
+                    _refuse(f"{what} computed in {_mel}, which the templates cannot replay")
+                return ld[li], m
+
+            # ---- shared: scores, dP, dS ----
+            _need(scores_dot.id, ("j", "k"), "the score dot Q(j,d) @ K(d,k)")
+            q_addr = load_addr(scores_dot.operand_ids[0])
+            k_addr = load_addr(scores_dot.operand_ids[1])
+            if kind == "b":
+                _scaled_load(scores_dot.operand_ids[0], q_addr, "the score dot's Q operand")
+                k_load = _raw_load(scores_dot.operand_ids[1], k_addr, "the score dot's K operand")
+                k_val_root = None
+            else:
+                _raw_load(scores_dot.operand_ids[0], q_addr, "the score dot's Q operand")
+                k_load, _km = _scaled_load(scores_dot.operand_ids[1], k_addr, "the score dot's K operand")
+                k_val_root = _km.id
+            if len(scores_dot.operand_ids or []) > 2:
+                bo = op_by_id.get(_peel_ids(scores_dot.operand_ids[2], _LAY + ("arith.extf",)))
+                if bo is None or bo.op != "tt.load" or load_addr(bo.id) != load_addr(scores_dot.operand_ids[2]):
+                    _refuse("the score dot's accumulator being the Bias load VALUE itself (a widening is replayed; arithmetic is not)")
+            k_orient = _orient(k_load.id)
+            dp = next((d for d in dots if d.id != scores_dot.id and len(d.operand_ids or []) >= 2
+                       and load_addr(d.operand_ids[0]) == do_addr and load_addr(d.operand_ids[1]) == v_addr), None)
+            if dp is None:
+                _refuse("the dP dot dO @ Vᵀ on the recognised dO and V loads")
+            _need(dp.id, ("j", "k"), "the dP dot dO(j,d) @ V(d,k)")
+            _raw_load(dp.operand_ids[0], do_addr, "the dP dot's dO operand")
+            v_load = _raw_load(dp.operand_ids[1], v_addr, "the dP dot's V operand")
+            if len(dp.operand_ids or []) < 3 or not _is_zero_const(dp.operand_ids[2]):
+                _refuse("the dP dot accumulating from a literal zero (not a loop-carried value)")
+            v_orient = _orient(v_load.id)
+            if not (_full(k_orient) and _full(v_orient)):
+                _refuse("oriented K and V loads")
+            dS = None
+            for s_ in allops:
+                if s_.op != "arith.mulf" or len(s_.operand_ids or []) != 2:
+                    continue
+                roots = [_root(x) for x in s_.operand_ids]
+                if P_id not in roots:
+                    continue
+                other = op_by_id.get(next(r for r in roots if r != P_id)) if len(set(roots)) == 2 else None
+                if other is not None and other.op == "arith.subf" and len(other.operand_ids or []) == 2 and _root(other.operand_ids[0]) == dp.id:
+                    dS = s_
+                    break
+            if dS is None:
+                _refuse("dS = P * (dP - delta)")
+            _dS_holder[0] = dS
+            _need(dS.id, ("j", "k"), "dS = P(j,k) * (dP(j,k) - delta[j])")
+            sub = op_by_id.get(next(r for r in [_root(x) for x in dS.operand_ids] if r != P_id))
+            if kind in ("kv", "b"):
+                dl = op_by_id.get(_bcast_source(sub.operand_ids[1]) or -1)
+                if dl is None or dl.op != "tt.load" or load_addr(dl.id) != dlt_addr:
+                    _refuse("delta broadcast from the recognised delta load")
+            else:
+                if reduce_op is None or _bcast_source(sub.operand_ids[1]) != reduce_op.id:
+                    _refuse("delta broadcast from the rowsum(O * dO) reduce")
+                _rel = _elem_of(reduce_op.type_str)
+                if _rel in _ELEM:
+                    # packet 174: `tl.sum(o * do)` on fp16 / bf16 inputs accumulates IN that dtype
+                    # (the reduce region adds narrow values in the backend's reduction order); the
+                    # template's sequential fp32 rowsum is a different, more precise value, and no
+                    # sequential emulation reproduces the tree bit-for-bit. Refuse rather than ship
+                    # a delta the source did not compute.
+                    _refuse(f"delta = rowsum(O * dO) accumulated in fp32 (the source accumulates it in {_rel}, an order-dependent rounding the template cannot replay; keep the reduce in fp32 — e.g. tl.sum((o * do).to(tl.float32), 1) — for this route)")
+                # packet 152 (151 F1/F2): the reduce INPUT must be exactly O-load * dO-load (either
+                # order, through value-preserving wrappers only) and the combiner exactly a + b.
+                rin = op_by_id.get(_peel_ids(reduce_op.operand_ids[0], _LAY + ("arith.extf",)))
+                if rin is None or rin.op != "arith.mulf" or len(rin.operand_ids or []) != 2:
+                    _refuse("the delta reduce input being exactly the product O * dO")
+                _pel = _elem_of(rin.type_str)
+                if _pel in _ELEM:
+                    _rounding["round_dprod"] = _ELEM[_pel]   # packet 174: each O*dO product rounded, summed in fp32
+                elif _pel not in ("f32", ""):
+                    _refuse(f"the delta product computed in {_pel}, which the template cannot replay")
+                _roots = [op_by_id.get(_root(x)) for x in rin.operand_ids]
+                _addrs = sorted(load_addr(r.id) if (r is not None and r.op == "tt.load") else -1 for r in _roots)
+                if o_addr is None or _addrs != sorted([o_addr, do_addr]):
+                    _refuse("the delta reduce input being exactly the recognised O load VALUE times the recognised dO load VALUE (no other arithmetic)")
+                if not _plain_sum_reduce(reduce_op):
+                    _refuse("the delta reduction combiner being exactly a + b (the template sums)")
+                _need(reduce_op.id, ("j",), "delta = rowsum over d of O(j,d) * dO(j,d)")
+
+            _output_casts = {}
+            _store_roles = {st.id: role for role, st in out_stores.items()}
+
+            def _out_cast(st):
+                """Prove and record the conversion of THIS output role, including no conversion.
+
+                A sibling's dtype says nothing about this store. The source accumulator is
+                fp32: either store it to fp32, or replay its one narrowing to this pointer's
+                own element type. The surrounding proof still checks the underlying value.
+                """
+                role = _store_roles[st.id]
+                v = st.operand_ids[1]
+                o = op_by_id.get(_peel_ids(v, _LAY))
+                _po = op_by_id.get(st.operand_ids[0])
+                _pm = re.search(r"!tt\.ptr<([A-Za-z0-9_]+)", (_po.type_str or "") if _po is not None else "")
+                if o is None or o.op != "arith.truncf" or not o.operand_ids:
+                    if _pm is None or _pm.group(1) != "f32":
+                        _refuse(f"{role}: an unconverted fp32 accumulator stored to its own fp32 pointer")
+                    _output_casts[role] = None
+                    return v
+                el = _ELEM.get(_elem_of(o.type_str))
+                pel = _ELEM.get(_pm.group(1)) if _pm else None
+                if el is None or pel != el:
+                    _refuse("an output cast to exactly the stored pointer's element type (fp16 / bf16), which the template replays")
+                _output_casts[role] = el
+                _rounded_truncf[o.id] = "out"
+                return o.operand_ids[0]
+
+            def _store_check(st, want, what, mask_want=None):
+                val = _out_cast(st)
+                _need(val, want, what)
+                # the stored tile's shape: the first typed op on the value's layout chain (the
+                # store itself has no result type; a loop result id is not an op)
+                shape, cur, seen = None, st.operand_ids[1], set()   # the typed chain (incl. an output cast)
+                while cur not in seen and shape is None:
+                    seen.add(cur)
+                    o_ = op_by_id.get(cur)
+                    if o_ is None:
+                        break
+                    shape = _extract_shape(o_.type_str or "") or None
+                    cur = o_.operand_ids[0] if (o_.op in _LAY and o_.operand_ids) else cur
+                if len(st.operand_ids or []) < 3:
+                    _refuse(f"{what} stored under a mask")
+                mo = _mask_orient(st.operand_ids[2], shape) if len(want) == 2 else ((_leaf_coord(st.operand_ids[2]),))
+                if mo != (mask_want or want):
+                    _refuse(f"{what} stored under the {mask_want or want} mask (proved {mo})")
+
+            def _acc_of(st, scaled=False):
+                """Packet 150 (149 F2): the exact recurrence behind a store — (loop, position) from
+                the store's loop RESULT, that position's zero INIT, its BLOCK ARG and its YIELD.
+                Returns (yielded op, block arg id). The accumulating op must consume THAT block arg."""
+                v = _peel_ids(_out_cast(st), _LAY)
+                o = op_by_id.get(v)
+                if scaled:
+                    if o is None or o.op != "arith.mulf" or len(o.operand_ids or []) != 2:
+                        _refuse("the scaled output store being mulf(loop result, splat(sm_scale))")
+                    cand = [(_peel_ids(x, _LAY), _peel_ids(y_, _bcast)) for x, y_ in (o.operand_ids, o.operand_ids[::-1])]
+                    pick = next(((r, sc) for r, sc in cand if r in res_pos), None)
+                    if pick is None:
+                        _refuse("the scaled output store multiplying the loop result")
+                    v, sc_id = pick
+                    sc = arg_by_id.get(sc_id)
+                    if sc is None or sc.is_ptr or scale_arg is None or sc.index != scale_arg:
+                        _refuse("the output scaled by exactly the sm_scale argument the template binds")
+                elif o is not None and o.op == "arith.mulf":
+                    _refuse("an unscaled output store (this output is not scaled by the template)")
+                if v not in res_pos:
+                    _refuse("an output accumulated by the j/k loop")
+                lid, i = res_pos[v]
+                if not _is_zero_const(inits_of[(lid, i)]):
+                    _refuse("the output accumulator initialised to literal zero")
+                bids = bids_of.get(lid) or []
+                if i + 1 >= len(bids):
+                    _refuse("a resolvable accumulator block argument")
+                y = op_by_id.get(_yielded(lid, i))
+                return y, bids[i + 1]
+
+            def _acc_dot(st, a_root, b_addr, what, scaled=False, b_root=None):
+                y, ba = _acc_of(st, scaled)
+                if y is None or y.op != "tt.dot" or len(y.operand_ids or []) < 3:
+                    _refuse(f"{what} being a dot accumulated into the loop carry")
+                if _root_rd(y.operand_ids[0]) != a_root:
+                    _refuse(f"{what}: the first operand being exactly the proved value (or the source's recorded rounding of it)")
+                if b_root is not None:
+                    if _root(y.operand_ids[1]) != b_root:
+                        _refuse(f"{what}: the second operand being exactly the scaled K value used by the score dot")
+                else:
+                    _raw_load(y.operand_ids[1], b_addr, f"{what}: the second operand")
+                if y.operand_ids[2] != ba:
+                    _refuse(f"{what} accumulating into ITS OWN loop carry (C is the block argument of the stored result's position)")
+
+            if kind == "kv":
+                dk_st, dv_st = out_stores["dk"], out_stores["dv"]
+                _store_check(dv_st, ("k", "d"), "dV = Pᵀ(k,j) @ dO(j,d)")
+                _store_check(dk_st, ("k", "d"), "dK = dSᵀ(k,j) @ Q(j,d), scaled")
+                _acc_dot(dv_st, P_id, do_addr, "the dV accumulation dot(Pᵀ, dO)")
+                _acc_dot(dk_st, dS.id, q_addr, "the dK accumulation dot(dSᵀ, Q)", scaled=True)
+            elif kind == "q":
+                dq_st, dlt_st = out_stores["dq"], out_stores["delta"]
+                _store_check(dq_st, ("j", "d"), "dQ = dS(j,k) @ K(k,d)")
+                _store_check(dlt_st, ("j",), "delta(j)")
+                _acc_dot(dq_st, dS.id, k_addr, "the dQ accumulation dot(dS, K·scale)", b_root=k_val_root)
+                if _peel_ids(_out_cast(dlt_st), _LAY) != reduce_op.id:
+                    _refuse("the delta store value being the rowsum reduce itself")
+            else:
+                db_st = out_stores["db"]
+                _store_check(db_st, ("j", "k"), "dbias = Σ_i dS(j,k)")
+                y, ba = _acc_of(db_st)
+                if y is None or y.op != "arith.addf" or len(y.operand_ids or []) != 2:
+                    _refuse("the dbias accumulation being acc + dS")
+                ops_ = [_peel_ids(x, _LAY) for x in y.operand_ids]
+                if sorted(ops_, key=lambda x: x == dS.id) != [ba, dS.id]:
+                    _refuse("the dbias accumulation being exactly ITS OWN loop carry plus dS")
+            if set(_output_casts) != set(out_stores):
+                _refuse("a proved conversion for every output store role")
+            return {"k_orient": k_orient, "v_orient": v_orient,
+                    "rounding": {**_rounding, "output_casts": _output_casts}}
 
         # ----- N_CTX (loop bound) + H (mask cross-head divisor): shared by q/kv -----
         def _arg_through_casts(sid):
@@ -8426,6 +9227,10 @@ class GenericLowerer(
             # delta = rowsum(O * dO): the reduce input is mulf(O_load, dO_load).
             reduce_op = next((s for s in allops if s.op == "tt.reduce"), None)
             mul = op_by_id.get(skip_layout(reduce_op.operand_ids[0])) if (reduce_op and reduce_op.operand_ids) else None
+            if mul is not None and mul.op == "arith.extf" and mul.operand_ids:
+                # packet 174: `tl.sum((o * do).to(tl.float32), 1)` — an exact widening of the
+                # narrow product; the proof records the product's rounding (round_dprod).
+                mul = op_by_id.get(skip_layout(mul.operand_ids[0]))
             if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids or []) < 2:
                 _refuse("the delta reduce (O * dO)")
             od_cands = []
@@ -8478,12 +9283,15 @@ class GenericLowerer(
                 return False
 
             dlt_res = dq_res = _dq_addr = None
+            _dlt_store = _dq_store = None
             for st_ in stores:
                 if len(st_.operand_ids) > 1 and _traces_to_reduce(st_.operand_ids[1]):
                     dlt_res = resolve_1d(st_.operand_ids[0])
+                    _dlt_store = st_
                 else:
                     dq_res = resolve_2d(st_.operand_ids[0])
                     _dq_addr = st_.operand_ids[0]
+                    _dq_store = st_
             if dlt_res is None:
                 _refuse("the delta output store")
             if dq_res is None:
@@ -8532,6 +9340,10 @@ class GenericLowerer(
             out_dtype = "f16" if str(self.graph.args[dq_res[0]].elem_type) in ("fp16", "f16") else (
                 "bf16" if str(self.graph.args[dq_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
 
+            sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
+            _ds = _prove_downstream("q", n_ctx_arg, block_j, block_k, head_dim, do_addr, _v_addr_q, None,
+                                    {"dq": _dq_store, "delta": _dlt_store}, reduce_op=reduce_op, scale_arg=scale_arg,
+                                    o_addr=_o_addr_q)
             roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
                      dlt_res[0], do_res[0], o_res[0], dq_res[0]]
             if len(set(roles)) != 10:
@@ -8543,8 +9355,10 @@ class GenericLowerer(
                 "bwd_kind": "q", "grid_3d": grid_3d,
                 "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
                 "lse": lse_res, "delta": dlt_res, "do": do_res, "o": o_res, "dq": dq_res,
-                "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
+                "sentinel": sentinel_ref, "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
                 "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+                "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
+                "rounding": _ds.get("rounding") or {},   # packet 174
             }
 
         # ======================= _bwd_b (dbias) ==============================
@@ -8730,6 +9544,9 @@ class GenericLowerer(
             out_dtype = "f16" if str(self.graph.args[db_res[0]].elem_type) in ("fp16", "f16") else (
                 "bf16" if str(self.graph.args[db_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
 
+            sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
+            _ds = _prove_downstream("b", n_ctx_arg, block_j, block_k, head_dim, do_addr, v_addr, dlt_addr,
+                                    {"db": stores[0]}, scale_arg=scale_arg)
             roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
                      dlt_res[0], do_res[0], db_res[0]]
             if len(set(roles)) != 9:
@@ -8739,8 +9556,10 @@ class GenericLowerer(
                 "bwd_kind": "b", "grid_3d": True,
                 "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
                 "lse": lse_res, "delta": dlt_res, "do": do_res, "db": db_res,
-                "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
+                "sentinel": sentinel_ref, "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
                 "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+                "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
+                "rounding": _ds.get("rounding") or {},   # packet 174
             }
 
         # ========================= _bwd_kv (dK/dV) ===========================
@@ -8789,7 +9608,7 @@ class GenericLowerer(
             return None  # V/dO batch-head offsets differ from Q's -> generic path
 
         # delta: dscores = P * (dP - delta). Find subf(dot_result, load) -> the load.
-        dlt_res = None
+        dlt_res = _dlt_addr_kv = None
         for s in allops:
             if s.op == "arith.subf" and s.operand_ids:
                 for o in s.operand_ids:
@@ -8799,7 +9618,7 @@ class GenericLowerer(
                         # the OTHER operand must be a dot result (dP), not a load
                         others = [x for x in s.operand_ids if x != o]
                         if others and load_addr(others[0]) is None:
-                            dlt_res = r
+                            dlt_res, _dlt_addr_kv = r, la
         if dlt_res is None:
             _refuse("the delta pointer (dP - delta)")
 
@@ -8826,6 +9645,7 @@ class GenericLowerer(
             return None
 
         dk_res = dv_res = scale_from_dk = None
+        _dk_store = _dv_store = None
         for st_ in stores:
             addr_r = resolve_2d(st_.operand_ids[0])
             if addr_r is None:
@@ -8834,9 +9654,9 @@ class GenericLowerer(
                 return None  # dK/dV store batch-head offsets differ from Q's -> generic path
             sc = _traces_scale_mul(st_.operand_ids[1]) if len(st_.operand_ids) > 1 else None
             if sc is not None and dk_res is None:
-                dk_res, scale_from_dk = addr_r, sc
+                dk_res, scale_from_dk, _dk_store = addr_r, sc, st_
             else:
-                dv_res = addr_r
+                dv_res, _dv_store = addr_r, st_
         if dk_res is None or dv_res is None or scale_from_dk is None:
             _refuse("the dK (scaled) / dV store pointers")
 
@@ -8890,6 +9710,9 @@ class GenericLowerer(
         out_dtype = "f16" if str(self.graph.args[dk_res[0]].elem_type) in ("fp16", "f16") else (
             "bf16" if str(self.graph.args[dk_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
 
+        sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
+        _ds = _prove_downstream("kv", n_ctx_arg, block_j, block_k, head_dim, do_addr, _v_addr_kv, _dlt_addr_kv,
+                                {"dk": _dk_store, "dv": _dv_store}, scale_arg=scale_from_dk)
         roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
                  dlt_res[0], do_res[0], dk_res[0], dv_res[0]]
         if len(set(roles)) != 10:
@@ -8901,8 +9724,10 @@ class GenericLowerer(
             "bwd_kind": "kv", "grid_3d": grid_3d,
             "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
             "lse": lse_res, "delta": dlt_res, "do": do_res, "dk": dk_res, "dv": dv_res,
-            "scale_arg": scale_from_dk, "N_CTX": n_ctx_arg, "H": h_arg,
+            "sentinel": sentinel_ref, "scale_arg": scale_from_dk, "N_CTX": n_ctx_arg, "H": h_arg,
             "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
+            "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
+            "rounding": _ds.get("rounding") or {},   # packet 174
         }
 
     def _lower_biased_fa_backward(self, info: dict) -> str:
@@ -8931,6 +9756,15 @@ class GenericLowerer(
         kind = info.get("bwd_kind")
         if kind not in ("kv", "q", "b"):
             raise MetalNonRecoverableError("only biased-FA backward dK/dV, dQ, dbias are routed so far")
+        output_roles = {"kv": ("dk", "dv"), "q": ("dq", "delta"), "b": ("db",)}[kind]
+        output_casts = (info.get("rounding") or {}).get("output_casts")
+        if not isinstance(output_casts, dict) or set(output_casts) != set(output_roles):
+            raise MetalNonRecoverableError("biased-FA backward requires a proved cast for every output role")
+        storage_cast = {"f32": None, "fp32": None, "f16": "half", "fp16": "half", "bf16": "bfloat"}
+        for role in output_roles:
+            dtype = str(self.graph.args[info[role][0]].elem_type)
+            if dtype not in storage_cast or output_casts[role] != storage_cast[dtype]:
+                raise MetalNonRecoverableError(f"biased-FA backward {role}: cast does not match its own output pointer")
         MAX_BUFFERS = 31
         C1 = "c1"
         args = self.graph.args
@@ -9005,13 +9839,26 @@ class GenericLowerer(
 
         qs, ks, vs = info["q"][1], info["k"][1], info["v"][1]
         os_, bs, ms, ls = info["do"][1], info["bias"][1], info["mask"][1], info["lse"][1]
+
+        # packet 148: the template addresses K / V as [k (sn), d (sk)]; the source may hold
+        # either orientation, so the resolver's [row, col] strides map by the PROVED load
+        # orientation rather than by kind: (d, k) -> sn = col, sk = row; (k, d) -> direct.
+        def _sn_sk(res, orient, what):
+            if orient == ("d", "k"):
+                return res[1][3], res[1][2]
+            if orient == ("k", "d"):
+                return res[1][2], res[1][3]
+            raise MetalNonRecoverableError(f"biased-FA backward: unproved {what} orientation {orient!r}; refusing.")
+
+        _k_sn, _k_sk = _sn_sk(info["k"], info.get("k_orient"), "K")
+        _v_sn, _v_sk = _sn_sk(info["v"], info.get("v_orient"), "V")
         ds = info["delta"][1]
         grid_3d = bool(info.get("grid_3d"))
         mask_batch_div = _u(info["H"]) if (grid_3d and info["H"] != C1) else None
         head_dim, block_j, block_k = info["head_dim"], info["block_j"], info["block_k"]
         common = {
             "q_sz": _u(qs[0]), "q_sh": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
-            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(vs[3]), "v_sk": _u(vs[2]),  # Vᵀ swap
+            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(_v_sn), "v_sk": _u(_v_sk),  # from the proven V orientation
             "b_sz": _u(bs[0]), "b_sh": _u(bs[1]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
             "mask_sz": _u(ms[0]), "mask_sh": _u(ms[1]), "mask_sn": _u(ms[2]),
             "lse_sz": _u(ls[0]), "lse_sh": _u(ls[1]), "lse_sm": _u(ls[2]),
@@ -9019,6 +9866,16 @@ class GenericLowerer(
             "do_sz": _u(os_[0]), "do_sh": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
             "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
         }
+        # packet 134: forward the proven score sentinel (natural units in the backward: the
+        # source applies it BEFORE the inv_ln2 multiply) — runtime arg or baked literal.
+        _snt = info.get("sentinel")
+        if not _snt:
+            raise MetalNonRecoverableError("biased-FA backward: the score sentinel was not proven; refusing.")
+        if _snt[0] == "arg":
+            common["neg_inf"] = _scale(_snt[1])
+        else:
+            common["neg_inf"] = "(-INFINITY)" if _snt[1] == float("-inf") else f"({float(_snt[1])!r}f)"
+
         # simdgroup-MMA fast path (dK/dV, dQ): ~2-2.5x the scalar template at the tile
         # sizes it supports. dbias stays scalar (memory-bound i-loop; MMA lost).
         simd_ok = (head_dim % 8 == 0 and block_j % 8 == 0 and block_k % 8 == 0
@@ -9027,8 +9884,7 @@ class GenericLowerer(
             dks, dvs = info["dk"][1], info["dv"][1]
             bindings = dict(common)
             bindings.update({
-                # K loaded transposed [d,k] -> swap.
-                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[3]), "k_sk": _u(ks[2]),
+                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven K orientation
                 "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
                 "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
             })
@@ -9047,7 +9903,8 @@ class GenericLowerer(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div)
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div, runtime_neg_inf=True,
+                **(info.get("rounding") or {}))
             # scalar path k-subtiles so a large head_dim fits: TPG = KS*head_dim (KS==block_k
             # for head_dim<=32 -> unchanged block_k*head_dim). Must match the template's KS.
             if simd_ok:
@@ -9060,8 +9917,7 @@ class GenericLowerer(
             oo, dqs = info["o"][1], info["dq"][1]
             bindings = dict(common)
             bindings.update({
-                # K loaded UNtransposed [k,d] -> direct.
-                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(ks[2]), "k_sk": _u(ks[3]),
+                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven K orientation
                 "o_sz": _u(oo[0]), "o_sh": _u(oo[1]), "o_sm": _u(oo[2]), "o_sk": _u(oo[3]),
                 "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
             })
@@ -9085,14 +9941,14 @@ class GenericLowerer(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div)
+                grid_3d=grid_3d, mask_batch_div=mask_batch_div, runtime_neg_inf=True,
+                **(info.get("rounding") or {}))
         else:  # b — triangle-i is a loop; slot [1] of each stride list is the i-stride.
             dbs = info["db"][1]
             bindings = {
                 "q_sh": _u(qs[0]), "q_si": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
-                # K and V both UNtransposed [k,d] -> direct (no swap).
-                "k_sh": _u(ks[0]), "k_si": _u(ks[1]), "k_sn": _u(ks[2]), "k_sk": _u(ks[3]),
-                "v_sh": _u(vs[0]), "v_si": _u(vs[1]), "v_sn": _u(vs[2]), "v_sk": _u(vs[3]),
+                "k_sh": _u(ks[0]), "k_si": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven orientations
+                "v_sh": _u(vs[0]), "v_si": _u(vs[1]), "v_sn": _u(_v_sn), "v_sk": _u(_v_sk),
                 "b_sh": _u(bs[0]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
                 "mask_sz": _u(ms[0]), "mask_si": _u(ms[1]), "mask_sn": _u(ms[2]),
                 "lse_sh": _u(ls[0]), "lse_si": _u(ls[1]), "lse_sm": _u(ls[2]),
@@ -9100,6 +9956,7 @@ class GenericLowerer(
                 "do_sh": _u(os_[0]), "do_si": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
                 "db_sh": _u(dbs[0]), "db_sm": _u(dbs[2]), "db_sn": _u(dbs[3]),
                 "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
+                "neg_inf": common["neg_inf"],  # packet 134: the proven score sentinel
             }
             # dbias de-stages Q for a large head_dim; if even that overflows 32 KB
             # (head_dim>=128 at BLOCK_K=32) it has no correct lowering here -> refuse LOUDLY.
@@ -9114,7 +9971,8 @@ class GenericLowerer(
                 head_dim, block_j, block_k, out_dtype=info["out_dtype"],
                 arg_decls=arg_decls, bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                mask_batch_div=mask_batch_div)
+                mask_batch_div=mask_batch_div, runtime_neg_inf=True,
+                **(info.get("rounding") or {}))
             self.effective_block_size = block_j * block_k
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
@@ -9136,7 +9994,10 @@ class GenericLowerer(
         """
         from triton_msl.errors import MetalNonRecoverableError
         from triton_msl.codegen.msl_types import triton_type_to_msl
-        from triton_msl.codegen._msl_templates import make_flash_attention_kernel_tiled
+        from triton_msl.codegen._msl_templates import (
+            make_flash_attention_kernel_tiled,
+            flash_attention_tiled_threads,
+        )
 
         MAX_BUFFERS = 31  # mirrors driver._MAX_METAL_BUFFERS
         C1 = "c1"
@@ -9180,6 +10041,7 @@ class GenericLowerer(
             detected_v_index=info["v"],
             detected_out_index=info["out"],
             q_scale_arg=info["scale_arg"],
+            scalar_rounding_replay=True,
             k_transposes=0,
             detected_n_ctx_index=info.get("N_CTX"),
             load_mask_policy="boundary",
@@ -9327,6 +10189,11 @@ class GenericLowerer(
         # template handles arbitrary strides (correctness-first). Correct-or-refuse:
         # only take the fast path when provably contiguous; else the tiled fallback.
         qs2, ks2, vs2, os2 = info["q_strides"], info["k_strides"], info["v_strides"], info["o_strides"]
+        # packet 164 (item F-a): the rounding points the value-path verifier recorded for THIS
+        # kernel (bf16 / fp16 sources round q*scale and P; fp32 sources record nothing).
+        _rq = getattr(self, "_fa_rounding", {}).get("round_q")
+        _rp = getattr(self, "_fa_rounding", {}).get("round_p")
+        _scale_chain = getattr(self, "_fa_rounding", {}).get("scale_chain", ())
         simd_eligible = (
             head_dim % 8 == 0
             # Valid v_head_dim tilings: <=64 (guarded surplus groups) OR the exact
@@ -9338,6 +10205,12 @@ class GenericLowerer(
             and ks2[2] == C1        # K head-dim (Kᵀ row) contiguous
             and vs2[3] == C1        # V head-dim (col) contiguous
             and os2[3] == C1        # Out head-dim (col) contiguous
+            # packet 164: a source that rounds P to its dtype does so RELATIVE TO ITS OWN kv-block
+            # running max; rounding then rescaling differs from rescaling then rounding, so the
+            # replay must walk the source's block width. The simd maker is fixed at 64-wide
+            # blocks: exact only when the source's kv block is 64. Otherwise the tiled maker
+            # (which takes block_n from the source) replays it exactly — slower, correct.
+            and (not _rp or block_n == 64)
         )
         if simd_eligible:
             from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup
@@ -9350,6 +10223,7 @@ class GenericLowerer(
                 bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
                 runtime_neg_inf=True, neg_inf_unit=_ni_unit,
+                round_q=_rq, round_p=_rp, scale_chain=_scale_chain,
             )
             self.effective_block_size = 256
         else:
@@ -9362,8 +10236,9 @@ class GenericLowerer(
                 bias=True, mask=has_mask, lse=True, runtime_scale=True,
                 grid_3d=grid_3d, mask_batch_div=mask_batch_div,
                 runtime_neg_inf=True, neg_inf_unit=_ni_unit,
+                round_q=_rq, round_p=_rp, scale_chain=_scale_chain,
             )
-            self.effective_block_size = block_m * block_n
+            self.effective_block_size = flash_attention_tiled_threads(block_m, block_n)
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
         self._prescan_stores()
@@ -9499,6 +10374,7 @@ class GenericLowerer(
         detected_out_index,
         q_scale_arg=None,
         q_scale_required=True,
+        scalar_rounding_replay=False,
         k_transposes=1,
         verify_score_path=False,
         expected_score_scale=None,
@@ -9699,6 +10575,11 @@ class GenericLowerer(
             "arith.extf",
         }
         _transpose = {"tt.trans", "ttg.memdesc_trans"}
+        # packet 164 (item F-a): the source's rounding points found on the value paths — the
+        # caller passes them to the makers (`round_q`, `round_p`) so the emitted kernel rounds
+        # exactly where the source does. Reset per verification.
+        _rounding = {}
+        self._fa_rounding = _rounding
         _scalar_wrappers = {
             "tt.splat",
             "tt.broadcast",
@@ -9813,6 +10694,58 @@ class GenericLowerer(
             if q_scale_arg is None:
                 return _constant_cone(start_id)
             return _scalar_arg_index(start_id) == q_scale_arg
+
+        def _scale_conversion_chain(start_id, role):
+            """Separate scalar VALUE proof; never reuse the shape/address transparent peel.
+
+            Only fp32 scalars, representation changes, exact narrow-to-fp32 widenings,
+            and the explicitly replayed fp32-to-half/bfloat roundings are admitted.
+            Record execution order, not the reverse order of this backward walk.
+            """
+            def element(oid):
+                arg = _arg_by_id.get(oid)
+                if arg is not None:
+                    return str(arg.elem_type)
+                op = _by_id.get(oid)
+                text = (op.type_str or "") if op is not None else ""
+                match = re.search(r"(?:^|x)(f32|f16|bf16)(?=[,>]|$)", text)
+                return match.group(1) if match else None
+
+            cur, seen, reversed_chain = start_id, set(), []
+            layout = {"tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout"}
+            while cur not in seen and len(seen) < 32:
+                seen.add(cur)
+                arg = _arg_by_id.get(cur)
+                op = _by_id.get(cur)
+                if arg is not None:
+                    if arg.is_ptr or element(cur) not in ("f32", "fp32"):
+                        _refuse(role, f"runtime scalar {arg.name} must be fp32 at the root of the scalar conversion chain")
+                    break
+                if op is not None and op.op == "arith.constant":
+                    if element(cur) not in ("f32", "f16", "bf16"):
+                        _refuse(role, "the scalar conversion chain has an unsupported constant type")
+                    break
+                if op is None or len(op.operand_ids or []) != 1:
+                    _refuse(role, "an unproved scalar conversion chain")
+                src = op.operand_ids[0]
+                if op.op in layout:
+                    if element(cur) != element(src):
+                        _refuse(role, "a scalar representation operation changed element type")
+                elif op.op == "arith.truncf" and element(src) == "f32" and element(cur) in ("f16", "bf16"):
+                    reversed_chain.append({"f16": "half", "bf16": "bfloat"}[element(cur)])
+                elif op.op == "arith.extf" and element(src) in ("f16", "bf16") and element(cur) == "f32":
+                    pass
+                else:
+                    _refuse(role, f"unreplayed scalar conversion {op.op}")
+                cur = src
+            else:
+                _refuse(role, "a cyclic or overlong scalar conversion chain")
+            chain = tuple(reversed(reversed_chain))
+            if chain not in ((), ("half",), ("bfloat",), ("half", "bfloat")):
+                _refuse(role, f"unproved scalar conversion chain {chain}")
+            if chain and not scalar_rounding_replay:
+                _refuse(role, "this route has no scalar conversion chain replay")
+            return chain
 
         def _peel_to_core(start_id, allowed, limit=64):
             cur, seen = start_id, set()
@@ -9976,7 +10909,20 @@ class GenericLowerer(
                     other = next(oid for oid in op.operand_ids if oid != loaded[0])
                     if not _scale_matches(other):
                         _refuse(role, "the multiply's scale source disagrees with detection")
+                    _scale_chain = _scale_conversion_chain(other, role)
+                    if _scale_chain:
+                        _rounding["scale_chain"] = _scale_chain
                     scale_value = _const_value(other)
+                    # packet 164 (item F-a): the multiply's element type IS a rounding point when it
+                    # is narrower than fp32 — the source computes q * full(scale, dtype) in that
+                    # dtype (scale rounded, each product rounded). Record it for the makers.
+                    _mt = (op.type_str or "")
+                    _el = _mt.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in _mt else _mt.strip()
+                    _round_q = {"f16": "half", "bf16": "bfloat"}.get(_el)
+                    if _round_q is not None:
+                        _rounding["round_q"] = _round_q
+                    elif _el not in ("f32", ""):
+                        _refuse(role, f"a scale multiply in {_el} the templates cannot replay")
                     n_scale += 1
                     cur = loaded[0]
                     continue
@@ -10028,6 +10974,15 @@ class GenericLowerer(
                 break
             if _op.op not in _p_passthrough or len(_op.operand_ids or []) != 1:
                 _refuse("P", f"unsupported operation {_op.op} appears after softmax")
+            if _op.op in ("arith.truncf", "tt.fp_to_fp"):
+                # packet 164 (item F-a): P rounded to the input dtype before P @ V is a rounding
+                # point the makers replay; record its target type (one narrowing at most).
+                _pt = (_op.type_str or "")
+                _pel = _pt.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in _pt else _pt.strip()
+                _round_p = {"f16": "half", "bf16": "bfloat"}.get(_pel)
+                if _round_p is None or "round_p" in _rounding:
+                    _refuse("P", f"a P conversion to {_pel or '?'} the templates cannot replay")
+                _rounding["round_p"] = _round_p
             _cur = _op.operand_ids[0]
         else:
             _refuse("P", "the path is cyclic or exceeds the verification bound")
@@ -10425,6 +11380,7 @@ class GenericLowerer(
         from triton_msl.codegen._msl_templates import (
             make_flash_attention_kernel_tiled,
             make_flash_attention_kernel_simdgroup,
+            flash_attention_tiled_threads,
         )
 
         head_dim = info["head_dim"]
@@ -10632,8 +11588,8 @@ class GenericLowerer(
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
             )
-            # scalar template: 1024 threads/threadgroup (BLOCK_M * BLOCK_N).
-            self.effective_block_size = block_m * block_n
+            # Match every cooperative loop's physical stride, even for >1024 scores.
+            self.effective_block_size = flash_attention_tiled_threads(block_m, block_n)
         # The kernel uses program_id(0) (q-block) AND program_id(1) (z*h); force
         # the 2-D threadgroup grid (n_q_blocks, Z*H, 1) so the template's pid3.x /
         # pid3.y resolve correctly (emit_msl derives needs_2d_grid from this).

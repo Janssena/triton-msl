@@ -30,11 +30,69 @@ class MSLExtraction:
     uses_2d: bool = False
     uses_tpg: bool = False
     tpg_axes: Set[int] = None  # Which grid axes tpg is needed for (0, 1, 2)
+    arg_positions: Optional[List[int]] = None  # Pointer-then-scalar order -> source runtime positions
+
+
+def _reads_output(body: str, name: str) -> bool:
+    """Conservatively prove write-only uses of an output and its emitted aliases.
+
+    Exempt only the *base identifier* of an address/store, not the enclosing
+    expression: both an alias offset and a store index may READ that same output.
+    Unknown pointer spellings refuse; this is not a general-purpose MSL parser.
+    """
+    text = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", body)
+    pending, seen = [name], set()
+    safe_uses = set()
+    declarations = list(re.finditer(
+        r"(?:volatile\s+)?device\s+\w+\s*\*\s+(\w+)\s*=\s*([^;]+);", text
+    ))
+    while pending:
+        n = pending.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        for decl in declarations:
+            # Only the emitter's direct base / optional device-pointer-cast
+            # form establishes an alias. In particular `(device int*)o[0]`
+            # is a load converted to a pointer, NOT a pointer alias.
+            head = re.match(
+                r"\s*(?:\(\s*(?:volatile\s+)?device\s+\w+\s*\*\s*\)\s*)?"
+                r"(?:\(\s*)*(" + re.escape(n) + r")\b(?=\s*(?:[+\-)]|$))",
+                decl.group(2),
+            )
+            if head is not None:
+                safe_uses.add(decl.start(2) + head.start(1))
+                safe_uses.add(decl.start(1))  # the alias's definition, not a read
+                pending.append(decl.group(1))
+
+        for use in re.finditer(r"\b" + re.escape(n) + r"\b", text):
+            if use.start() in safe_uses:
+                continue
+            # Balance nested subscripts, but exempt ONLY the left-hand base.
+            # All names inside the index remain visible to this same walk.
+            i = use.end()
+            while i < len(text) and text[i].isspace():
+                i += 1
+            if i < len(text) and text[i] == "[":
+                depth = 1
+                i += 1
+                while i < len(text) and depth:
+                    depth += (text[i] == "[") - (text[i] == "]")
+                    i += 1
+                while i < len(text) and text[i].isspace():
+                    i += 1
+                if depth == 0 and text[i:i + 1] == "=" and text[i:i + 2] != "==":
+                    safe_uses.add(use.start())
+                    continue
+            return True  # load, atomic, escaping address, or unknown syntax
+    return False
 
 
 def extract_msl_for_mlx(
     msl_source: str,
     output_arg_indices: Optional[List[int]] = None,
+    expected_args: Optional[int] = None,
+    expected_signature: Optional[List[tuple]] = None,
 ) -> MSLExtraction:
     """Parse full MSL into components for mx.fast.metal_kernel().
 
@@ -50,6 +108,15 @@ def extract_msl_for_mlx(
     kernel_match = re.search(r"^kernel\s+void\s+(\w+)\s*\(", msl_source, re.MULTILINE)
     if not kernel_match:
         raise ValueError("No kernel function found in MSL source")
+    _n_kernels = len(re.findall(r"^kernel\s+void\s+", msl_source, re.MULTILINE))
+    if _n_kernels != 1:
+        # packet 176: the body is cut from the first `kernel void` to the LAST brace; a second
+        # kernel (a two-kernel split, a fast + fallback pair) would be swallowed into the body.
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(
+            f"MLX route: the emitted MSL holds {_n_kernels} kernels; mx.fast.metal_kernel dispatches one. Refusing."
+        )
 
     kernel_name = kernel_match.group(1)
     pre_kernel = msl_source[: kernel_match.start()].strip()
@@ -71,7 +138,46 @@ def extract_msl_for_mlx(
 
     # Parse signature to extract args
     sig_text = msl_source[sig_start : sig_start + brace_match.start() + 1]
-    ptr_args, scalar_args, thread_vars = _parse_signature(sig_text)
+    ptr_args, scalar_args, thread_vars, arg_positions = _parse_signature(sig_text)
+    if expected_args is not None and len(ptr_args) + len(scalar_args) != expected_args:
+        # packet 176: the launcher binds the Triton arguments positionally; a signature the
+        # parser reads differently from the Triton signature (a packed scalar buffer, a
+        # `const device` pointer the pattern skips, a template-ordered ABI) is a silent mis-bind.
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(
+            f"MLX route: the emitted kernel signature has {len(ptr_args)} pointer + {len(scalar_args)} "
+            f"scalar arguments but the Triton signature has {expected_args} runtime arguments; refusing "
+            f"rather than binding positionally."
+        )
+
+    # Counts alone do not establish an ABI: the same count can hide reordered
+    # roles, a scalar exposed as a pointer, or an incorrect storage width.
+    # Buffer positions are the generic emitter's source runtime positions.
+    from triton_msl.errors import MetalNonRecoverableError
+
+    n_buffers = len(re.findall(r"\[\[\s*buffer\s*\(", sig_text))
+    if n_buffers != len(arg_positions) or sorted(arg_positions) != list(range(n_buffers)):
+        raise MetalNonRecoverableError("MLX route: kernel buffer bindings are not a complete unique runtime-argument map.")
+    if expected_signature is not None:
+        from triton_msl.codegen.msl_emitter import _sanitize_msl_name, triton_type_to_msl
+
+        if len(expected_signature) != n_buffers:
+            raise MetalNonRecoverableError("MLX route: source signature and kernel buffer counts differ.")
+        for ordinal, ((name, dtype), source_pos) in enumerate(zip(ptr_args + scalar_args, arg_positions)):
+            source_name, source_type = expected_signature[source_pos]
+            is_ptr = ordinal < len(ptr_args)
+            source_ptr = source_type.startswith("*")
+            source_dtype = triton_type_to_msl(source_type[1:] if source_ptr else source_type)
+            if name != _sanitize_msl_name(source_name) or is_ptr != source_ptr or dtype != source_dtype:
+                raise MetalNonRecoverableError(
+                    f"MLX route: buffer {source_pos} does not preserve source argument '{source_name}' "
+                    f"({source_type}); emitted '{name}' is {'pointer' if is_ptr else 'scalar'} {dtype}. Refusing."
+                )
+    if output_arg_indices is not None:
+        ptr_positions = set(arg_positions[:len(ptr_args)])
+        if any(type(i) is not int or i not in ptr_positions for i in output_arg_indices):
+            raise MetalNonRecoverableError("MLX route: an output argument index does not identify a source pointer.")
 
     # Classify pointer args as input vs output
     output_indices = set(output_arg_indices) if output_arg_indices else None
@@ -79,11 +185,24 @@ def extract_msl_for_mlx(
     output_names = []
     output_ptr_idx_set = set()
     for i, (name, _dtype) in enumerate(ptr_args):
-        if output_indices is None or i in output_indices:
+        if output_indices is None or arg_positions[i] in output_indices:
             output_names.append(name)
             output_ptr_idx_set.add(i)
         else:
             input_names.append(name)
+    # packet 176: an output the kernel also reads (an accumulating / in-place store, an atomic on
+    # it, a cast of its address) cannot be expressed through fresh MLX outputs — refuse. With
+    # output_arg_indices=None EVERY pointer is an output, so a kernel that reads any pointer
+    # refuses too (the old "conservative" mode handed the kernel uninitialised inputs).
+    for name in output_names:
+        if _reads_output(raw_body, name):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"MLX route: the kernel reads (or atomically updates) its output pointer '{name}'; "
+                f"mx.fast.metal_kernel outputs are fresh, uninitialised arrays, so the read would see "
+                f"garbage. Use the torch.mps path for accumulating / in-place / atomic outputs."
+            )
 
     scalar_names = [name for name, _ty in scalar_args]
     scalar_types = [ty for _name, ty in scalar_args]
@@ -194,6 +313,7 @@ def extract_msl_for_mlx(
         uses_2d=uses_2d,
         uses_tpg=uses_tpg,
         tpg_axes=tpg_axes if tpg_axes else None,
+        arg_positions=arg_positions,
     )
 
 
@@ -206,25 +326,28 @@ def _parse_signature(sig_text: str):
     ptr_args = []
     scalar_args = []
     thread_vars = set()
+    ptr_positions, scalar_positions = [], []
 
     for m in re.finditer(
-        r"(?:volatile\s+)?device\s+(?:const\s+)?(\w+)\*\s+(\w+)\s+\[\[buffer\(\d+\)\]\]",
+        r"(?:volatile\s+)?device\s+(?:const\s+)?(\w+)\*\s+(\w+)\s+\[\[buffer\((\d+)\)\]\]",
         sig_text,
     ):
         dtype, name = m.group(1), m.group(2)
         ptr_args.append((name, dtype))
+        ptr_positions.append(int(m.group(3)))
 
     for m in re.finditer(
-        r"constant\s+(\w+)&\s+(\w+)\s+\[\[buffer\(\d+\)\]\]",
+        r"constant\s+(\w+)&\s+(\w+)\s+\[\[buffer\((\d+)\)\]\]",
         sig_text,
     ):
         dtype, name = m.group(1), m.group(2)
         scalar_args.append((name, dtype))
+        scalar_positions.append(int(m.group(3)))
 
     for m in re.finditer(r"uint3?\s+(\w+)\s+\[\[", sig_text):
         thread_vars.add(m.group(1))
 
-    return ptr_args, scalar_args, thread_vars
+    return ptr_args, scalar_args, thread_vars, ptr_positions + scalar_positions
 
 
 def _extract_device_functions(pre_kernel: str) -> str:

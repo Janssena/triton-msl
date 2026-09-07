@@ -828,6 +828,45 @@ class _ControlFlowMixin:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "i32"
 
+    def _atomic_ordering_fences(self, ssa):
+        """190/201: fence-bracket ONE logical atomic, with closed source metadata.
+
+        Flags cover the whole kernel conservatively: later lowering stages can add
+        threadgroup buffers, so the builder's current declarations cannot exclude them.
+        These are thread fences, not barriers or a scheduler-progress guarantee.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        sem, scope = ssa.attrs.get("sem"), ssa.attrs.get("scope")
+        if sem not in ("relaxed", "acquire", "release", "acq_rel"):
+            raise MetalNonRecoverableError(f"atomic has missing/unknown semantics {sem!r}", op_name=ssa.op)
+        if scope not in ("gpu", "cta"):
+            raise MetalNonRecoverableError(f"atomic scope {scope!r} is missing, unknown or unsupported on Metal", op_name=ssa.op)
+        if ssa.op == "tt.atomic_rmw" and ssa.attrs.get("rmw_op") not in (
+            "and", "or", "xor", "add", "fadd", "max", "min", "umax", "umin", "exch"
+        ):
+            raise MetalNonRecoverableError("atomic has missing/unknown RMW opcode", op_name=ssa.op)
+        if sem == "relaxed":
+            return None, None
+        from triton_msl.backend.device_detect import get_device_info
+
+        device = get_device_info()
+        version = getattr(self.options, "target_metal_version", "auto")
+        if version == "auto":
+            version = device.metal_version
+        match = re.fullmatch(r"([0-9]+)\.([0-9]+)", str(version))
+        capability = re.fullmatch(r"([0-9]+)\.([0-9]+)", str(device.metal_version))
+        if (match is None or capability is None
+                or not (3, 2) <= tuple(map(int, match.groups())) <= tuple(map(int, capability.groups()))
+                or re.fullmatch(r"M[1-9][0-9]*", device.chip_family) is None):
+            raise MetalNonRecoverableError(
+                f"ordered atomic requires Metal >=3.2 on Apple silicon; got {version!r}/{device.chip_family!r}",
+                op_name=ssa.op)
+        fence = ("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, "
+                 "memory_order_seq_cst, thread_scope_" + ("device" if scope == "gpu" else "threadgroup") + ");")
+        return (fence if sem in ("release", "acq_rel") else None,
+                fence if sem in ("acquire", "acq_rel") else None)
+
     def _emit_atomic_rmw_16bit(self, base_ptr, offsets, val_var, rmw_op, half_type, result_var, indent, n):
         """Neighbor-preserving 16-bit float atomic RMW via a 32-bit word CAS.
 
@@ -891,11 +930,13 @@ class _ControlFlowMixin:
         if len(ssa.operand_ids) < 2:
             return
 
+        fence_before, fence_after = self._atomic_ordering_fences(ssa)
+
         ptr_id = ssa.operand_ids[0]
         val_id = ssa.operand_ids[1]
         mask_id = ssa.operand_ids[2] if len(ssa.operand_ids) >= 3 else None
 
-        rmw_op = ssa.attrs.get("rmw_op", "add")
+        rmw_op = ssa.attrs["rmw_op"]
         val_var = self._lookup(val_id)
 
         # Resolve pointer info
@@ -1153,6 +1194,9 @@ class _ControlFlowMixin:
             guard_cond = " && ".join(guard_parts)
             self.kb.raw_line(f"    if ({guard_cond}) {{")
 
+        if fence_before:
+            self.kb.raw_line(f"{indent}{fence_before}")
+
         if is_16bit_float:
             self._emit_atomic_rmw_16bit(base_ptr, offsets, val_var, rmw_op, half_type, result_var, indent, n)
         elif is_float and rmw_op in ("fadd", "add"):
@@ -1188,6 +1232,9 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"{indent}device atomic_int* aptr_{n} = (device atomic_int*)({base_ptr} + {offsets});")
             self.kb.raw_line(f"{indent}{result_var} = {msl_fn}(aptr_{n}, (int){val_var}, memory_order_relaxed);")
 
+        if fence_after:
+            self.kb.raw_line(f"{indent}{fence_after}")
+
         # Close guard if-block
         if has_guard:
             self.kb.raw_line(f"    }}")
@@ -1215,6 +1262,8 @@ class _ControlFlowMixin:
         """
         if len(ssa.operand_ids) < 3:
             return
+
+        fence_before, fence_after = self._atomic_ordering_fences(ssa)
 
         ptr_id = ssa.operand_ids[0]
         cmp_id = ssa.operand_ids[1]
@@ -1327,21 +1376,38 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"    if ({guard}) {{")
             indent = "        "
 
+        if fence_before:
+            self.kb.raw_line(f"{indent}{fence_before}")
+
+        # MSL offers only the WEAK compare-exchange, which may fail spuriously: the location still
+        # holds `cmp`, `expected` is reloaded with that same value, and a one-shot call would report
+        # old == cmp ("swapped") with nothing stored. Emulate the strong CAS: retry while the failure
+        # is spurious (reloaded value == cmp, compared as bits, as the CAS itself compares), stop on
+        # a genuine mismatch. On success `expected` still holds cmp — the old value either way.
         if is_float:
             # Float CAS: use atomic_uint + as_type casts
             self.kb.raw_line(f"{indent}device atomic_uint* aptr_{n} = (device atomic_uint*)({base_ptr} + {offsets});")
-            self.kb.raw_line(f"{indent}uint expected_{n} = as_type<uint>((float){cmp_var});")
+            self.kb.raw_line(f"{indent}uint cmp_bits_{n} = as_type<uint>((float){cmp_var});")
+            self.kb.raw_line(f"{indent}uint expected_{n} = cmp_bits_{n};")
             self.kb.raw_line(f"{indent}uint desired_{n} = as_type<uint>((float){val_var});")
-            self.kb.raw_line(f"{indent}atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, desired_{n},")
-            self.kb.raw_line(f"{indent}    memory_order_relaxed, memory_order_relaxed);")
+            self.kb.raw_line(f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, desired_{n},")
+            self.kb.raw_line(f"{indent}        memory_order_relaxed, memory_order_relaxed)) {{")
+            self.kb.raw_line(f"{indent}    if (expected_{n} != cmp_bits_{n}) break;  // genuine mismatch: not spurious")
+            self.kb.raw_line(f"{indent}}}")
             self.kb.raw_line(f"{indent}{result_var} = as_type<float>(expected_{n});")
         else:
             # Integer CAS
             self.kb.raw_line(f"{indent}device atomic_int* aptr_{n} = (device atomic_int*)({base_ptr} + {offsets});")
-            self.kb.raw_line(f"{indent}int expected_{n} = (int){cmp_var};")
-            self.kb.raw_line(f"{indent}atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, (int){val_var},")
-            self.kb.raw_line(f"{indent}    memory_order_relaxed, memory_order_relaxed);")
+            self.kb.raw_line(f"{indent}int cmp_val_{n} = (int){cmp_var};")
+            self.kb.raw_line(f"{indent}int expected_{n} = cmp_val_{n};")
+            self.kb.raw_line(f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, (int){val_var},")
+            self.kb.raw_line(f"{indent}        memory_order_relaxed, memory_order_relaxed)) {{")
+            self.kb.raw_line(f"{indent}    if (expected_{n} != cmp_val_{n}) break;  // genuine mismatch: not spurious")
+            self.kb.raw_line(f"{indent}}}")
             self.kb.raw_line(f"{indent}{result_var} = expected_{n};")
+
+        if fence_after:
+            self.kb.raw_line(f"{indent}{fence_after}")
 
         if guard is not None:
             self.kb.raw_line(f"    }}")
