@@ -1,11 +1,12 @@
 """Whole normalization semantics, not the presence of normalization-like op names.
 
 The five packet189 witnesses plus sum-input, exponent-base and variance/divisor
-siblings. Compile-time pins bypass executable caches; numerical pins require
-the source math or a deliberate pre-template refusal. Canonical controls must route.
+siblings. Compile-time pins bypass executable caches; supported source variants
+must compute their actual math. Canonical controls must use the template.
 """
 
 import importlib
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -49,7 +50,9 @@ def _soft(x_ptr, o_ptr, N, BLOCK: tl.constexpr, MODE: tl.constexpr):
     if MODE == 2:
         s = s.to(tl.float16).to(tl.float32)
     if MODE == 9:
-        tl.atomic_add(o_ptr, 1.0, sem="relaxed")
+        # The effect witness launches eight rows; its counter is disjoint from
+        # every ordinary output store, so the expected count is deterministic.
+        tl.atomic_add(o_ptr + 8 * N, 1.0, sem="relaxed")
     if MODE == 10:
         tl.store(o_ptr + r * N + c, e / s, c < N - 1)
     else:
@@ -114,12 +117,7 @@ def _positive(family, mode):
 @pytest.mark.parametrize("family,mode", CASES)
 def test_normalization_proof_at_lowering(routes, family, mode):
     fn = _soft if family == "soft" else _norm
-    try:
-        text = _build_lowerer(fn, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": mode}).lower()
-    except MetalNonRecoverableError:
-        assert not _positive(family, mode)
-        assert not routes
-        return
+    text = _build_lowerer(fn, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": mode}).lower()
     assert "kernel void" in text
     assert bool(routes) == _positive(family, mode), routes
 
@@ -152,22 +150,16 @@ def _reference(x, family, mode):
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
 @pytest.mark.parametrize("family,mode", CASES)
 @pytest.mark.parametrize("n", [47, 64])
-def test_normalization_source_math_or_refusal(routes, family, mode, n):
+def test_normalization_source_math_must_compute(routes, family, mode, n):
     torch.manual_seed(189)
     cpu = torch.randn(8, n) * 3 + 2
     x = cpu.to("mps")
     out = torch.full_like(x, float("nan"))
     fn = _soft if family == "soft" else _norm
-    try:
-        fn[(8,)](x, out, n, 64, mode)
-        torch.mps.synchronize()
-    except MetalNonRecoverableError:
-        assert not _positive(family, mode)
-        assert not routes
-        return
+    fn[(8,)](x, out, n, 64, mode)
+    torch.mps.synchronize()
     torch.testing.assert_close(out.cpu(), _reference(cpu, family, mode), rtol=1e-6, atol=1e-6)
-    if _positive(family, mode):
-        assert len(routes) == 1
+    assert len(routes) == int(_positive(family, mode))
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
@@ -212,16 +204,47 @@ def test_runtime_row_length_does_not_extend_source_tile(routes, family):
 
 @pytest.mark.parametrize("mode", [6, 7, 8, 9, 10])
 def test_normalization_address_fill_and_effect_near_misses(routes, mode):
-    try:
-        _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": mode}).lower()
-    except MetalNonRecoverableError:
-        pass
+    text = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": mode}).lower()
+    assert "kernel void" in text
     assert not routes
 
 
-@pytest.mark.parametrize("kind", ["missing_return", "projection_return", "duplicate_operand", "wrong_axis"])
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
+@pytest.mark.parametrize("mode", [6, 7, 8, 9, 10])
+def test_normalization_address_fill_and_effects_compute(routes, mode):
+    """Each row adds a distinct contract absent from the value-only matrix."""
+    torch.manual_seed(261)
+    n, rows = 47, 8
+    cpu = torch.randn(rows * n + int(mode == 7)) * 3 + 2
+    source = cpu[int(mode == 7):].reshape(rows, n)
+    x = cpu.to("mps")
+    storage = torch.full((rows * n + int(mode == 9),), -12345.0, device="mps")
+    if mode == 9:
+        storage[-1] = 0
+    grid = (1, rows) if mode == 8 else (rows,)
+    _soft[grid](x, storage, n, 64, mode)
+    torch.mps.synchronize()
+    if mode == 6:
+        # other=0 participates in both max and denominator across all64 lanes.
+        padded = torch.nn.functional.pad(source, (0, 64 - n))
+        expected = torch.softmax(padded, dim=-1)[:, :n]
+    else:
+        expected = torch.softmax(source, dim=-1)
+    actual = storage[:rows * n].cpu().reshape(rows, n)
+    if mode == 10:
+        assert (actual[:, -1] == -12345).all()
+        actual, expected = actual[:, :-1], expected[:, :-1]
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    if mode == 9:
+        assert storage[-1].item() == rows
+    assert not routes
+
+
+@pytest.mark.parametrize("kind", ["missing_return", "projection_return", "duplicate_operand", "wrong_axis",
+                                 "missing_type", "unknown_rank", "wrong_result_shape"])
 def test_normalization_combiner_metadata_is_mandatory(routes, kind):
-    lowerer = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 0})
+    type_case = kind in ("missing_type", "unknown_rank", "wrong_result_shape")
+    lowerer = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 1 if type_case else 0})
     reduce = next(o for o in lowerer.graph.ops if o.op == "tt.reduce")
     args = reduce.attrs["block_arg_ids"]
     if kind == "missing_return":
@@ -230,8 +253,15 @@ def test_normalization_combiner_metadata_is_mandatory(routes, kind):
         reduce.attrs["return_ids"] = [args[0]]
     elif kind == "duplicate_operand":
         reduce.region_ops[0].operand_ids = [args[0], args[0]]
-    else:
+    elif kind == "wrong_axis":
         reduce.attrs["axis"] = 1
+    elif kind == "missing_type":
+        lowerer.graph.result_meta.pop(reduce.operand_ids[0])
+    else:
+        vid = reduce.operand_ids[0] if kind == "unknown_rank" else reduce.id
+        meta = lowerer.graph.result_meta[vid]
+        shape = None if kind == "unknown_rank" else (64,)
+        lowerer.graph.result_meta[vid] = replace(meta, type=replace(meta.type, shape=shape))
     with pytest.raises(MetalNonRecoverableError):
         lowerer.lower()
     assert not routes

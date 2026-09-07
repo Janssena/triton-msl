@@ -12,8 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from triton_msl.errors import MetalNonRecoverableError
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_fa_bwd_routing import _build_lowerer
 
@@ -79,13 +77,9 @@ def test_softmax_final_half_store_must_route(routes, boundary):
 
 
 @pytest.mark.parametrize("boundary", ["lowering", "gpu"])
-def test_layernorm_mask_before_center_source_math_or_refusal(routes, boundary):
+def test_layernorm_mask_before_center_source_math_must_compute(routes, boundary):
     if boundary == "lowering":
-        try:
-            text = _build_lowerer(_norm_mask_before_center, {"X": "*fp32", "O": "*fp32", "N": "i32"}, {"BLOCK": 64}).lower()
-        except MetalNonRecoverableError:
-            assert not routes
-            return
+        text = _build_lowerer(_norm_mask_before_center, {"X": "*fp32", "O": "*fp32", "N": "i32"}, {"BLOCK": 64}).lower()
         assert "kernel void" in text
         # A safe generic fallback may compute this source, but the canonical
         # template must never discard the nonzero centered padding.
@@ -97,12 +91,8 @@ def test_layernorm_mask_before_center_source_math_or_refusal(routes, boundary):
     cpu = torch.randn(8, 47) * 3 + 2
     x = cpu.to("mps")
     out = torch.full_like(x, float("nan"))
-    try:
-        _norm_mask_before_center[(8,)](x, out, 47, 64)
-        torch.mps.synchronize()
-    except MetalNonRecoverableError:
-        assert not routes
-        return
+    _norm_mask_before_center[(8,)](x, out, 47, 64)
+    torch.mps.synchronize()
     mean = cpu.sum(-1, keepdim=True) / 47
     centered = cpu - mean
     variance = (centered.square().sum(-1, keepdim=True) + (64 - 47) * mean.square()) / 47

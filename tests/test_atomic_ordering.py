@@ -117,7 +117,9 @@ def test_each_family_brackets_one_logical_atomic(family, sem, scope):
         assert all(d == loop_depth for d in depths)
 
 
-@pytest.mark.parametrize("scope", ["gpu", "cta", "sys"])
+# gpu/cta metadata is already asserted for every sem in the family matrix above.
+# Keep the separate decoder check only for sys, which cannot reach emission.
+@pytest.mark.parametrize("scope", ["sys"])
 @pytest.mark.parametrize("sem", SEMS)
 @pytest.mark.parametrize("kind", ["add", "cas"])
 def test_native_walker_retains_semantics_and_scope(scope, sem, kind):

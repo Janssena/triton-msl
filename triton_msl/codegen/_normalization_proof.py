@@ -19,6 +19,51 @@ class _NotProven(Exception):
     pass
 
 
+def normalization_template_matches(graph, info, family):
+    """A failed specialization proof may decline, never erase source operations.
+
+    The newly enabled generic fallback is bounded to single-result fp32 row
+    reductions with native per-value shape facts. Validate the ORIGINAL input
+    rank here: effective shapes later change during wrapping/register folding.
+    Generic lowering still owns (and can refuse) the combiner, returns, effects,
+    layouts and every other operation. No generic-lowering exception is caught.
+    """
+    try:
+        prove_normalization(graph, info, family)
+        return True
+    except MetalNonRecoverableError:
+        metadata = graph.result_meta
+        for op in graph.ops:
+            if op.op != "tt.reduce":
+                continue
+            operands = op.operand_ids or []
+            results = op.result_ids or [op.id]
+            axis = op.attrs.get("axis")
+            if len(operands) != 1 or len(results) != 1:
+                raise MetalNonRecoverableError("Normalization fallback requires a single-value row reduction.", op_name="tt.reduce") from None
+            source = metadata.get(operands[0])
+            result = metadata.get(results[0])
+            if source is None or result is None:
+                raise MetalNonRecoverableError("Normalization fallback requires native per-result reduction types.", op_name="tt.reduce") from None
+            src, dst = source.type, result.type
+            if not (
+                source.schema_version == result.schema_version == 1
+                and source.value_id == operands[0] and result.value_id == results[0]
+                and result.producer_id == op.id and result.result_index == 0
+                and not src.unknown_reason and not dst.unknown_reason
+                and src.kind == dst.kind == "float" and src.elem == dst.elem == "f32"
+                and src.width == dst.width == 32
+                and src.is_tensor and src.shape == (info["block_size"],)
+                and type(axis) is int and 0 <= axis < len(src.shape)
+                and not dst.is_tensor and dst.shape == src.shape[:axis] + src.shape[axis + 1:]
+            ):
+                raise MetalNonRecoverableError(
+                    "Normalization fallback cannot prove the original reduction axis, shape or precision.",
+                    op_name="tt.reduce",
+                ) from None
+        return False
+
+
 def prove_normalization(graph, info, family):
     """Validate the candidate's whole row contract, or refuse before emission.
 

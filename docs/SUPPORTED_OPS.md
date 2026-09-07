@@ -148,6 +148,16 @@ matmul (`simdgroup_matmul` + the fast variant, `int8`/`int4` matmul, `fused_mlp`
 and conv/pool (`conv2d`, `max_pool2d`, `avg_pool2d`). Unmatched kernels use the generic
 lowering (which is correct for any supported op, just less specialized).
 
+**Row softmax / layer-normalization routing.** A specialized template is used only
+when its complete value, address and effect proof matches the source. For single-value
+fp32 row reductions of at most1024 elements, a proof mismatch may instead select the
+generic lowerer, which preserves the source operations (including intermediate rounding,
+noncanonical padding, changed divisors, partial stores and atomic effects). This is not
+a promise that every normalization-like kernel computes: the fallback first validates
+the original reduction axis, input and result shapes using native per-result metadata;
+missing/unknown facts refuse. Generic combiner/returned-value, layout and effect checks
+remain in force. Canonical sources continue to use the specialized templates.
+
 ## How to read this
 
 - **✓ supported** — the kernel lowers to MSL and runs correctly on the Apple GPU.

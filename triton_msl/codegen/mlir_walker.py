@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .result_metadata import ResultMeta, layout_aliases, parse_type_facts
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -76,6 +78,9 @@ class IRGraph:
     # (#ttg.blocked, #ttg.linear, #ttg.slice) on demand. Populated by the
     # walker; defaults to empty for tests that hand-construct an IRGraph.
     mod_text: str = ""
+    # Additive stage 1a: genuinely per native SSA result/argument, including
+    # later mixed-type results that the legacy SSAValue object still aliases.
+    result_meta: Dict[int, ResultMeta] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -487,12 +492,16 @@ class MLIRWalker:
         self.options = options
         self._var_counter = 0
         self._value_map = {}  # value.id() -> SSAValue
+        self._result_meta = {}
+        self._metadata_blocks = set()
+        self._type_facts_cache = {}
         self._func_args = []  # FuncArg list
         self._block_size = 256
         self._num_warps = getattr(options, "num_warps", 4) if options else 4
 
         # Parse module text once for supplementary info
         self._mod_text = str(module)
+        self._type_aliases = layout_aliases(self._mod_text)
         self._text_index = _ModuleTextIndex(self._mod_text)
         self._layout = _parse_blocked_layout(self._mod_text)
 
@@ -577,7 +586,36 @@ class MLIRWalker:
             called_funcs=called_funcs if called_funcs else None,
             size_per_thread=self._layout["size_per_thread"] if self._layout else None,
             mod_text=self._mod_text,
+            result_meta=dict(self._result_meta),
         )
+
+    def _type_facts(self, native_value):
+        raw = str(native_value.get_type())
+        if raw not in self._type_facts_cache:
+            self._type_facts_cache[raw] = parse_type_facts(raw, self._type_aliases)
+        return self._type_facts_cache[raw]
+
+    def _record_native_metadata(self, op, block, body_block, entry, function_name):
+        """Do not derive later results or block arguments from result zero.
+
+        Called inside the existing native walk. The caller catches exceptions
+        and refuses after leaving pybind, never across its callback boundary.
+        No existing emitter or value-map entry is changed by these records.
+        """
+        bid = block.id() if block is not None else None
+        if block is not None and bid not in self._metadata_blocks:
+            self._metadata_blocks.add(bid)
+            kind = ("entry_arg" if entry else "callee_arg") if body_block else "block_arg"
+            for i in range(block.get_num_arguments()):
+                value = block.get_argument(i)
+                self._result_meta[value.id()] = ResultMeta(
+                    value.id(), self._type_facts(value), kind, None, i, bid, function_name)
+        if op.get_num_results():
+            producer = op.get_result(0).id()
+            for i in range(op.get_num_results()):
+                value = op.get_result(i)
+                self._result_meta[value.id()] = ResultMeta(
+                    value.id(), self._type_facts(value), "result", producer, i, bid, function_name)
 
     def _record_reduce_return(self, op, block_id):
         """Packet 154: remember the operand ids of a ``tt.reduce.return`` for its block, so the
@@ -823,6 +861,13 @@ class MLIRWalker:
 
             block = op.get_block()
             block_id = block.id() if block is not None else None
+            try:
+                self._record_native_metadata(
+                    op, block, block is not None and _is_function_body_block(block),
+                    _collecting_entry(), func_order[func_k[0]][0] if func_k[0] < len(func_order) else None)
+            except Exception as exc:
+                refusal[0] = f"walker: per-result metadata extraction failed: {type(exc).__name__}: {exc}"
+                return
             if block is not None and _is_function_body_block(block):
                 func_body_blocks[0].add(block_id)
 

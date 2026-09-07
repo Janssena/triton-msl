@@ -15,7 +15,7 @@ import re
 from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
 
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
-from triton_msl.codegen._normalization_proof import prove_normalization
+from triton_msl.codegen._normalization_proof import normalization_template_matches
 
 
 # Epilogue ops that don't compute a new value — they only reshape the layout or
@@ -3829,7 +3829,8 @@ class _DetectionMixin:
             "n_arg": n_arg,
             "block_size": block_size,
         }
-        prove_normalization(self.graph, info, "softmax")
+        if not normalization_template_matches(self.graph, info, "softmax"):
+            return None
         return info
 
     def _detect_layer_norm(self):
@@ -3996,7 +3997,8 @@ class _DetectionMixin:
             "block_size": block_size,
             "eps": eps_val,
         }
-        prove_normalization(self.graph, info, "layer_norm")
+        if not normalization_template_matches(self.graph, info, "layer_norm"):
+            return None
         return info
 
     def _detect_transpose_via_reshape(self):
