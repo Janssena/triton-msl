@@ -1,6 +1,7 @@
 """Derived stamp reuse never replaces live checks or crosses invocation boundaries."""
 import json
 import os
+import sys
 
 import pytest
 
@@ -29,24 +30,28 @@ def literal():
 def test_single_capture_reuses_only_after_live_checks(inputs, monkeypatch):
     events = []
     original = env.environment_snapshot
-    def capture():
-        events.append("environment")
-        return original()
     def framework():
         events.append("framework/native")
         return "controlled-framework"
-    monkeypatch.setattr(env, "environment_snapshot", capture)
     monkeypatch.setattr(cache, "framework_identity", framework)
-    first = cache.execution_contract()
     owned = env.is_snapshot(original())
-    events.clear()
-    assert cache.execution_contract() == first
+    def observe(frame, event, arg):
+        if event == "call" and frame.f_code is original.__code__:
+            events.append("environment")
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        first = cache.execution_contract()
+        events.clear()
+        assert cache.execution_contract() == first
+    finally:
+        sys.setprofile(previous)
     assert events == (["framework/native", "environment"] if owned else
                       ["framework/native", "environment", "environment"])
     assert first == literal()
     if owned:
         assert cache._execution_snapshot[6] is first
-        # Warm hits do not rematerialize source/policy/JSON; live checks remain.
+        # Warm hits do not re-encode the stamp; live checks/policy still run.
         def forbidden(*args):
             pytest.fail("unchanged owned inputs rebuilt the derived stamp")
         monkeypatch.setattr(cache, "_encode_execution", forbidden)
@@ -147,3 +152,57 @@ def test_second_invocation_and_selector_are_not_waived(inputs, monkeypatch):
     monkeypatch.setenv("DEVELOPER_DIR", "/different-selector")
     with pytest.raises(MetalNonRecoverableError, match="toolchain selection changed"):
         cache.execution_contract()
+
+
+def test_callbacks_select_remaining_providers_without_replaying_prefix(inputs, monkeypatch):
+    original_policy = cache.effective_policy
+    original_compiler = cache.toolchain_identity
+    original_native_compiler = tc.toolchain_identity
+    original_capture = env.environment_snapshot
+    for mode in ("framework_policy", "framework_compiler", "framework_native_compiler",
+                 "policy_compiler", "capture_compiler", "capture_changes_environment"):
+        results = []
+        for run in (literal, cache.execution_contract):
+            with monkeypatch.context() as patch:
+                events = []
+                patch.setattr(cache, "effective_policy", original_policy)
+                patch.setattr(cache, "toolchain_identity", original_compiler)
+                patch.setattr(tc, "toolchain_identity", original_native_compiler)
+                patch.setattr(env, "environment_snapshot", original_capture)
+                patch.setattr(cache, "_execution_snapshot", None, raising=False)
+                patch.delenv("DYLD_CALLBACK_EXECUTION_TEST", raising=False)
+                def compiler():
+                    events.append("changed_compiler")
+                    return "callback-compiler"
+                def policy():
+                    events.append("changed_policy")
+                    if mode == "policy_compiler":
+                        patch.setattr(cache, "toolchain_identity", compiler)
+                    return {"callback-selected-policy": True}
+                def framework():
+                    events.append("framework")
+                    if mode in ("framework_policy", "policy_compiler"):
+                        patch.setattr(cache, "effective_policy", policy)
+                    elif mode == "framework_compiler":
+                        patch.setattr(cache, "toolchain_identity", compiler)
+                    elif mode == "framework_native_compiler":
+                        patch.setattr(tc, "toolchain_identity", compiler)
+                    return "controlled-framework"
+                def capture():
+                    events.append("capture")
+                    value = original_capture()
+                    if mode == "capture_compiler":
+                        patch.setattr(cache, "toolchain_identity", compiler)
+                    else:
+                        patch.setenv("DYLD_CALLBACK_EXECUTION_TEST", "injected-after-capture")
+                    return value
+                patch.setattr(cache, "framework_identity", framework)
+                if mode.startswith("capture_"):
+                    patch.setattr(env, "environment_snapshot", capture)
+                try:
+                    outcome = ("stamp", run())
+                except MetalNonRecoverableError as exc:
+                    outcome = ("refusal", str(exc))
+                results.append((outcome, events))
+        assert results[0] == results[1], (mode, results)
+        assert results[1][1].count("framework") == 1

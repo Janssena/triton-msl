@@ -195,3 +195,4 @@ def _identity_for_environment(environment):
 
 
 _standard_toolchain_identity = toolchain_identity
+_standard_identity_for_environment = _identity_for_environment

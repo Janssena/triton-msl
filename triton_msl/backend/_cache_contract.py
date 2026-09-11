@@ -233,6 +233,7 @@ def _encode_execution(source, toolchain):
 
 _standard_source_contract = source_contract
 _standard_effective_policy = effective_policy
+_standard_policy_for_environment = _policy_for_environment
 _standard_toolchain_identity = toolchain_identity
 _execution_snapshot = None
 
@@ -246,25 +247,45 @@ def execution_contract():
     modules or run custom finders. Never cache across those live checks.
     """
     global _execution_snapshot
-    from triton_msl import CODEGEN_VERSION
-    from . import _toolchain_contract as toolchain
-    from ._environment_snapshot import environment_snapshot, is_snapshot
-
-    # Alternate providers keep their original call signatures and encoders. A
-    # cache of our policy derivation must not bypass a substituted live provider.
-    if (source_contract is not _standard_source_contract
-            or effective_policy is not _standard_effective_policy
-            or toolchain_identity is not _standard_toolchain_identity
-            or toolchain.toolchain_identity is not toolchain._standard_toolchain_identity):
+    if source_contract is not _standard_source_contract:
         return _encode_execution(source_contract(), toolchain_identity())
 
+    from triton_msl import CODEGEN_VERSION
     schema = SOURCE_SCHEMA
     implementation = implementation_identity()
     frameworks = framework_identity()
-    environment = environment_snapshot()
-    owned = is_snapshot(environment)
-    if owned:
-        compiler = toolchain._identity_for_environment(environment)
+
+    # Select providers at their ORIGINAL observation points. A framework
+    # callback can replace policy; policy can replace the toolchain provider.
+    # Never restart source_contract after either callback or bypass its successor.
+    policy_provider = effective_policy
+    owned = False
+    if policy_provider is _standard_effective_policy:
+        from . import _environment_snapshot as snapshots
+        capture = snapshots.environment_snapshot
+        policy_helper = _policy_for_environment  # selected before argument evaluation
+        environment = capture()
+        policy = policy_helper(environment)
+        owned = (capture is snapshots._standard_environment_snapshot
+                 and policy_helper is _standard_policy_for_environment
+                 and snapshots.is_snapshot(environment))
+    else:
+        policy = policy_provider()
+
+    compiler_provider = toolchain_identity
+    shared = False
+    if owned and compiler_provider is _standard_toolchain_identity:
+        from . import _toolchain_contract as toolchain
+        if (toolchain.toolchain_identity is toolchain._standard_toolchain_identity
+                and toolchain._identity_for_environment is toolchain._standard_identity_for_environment):
+            compiler = toolchain._identity_for_environment(environment)
+            shared = True
+        else:
+            compiler = compiler_provider()
+    else:
+        compiler = compiler_provider()
+
+    if shared:
         cached = _execution_snapshot
         # Strong references, not id() values: identity reuse after GC cannot
         # turn changed inputs into a hit. Every identity/check above stays live.
@@ -272,16 +293,10 @@ def execution_contract():
                 and cached[2] is implementation and cached[3] is frameworks
                 and cached[4] is CODEGEN_VERSION and cached[5] is compiler):
             return cached[6]
-        policy = _policy_for_environment(environment)
-    else:
-        # Foreign/mutable mappings preserve two independent original reads and
-        # all getter side effects; they never acquire immutable-stamp credit.
-        policy = _policy_for_environment(environment)
-        compiler = toolchain_identity()
     source = {"schema": schema, "implementation": implementation, "frameworks": frameworks,
               "policy": policy, "label": CODEGEN_VERSION}
     stamp = _encode_execution(source, compiler)
-    if (owned and type(schema) is int and type(implementation) is str
+    if (shared and type(schema) is int and type(implementation) is str
             and type(frameworks) is str and type(CODEGEN_VERSION) is str
             and type(compiler) is str):
         _execution_snapshot = environment, schema, implementation, frameworks, CODEGEN_VERSION, compiler, stamp

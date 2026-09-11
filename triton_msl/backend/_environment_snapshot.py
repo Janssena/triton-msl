@@ -120,3 +120,6 @@ def is_snapshot(value):
     # Only our own private copy proves immutability, never the wrapper type.
     cached = _cached
     return cached is not None and value is cached[2]
+
+
+_standard_environment_snapshot = environment_snapshot
