@@ -284,6 +284,13 @@ def _selection_identity(roots, metadata):
     return _format_selection(roots, metadata)
 
 
+def _json_metadata(metadata):
+    owned = _owned_selection
+    if owned is not None and metadata is owned[1]:
+        return dict(metadata)
+    return metadata
+
+
 def framework_identity():
     """Hash package contents once; recheck actual module selection every time."""
     global _snapshot, _native_guard
@@ -333,7 +340,7 @@ def framework_identity():
             again, again_metadata = _discover_selection()
             if again != roots or again_metadata != metadata:
                 raise RuntimeError("framework selection changed during content inventory")
-            payload = json.dumps({"schema": 5, "metadata": dict(metadata), "packages": manifests, "native": native},
+            payload = json.dumps({"schema": 5, "metadata": _json_metadata(metadata), "packages": manifests, "native": native},
                                  sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(payload.encode()).hexdigest()
             _snapshot = selection, digest

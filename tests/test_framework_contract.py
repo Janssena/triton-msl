@@ -213,6 +213,8 @@ def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, m
     roots, metadata = module._discover_selection()
     expected = module._format_selection(dict(roots), dict(metadata))
     assert module._selection_identity(roots, metadata) == expected
+    assert type(module._json_metadata(metadata)) is dict
+    assert module._json_metadata(metadata) == dict(metadata)
     with pytest.raises(TypeError):
         roots["torch"] = ()
     with pytest.raises(TypeError):
@@ -220,6 +222,14 @@ def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, m
     # Wrapper type alone proves nothing about ownership or nested values.
     foreign_roots = {"torch": [root]}
     foreign_metadata = {"nested": ["old"]}
+    assert module._json_metadata(foreign_metadata) is foreign_metadata
+    class ForeignMetadata(dict):
+        def items(self):
+            return [("provider", "custom-items-provider")]
+    custom = ForeignMetadata(foreign_metadata)
+    assert module._json_metadata(custom) is custom
+    assert module.json.dumps(custom) != module.json.dumps(dict(custom))
+    assert module.json.dumps(module._json_metadata(custom)) == module.json.dumps(custom)
     foreign = MappingProxyType(foreign_roots), foreign_metadata
     first = module._selection_identity(*foreign)
     foreign_roots["torch"].append(root / "different")
