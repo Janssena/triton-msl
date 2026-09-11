@@ -2,7 +2,7 @@
 
 Implementation identity is immutable for a Python process: editing installed
 sources is an upgrade requiring restart, not a supported hot-reload operation.
-Policy is deliberately NOT cached. Cache keys never use checkout paths/mtimes.
+Policy is revalidated on every call. Cache keys never use checkout paths/mtimes.
 """
 
 import functools
@@ -191,10 +191,45 @@ def framework_identity():
     return implementation()
 
 
-def execution_contract():
-    """Small immutable producer stamp, separate from the still-versioning launch ABI."""
-    return json.dumps({"schema": 1, "source": source_contract(), "toolchain": toolchain_identity()},
+_STAMP_FIELDS = frozenset(("schema", "implementation", "frameworks", "policy", "label"))
+_STAMP_FLAGS = ("MEPT", "QUANT_MATMUL", "FAST_MATMUL", "COMPILE_SHADER", "FA_FAST",
+                "INFER_LAYOUT", "LEGACY", "USE_CPP", "FORCE_PYTHON", "FA_HALF_ACCUM")
+_STAMP_POLICY_FIELDS = frozenset((*_STAMP_FLAGS, "CPP_SKIP"))
+
+
+@functools.lru_cache(maxsize=8, typed=True)
+def _encode_known_stamp(schema, implementation, frameworks, label, toolchain, *policy):
+    # Only exact immutable primitives reach this cache. All live source/native/
+    # toolchain/policy checks have ALREADY executed before its key is assembled.
+    source = {"schema": schema, "implementation": implementation, "frameworks": frameworks,
+              "label": label, "policy": dict(zip((*_STAMP_FLAGS, "CPP_SKIP"), policy))}
+    return json.dumps({"schema": 1, "source": source, "toolchain": toolchain},
                       sort_keys=True, separators=(",", ":"))
+
+
+def _encode_execution(source, toolchain):
+    if (type(source) is dict and all(type(key) is str for key in source)
+            and source.keys() == _STAMP_FIELDS
+            and type(source["schema"]) is int
+            and all(type(source[key]) is str for key in ("implementation", "frameworks", "label"))
+            and type(toolchain) is str):
+        policy = source["policy"]
+        if (type(policy) is dict and all(type(key) is str for key in policy)
+                and policy.keys() == _STAMP_POLICY_FIELDS
+                and all(type(policy[key]) is bool for key in _STAMP_FLAGS)
+                and type(policy["CPP_SKIP"]) is str):
+            return _encode_known_stamp(source["schema"], source["implementation"],
+                                       source["frameworks"], source["label"], toolchain,
+                                       *(policy[key] for key in _STAMP_FLAGS), policy["CPP_SKIP"])
+    # Unknown schemas/values retain the original encoder, including its errors.
+    # Never use Python's bool/int or custom equality as JSON type equivalence.
+    return json.dumps({"schema": 1, "source": source, "toolchain": toolchain},
+                      sort_keys=True, separators=(",", ":"))
+
+
+def execution_contract():
+    """Recheck all live identities; reuse only serialization of equal values."""
+    return _encode_execution(source_contract(), toolchain_identity())
 
 
 def validate_execution_contract(stamp):

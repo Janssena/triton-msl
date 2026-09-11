@@ -188,6 +188,7 @@ def discovery(tmp_path, monkeypatch):
     monkeypatch.setattr(module.importlib.util, "find_spec", find)
     monkeypatch.setattr(module, "_snapshot", None)
     monkeypatch.setattr(module, "_discovery_snapshot", None)
+    monkeypatch.setattr(module, "_owned_selection", None)
     monkeypatch.setattr(module, "_python_roots", lambda: {})
     monkeypatch.setattr(module, "_native_dependencies", lambda roots: ())
     monkeypatch.setattr(module, "_native_guard", None)
@@ -201,8 +202,39 @@ def test_warm_selection_needs_no_repeated_filesystem_resolution(discovery, monke
     def forbidden(*args, **kwargs):
         pytest.fail("unchanged import selection must not resolve the filesystem per launch")
     monkeypatch.setattr(Path, "resolve", forbidden)
+    monkeypatch.setattr(module, "_format_selection", forbidden)
     assert module.framework_identity() == first
     assert len(calls) == count
+
+
+def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, monkeypatch):
+    from types import MappingProxyType
+    module, _, root, _ = discovery
+    roots, metadata = module._discover_selection()
+    expected = module._format_selection(dict(roots), dict(metadata))
+    assert module._selection_identity(roots, metadata) == expected
+    with pytest.raises(TypeError):
+        roots["torch"] = ()
+    with pytest.raises(TypeError):
+        metadata["byteorder"] = "changed"
+    # Wrapper type alone proves nothing about ownership or nested values.
+    foreign_roots = {"torch": [root]}
+    foreign_metadata = {"nested": ["old"]}
+    foreign = MappingProxyType(foreign_roots), foreign_metadata
+    first = module._selection_identity(*foreign)
+    foreign_roots["torch"].append(root / "different")
+    foreign_metadata["nested"][0] = "new"
+    assert module._selection_identity(*foreign) != first
+    with pytest.raises(TypeError):  # Original JSON encoder does not admit this.
+        module._selection_identity(foreign[0], MappingProxyType(foreign_metadata))
+    # Nonstandard environment values cannot be frozen merely by wrapping them.
+    monkeypatch.setattr(module, "_discovery_snapshot", None)
+    mutable = ["old"]
+    monkeypatch.setattr(module.os, "environ", {"PYTORCH_MPS_FAST_MATH": mutable})
+    roots, metadata = module._discover_selection()
+    first = module._selection_identity(roots, metadata)
+    mutable[0] = "new"
+    assert module._selection_identity(roots, metadata) != first
 
 
 def test_new_loaded_module_cannot_hide_behind_discovery_memo(discovery, tmp_path):

@@ -12,12 +12,14 @@ import os
 from pathlib import Path
 import sys
 import threading
+from types import MappingProxyType
 
 from ._toolchain_contract import _tree_manifest
 
 
 _snapshot = None
 _discovery_snapshot = None
+_owned_selection = None
 _native_guard = None
 _lock = threading.RLock()
 _RUNTIME_SELECTION_ENV = ("PYTORCH_MPS_FAST_MATH", "PYTORCH_MPS_PREFER_METAL", "PYTORCH_ENABLE_MPS_FALLBACK")
@@ -209,7 +211,7 @@ class _LoadedNativeGuard:
 
 
 def _discover_selection():
-    global _discovery_snapshot
+    global _discovery_snapshot, _owned_selection
     required = ("triton",)
     if sys.platform == "darwin":
         required += ("objc", "Metal", "Foundation", "CoreFoundation", "AppKit", "MetalPerformanceShaders")
@@ -253,8 +255,33 @@ def _discover_selection():
     metadata = {"python_abi": sys.implementation.cache_tag,
                 "python_version": sys.version, "byteorder": sys.byteorder,
                 "runtime_environment": runtime_env}
+    # These dictionaries are private construction products, not caller-owned
+    # proxies. Freeze their entire normal value graph before reusing its text.
+    # Foreign/nonstandard metadata keeps the original live serialization path.
+    if (all(type(metadata[key]) is str for key in ("python_abi", "python_version", "byteorder"))
+            and all(type(key) is str and (value is None or type(value) is str)
+                    for key, value in runtime_env)
+            and all(type(name) is str and type(paths) is tuple
+                    and all(type(path) is type(Path()) for path in paths)
+                    for name, paths in roots.items())):
+        selection = _format_selection(roots, metadata)
+        roots = MappingProxyType(roots)
+        metadata = MappingProxyType(metadata)
+        _owned_selection = roots, metadata, selection
     _discovery_snapshot = token, roots, metadata
     return roots, metadata
+
+
+def _format_selection(roots, metadata):
+    return (tuple((name, tuple(map(str, paths))) for name, paths in sorted(roots.items())),
+            json.dumps(metadata, sort_keys=True))
+
+
+def _selection_identity(roots, metadata):
+    owned = _owned_selection
+    if owned is not None and roots is owned[0] and metadata is owned[1]:
+        return owned[2]
+    return _format_selection(roots, metadata)
 
 
 def framework_identity():
@@ -268,8 +295,7 @@ def framework_identity():
             roots, metadata = _discover_selection()
             # Paths are only a live-process selection guard, NEVER persistent
             # identity. Identical relocations after restart retain their hash.
-            selection = (tuple((name, tuple(map(str, paths))) for name, paths in sorted(roots.items())),
-                         json.dumps(metadata, sort_keys=True))
+            selection = _selection_identity(roots, metadata)
             if _snapshot is not None:
                 if _snapshot[0] != selection:
                     raise MetalNonRecoverableError("framework selection changed in this process; restart before compiling")
@@ -307,7 +333,7 @@ def framework_identity():
             again, again_metadata = _discover_selection()
             if again != roots or again_metadata != metadata:
                 raise RuntimeError("framework selection changed during content inventory")
-            payload = json.dumps({"schema": 5, "metadata": metadata, "packages": manifests, "native": native},
+            payload = json.dumps({"schema": 5, "metadata": dict(metadata), "packages": manifests, "native": native},
                                  sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(payload.encode()).hexdigest()
             _snapshot = selection, digest

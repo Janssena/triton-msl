@@ -19,6 +19,47 @@ def _stamp():
                        "toolchain": contract.toolchain_identity()}, sort_keys=True, separators=(",", ":"))
 
 
+def test_stamp_text_reuse_never_reuses_live_validation(monkeypatch):
+    source = {"schema": 3, "implementation": "implementation", "frameworks": "framework",
+              "label": "label", "policy": {key: False for key in contract._STAMP_FLAGS}}
+    source["policy"]["CPP_SKIP"] = ""
+    calls = []
+    def current():
+        calls.append("source")
+        return source
+    def toolchain():
+        calls.append("toolchain")
+        return "toolchain"
+    monkeypatch.setattr(contract, "source_contract", current)
+    monkeypatch.setattr(contract, "toolchain_identity", toolchain)
+    contract._encode_known_stamp.cache_clear()
+    first = contract.execution_contract()
+    assert contract.execution_contract() == first
+    assert calls == ["source", "toolchain", "source", "toolchain"]
+    assert contract._encode_known_stamp.cache_info().hits == 1
+    # Same dict, changed primitive or schema, and Python-equal JSON type aliases.
+    for key, value in [*((key, True) for key in contract._STAMP_FLAGS),
+                       ("CPP_SKIP", "changed"), ("FA_FAST", 0), ("FA_FAST", 1.0)]:
+        prior = source["policy"][key]
+        source["policy"][key] = value
+        assert contract.execution_contract() == _stamp()
+        assert contract.execution_contract() != first
+        source["policy"][key] = prior
+        assert contract.execution_contract() == first
+    source["schema"] = True
+    source["extra"] = ["live"]
+    assert contract.execution_contract() == _stamp()
+    before = contract.execution_contract()
+    source["extra"][0] = "changed"
+    assert contract.execution_contract() != before
+    assert contract.execution_contract() == _stamp()
+    def failed_check():
+        raise MetalNonRecoverableError("current native identity failed")
+    monkeypatch.setattr(contract, "toolchain_identity", failed_check)
+    with pytest.raises(MetalNonRecoverableError, match="current native identity failed"):
+        contract.execution_contract()
+
+
 @pytest.fixture(autouse=True)
 def controlled_dependencies(monkeypatch, tmp_path):
     monkeypatch.setattr(contract, "toolchain_identity", lambda: "controlled-toolchain")
