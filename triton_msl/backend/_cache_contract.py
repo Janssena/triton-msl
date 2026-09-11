@@ -57,9 +57,13 @@ def effective_policy():
     FORCE_PYTHON and USE_CPP are retained separately: the family predicate reads
     USE_CPP itself, so collapsing them to one boolean would lose that dependency.
     """
-    from ._environment_snapshot import environment_snapshot, is_snapshot
+    from ._environment_snapshot import environment_snapshot
+    return _policy_for_environment(environment_snapshot())
+
+
+def _policy_for_environment(environment):
+    from ._environment_snapshot import is_snapshot
     global _policy_snapshot
-    environment = environment_snapshot()
     cached = _policy_snapshot
     if cached is not None and cached[0] is environment:
         return cached[1].copy()
@@ -227,9 +231,61 @@ def _encode_execution(source, toolchain):
                       sort_keys=True, separators=(",", ":"))
 
 
+_standard_source_contract = source_contract
+_standard_effective_policy = effective_policy
+_standard_toolchain_identity = toolchain_identity
+_execution_snapshot = None
+
+
 def execution_contract():
-    """Recheck all live identities; reuse only serialization of equal values."""
-    return _encode_execution(source_contract(), toolchain_identity())
+    """Recheck live identities; reuse only our own immutable derived stamp.
+
+    One environment capture is shared by policy and toolchain validation within
+    THIS evaluation. The JIT guard and launcher still evaluate independently.
+    Capture follows framework discovery/native verification, which may import
+    modules or run custom finders. Never cache across those live checks.
+    """
+    global _execution_snapshot
+    from triton_msl import CODEGEN_VERSION
+    from . import _toolchain_contract as toolchain
+    from ._environment_snapshot import environment_snapshot, is_snapshot
+
+    # Alternate providers keep their original call signatures and encoders. A
+    # cache of our policy derivation must not bypass a substituted live provider.
+    if (source_contract is not _standard_source_contract
+            or effective_policy is not _standard_effective_policy
+            or toolchain_identity is not _standard_toolchain_identity
+            or toolchain.toolchain_identity is not toolchain._standard_toolchain_identity):
+        return _encode_execution(source_contract(), toolchain_identity())
+
+    schema = SOURCE_SCHEMA
+    implementation = implementation_identity()
+    frameworks = framework_identity()
+    environment = environment_snapshot()
+    owned = is_snapshot(environment)
+    if owned:
+        compiler = toolchain._identity_for_environment(environment)
+        cached = _execution_snapshot
+        # Strong references, not id() values: identity reuse after GC cannot
+        # turn changed inputs into a hit. Every identity/check above stays live.
+        if (cached is not None and cached[0] is environment and cached[1] is schema
+                and cached[2] is implementation and cached[3] is frameworks
+                and cached[4] is CODEGEN_VERSION and cached[5] is compiler):
+            return cached[6]
+        policy = _policy_for_environment(environment)
+    else:
+        # Foreign/mutable mappings preserve two independent original reads and
+        # all getter side effects; they never acquire immutable-stamp credit.
+        policy = _policy_for_environment(environment)
+        compiler = toolchain_identity()
+    source = {"schema": schema, "implementation": implementation, "frameworks": frameworks,
+              "policy": policy, "label": CODEGEN_VERSION}
+    stamp = _encode_execution(source, compiler)
+    if (owned and type(schema) is int and type(implementation) is str
+            and type(frameworks) is str and type(CODEGEN_VERSION) is str
+            and type(compiler) is str):
+        _execution_snapshot = environment, schema, implementation, frameworks, CODEGEN_VERSION, compiler, stamp
+    return stamp
 
 
 def validate_execution_contract(stamp):

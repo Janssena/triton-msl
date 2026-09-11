@@ -143,11 +143,16 @@ def _resolve_toolchain():
 
 def toolchain_identity():
     """Fail closed on incomplete identity or live selector changes, never 'unknown'."""
+    from ._environment_snapshot import environment_snapshot
+    return _identity_for_environment(environment_snapshot())
+
+
+def _identity_for_environment(environment):
+    """Shared implementation; internal callers capture the live environment first."""
     global _snapshot, _environment_inputs
     from triton_msl.errors import MetalNonRecoverableError
-    from ._environment_snapshot import environment_snapshot, is_snapshot
+    from ._environment_snapshot import is_snapshot
 
-    environment = environment_snapshot()
     cached = _environment_inputs
     if (cached is not None and cached[0] is environment
             and cached[1:3] == (_SELECTION, _EXTERNAL_SEARCH)):
@@ -187,3 +192,6 @@ def toolchain_identity():
             raise MetalNonRecoverableError(f"cannot establish Metal compiler/SDK identity: {exc}") from exc
         _snapshot = selection, digest
         return digest
+
+
+_standard_toolchain_identity = toolchain_identity
