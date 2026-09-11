@@ -97,6 +97,24 @@ def test_policy_copy_and_same_mapping_changes_cannot_stale(monkeypatch):
     assert cache.effective_policy()["FA_HALF_ACCUM"] is True
     monkeypatch.setenv("TRITON_MSL_FA_HALF_ACCUM", "0")
     assert cache.effective_policy()["FA_HALF_ACCUM"] is False
+    if hasattr(os, "environb"):
+        monkeypatch.setenv("TRITON_MSL_FA_FAST", "0")
+        assert cache.effective_policy()["FA_FAST"] is False  # Prime ordinary bytes.
+        state = ["0"]
+        class PretendBytes(type):
+            def __hash__(cls):
+                return hash(bytes)
+            def __eq__(cls, other):
+                return other is bytes or type.__eq__(cls, other)
+        class EncodedValue(bytes, metaclass=PretendBytes):
+            def decode(self, *args, **kwargs):
+                return state[0]
+        monkeypatch.setitem(os.environb, b"TRITON_MSL_FA_FAST", EncodedValue(b"0"))
+        assert environment.environment_snapshot() is os.environ
+        assert cache.effective_policy()["FA_FAST"] is False
+        state[0] = "1"
+        assert os.environ.get("TRITON_MSL_FA_FAST") == "1"
+        assert cache.effective_policy()["FA_FAST"] is True
 
 
 def test_preimport_overrides_are_not_certified_as_standard(monkeypatch):

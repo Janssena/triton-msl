@@ -10,6 +10,8 @@ import sys
 import threading
 from collections.abc import Mapping
 from importlib.machinery import FrozenImporter
+from itertools import repeat
+from operator import is_
 from types import CodeType, MappingProxyType, MethodType
 
 
@@ -93,6 +95,12 @@ The result is immutable only on the recognized path.
         return env
     with _lock:
         raw = env._data.copy()
+        # environb accepts bytes subclasses whose decode/equality can depend on
+        # mutable state. Equal byte payloads alone do not prove those objects
+        # immutable, so check exact types BEFORE the cached equality fast path.
+        if (not all(map(is_, map(type, raw), repeat(bytes)))
+                or not all(map(is_, map(type, raw.values()), repeat(bytes)))):
+            return env
         if _cached is not None and _cached[0] is env and _cached[1] == raw:
             return _cached[2]
         # Decode the private copy, not the live mapping: A->B->A edits during
