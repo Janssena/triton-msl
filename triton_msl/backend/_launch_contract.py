@@ -4,6 +4,8 @@ This binds descriptor contents, not the dynamic tensor argument ABI or a foreign
 pipeline's binary. Those boundaries must not infer protection from this record.
 """
 import json
+import math
+from functools import lru_cache
 
 from triton_msl.errors import MetalNonRecoverableError
 
@@ -95,11 +97,102 @@ def validate_launch_metadata(metadata):
 def validate_packed_launch(packed, expected):
     if type(packed) not in (tuple, list) or len(packed) != len(FIELDS):
         _refuse("wrong packed descriptor arity")
+    # Template descriptors carry whole immutable MSL strings. Re-encoding and
+    # decoding those strings on every call costs more than checking the small
+    # mutable descriptor around them. Small records retain the cheaper JSON path.
+    if type(expected) is str and len(expected) >= 1024:
+        plan = _packed_snapshot_plan(expected)
+        if plan is not None:
+            try:
+                return tuple(_checked_packed_copy(packed, plan))
+            except _UsePackedJSON:
+                # JSON supports some custom containers/scalars and non-string
+                # dictionary keys. Preserve its existing behavior for those.
+                pass
     if type(expected) is not str or _canonical(packed) != expected:
         _refuse("descriptor changed after launcher construction")
     # Hooks can hold references to the caller's tuple and nested lists. Execute
     # from an unaliased checked snapshot, not mutable data checked before a hook.
     return tuple(json.loads(expected))
+
+
+class _UsePackedJSON(Exception):
+    pass
+
+
+@lru_cache(maxsize=64)
+def _packed_snapshot_plan(expected):
+    """Only canonical JSON supplies a reusable, recursively immutable plan."""
+    try:
+        decoded = json.loads(expected)
+        if _canonical(decoded) != expected:
+            return None
+    except (ValueError, TypeError, OverflowError, RecursionError, MetalNonRecoverableError):
+        return None
+
+    has_large_string = False
+
+    def freeze(value, depth=0):
+        nonlocal has_large_string
+        if depth > 32:
+            raise _UsePackedJSON
+        kind = type(value)
+        if kind is list:
+            return kind, tuple(freeze(child, depth + 1) for child in value)
+        if kind is dict:
+            return kind, tuple((key, freeze(child, depth + 1)) for key, child in value.items())
+        if kind is str and len(value) >= 512:
+            has_large_string = True
+        return kind, value
+
+    try:
+        plan = freeze(decoded)
+        # Large scalar-heavy arrays do not have the measured shader-string
+        # cost. Keep those on their original C JSON encoder/decoder path.
+        return plan if has_large_string else None
+    except (RecursionError, _UsePackedJSON):
+        return None
+
+
+def _checked_packed_copy(value, plan):
+    """Check every live value and allocate fresh containers for this invocation.
+
+    Builtin leaf type equality preserves JSON's bool/int/float distinctions;
+    signed floating zero also has distinct canonical spelling. Tuple/list input
+    equivalence is preserved, and both produce new lists as json.loads does.
+    No mutable object from either the caller or an earlier return is reused.
+    """
+    kind, wanted = plan
+    if kind is list:
+        if type(value) is not list and type(value) is not tuple:
+            raise _UsePackedJSON
+        observed = tuple(value)
+        if len(observed) != len(wanted):
+            _refuse("descriptor changed after launcher construction")
+        return [_checked_packed_copy(child, child_plan)
+                for child, child_plan in zip(observed, wanted)]
+    if kind is dict:
+        if type(value) is not dict:
+            raise _UsePackedJSON
+        observed = value.copy()
+        if any(type(key) is not str for key in observed):
+            raise _UsePackedJSON
+        if len(observed) != len(wanted) or any(key not in observed for key, _ in wanted):
+            # An explicit Unicode surrogate pair and its decoded character
+            # can spell the same JSON object key. Let the encoder decide.
+            raise _UsePackedJSON
+        return {key: _checked_packed_copy(observed[key], child_plan)
+                for key, child_plan in wanted}
+    if type(value) is not kind:
+        raise _UsePackedJSON
+    if kind is str and value != wanted:
+        # JSON's ASCII escaping can equate a surrogate pair with one Unicode
+        # character even though the Python strings compare unequal.
+        raise _UsePackedJSON
+    if value != wanted or (kind is float and value == 0.0
+                           and math.copysign(1.0, value) != math.copysign(1.0, wanted)):
+        _refuse("descriptor changed after launcher construction")
+    return wanted
 
 
 def pack_launch_metadata(metadata):
