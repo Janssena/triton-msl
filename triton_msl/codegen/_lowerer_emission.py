@@ -386,6 +386,15 @@ class _EmissionMixin:
                 self.env_is_mask[ssa.id] = True
             if src_id in self.env_is_ptr:
                 self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
+            # A shape-only pointer transform (notably expand_dims followed
+            # by broadcast) preserves each register slot's exact address.
+            # Keep the proved base+offset-array representation intact so a
+            # subsequent addptr composes offsets elementwise.  Dropping it
+            # here makes the fallback expression look like ``base[a][b]``:
+            # invalid MSL, and—if accepted by a different frontend—not the
+            # single flattened address Triton specified.
+            if src_id in getattr(self, "env_ptr_array", {}):
+                self.env_ptr_array[ssa.id] = self.env_ptr_array[src_id]
             # Propagate shared_mem_descs for smem-backed oversized arrays
             smem_descs = getattr(self, "_shared_mem_descs", {})
             if src_id in smem_descs:

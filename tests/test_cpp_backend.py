@@ -414,13 +414,16 @@ def test_cpp_cumsum():
 
 @requires_cpp
 @requires_metal
-def test_cpp_dot_32x32():
-    """32x32x32 f16 matmul through C++ path with tiled MMA."""
+def test_cpp_dot_32x32(monkeypatch, tmp_path):
+    """C++ opt-in de-routes this dot to MSL; no C++ dot capability credit."""
     import os
     import torch
     import triton
     import triton.language as tl
 
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
 
@@ -452,7 +455,9 @@ def test_cpp_dot_32x32():
         a = torch.randn(M, K).half()
         b = torch.randn(K, N).half()
         c = torch.zeros(M, N)
-        matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
+        compiled = matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
+        assert compiled.metadata.binary_route == "msl"
+        assert "tt.dot" in compiled.metadata.cpp_fallback_reason
 
         expected = a.float() @ b.float()
         max_err = (c - expected).abs().max().item()
@@ -500,18 +505,16 @@ def test_cpp_layer_norm():
 
 @requires_cpp
 @requires_metal
-def test_cpp_dot_k_loop():
-    """Matmul with K-loop (scf.for wrapping tt.dot).
-
-    DotOpConversion threads the input C accumulator through a threadgroup
-    buffer so that the iter_arg from a prior iteration is preserved across
-    successive tt.dot calls (not just the common tl.zeros fast path).
-    """
+def test_cpp_dot_k_loop(monkeypatch, tmp_path):
+    """K-loop dot must compute through explicitly recorded MSL fallback."""
     import os
     import torch
     import triton
     import triton.language as tl
 
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
 
@@ -543,7 +546,9 @@ def test_cpp_dot_k_loop():
         a = torch.randn(M, K).half()
         b = torch.randn(K, N).half()
         c = torch.zeros(M, N)
-        matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
+        compiled = matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
+        assert compiled.metadata.binary_route == "msl"
+        assert "tt.dot" in compiled.metadata.cpp_fallback_reason
 
         expected = a.float() @ b.float()
         max_err = (c - expected).abs().max().item()
@@ -677,7 +682,7 @@ def _run_fa_cpp(N_CTX, HEAD_DIM):
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
         grid = (triton.cdiv(N_CTX, BLOCK_M),)
-        _fa_fwd_strided_kernel[grid](
+        compiled = _fa_fwd_strided_kernel[grid](
             q,
             k,
             v,
@@ -704,36 +709,33 @@ def _run_fa_cpp(N_CTX, HEAD_DIM):
         k.unsqueeze(0).unsqueeze(0),
         v.unsqueeze(0).unsqueeze(0),
     ).squeeze()
+    assert compiled.metadata.binary_route == "msl"
+    assert "tt.dot" in compiled.metadata.cpp_fallback_reason
     return (out - expected).abs().max().item()
 
 
 @requires_cpp
 @requires_metal
-def test_cpp_flash_attention_head32():
-    """FlashAttention HEAD_DIM=32 through the C++ metallib path.
-
-    Tile = BLOCK_M*HEAD_DIM = 32*32 = 1024, which fits within Metal's 1024
-    thread cap so no wrap loop is injected, and the C++ path's tt.dot
-    lowering (simdgroup_matrix_8x8 + memdesc_trans for q@k^T) handles the
-    kernel end-to-end. See _has_complex_ops for the wrap-loop + tt.dot
-    incompatibility that routes HEAD_DIM=64 to MSL.
-    """
+def test_cpp_flash_attention_head32(monkeypatch, tmp_path):
+    """HEAD_DIM=32 computes through recorded MSL fallback under C++ opt-in."""
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=32)
     assert max_err < 5e-2, f"FA HEAD_DIM=32: max error {max_err}"
 
 
 @requires_cpp
 @requires_metal
-def test_cpp_flash_attention_head64():
+def test_cpp_flash_attention_head64(monkeypatch, tmp_path):
     """FlashAttention HEAD_DIM=64 with TRITON_MSL_USE_CPP=1 set.
 
-    Tile = BLOCK_M*HEAD_DIM = 32*64 = 2048 > 1024, so make_llir would
-    inject a wrapping loop over the kernel body. The wrap loop is
-    fundamentally incompatible with tt.dot (simdgroup_matrix reads the
-    whole tile but the populate under the wrap only fills half on
-    iteration 0), so _has_complex_ops routes this to MSL, which uses a
-    different (threadgroup-wide) code model for tt.dot.
+    Dot is de-routed before C++ lowering, not merely when a wrap loop happens
+    to be required. The returned binary metadata must explicitly say MSL.
     """
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=64)
     assert max_err < 5e-2, f"FA HEAD_DIM=64: max error {max_err}"
 

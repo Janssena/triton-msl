@@ -23,6 +23,20 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
+def _scalar_buffer_decl(arg, index):
+    """Match the driver's scalar storage ABI, not a template's index type.
+
+    Even an unused scalar keeps its native positional argument slot. Declaration
+    and unpacking share the type mapping so a float's bits cannot become an int,
+    or a narrow/wide integer be read at the wrong width (GitHub issue11).
+    """
+    return f"    device {triton_type_to_msl(arg.elem_type)}* {arg.name}_buf [[buffer({index})]]"
+
+
+def _scalar_unpack(arg):
+    return f"    {triton_type_to_msl(arg.elem_type)} {arg.name} = {arg.name}_buf[0];"
+
+
 def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_type, store_pfx="", indent="    "):
     """Emit the masked, per-simdgroup staged store of ONE float8x8 accumulator.
 
@@ -189,8 +203,32 @@ class _TemplateMixin:
         """The tile coordinates, replaying the PROVEN grid mapping (packet 080):
         the 2-D form reads ``program_id(0)`` / ``program_id(1)``; the tutorial's 1-D form
         splits ``program_id(0)`` by ``num_pid_m = cdiv(M, BLOCK_M)`` — rows are the
-        remainder, cols the quotient. Requires ``_M`` to be defined already."""
+        remainder, cols the quotient. The N-fastest form reverses those roles
+        using the proved N extent. Requires ``_M``/``_N`` to be defined already."""
         pid_map = info.get("pid_map")
+        if isinstance(pid_map, tuple) and len(pid_map) == 2 and pid_map[0] == "flat_n":
+            block_n = pid_map[1]
+            return [
+                "    // N-fastest source tile mapping; preserve signed i32 add/div/rem",
+                f"    int _npn = as_type<int>(_N + {block_n - 1}u) / {block_n};",
+                "    uint pid_m = as_type<uint>(as_type<int>(pid3.x) / _npn);",
+                "    uint pid_n = as_type<uint>(as_type<int>(pid3.x) % _npn);",
+            ]
+        if isinstance(pid_map, tuple) and len(pid_map) == 3 and pid_map[0] == "grouped":
+            group, block_n = pid_map[1:]
+            return [
+                "    // grouped source tile mapping; retain the short final group",
+                # arith.addi/muli/subi wrap at i32, while divsi/remsi/minsi
+                # interpret those bits as signed. Do not turn the latter unsigned.
+                f"    int _npm = as_type<int>(_M + {block_m - 1}u) / {block_m};",
+                f"    int _npn = as_type<int>(_N + {block_n - 1}u) / {block_n};",
+                f"    int _span = as_type<int>(as_type<uint>(_npn) * {group}u);",
+                f"    int _first_m = as_type<int>(as_type<uint>(as_type<int>(pid3.x) / _span) * {group}u);",
+                f"    int _group_m = min(as_type<int>(as_type<uint>(_npm) - as_type<uint>(_first_m)), {group});",
+                "    int _within = as_type<int>(pid3.x) % _span;",
+                "    uint pid_m = as_type<uint>(_first_m) + as_type<uint>(_within % _group_m);",
+                "    uint pid_n = as_type<uint>(_within / _group_m);",
+            ]
         if pid_map == "1d":
             return [
                 f"    uint _npm = (_M + {block_m}u - 1u) / {block_m}u;  // cdiv(M, BLOCK_M), as in the IR",
@@ -398,7 +436,7 @@ class _TemplateMixin:
                 m = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {m}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(_scalar_buffer_decl(arg, i))
         lines.append(",\n".join(arg_decls) + ",")
         if has_pid:
             self._used_pid_axes = {0, 1}
@@ -415,7 +453,7 @@ class _TemplateMixin:
             lines.append(") {")
             lines.append("    uint pid_m = 0u, pid_n = 0u;")
         for arg in all_scalar_args:
-            lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+            lines.append(_scalar_unpack(arg))
 
         # Output extents resolved structurally from the store mask (issue #4.5): any arg
         # name works, so a square N x N matmul clips both axes correctly instead of _M=BLOCK_M.
@@ -601,7 +639,7 @@ class _TemplateMixin:
                 _const = "const " if _arg.name != c_name else ""
                 lines.append(f"    device {_const}{_m}* {_arg.name} [[buffer({_i})]],")
             else:
-                lines.append(f"    device int* {_arg.name}_buf [[buffer({_i})]],")
+                lines.append(_scalar_buffer_decl(_arg, _i) + ",")
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
         lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
         lines.append(f") {{")
@@ -818,7 +856,7 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(_scalar_buffer_decl(arg, i))
         lines.append(",\n".join(arg_decls) + ",")
         lines.append(f"    uint3 pid3 [[threadgroup_position_in_grid]],")
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
@@ -827,7 +865,7 @@ class _TemplateMixin:
 
         # Unpack scalar args from buffers
         for arg in all_scalar_args:
-            lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+            lines.append(_scalar_unpack(arg))
 
         lines.append(f"")
         # pid_m / pid_n are defined AFTER the extents below: the proven 1-D grid mapping
@@ -1108,7 +1146,7 @@ class _TemplateMixin:
             lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
             lines.append(f") {{")
             for arg in all_scalar_args:
-                lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+                lines.append(_scalar_unpack(arg))
             lines.append(f"    uint _M = (uint)M, _N = (uint)N, _K = (uint)K;")
             # Packet 106: the direct variant replays the SAME proven grid mapping as the
             # staged kernel (the tutorial's 1-D split, and tile 0 on an axis the source
@@ -1187,7 +1225,7 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(_scalar_buffer_decl(arg, i))
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -2271,7 +2309,7 @@ class _TemplateMixin:
 
         # Identity and combine expression
         if combine_op == "sum":
-            identity = "0.0f" if msl_type == "float" else "0"
+            identity = "-0.0f" if msl_type == "float" else "0"
             combine_expr = "acc + val"
         elif combine_op == "max":
             identity = "(-INFINITY)" if msl_type == "float" else "INT_MIN"
@@ -2292,7 +2330,7 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(_scalar_buffer_decl(arg, i))
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
@@ -2412,7 +2450,7 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(_scalar_buffer_decl(arg, i))
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
@@ -2683,6 +2721,21 @@ class _TemplateMixin:
         if len(ptr_args) >= 3:
             a_arg, b_arg, c_arg = self._dot_template_ptr_roles()  # P0 (065): dataflow, not position
             out_dtype = _mlir_to_triton_dtype(c_arg.elem_type)
+            # Prove integrity BEFORE constructing the template: construction may
+            # raise a prunable resource failure, which must not hide bad roles.
+            # The template hard-binds A/B/C to buffers 0/1/2 and cannot re-slot.
+            _idx = tuple(a.index for a in (a_arg, b_arg, c_arg))
+            if _idx != (0, 1, 2) or len(ptr_args) != 3:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"simple matmul template requires the canonical (A, B, C, ...) "
+                    f"signature with the three pointers at argument slots 0/1/2 "
+                    f"(dataflow-resolved roles sit at {_idx}, {len(ptr_args)} pointer "
+                    f"args): make_matmul_kernel binds buffers by position and would "
+                    f"write the output into the wrong buffer. Refusing.",
+                    op_name="tt.dot",
+                )
 
         # Phase 4: record the runtime fast-matmul dispatch descriptor (additive;
         # the generic kernel below is still emitted + returned). The launcher only
@@ -2701,22 +2754,6 @@ class _TemplateMixin:
         msl = msl.replace("matmul_kernel", safe_name, 1)
 
         if len(ptr_args) >= 3:
-            # make_matmul_kernel hard-addresses A/B/C at buffers 0/1/2 (and M/N/K at
-            # 3/4/5); it cannot re-slot. The launcher binds by position, so the
-            # dataflow-resolved roles must sit EXACTLY at those indices and no other
-            # pointer may precede C — otherwise refuse (P0, packet 065).
-            _idx = tuple(a.index for a in (a_arg, b_arg, c_arg))
-            if _idx != (0, 1, 2) or len(ptr_args) != 3:
-                from triton_msl.errors import MetalNonRecoverableError
-
-                raise MetalNonRecoverableError(
-                    f"simple matmul template requires the canonical (A, B, C, ...) "
-                    f"signature with the three pointers at argument slots 0/1/2 "
-                    f"(dataflow-resolved roles sit at {_idx}, {len(ptr_args)} pointer "
-                    f"args): make_matmul_kernel binds buffers by position and would "
-                    f"write the output into the wrong buffer. Refusing.",
-                    op_name="tt.dot",
-                )
             a_name, b_name, c_name = a_arg.name, b_arg.name, c_arg.name
             # Replace parameter declarations -- use regex to match any MSL type (float, half, etc.)
             msl = re.sub(r"(device\s+const\s+\w+\*)\s+A\s", rf"\1 {a_name} ", msl)
@@ -4686,6 +4723,11 @@ class _TemplateMixin:
         # fast template only for exactly that program grid.
         _vp = self._dot_template_value_paths()
         if _vp[0] is not None or len(_vp) < 5:
+            return None
+        if isinstance(_vp[3], tuple):
+            # Grouped and N-fastest sources use the coordinate-preserving template.
+            # Do not mislabel it "2d" and let a full-output replacement reinterpret
+            # a partial/swizzled source launch. Fast-grid admission is separate work.
             return None
         _ops = {o.id: o for o in _all(self.graph.ops)}
         _ash = _extract_shape(_ops[dot_ssa.operand_ids[0]].type_str or "") if dot_ssa.operand_ids[0] in _ops else None

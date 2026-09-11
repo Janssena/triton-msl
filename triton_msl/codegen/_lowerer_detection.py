@@ -168,11 +168,84 @@ class _DetectionMixin:
         x, y = (self._strip_wrappers(v, op_by_id, self._IDX_CASTS) for v in o.operand_ids)
         return (x == iv and self._const_int(y, op_by_id) == iv_scale) or (y == iv and self._const_int(x, op_by_id) == iv_scale)
 
-    def _pid_expr(self, vid, op_by_id):
+    def _grouped_pid_expr(self, vid, op_by_id):
+        """Recognize the exact grouped tutorial DAG, not arbitrary scalar arithmetic.
+
+        Return an axis and a shared structural key. The caller must ALSO prove the
+        two cdiv extents match its actual M/N tiles before any template is admitted.
+        """
+        def binary(v, name):
+            op = op_by_id.get(v)
+            if op is not None and op.op == name and len(op.operand_ids or []) == 2:
+                from triton_msl.errors import MetalNonRecoverableError
+                try:
+                    facts = self._native_value_facts(v, op_name="tt.dot")
+                except MetalNonRecoverableError:
+                    return None  # unknown metadata cannot prove this NEW mapping
+                if facts.kind != "integer" or facts.width != 32 or facts.shape != () or facts.is_tensor:
+                    return None
+                return tuple(op.operand_ids)
+            return None
+
+        def scaled(v, scale):
+            pair = binary(v, "arith.muli")
+            if pair:
+                for x, c in (pair, pair[::-1]):
+                    if self._const_int(c, op_by_id) == scale:
+                        return x
+            return None
+
+        root = op_by_id.get(vid)
+        if root is None:
+            return None
+        candidates = []
+        add = binary(vid, "arith.addi")
+        if add:
+            for first, remainder in (add, add[::-1]):
+                rem = binary(remainder, "arith.remsi")
+                if rem:
+                    candidates.append((0, first, *rem))
+        div = binary(vid, "arith.divsi")
+        if div:
+            candidates.append((1, None, *div))
+        for axis, row_first, within, group_size in candidates:
+            minimum = binary(group_size, "arith.minsi")
+            if not minimum:
+                continue
+            for remaining, constant in (minimum, minimum[::-1]):
+                group = self._const_int(constant, op_by_id)
+                if group is None or not 1 <= group <= 32:
+                    continue
+                sub = binary(remaining, "arith.subi")
+                if not sub:
+                    continue
+                npm, first = sub
+                if row_first is not None and row_first != first:
+                    continue
+                group_id = scaled(first, group)
+                quotient = binary(group_id, "arith.divsi")
+                local = binary(within, "arith.remsi")
+                if not quotient or local != quotient:
+                    continue
+                pid, span = quotient
+                npn = scaled(span, group)
+                pop = op_by_id.get(pid)
+                if npn is None or pop is None or pop.op not in self._PID_OPS:
+                    continue
+                if str(pop.attrs.get("axis", pop.attrs.get("dim", 0))) != "0":
+                    continue
+                return axis, ("grouped", group, npm, npn)
+        return None
+
+    def _pid_expr(self, vid, op_by_id, *, allow_grouped=False):
         """Classify a scalar as a tile-coordinate expression the templates replay:
         ``program_id(axis)`` -> ``(axis, None)``; the tutorial's 1-D grid mapping
         ``program_id(0) % D`` -> ``(0, D)`` (rows) and ``program_id(0) // D`` ->
         ``(1, D)`` (cols). Else None."""
+        if allow_grouped:
+            grouped = self._grouped_pid_expr(vid, op_by_id)
+            if grouped is not None:
+                return grouped
         vid = self._strip_wrappers(vid, op_by_id, self._IDX_CASTS)
         o = op_by_id.get(vid)
         if o is None:
@@ -194,7 +267,7 @@ class _DetectionMixin:
             return (0 if o.op == "arith.remsi" else 1, o.operand_ids[1])
         return None
 
-    def _index_shape(self, vid, op_by_id, arg_by_id, iv, iv_scale=1):
+    def _index_shape(self, vid, op_by_id, arg_by_id, iv, iv_scale=1, *, allow_grouped=False):
         """Decompose a 1-D tile index into what the matmul templates replay:
         ``[program_id(axis) * BLOCK +] make_range [+ <K offset>]`` where the K offset
         is the induction variable (element-stepped loop) or ``iv * BLOCK_K``
@@ -202,7 +275,7 @@ class _DetectionMixin:
         "pid", "bad"}``: counts of make_range / K-offset addends, the program_id axis
         (None if absent, -1 if mixed) and the first un-replayed construct (a runtime
         scalar offset, a constant addend, a scaled index, ...) or None."""
-        res = {"range": 0, "iv": 0, "pid": None, "bad": None, "mod": None, "pid_div": None, "coef": None, "bounds": None}
+        res = {"range": 0, "iv": 0, "pid": None, "bad": None, "mod": None, "pid_div": None, "coef": None, "bounds": None, "index_casts": []}
 
         def note_pid(axis, div, coef=1):
             # packet 106: the pid's tile COEFFICIENT (``pid * BLOCK``) and the make_range
@@ -220,7 +293,7 @@ class _DetectionMixin:
             if iv is not None and self._is_k_offset(v, op_by_id, iv, iv_scale):
                 res["iv"] += 1
                 return
-            pe = self._pid_expr(v, op_by_id)
+            pe = self._pid_expr(v, op_by_id, allow_grouped=allow_grouped)
             if pe is not None:
                 note_pid(*pe)
                 return
@@ -252,6 +325,8 @@ class _DetectionMixin:
                 res["bounds"] = b if res["range"] == 1 else None
                 return
             if (o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") or o.op in self._IDX_CASTS) and o.operand_ids:
+                if o.op in self._IDX_CASTS:
+                    res["index_casts"].append(v)
                 walk(o.operand_ids[0], depth + 1)
                 return
             if o.op in ("arith.addi", "arith.add"):
@@ -262,7 +337,7 @@ class _DetectionMixin:
                 # only ``<pid expr> * BLOCK`` (either order) is a replayed product
                 sides = [op_by_id.get(x) for x in o.operand_ids]
                 ci = next((i for i, s in enumerate(sides) if s is not None and s.op == "arith.constant"), None)
-                pe = self._pid_expr(o.operand_ids[1 - ci], op_by_id) if ci is not None else None
+                pe = self._pid_expr(o.operand_ids[1 - ci], op_by_id, allow_grouped=allow_grouped) if ci is not None else None
                 if pe is None:
                     res["bad"] = "scaled index"
                     return
@@ -549,7 +624,8 @@ class _DetectionMixin:
         Returns ``(reason, proven_cast_ids, roles, pid_map)``: ``reason`` None when every
         proof holds — then ``proven_cast_ids`` are the cast ops the template DOES replay
         (admitted by the allowlist by IDENTITY, not by opcode), ``roles`` is ``(A, B, C)``
-        and ``pid_map`` is the PROVEN grid mapping (``"2d"`` | ``"1d"``) the pid-tiled
+        and ``pid_map`` is the PROVEN grid mapping (``"2d"`` | ``"1d"`` or a
+        coordinate-preserving grouped/N-fastest tuple) the pid-tiled
         templates replay verbatim; otherwise a role-naming reason with the rest None.
         """
         op_by_id = {}
@@ -691,6 +767,64 @@ class _DetectionMixin:
         if opnd_shape and len(opnd_shape) >= 2 and _b_shape and len(_b_shape) >= 2:
             _bm_t, _bk_t, _bn_t = opnd_shape[-2], opnd_shape[-1], _b_shape[-1]
             _blk = {("A", 0): _bm_t, ("A", 1): _bk_t, ("B", 0): _bk_t, ("B", 1): _bn_t, ("C", 0): _bm_t, ("C", 1): _bn_t}
+
+        # N-fastest flat grids are a DOT-role proof, not a changed meaning for
+        # the shared _pid_expr/_index_shape helpers (quantized callers use them).
+        # Establish the output's opposite quotient/remainder orientation first;
+        # all A/B/C role checks below must then agree on this exact divisor.
+        def i32_index_dag(value):
+            pending, seen = [value], set()
+            while pending:
+                v = pending.pop()
+                if v in seen:
+                    continue
+                seen.add(v)
+                from triton_msl.errors import MetalNonRecoverableError
+                try:
+                    facts = self._native_value_facts(v, op_name="tt.dot")
+                except MetalNonRecoverableError:
+                    return False
+                if facts.kind != "integer" or facts.width != 32:
+                    return False
+                op = op_by_id.get(v)
+                if op is not None:
+                    if op.op in self._IDX_CASTS or op.op == "arith.trunci":
+                        return False  # no discarded width/signedness conversions
+                    pending.extend(op.operand_ids or [])
+                elif v not in arg_by_id:
+                    return False
+            return True
+
+        flat_n_divisor = None
+        c_indices = index_ids.get("C", (None, None))
+        if all(v is not None for v in c_indices):
+            c_shapes = [self._index_shape(v, op_by_id, arg_by_id, iv, iv_scale, allow_grouped=True) for v in c_indices]
+            d = c_shapes[0]["pid_div"]
+            if (c_shapes[0]["pid"] == 1 and c_shapes[1]["pid"] == 0
+                    and d is not None and not isinstance(d, tuple) and c_shapes[1]["pid_div"] == d):
+                div = op_by_id.get(d)
+                bn = _blk.get(("C", 1))
+                if div is not None and div.op == "arith.divsi" and len(div.operand_ids or []) == 2 and bn:
+                    numerator, denominator = div.operand_ids
+                    add = op_by_id.get(numerator)
+                    if (self._const_int(denominator, op_by_id) == bn
+                            and add is not None and add.op == "arith.addi" and len(add.operand_ids or []) == 2):
+                        x, y = add.operand_ids
+                        if (any(v in arg_by_id and not arg_by_id[v].is_ptr
+                                and arg_by_id[v].name == mn_names[1] and self._const_int(c, op_by_id) == bn - 1
+                                for v, c in ((x, y), (y, x))) and i32_index_dag(d)):
+                            flat_n_divisor = d
+
+        def dot_index_shape(value):
+            sh = self._index_shape(value, op_by_id, arg_by_id, iv, iv_scale, allow_grouped=True)
+            if flat_n_divisor is not None and sh["pid_div"] == flat_n_divisor and sh["pid"] in (0, 1):
+                if not i32_index_dag(value):
+                    sh["bad"] = "N-fastest coordinate is not an exact cast-free i32 DAG"
+                else:
+                    sh["pid"] = 1 - sh["pid"]
+                    sh["pid_div"] = ("flat_n", flat_n_divisor)
+            return sh
+
         _has_pid = {}
         k_form = {}
         for role, ax, want_pid, is_k in (
@@ -706,7 +840,9 @@ class _DetectionMixin:
                     None,
                     None,
                 )
-            sh = self._index_shape(vid, op_by_id, arg_by_id, iv, iv_scale)
+            sh = dot_index_shape(vid)
+            if isinstance(sh["pid_div"], tuple) and sh["index_casts"]:
+                return (f"{role} grouped tile index contains an unreplayed width cast", set(), None, None)
             if sh["bad"]:
                 return (f"{role} {axis_name} index contains {sh['bad']}, which the template does not replay", set(), None, None)
             if sh["range"] != 1:
@@ -770,14 +906,41 @@ class _DetectionMixin:
         for role in ("A", "B", "C"):
             for ax in (0, 1):
                 vid = index_ids.get(role, (None, None))[ax]
-                sh = self._index_shape(vid, op_by_id, arg_by_id, iv, iv_scale) if vid is not None else None
+                sh = dot_index_shape(vid) if vid is not None else None
                 if sh and sh["pid"] is not None:
                     pid_divs[(role, ax)] = sh["pid_div"]
         divs = set(pid_divs.values())
         if len(divs) > 1:
             return ("tile indices mix grid mappings (2-D program ids with a 1-D pid split)", set(), None, None)
         pid_map = "2d"
-        if divs and divs != {None}:
+        grouped = next(iter(divs)) if len(divs) == 1 else None
+        if isinstance(grouped, tuple) and grouped[0] == "flat_n":
+            pid_map = ("flat_n", _blk[("C", 1)])
+        elif isinstance(grouped, tuple) and grouped[0] == "grouped":
+            def cdiv_extent(value, extent, block):
+                op = op_by_id.get(value)
+                if op is None or not block or len(op.operand_ids or []) != 2:
+                    return False
+                numerator, denominator = op.operand_ids
+                if self._const_int(denominator, op_by_id) != block:
+                    return False
+                # Replay exactly the i32 add-then-div composition. ceildivsi has
+                # different overflow semantics; cast-through-extent matching can
+                # silently discard a narrowed dimension. Neither is admitted here.
+                add = op_by_id.get(numerator)
+                if op.op != "arith.divsi" or add is None or add.op != "arith.addi" or len(add.operand_ids or []) != 2:
+                    return False
+                x, y = add.operand_ids
+                return any(self._const_int(c, op_by_id) == block - 1 and
+                           v in arg_by_id and not arg_by_id[v].is_ptr and arg_by_id[v].name == extent
+                           for v, c in ((x, y), (y, x)))
+            _, group, npm, npn = grouped
+            bm, bn = _blk.get(("C", 0)), _blk.get(("C", 1))
+            if (None in mn_names or not cdiv_extent(npm, mn_names[0], bm)
+                    or not cdiv_extent(npn, mn_names[1], bn)):
+                return ("grouped grid extents do not match the source M/N tiles", set(), None, None)
+            pid_map = ("grouped", group, bn)
+        elif divs and divs != {None}:
             d = next(iter(divs))
             block_m = opnd_shape[-2] if opnd_shape and len(opnd_shape) >= 2 else None
             dop = op_by_id.get(self._strip_wrappers(d, op_by_id, self._IDX_CASTS))
@@ -965,7 +1128,7 @@ class _DetectionMixin:
                     _pending.append(_c.id)
                     continue
                 return (f"the dot result is observed by '{_c.op}', which the template does not replay", set(), None, None)
-        if pid_map == "1d" and pid_axes != (True, True):
+        if (pid_map == "1d" or isinstance(pid_map, tuple)) and pid_axes != (True, True):
             return ("a 1-D grid split needs program_id on both tile axes", set(), None, None)
         return (None, proven, (a_arg, b_arg, c_arg), pid_map, pid_axes)
 
@@ -1925,6 +2088,13 @@ class _DetectionMixin:
                     val = int(o.attrs.get("value"))
                 except (TypeError, ValueError):
                     return False
+                # Equal-to-one specialization removes the FA N_CTX argument,
+                # while the emitted template still clips query rows at the exact
+                # literal 1.  Only that row-axis boundary is therefore harmless
+                # to drop; a column mask or any other constant remains subject to
+                # the ordinary multi-block refusal below.
+                if is_fa and fa_ctx_index == "c1" and ok_names == {"N_CTX"}:
+                    return val == 1
                 # a CONSTANT bound on a MULTI-BLOCK index (pid*BLOCK+range) can't be
                 # proven trivial: the make_range extent is the per-block span, the index
                 # runs to a RUNTIME total -> a const between BLOCK and total clips later
@@ -1982,14 +2152,17 @@ class _DetectionMixin:
 
     def _refuse_nontrivial_template_output_mask(self):
         """SYSTEMIC anti-silent-wrong gate at the SINGLE matmul dispatch chokepoint in
-        ``lower()`` (BEFORE any template store site, so the fix can never be missing from
-        one copy): a MATMUL with a non-tile-boundary output ``tt.store`` mask has NO
+        ``lower()`` for every route that has not already proved its own stores: a MATMUL
+        with a non-tile-boundary output ``tt.store`` mask has NO
         correct lowering on this backend — the simdgroup simple-dot / K-loop / strided /
         matmul+softmax templates compute the FULL tile and gate writes only on the tile
         boundary (silently DROPPING a tighter user mask), AND the generic per-element
         matmul fallback is itself wrong at 16/32/64 — so we REFUSE LOUDLY rather than emit
         silently-wrong output.
 
+        Backward FlashAttention runs its whole-value and exact-store-mask proof before
+        this gate and returns only after that proof succeeds; an unrecognized or
+        ambiguous backward-shaped graph still reaches this fail-closed check. Forward
         FlashAttention is DELIBERATELY EXEMPTED here. An FA kernel routes to a mask-
         HONORING path: head_dim<=64 lowers through the scalar-tiled / generic
         ``_lower_store``, which clips the user's output mask correctly. Refusing FA at

@@ -159,8 +159,11 @@ def test_generic_dot_unwired_epilogue_above_1024_still_refuses(monkeypatch):
     # has one scalar value per lid and must not inherit the cooperative-loop exemption.
     _force_generic_dot(monkeypatch)
     lowerer = _generic_lowerer(64, 32, 16, fn=_dot_plus_one)
-    with pytest.raises(MetalNonRecoverableError, match=r"2048.*1024.*unwritten"):
+    with pytest.raises(MetalNonRecoverableError, match=r"2048.*1024.*unwritten") as caught:
         lowerer.lower()
+    from triton.runtime.errors import OutOfResources
+
+    assert not isinstance(caught.value, OutOfResources)
 
 
 @pytest.fixture()

@@ -380,6 +380,86 @@ def test_b1_lowering_replays_rank3_address_contract():
 
 
 @requires
+@pytest.mark.parametrize("flattened", [False, True])
+def test_batched_shape_proof_uses_native_metadata(flattened):
+    """Printed operation shapes cannot change the proved batched plan."""
+    lowerer = _flat_lowerer(rank=6, ta=True, tb=True) if flattened else _lowerer(_dot3d_batched, batch=2)
+    expected = lowerer._detect_batched_dot()
+    assert expected is not None
+    expected_msl = lowerer._lower_batched_dot_template(expected)
+    changed = 0
+    for op in lowerer.graph.ops:
+        if op.op in {"tt.dot", "tt.reshape", "tt.trans", "tt.make_range", "tt.load", "tt.expand_dims"}:
+            op.type_str = "tensor<1x999xf32>"
+            changed += 1
+    assert changed >= 4
+    actual = lowerer._detect_batched_dot()
+    assert actual == expected
+    assert lowerer._lower_batched_dot_template(actual) == expected_msl
+
+
+@requires
+@pytest.mark.parametrize("flattened", [False, True])
+def test_batched_shape_proof_refuses_missing_or_dynamic_native_metadata(flattened):
+    """The recognizer itself must reject damaged facts before template emission."""
+    from dataclasses import replace
+
+    for damage in ("missing", "dynamic", "false_scalar"):
+        lowerer = _flat_lowerer(rank=6) if flattened else _lowerer(_dot3d_batched, batch=2)
+        assert lowerer._detect_batched_dot() is not None
+        dot = next(op for op in lowerer.graph.ops if op.op == "tt.dot")
+        meta = lowerer.graph.result_meta[dot.id]
+        if damage == "missing":
+            lowerer.graph.result_meta.pop(dot.id)
+        elif damage == "dynamic":
+            lowerer.graph.result_meta[dot.id] = replace(meta, type=replace(meta.type, shape=(None, 32, 32)))
+        else:
+            lowerer.graph.result_meta[dot.id] = replace(meta, type=replace(meta.type, is_tensor=False, shape=()))
+        with pytest.raises(MetalNonRecoverableError, match="native.*(missing|shape|tensor-kind)"):
+            lowerer._detect_batched_dot()
+
+
+@requires
+@pytest.mark.parametrize("flattened", [False, True])
+def test_batched_dtype_proof_and_emitter_ignore_legacy_fields(flattened):
+    """Admission and emission must use the same native dtype authority."""
+    lowerer = _flat_lowerer(rank=6, ta=True, tb=True) if flattened else _lowerer(_dot3d_batched, batch=2)
+    expected = lowerer._detect_batched_dot()
+    assert expected is not None
+    expected_msl = lowerer._lower_batched_dot_template(expected)
+    for value in [*lowerer.graph.args, *lowerer.graph.ops]:
+        value.elem_type = "i64"
+    actual = lowerer._detect_batched_dot()
+    assert actual == expected
+    assert lowerer._lower_batched_dot_template(actual) == expected_msl
+
+
+@requires
+@pytest.mark.parametrize("flattened", [False, True])
+def test_batched_dtype_proof_rejects_contradictory_native_facts(flattened):
+    """Pointer pointees and result widths cannot inherit legacy dtype defaults."""
+    from dataclasses import replace
+
+    for target in ("input", "output", "dot", "load"):
+        lowerer = _flat_lowerer(rank=6) if flattened else _lowerer(_dot3d_batched, batch=2)
+        plan = lowerer._detect_batched_dot()
+        assert plan is not None
+        if target in {"input", "output"}:
+            value = plan["a_arg" if target == "input" else "c_arg"]
+        else:
+            value = next(op for op in lowerer.graph.ops if op.op == ("tt.dot" if target == "dot" else "tt.load"))
+        meta = lowerer.graph.result_meta[value.id]
+        facts = meta.type
+        if facts.kind == "pointer":
+            broken = replace(facts, pointee=replace(facts.pointee, width=7))
+        else:
+            broken = replace(facts, width=7)
+        lowerer.graph.result_meta[value.id] = replace(meta, type=broken)
+        with pytest.raises(MetalNonRecoverableError, match="batched.dot.*dtype"):
+            lowerer._detect_batched_dot()
+
+
+@requires
 def test_b2_lowering_replays_batch_stride_and_uniform_barriers():
     lowerer = _lowerer(_dot3d_batched, batch=2)
     msl = lowerer.lower()

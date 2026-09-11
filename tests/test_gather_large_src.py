@@ -69,7 +69,11 @@ def test_gather1d_src_exceeds_1024():
         _gather1d_large_src_indexed[(1,)](src, idx, out, S, I)
         torch.mps.synchronize()
     except MetalNonRecoverableError as e:
-        # Good: loud refusal instead of silent wrong
+        # Only this known gather-staging limitation earns refusal credit.
+        # A framework/cache/compiler failure is NOT evidence about gather.
+        assert e.op_name == "tt.gather", e
+        assert "2048" in str(e) and "1024" in str(e), e
+        assert "tail unwritten" in str(e) or "read uninitialized memory" in str(e), e
         pytest.skip(f"backend refused loudly (correct behavior): {e}")
         return
 
@@ -103,6 +107,9 @@ def test_gather1d_src_2048_indices_in_high_half():
         _gather1d_large_src_indexed[(1,)](src, idx, out, S, I)
         torch.mps.synchronize()
     except MetalNonRecoverableError as e:
+        assert e.op_name == "tt.gather", e
+        assert "2048" in str(e) and "1024" in str(e), e
+        assert "tail unwritten" in str(e) or "read uninitialized memory" in str(e), e
         pytest.skip(f"backend refused loudly (correct behavior): {e}")
         return
 

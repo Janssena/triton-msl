@@ -65,18 +65,18 @@
   },
   "matmul_2048_fp32": {
     "name": "matmul_2048_fp32",
-    "min_ms": 1.4892,
-    "tflops": 11.54
+    "min_ms": 2.0112,
+    "tflops": 8.54
   },
   "matmul_2048_fp16": {
     "name": "matmul_2048_fp16",
-    "min_ms": 1.3977,
-    "tflops": 12.29
+    "min_ms": 1.5299,
+    "tflops": 11.23
   },
   "matmul_2048_fp16out": {
     "name": "matmul_2048_fp16out",
-    "min_ms": 1.4069,
-    "tflops": 12.21
+    "min_ms": 1.5254,
+    "tflops": 11.26
   },
   "flash_attention_simdgroup_fp32": {
     "name": "flash_attention_simdgroup_fp32",

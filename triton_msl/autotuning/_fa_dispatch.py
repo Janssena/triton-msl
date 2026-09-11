@@ -13,9 +13,9 @@ in cold A/B). On the zero-copy path the kernel beats PyTorch SDPA up to 2.27x
 Unlike the quantized path (fail-CLOSED: the compiled kernel IS the fast dequant
 kernel and the host path can't run it), FlashAttention is fail-OPEN: the host
 metallib path produces the SAME correct result, just slower. So any miss here
-(non-MPS, compile_shader unavailable, opt-out, or an error) returns False and the
-caller simply falls through to the host path -- never a wrong result, never a hard
-refusal.
+(non-MPS, compile_shader unavailable, opt-out, or a pre-invocation error) returns
+False. Once caller-workload invocation is attempted, errors propagate: replay
+could apply side effects twice, even when submission/completion is uncertain.
 
 Signature:
     dispatch_flash_attention(rt, descriptor, kernel_name, kargs, gridX, gridY, gridZ,
@@ -26,6 +26,9 @@ non-constexpr arg list (matches the kernel's [[buffer(i)]] order: Q,K,V,Out, 16
 strides, Z,H,N). The 2-D dispatch is threads=(gridX*tg, gridY, gridZ),
 group_size=(tg, 1, 1) -- exactly the (validated) native-grid launch.
 """
+
+
+from triton_msl.autotuning._submission import SubmissionState
 
 
 def _launch_grid_ok(grid, expected):
@@ -42,12 +45,13 @@ def _launch_grid_ok(grid, expected):
     return len(g) == 3 and len(e) == 3 and g == e
 
 
-def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """MLA (nope/rope) dispatch: concat the split QK tensors and run the qk=head_dim /
     v=v_head_dim kernel. descriptor = ('mla', msl, name, tg, q_nope, q_rope, k_nope,
     k_rope, v, out, Z, H, N) with the last 9 being indices into kargs. FAIL-CLOSED in the
     caller: a False here (non-MPS / bad shape / error) makes the driver refuse, since the
     qk=head_dim kernel's ABI differs from the @jit kernel's (the host path would mis-run)."""
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         import torch
 
@@ -120,14 +124,17 @@ def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, la
         o_t, o_st = views["out"][2], views["out"][1]
         buffers = [q, k, v_t, o_t] + list(q.stride()) + list(k.stride()) + list(v_st) + list(o_st) + [Z, H, N]
         lib = rt.get_library(msl)
+        _submission.begin()
         rt.dispatch(lib, name, buffers, threads=(n_qb * tg, Z * H, 1), group_size=(tg, 1, 1))
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             rt.mark_unsupported(descriptor[1])
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False
 
@@ -143,12 +150,14 @@ def dispatch_flash_attention(
     *,
     launch_exit_hook=None,
     launch_metadata=None,
+    submission_state=None,
 ):
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 10 and descriptor[0] == "mla":
             return _dispatch_mla(
                 rt, descriptor, kargs, grid=(gridX, gridY, gridZ),
-                launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
             )
         if not (isinstance(descriptor, (tuple, list)) and len(descriptor) >= 3 and descriptor[0] == "flash_attention"):
             return False
@@ -168,13 +177,16 @@ def dispatch_flash_attention(
         _dk = _pack_overflow_scalars(kargs) if len(kargs) > _MAX_METAL_BUFFERS else kargs
         # Native 2-D/3-D grid: gx*gy*gz threadgroups, tg threads each (in x).
         # threadgroup_position_in_grid -> (q_block, zh, 0); thread_index -> 0..tg-1.
+        _submission.begin()
         rt.dispatch(lib, kernel_name, _dk, threads=(gx * tg, gy, gz), group_size=(tg, 1, 1))
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             rt.mark_unsupported(descriptor[1])
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False

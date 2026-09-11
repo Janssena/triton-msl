@@ -298,7 +298,24 @@ def extract_msl_for_mlx(
         raw_body = re.sub(r"\s*uint\s+tpg_y\s*=\s*tpg3\.y\s*;\n?", "\n", raw_body)
         raw_body = re.sub(r"\s*uint\s+tpg_z\s*=\s*tpg3\.z\s*;\n?", "\n", raw_body)
 
-    body = "\n".join(preamble_lines) + "\n" + raw_body
+    # The original signature is discarded. Any surviving reference to one of
+    # its thread parameters must be supplied by OUR preamble, not by a caller's
+    # output-index hint. In particular pid_m=pid3.x and lid=_lid3.x are not the
+    # canonical decomposition spellings rewritten above (GitHub issue #2).
+    # Check the transformed body, and ignore quoted text before comments so a
+    # comment delimiter inside a string cannot alter the scan.
+    preamble = "\n".join(preamble_lines)
+    supplied = set(re.findall(r"\buint(?:3)?\s+(\w+)\s*=", preamble))
+    code = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*[\s\S]*?\*/', "", raw_body)
+    unresolved = sorted(name for name in thread_vars - supplied if re.search(r"\b" + re.escape(name) + r"\b", code))
+    if unresolved:
+        raise MetalNonRecoverableError(
+            "MLX route: extraction would discard live thread parameters "
+            + ", ".join(unresolved)
+            + "; their signature mapping is unsupported. Refusing before lazy shader construction."
+        )
+
+    body = preamble + "\n" + raw_body
 
     return MSLExtraction(
         kernel_name=kernel_name,

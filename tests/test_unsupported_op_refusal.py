@@ -2,9 +2,9 @@
 
 An unknown op with NO result (negative synthetic id — a store/atomic/scatter/cf
 variant the lowerer doesn't model) must REFUSE loudly, not be dropped silently
-(which would lose its side effect). An unknown op WITH a result is tolerated
-(its UNKNOWN_<id> result fails loud at MSL compile if consumed, or is harmless
-if dead), so it stays a comment.
+(which would lose its side effect). An unknown op WITH a result records an
+unsupported outcome at dispatch; emit_msl refuses by default even if it is dead.
+Consuming its undefined result refuses immediately at lookup.
 """
 
 import pytest
@@ -34,8 +34,7 @@ def test_no_result_unknown_op_refuses():
 
 
 def test_result_producing_unknown_op_does_not_refuse():
-    # A positive id == has a result; tolerated as a comment (fails loud only if
-    # consumed). Must NOT raise MetalNonRecoverableError.
+    # A positive id records the unsupported outcome without raising at dispatch.
     lo = _bare_lowerer()
     import triton_msl.codegen.msl_emitter as _m
 
@@ -50,11 +49,13 @@ def test_result_producing_unknown_op_does_not_refuse():
     __import__("platform").system() != "Darwin",
     reason="Metal backend requires macOS",
 )
-def test_scan_over_1024_elements_refuses():
-    """Regression: tl.cumsum / tl.associative_scan over a >1024-element tile must
-    refuse loudly. The scan stages one element per thread through threadgroup memory
-    and Metal caps a threadgroup at 1024 threads, so elements past 1024 are left
-    uninitialized -> silently-wrong result. A <=1024 scan stays correct."""
+def test_scan_over_1024_elements_uses_register_array():
+    """A >1024 scan uses multi-element ownership instead of dropping its tail.
+
+    This was the original safety pin for the one-element-per-thread lowering.  Keep
+    the node as the capability-transition check now that the unsafe path has been
+    replaced, rather than deleting the historical boundary or adding another test.
+    """
     import torch
     import triton
     import triton.language as tl
@@ -70,11 +71,13 @@ def test_scan_over_1024_elements_refuses():
     kscan[(1,)](a, o, BLOCK=1024)
     assert (o - a.cumsum(0)).abs().max().item() < 1e-3
 
-    # >1024 -> loud refusal (was a silent-wrong path: elements past 1024 dropped).
+    # >1024 now computes through the register-array path.  Before that path existed,
+    # elements past 1024 were unwritten; the interim guard refused this exact row.
     a2 = torch.randn(2048)
     o2 = torch.empty(2048)
-    with pytest.raises(MetalNonRecoverableError):
-        kscan[(1,)](a2, o2, BLOCK=2048)
+    kernel = kscan[(1,)](a2, o2, BLOCK=2048)
+    assert (o2 - a2.cumsum(0)).abs().max().item() < 1e-3
+    assert "scan_d <<= 1u" in kernel.asm["msl"]
 
 
 def test_generic_dot_refuses_large_tile():

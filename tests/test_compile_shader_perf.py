@@ -7,7 +7,7 @@ M4 Max). If this test fails, the fast-path is either not firing through the
 real Triton→driver path or measurement includes unexpected overhead.
 
 Run with:
-    pytest tests/test_compile_shader_perf.py -v
+    pytest tests/test_compile_shader_perf.py --project-lane=performance -p no:randomly -v
 """
 
 import os
@@ -57,6 +57,7 @@ def _vadd_perf(A, B, OUT, N, BLOCK: tl.constexpr):
 
 
 @requires_fast_path
+@pytest.mark.performance_sentinel
 def test_vector_add_fast_path_throughput():
     """vector_add@16M through compile_shader must achieve ≥ 250 GB/s."""
     N = 16 * 1024 * 1024

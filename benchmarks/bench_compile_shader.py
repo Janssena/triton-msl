@@ -10,14 +10,23 @@ Runs each measurement in a *separate subprocess* so the in-process JIT and
 Metal kernel cache are completely clean for each flag value.
 
 Usage:
-    rm -rf ~/.cache/triton_msl ~/.triton/cache
     python benchmarks/bench_compile_shader.py
+
+This legacy minimum-of-minima diagnostic is NOT the controlled, paired release
+claims gate. Per-child caches and complete stdout/stderr records are retained;
+caller cache paths are placement parents, never deletion targets.
 """
 
 import json
+import math
 import os
+from pathlib import Path
 import subprocess
 import sys
+
+# Direct-script execution uses the helper belonging to this repository checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from triton_msl.profiling.cache_session import fresh_cache_environment, private_directory
 
 # M4 Max memory bandwidth (GB/s)
 PEAK_BW = 546.0
@@ -166,33 +175,73 @@ sys.stdout.flush()
 # Orchestrator — spawns two child processes
 # ---------------------------------------------------------------------------
 
-def run_one_flag(flag: str) -> dict:
-    """Run the inner benchmark in a fresh process with the given flag."""
-    # Clear caches before each run
-    subprocess.run(["rm", "-rf", os.path.expanduser("~/.cache/triton_msl"),
-                    os.path.expanduser("~/.triton/cache")],
-                   check=False, capture_output=True)
-    env = os.environ.copy()
+def _retain_output(directory, rc, classification):
+    """Publish both streams on every exit path; retained files remain authoritative."""
+    stdout = (directory / "stdout.txt").read_text()
+    stderr = (directory / "stderr.txt").read_text()
+    print(stdout, end="")
+    print(stderr, end="", file=sys.stderr)
+    record = {"returncode": rc, "classification": classification,
+              "stderr_present": bool(stderr), "release_claim_qualified": False}
+    (directory / "exit.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(f"[benchmark evidence: {directory}; {classification}]")
+    return stdout, stderr
+
+
+def run_one_flag(flag: str, *, record_dir=None) -> dict:
+    """Run a legacy timing diagnostic with owned caches and retained process output."""
+    if flag not in {"0", "1"}:
+        raise ValueError("compile_shader flag must be 0 or 1")
+    directory = private_directory(record_dir, prefix=f"compile-shader-{flag}-")
+    env = fresh_cache_environment(os.environ)
     env["TRITON_MSL_COMPILE_SHADER"] = flag
-    # Remove any inherited value so the child sees only our flag
-    result = subprocess.run(
-        [sys.executable, "-c", _INNER],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
+    root = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = str(root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # A real retained file also lets Triton's JIT inspect kernel source. A -c
+    # child neither inherits this process's sys.path nor has inspectable source.
+    workload = directory / "workload.py"
+    workload.write_text(
+        "from pathlib import Path\nimport triton_msl\n"
+        f"assert Path(triton_msl.__file__).resolve() == Path({str(root / 'triton_msl/__init__.py')!r}), 'benchmark package identity mismatch'\n"
+        + _INNER
     )
+    command = [sys.executable, str(workload)]
+    (directory / "run.json").write_text(json.dumps({
+        "command": command, "caches": {k: v for k, v in env.items() if k in (
+            "TRITON_CACHE_DIR", "TRITON_MSL_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
+            "TORCH_EXTENSIONS_DIR", "CLANG_MODULE_CACHE_PATH")},
+        "compile_shader_flag": flag, "release_claim_qualified": False,
+        "expected_package": str(root / "triton_msl/__init__.py"),
+        "measurement": "Legacy min-of-minima; no correctness/route/thermal qualification",
+    }, indent=2) + "\n")
+    try:
+        with (directory / "stdout.txt").open("x") as stdout, (directory / "stderr.txt").open("x") as stderr:
+            result = subprocess.run(command, env=env, stdout=stdout, stderr=stderr, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        _retain_output(directory, None, "TIMEOUT")
+        raise
+    except OSError:
+        _retain_output(directory, None, "SPAWN_FAILED")
+        raise
     if result.returncode != 0:
-        print(f"[bench flag={flag}] STDERR:\n{result.stderr}", file=sys.stderr)
-        raise RuntimeError(f"Inner process exited {result.returncode}")
-    # The last line of stdout is the JSON payload
-    lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
-    for line in reversed(lines):
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    raise RuntimeError(f"No JSON found in output:\n{result.stdout}")
+        _retain_output(directory, result.returncode, "PROCESS_FAILED")
+        raise RuntimeError(f"Inner process exited {result.returncode}; evidence: {directory}")
+    try:
+        lines = (directory / "stdout.txt").read_text().strip().splitlines()
+        payload = json.loads(lines[-1])
+        if not isinstance(payload, dict) or set(payload) != {"vector_add", "elementwise", "softmax", "reduction"}:
+            raise ValueError("Missing or unexpected benchmark rows")
+        for row in payload.values():
+            for key in ("ms", "gbps"):
+                value = row[key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"Invalid benchmark {key}")
+    except (ValueError, IndexError, KeyError, TypeError):
+        _retain_output(directory, result.returncode, "INVALID_RESULT")
+        raise
+    classification = "UNQUALIFIED_TIMING_WITH_STDERR" if (directory / "stderr.txt").stat().st_size else "UNQUALIFIED_TIMING"
+    _retain_output(directory, result.returncode, classification)
+    return payload
 
 
 def fmt_row(name, on, off):
@@ -211,6 +260,7 @@ def fmt_row(name, on, off):
 def main():
     print("=" * 100)
     print("compile_shader zero-copy fast-path benchmark")
+    print("UNQUALIFIED legacy timing diagnostic: not a release claims gate")
     print(f"Peak bandwidth: {PEAK_BW} GB/s (M4 Max)")
     print("=" * 100)
 

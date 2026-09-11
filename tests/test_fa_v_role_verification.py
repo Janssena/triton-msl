@@ -146,11 +146,19 @@ def _varlen_v_transform(
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
         v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
+        if MODE == 2:
+            # A pointer-valued select is legal for ordinary loads.  When the
+            # selected load feeds a cooperatively staged dot operand, codegen
+            # must either reconstruct every staged address exactly or refuse.
+            k_as_v_ptrs = K + (k_start + kn)[:, None] * stride_kt + off_h * stride_kh + offs_d[None, :] * stride_kd
+            v_ptrs = tl.where(off_h == 0, v_ptrs, k_as_v_ptrs)
         v = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         if MODE == 0:
             v_operand = v + k
-        else:
+        elif MODE == 1:
             v_operand = tl.trans(v)
+        else:
+            v_operand = v
         acc += tl.dot(p.to(tl.float32), v_operand.to(tl.float32))
         m_i = m_new
     acc = acc / l_i[:, None]
@@ -284,3 +292,21 @@ def test_fa_v_transpose_is_correct_or_refuses():
     ref = _ref_varlen(q, k, transposed_v, cu, cu, H, D, scale)
     err = (out - ref).abs().max().item()
     assert err < 1e-3, f"FA template dropped transpose on V: err {err}"
+
+
+@requires_mps
+def test_fa_v_selected_pointer_cooperative_staging_computes():
+    """Cooperative staging rebuilds both arms rather than collapsing to offset 0."""
+    from test_varlen_fa_routing import _ref_varlen
+
+    H, D = 2, 64
+    scale = 1.0 / math.sqrt(D)
+    q, k, v, out, cu = _run_v_transform(2, [64], H, D, scale)
+
+    # Head 0 selects V; head 1 selects K.  The source oracle is independent
+    # of the selected pointer expression and therefore catches any staged
+    # address collapse even when the resulting shader remains well formed.
+    source_v = torch.stack((v[:, 0], k[:, 1]), dim=1)
+    ref = _ref_varlen(q, k, source_v, cu, cu, H, D, scale)
+    err = (out - ref).abs().max().item()
+    assert err < 1e-3, f"cooperative staging changed selected-pointer semantics: err {err}"

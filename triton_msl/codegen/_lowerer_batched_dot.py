@@ -7,12 +7,48 @@ literal-zero accumulator before the template replays the operation.  A rank-3
 shape alone is never enough to select this path.
 """
 
-from triton_msl.codegen.mlir_walker import _extract_shape
 from triton_msl.codegen.msl_emitter import _sanitize_msl_name
 from triton_msl.codegen.msl_types import triton_type_to_msl
 
 
 class _BatchedDotMixin:
+    def _batched_dot_dtype(self, value_id, *, pointer=False):
+        """Use one checked native dtype authority for admission and emission.
+
+        A legacy element label is not evidence of the native width or of a
+        pointer's pointee. Check the complete representation before handing
+        its spelling to the existing fragment/type emitters.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        facts = self._native_value_facts(value_id, op_name="tt.dot")
+        if pointer:
+            if (
+                facts.kind != "pointer" or facts.is_tensor or facts.shape != ()
+                or facts.address_space != 1 or facts.pointee is None
+            ):
+                raise MetalNonRecoverableError(
+                    "batched-dot native dtype requires a scalar device pointer",
+                    op_name="tt.dot",
+                )
+            facts = facts.pointee
+            if facts.is_tensor or facts.shape != () or facts.unknown_reason is not None:
+                raise MetalNonRecoverableError(
+                    "batched-dot native dtype has an invalid pointee", op_name="tt.dot",
+                )
+        signatures = {
+            "f16": ("float", 16, None), "bf16": ("float", 16, None),
+            "f32": ("float", 32, None), "f64": ("float", 64, None),
+            "i1": ("integer", 1, None), "i8": ("integer", 8, None),
+            "i16": ("integer", 16, None), "i32": ("integer", 32, None),
+            "i64": ("integer", 64, None),
+        }
+        if signatures.get(facts.elem) != (facts.kind, facts.width, facts.signed):
+            raise MetalNonRecoverableError(
+                "batched-dot native dtype is unsupported or contradictory", op_name="tt.dot",
+            )
+        return facts.elem
+
     _BATCHED_DOT_ALLOWED_OPS = frozenset(
         {
             "arith.constant",
@@ -106,7 +142,7 @@ class _BatchedDotMixin:
                 if stride_side is None:
                     return None
                 stride_arg = arg_by_id[sides[stride_side][1].operand_ids[0]]
-                if stride_arg.elem_type != "i32":
+                if self._batched_dot_dtype(stride_arg.id) != "i32":
                     # The emitted scalar ABI is an MSL ``int``.  Accepting an
                     # i64 source stride would truncate it before address
                     # replay, so keep that surface fail-closed.
@@ -115,7 +151,7 @@ class _BatchedDotMixin:
                 index_id = sides[1 - stride_side][0]
                 term = sides[1 - stride_side][1]
 
-            shape = tuple(_extract_shape(term.type_str or "") or ())
+            shape = self._native_shape(term.id, op_name="tt.dot")
             if len(shape) != 3:
                 return None
             varying = [i for i, extent in enumerate(shape) if extent != 1]
@@ -174,7 +210,7 @@ class _BatchedDotMixin:
             bounds = (int(index.attrs.get("start")), int(index.attrs.get("end")))
         except (TypeError, ValueError):
             return None
-        if bounds != (0, total) or tuple(_extract_shape(index.type_str or "") or ()) != (total,):
+        if bounds != (0, total) or self._native_shape(index.id, op_name="tt.dot") != (total,):
             return None
         return {addptr.id, base.id, index.id}
 
@@ -202,9 +238,9 @@ class _BatchedDotMixin:
         dot = dots[0]
         if len(dot.operand_ids or []) != 3:
             return None
-        a_shape = tuple(_extract_shape(self._find_op_type_str(dot.operand_ids[0]) or "") or ())
-        b_shape = tuple(_extract_shape(self._find_op_type_str(dot.operand_ids[1]) or "") or ())
-        c_shape = tuple(_extract_shape(dot.type_str or "") or ())
+        a_shape = self._native_shape(dot.operand_ids[0], op_name="tt.dot")
+        b_shape = self._native_shape(dot.operand_ids[1], op_name="tt.dot")
+        c_shape = self._native_shape(dot.id, op_name="tt.dot")
         if (
             len(a_shape) != 3
             or a_shape != b_shape
@@ -256,10 +292,8 @@ class _BatchedDotMixin:
                 if current.op == "tt.reshape":
                     if len(current.operand_ids or []) != 1:
                         return None
-                    src_shape = tuple(
-                        _extract_shape(self._find_op_type_str(current.operand_ids[0]) or "") or ()
-                    )
-                    dst_shape = tuple(_extract_shape(current.type_str or "") or ())
+                    src_shape = self._native_shape(current.operand_ids[0], op_name="tt.dot")
+                    dst_shape = self._native_shape(current.id, op_name="tt.dot")
                     if (
                         src_shape not in permitted_shapes
                         or dst_shape not in permitted_shapes
@@ -274,10 +308,8 @@ class _BatchedDotMixin:
                 if current.op == "tt.trans":
                     if transposed or len(current.operand_ids or []) != 1:
                         return None
-                    src_shape = tuple(
-                        _extract_shape(self._find_op_type_str(current.operand_ids[0]) or "") or ()
-                    )
-                    dst_shape = tuple(_extract_shape(current.type_str or "") or ())
+                    src_shape = self._native_shape(current.operand_ids[0], op_name="tt.dot")
+                    dst_shape = self._native_shape(current.id, op_name="tt.dot")
                     rank = len(src_shape)
                     order = self._parse_trans_order(current, rank)
                     expected = list(range(rank - 2)) + [rank - 1, rank - 2]
@@ -294,7 +326,7 @@ class _BatchedDotMixin:
                     continue
                 if current.op != "tt.load" or len(current.operand_ids or []) != 1:
                     return None
-                if not saw_reshape or tuple(_extract_shape(current.type_str or "") or ()) != (total,):
+                if not saw_reshape or self._native_shape(current.id, op_name="tt.dot") != (total,):
                     return None
                 matches = []
                 for arg in ptr_args:
@@ -317,7 +349,13 @@ class _BatchedDotMixin:
             return None
         a_arg, trans_a, a_claimed = a_path
         b_arg, trans_b, b_claimed = b_path
-        if a_arg.id == b_arg.id or a_arg.elem_type != "bf16" or b_arg.elem_type != "bf16":
+        if (
+            a_arg.id == b_arg.id
+            or self._batched_dot_dtype(a_arg.id, pointer=True) != "bf16"
+            or self._batched_dot_dtype(b_arg.id, pointer=True) != "bf16"
+        ):
+            return None
+        if any(self._batched_dot_dtype(load.id) != "bf16" for load in loads):
             return None
         claimed.update(a_claimed)
         claimed.update(b_claimed)
@@ -326,7 +364,11 @@ class _BatchedDotMixin:
         if len(store.operand_ids or []) != 2:
             return None
         output_args = [arg for arg in ptr_args if arg.id not in (a_arg.id, b_arg.id)]
-        if len(output_args) != 1 or output_args[0].elem_type != "f32" or dot.elem_type != "f32":
+        if (
+            len(output_args) != 1
+            or self._batched_dot_dtype(output_args[0].id, pointer=True) != "f32"
+            or self._batched_dot_dtype(dot.id) != "f32"
+        ):
             return None
         c_arg = output_args[0]
         address_claimed = self._flat_contiguous_address(store.operand_ids[0], c_arg, op_by_id, total)
@@ -344,15 +386,13 @@ class _BatchedDotMixin:
             if current is None or len(current.operand_ids or []) != 1:
                 return None
             if current.op == "tt.reshape":
-                src_shape = tuple(
-                    _extract_shape(self._find_op_type_str(current.operand_ids[0]) or "") or ()
-                )
-                dst_shape = tuple(_extract_shape(current.type_str or "") or ())
+                src_shape = self._native_shape(current.operand_ids[0], op_name="tt.dot")
+                dst_shape = self._native_shape(current.id, op_name="tt.dot")
                 if saw_output_reshape or src_shape != (batch, 32, 32) or dst_shape != (total,):
                     return None
                 saw_output_reshape = True
             elif current.op == "ttg.convert_layout":
-                if tuple(_extract_shape(current.type_str or "") or ()) != (total,):
+                if self._native_shape(current.id, op_name="tt.dot") != (total,):
                     return None
             else:
                 return None
@@ -413,9 +453,9 @@ class _BatchedDotMixin:
         if len(dot.operand_ids or []) != 3:
             return None
 
-        a_shape = tuple(_extract_shape(self._find_op_type_str(dot.operand_ids[0]) or "") or ())
-        b_shape = tuple(_extract_shape(self._find_op_type_str(dot.operand_ids[1]) or "") or ())
-        c_shape = tuple(_extract_shape(dot.type_str or "") or ())
+        a_shape = self._native_shape(dot.operand_ids[0], op_name="tt.dot")
+        b_shape = self._native_shape(dot.operand_ids[1], op_name="tt.dot")
+        c_shape = self._native_shape(dot.id, op_name="tt.dot")
         if len(a_shape) != 3 or len(b_shape) != 3 or len(c_shape) != 3:
             return None
         batch_dims = a_shape[:-2]
@@ -459,9 +499,11 @@ class _BatchedDotMixin:
         b_load = _operand_load(dot.operand_ids[1])
         if a_load is None or b_load is None or {a_load.id, b_load.id} != {load.id for load in loads}:
             return None
-        if a_load.elem_type != a_arg.elem_type or b_load.elem_type != b_arg.elem_type:
+        a_dtype = self._batched_dot_dtype(a_arg.id, pointer=True)
+        b_dtype = self._batched_dot_dtype(b_arg.id, pointer=True)
+        if self._batched_dot_dtype(a_load.id) != a_dtype or self._batched_dot_dtype(b_load.id) != b_dtype:
             return None
-        if a_arg.elem_type != b_arg.elem_type or a_arg.elem_type not in ("f16", "f32", "i8"):
+        if a_dtype != b_dtype or a_dtype not in ("f16", "f32", "i8"):
             return None
 
         consumers = {}
@@ -485,10 +527,11 @@ class _BatchedDotMixin:
             current = use.id
         else:
             return None
-        if dot.elem_type != c_arg.elem_type:
+        c_dtype = self._batched_dot_dtype(c_arg.id, pointer=True)
+        if self._batched_dot_dtype(dot.id) != c_dtype:
             return None
-        if a_arg.elem_type == "i8" and (
-            c_arg.elem_type != "i32" or k * 128 * 128 >= 2**24
+        if a_dtype == "i8" and (
+            c_dtype != "i32" or k * 128 * 128 >= 2**24
         ):
             # Apple has no signed-int8 simdgroup fragment here.  Float MMA is
             # nevertheless bit-exact for the admitted K=32/64 envelope: int8
@@ -549,8 +592,10 @@ class _BatchedDotMixin:
         for extent in info["batch_dims"]:
             batch *= extent
         a_arg, b_arg, c_arg = info["a_arg"], info["b_arg"], info["c_arg"]
-        acc_frag, in_frag, tg_type, stage_cast, pad = self._simdgroup_frag_for(a_arg.elem_type)
-        output_type = triton_type_to_msl(c_arg.elem_type)
+        acc_frag, in_frag, tg_type, stage_cast, pad = self._simdgroup_frag_for(
+            self._batched_dot_dtype(a_arg.id, pointer=True)
+        )
+        output_type = triton_type_to_msl(self._batched_dot_dtype(c_arg.id, pointer=True))
         scalar_names = {arg.name for arg in self.graph.args if not arg.is_ptr}
         arg_indices = {arg.id: i for i, arg in enumerate(self.graph.args)}
         arg_name_indices = {arg.name: i for i, arg in enumerate(self.graph.args)}
@@ -602,7 +647,7 @@ class _BatchedDotMixin:
         declarations = []
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
-                msl_type = triton_type_to_msl(arg.elem_type)
+                msl_type = triton_type_to_msl(self._batched_dot_dtype(arg.id, pointer=True))
                 const = "const " if arg.id != c_arg.id else ""
                 declarations.append(f"    device {const}{msl_type}* {arg.name} [[buffer({i})]]")
             else:

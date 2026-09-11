@@ -248,31 +248,10 @@ class MetalUtils:
 
         pipeline_state, error = self.device.newComputePipelineStateWithFunction_error_(function, None)
         if error is not None:
-            # Pipeline-state creation can fail for resource reasons
-            # (threadgroup memory > 32 KB, register pressure, compiler
-            # complexity limit) or genuinely malformed code. Triton\'s
-            # autotuner catches ``OutOfResources`` to silently skip
-            # configs that don\'t fit; without translating these errors
-            # the autotuner aborts on the first oversized config
-            # instead of moving on. Detect resource-style failures by
-            # the error\'s description and raise ``OutOfResources`` so
-            # the autotuner can continue.
-            err_str = str(error).lower()
-            resource_markers = (
-                "internal error",  # AGXMetalG16X Code=3
-                "threadgroup memory",
-                "out of memory",
-                "register",
-                "too large",
-                "exceeds",
-            )
-            if any(m in err_str for m in resource_markers):
-                try:
-                    from triton.runtime.errors import OutOfResources
-
-                    raise OutOfResources(0, 0, f"pipeline state: {error}")
-                except ImportError:
-                    raise RuntimeError(f"Failed to create pipeline state: {error}")
+            # Free-form diagnostics (including "internal error" or "exceeds")
+            # do not prove resource exhaustion. Translating them would let the
+            # autotuner hide compiler defects. Only typed, numeric capacity
+            # checks upstream are prunable; unclassified pipeline errors stay loud.
             raise RuntimeError(f"Failed to create pipeline state: {error}")
 
         n_max_threads = pipeline_state.maxTotalThreadsPerThreadgroup()
@@ -491,6 +470,14 @@ def _compile_shader_scalars_ok(launcher, kargs) -> bool:
                 return False  # tuple/aggregate scalar — uncertain, fall back
             if sig not in _COMPILE_SHADER_SAFE_SCALAR_SIGS:
                 return False  # unknown or unsafe scalar type (fp16/bf16/...) -> fall back
+            # A declaration alone does not determine the raw Python argument's
+            # representation in compile_shader. In particular, int/bool supplied
+            # to an explicitly fp32 IRSource would bind integer bits, not 1.0f.
+            if sig == "fp32" and type(a) is not float:
+                return False
+            from triton_msl.backend._launch_signature import scalar_bytes
+
+            scalar_bytes(a, sig)  # prove representability, never truncate by guess
         return True
     except Exception:
         return False  # any resolution failure -> conservative fall back
@@ -541,9 +528,17 @@ class MetalLauncher:
     """
 
     def __init__(self, src, metadata):
+        from triton_msl.backend._cache_contract import validate_execution_contract, install_jit_policy_guard
+
+        self._execution_contract = validate_execution_contract(getattr(metadata, "execution_contract", None))
+        from triton_msl.backend._launch_contract import validate_launch_metadata
+
+        self._packed_contract = validate_launch_metadata(metadata)
+        install_jit_policy_guard(getattr(src, "fn", None), self._execution_contract)
         self.constants = src.constants if hasattr(src, "constants") else {}
-        self.arg_names = src.fn.arg_names if hasattr(src, "fn") else []
-        self.signature = src.signature if hasattr(src, "signature") else {}
+        from triton_msl.backend._launch_signature import ordered_source_signature
+
+        self.arg_names, self.signature = ordered_source_signature(src)
         # Identify constexpr arg indices — these are compiled into the kernel
         # and must NOT be packed as Metal buffers at launch time.
         self.constexpr_indices = set()
@@ -594,6 +589,22 @@ class MetalLauncher:
         launch_exit_hook,
         *args,
     ):
+        # This also runs for an already-resident JIT handle whose outer lookup
+        # bypassed backend.hash(). It precedes launch hooks and runtime/pipeline
+        # access. Packed-descriptor/argument ABI validation is a separate layer.
+        from triton_msl.backend._cache_contract import validate_execution_contract
+
+        validate_execution_contract(getattr(self, "_execution_contract", None))
+        from triton_msl.backend._launch_contract import validate_packed_launch
+
+        kernel_metadata = validate_packed_launch(kernel_metadata, getattr(self, "_packed_contract", None))
+        from triton_msl.backend._launch_signature import bind_arguments
+
+        flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments(args, self.arg_names, self.signature)
+        if kernel_metadata[4] is not None and any(i >= len(flat_args) for i in kernel_metadata[4]):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError("source signature: output index is outside the constexpr-free argument list")
         import ctypes
 
         if launch_enter_hook:
@@ -611,7 +622,7 @@ class MetalLauncher:
         block_size = kernel_metadata[3] if kernel_metadata and len(kernel_metadata) > 3 else num_warps * 32
         needs_2d_grid = kernel_metadata[5] if kernel_metadata and len(kernel_metadata) > 5 else False
 
-        # compile_shader zero-copy fast-path (Phase 4). Purely additive: any
+        # compile_shader zero-copy fast-path (Phase 4). A PRE-invocation
         # failure or ineligibility falls through to the existing (correct)
         # host-round-trip driver path below. A wrong result here is the one
         # unacceptable outcome, so eligibility is CONSERVATIVE — fire only for
@@ -619,10 +630,14 @@ class MetalLauncher:
         # types) and fall back on anything uncertain. NEVER silent-wrong.
         #
         # The entire attempt (runtime acquisition + checks + dispatch) is inside
-        # one try/except: on ANY exception we fall through to the existing path,
-        # marking the MSL unsupported only when it is known.
+        # one try/except, with monotonic state shared by every nested helper.
+        # After attempted invocation, exceptions cannot trigger fallback/replay,
+        # even when a return callback raises after the helper's own try completes.
         import os as _os
+        import torch as _torch
+        from triton_msl.autotuning._submission import SubmissionState
 
+        _submission = SubmissionState()
         fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
         quant_matmul = kernel_metadata[8] if (kernel_metadata and len(kernel_metadata) > 8) else None
         flash_attention = kernel_metadata[9] if (kernel_metadata and len(kernel_metadata) > 9) else None
@@ -648,7 +663,9 @@ class MetalLauncher:
                     kargs = [a for i, a in enumerate(args) if i not in self.constexpr_indices]
                     tensors = [a for a in kargs if hasattr(a, "data_ptr")]
                     all_mps = bool(tensors) and all(
-                        getattr(a, "device", None) is not None and str(a.device).startswith("mps") for a in tensors
+                        # TensorWrapper has data_ptr/device but compile_shader cannot
+                        # bind it. This is eligibility, not an ambiguous dispatch retry.
+                        isinstance(a, _torch.Tensor) and str(a.device).startswith("mps") for a in tensors
                     )
 
                     # --- Quantized-matmul dispatch (compile_shader-only) ---
@@ -661,7 +678,7 @@ class MetalLauncher:
 
                         if dispatch_quant_matmul(
                             _rt, quant_matmul, kargs, grid=(gridX, gridY, gridZ),
-                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
                         ):
                             return
 
@@ -675,7 +692,7 @@ class MetalLauncher:
 
                         if dispatch_fast_matmul(
                             _rt, fast_matmul, kargs, grid=(gridX, gridY, gridZ),
-                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
                         ):
                             return
 
@@ -698,7 +715,7 @@ class MetalLauncher:
                             gridY,
                             gridZ,
                             launch_exit_hook=launch_exit_hook,
-                            launch_metadata=launch_metadata,
+                            launch_metadata=launch_metadata, submission_state=_submission,
                         ):
                             return
 
@@ -731,12 +748,25 @@ class MetalLauncher:
                             # >31 args -> the MSL packs scalars into one buffer; pack the
                             # dispatch args to match (issue #4.7).
                             _dk = _pack_overflow_scalars(kargs) if len(kargs) > _MAX_METAL_BUFFERS else kargs
+                            _assert_desc = kernel_metadata[11]
+                            if _assert_desc is not None:
+                                from ._device_assert import check_binding, check_failure
+                                import torch as _assert_torch
+                                check_binding(_dk, _assert_desc)
+                                # Fresh per invocation; neither a failed launch nor
+                                # another concurrent launch can poison this flag.
+                                _assert_flag = _assert_torch.zeros(1, dtype=_assert_torch.int32, device='mps')
+                                _dk = list(_dk) + [_assert_flag]
+                            _submission.begin()
                             _rt.dispatch(lib, self.kernel_name, _dk, threads=threads, group_size=group_size)
+                            if _assert_desc is not None:
+                                check_failure(int(_assert_flag.cpu().item()), _assert_desc)
                             if launch_exit_hook:
                                 launch_exit_hook(launch_metadata)
                             return
-            except Exception:
-                # Any failure -> mark unsupported (when MSL is known) + fall
+            except Exception as _error:
+                _submission.reraise_if_attempted(_error)
+                # Only a pre-invocation failure can mark unsupported and fall
                 # through to the existing driver path (correct, just slower).
                 try:
                     if self._msl is not None:
@@ -801,7 +831,7 @@ class MetalLauncher:
         # has one packed scalar buffer, not one per scalar. The host round-trip path below
         # binds one buffer per arg and cannot match that signature, so packed kernels run
         # only via compile_shader (MPS tensors, 1-D grid). Refuse here rather than mis-bind.
-        _n_nonconstexpr = sum(1 for i in range(len(args)) if i not in self.constexpr_indices)
+        _n_nonconstexpr = len(flat_args)
         if _n_nonconstexpr > _MAX_METAL_BUFFERS:
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -835,39 +865,8 @@ class MetalLauncher:
         # dot-indexed names (e.g. `Ptrs.0`, `Ptrs.1`), so the launcher must
         # emit one Metal buffer per leaf element. Per-element signatures are
         # pulled from the top-level tuple signature (e.g. `('*fp32',)`).
-        def _flatten_arg(arg, sig):
-            """Yield (leaf_arg, leaf_sig) pairs in Triton flatten order.
-
-            `sig` may be None (unknown), a scalar string (e.g. 'i32',
-            '*fp32', 'constexpr'), or a tuple matching the structure of
-            `arg`. Nested tuples on either side are flattened together.
-            """
-            if isinstance(arg, tuple):
-                # Signature may be a tuple of per-element sigs; else None.
-                sig_tuple = sig if isinstance(sig, tuple) else None
-                for i, elem in enumerate(arg):
-                    elem_sig = sig_tuple[i] if (sig_tuple is not None and i < len(sig_tuple)) else None
-                    yield from _flatten_arg(elem, elem_sig)
-            else:
-                yield arg, sig
-
-        flat_args = []  # list of leaf args in flattened order
-        flat_sigs = []  # parallel list of per-leaf signature strings
-        flat_origin = []  # original top-level arg index for each leaf
-        for orig_idx, arg in enumerate(args):
-            sig_ty = None
-            if orig_idx < len(self.arg_names):
-                sig_ty = self.signature.get(self.arg_names[orig_idx])
-            # Fully-constexpr tuple (e.g. `('constexpr',)`) is compiled
-            # into the kernel — skip it entirely.
-            if isinstance(arg, tuple) and isinstance(sig_ty, tuple) and all(s == "constexpr" for s in sig_ty):
-                continue
-            if orig_idx in self.constexpr_indices:
-                continue
-            for leaf, leaf_sig in _flatten_arg(arg, sig_ty):
-                flat_args.append(leaf)
-                flat_sigs.append(leaf_sig)
-                flat_origin.append(orig_idx)
+        # Source-ordered leaves were bound and validated before launch hooks.
+        # Nested constexpr leaves are absent, exactly like TTGIR arguments.
 
         output_arg_indices = None
         if kernel_metadata and len(kernel_metadata) > 4 and kernel_metadata[4] is not None:
@@ -1226,68 +1225,14 @@ class MetalLauncher:
                         pool_releases.append((metal_buf, aligned_mem, size_class))
                         if is_output:
                             tensor_copies.append((metal_buf, arg, nbytes, None, None))
-            elif isinstance(arg, bool):
-                buf = pool.acquire_scalar(4)
-                view = buf.contents().as_buffer(4)
-                struct.pack_into("i", view, 0, int(arg))
+            elif isinstance(arg, (bool, int, float)):
+                payload = scalar_payloads[arg_idx]
+                size = len(payload)
+                buf = pool.acquire_scalar(size)
+                view = buf.contents().as_buffer(size)
+                view[:size] = payload
                 buffers.append((buf, 0))
-                pool_releases.append(("scalar", buf, 4))
-            elif isinstance(arg, int):
-                if arg > 0x7FFFFFFFFFFFFFFF:
-                    buf = pool.acquire_scalar(8)
-                    view = buf.contents().as_buffer(8)
-                    struct.pack_into("Q", view, 0, arg)  # uint64_t
-                elif arg < -(1 << 31) or arg > 0xFFFFFFFF:
-                    buf = pool.acquire_scalar(8)
-                    view = buf.contents().as_buffer(8)
-                    struct.pack_into("q", view, 0, arg)  # int64_t
-                elif arg < 0:
-                    buf = pool.acquire_scalar(4)
-                    view = buf.contents().as_buffer(4)
-                    struct.pack_into("i", view, 0, arg)  # int32_t (signed)
-                else:
-                    buf = pool.acquire_scalar(4)
-                    view = buf.contents().as_buffer(4)
-                    struct.pack_into("I", view, 0, arg)  # uint32_t
-                buffers.append((buf, 0))
-                sz = 8 if (arg > 0x7FFFFFFFFFFFFFFF or arg < -(1 << 31) or arg > 0xFFFFFFFF) else 4
-                pool_releases.append(("scalar", buf, sz))
-            elif isinstance(arg, float):
-                # Determine the declared scalar float width from the kernel
-                # signature so that bf16/fp16 scalar args are marshalled as
-                # 2 bytes (matching MSL `half&` / `bfloat&` parameters)
-                # instead of being silently packed as 4-byte fp32.
-                sig_ty = flat_sigs[arg_idx]
-                if sig_ty == "fp16":
-                    buf = pool.acquire_scalar(2)
-                    view = buf.contents().as_buffer(2)
-                    # struct 'e' = IEEE 754 binary16 (fp16)
-                    struct.pack_into("e", view, 0, arg)
-                    buffers.append((buf, 0))
-                    pool_releases.append(("scalar", buf, 2))
-                elif sig_ty == "bf16":
-                    buf = pool.acquire_scalar(2)
-                    view = buf.contents().as_buffer(2)
-                    # bf16 = upper 16 bits of fp32 (with round-to-nearest-even).
-                    # Using torch's conversion keeps nan/inf/denorm handling
-                    # consistent with the rest of the backend.
-                    import torch as _torch_bf16
-
-                    bf16_bits = (
-                        _torch_bf16.tensor([arg], dtype=_torch_bf16.float32)
-                        .to(_torch_bf16.bfloat16)
-                        .view(_torch_bf16.int16)
-                        .item()
-                    )
-                    struct.pack_into("h", view, 0, bf16_bits)
-                    buffers.append((buf, 0))
-                    pool_releases.append(("scalar", buf, 2))
-                else:
-                    buf = pool.acquire_scalar(4)
-                    view = buf.contents().as_buffer(4)
-                    struct.pack_into("f", view, 0, arg)
-                    buffers.append((buf, 0))
-                    pool_releases.append(("scalar", buf, 4))
+                pool_releases.append(("scalar", buf, size))
             elif arg is None:
                 # Optional pointer argument (mask, other, scale) — pack as null.
                 buf = pool.acquire_scalar(8)
@@ -1333,7 +1278,16 @@ class MetalLauncher:
                     dispatch_fn = function
 
         # Immediate mode: dispatch, wait, copy-back
+        _assert_desc = kernel_metadata[11]
+        if _assert_desc is not None:
+            from ._device_assert import check_binding, check_failure
+            check_binding(buffers, _assert_desc)
+            _assert_buffer = utils.make_buffer_with_data(bytes(4), 4)
+            buffers.append((_assert_buffer, 0))
         utils.launch(dispatch_fn, grid, threadgroup_size, buffers)
+
+        if _assert_desc is not None:
+            check_failure(int.from_bytes(_assert_buffer.contents().as_buffer(4), 'little'), _assert_desc)
 
         # Copy results back from Metal buffers to tensor memory.
         for entry in tensor_copies:

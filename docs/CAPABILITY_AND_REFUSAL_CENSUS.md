@@ -1,0 +1,160 @@
+# Capability & refusal evidence register — 0.3.0 release candidate
+
+triton-msl follows a **correct-or-refuse** contract: a kernel it accepts is meant to compute
+correctly, and one it cannot prove it can lower safely raises `MetalNonRecoverableError` rather
+than returning a wrong answer. This repository-only document records scoped capability and transition evidence. It is not an
+exhaustive paired before/after census of all kernels or a claim that every refusal has been probed.
+`MANIFEST.in` prunes `docs/`; release-facing limitations must also appear in the actual delivered materials.
+
+> **Scope note.** Capability rows cite the specific evidence that established them. The reviewed
+> dispatch, grouped-matmul and #8/#9 changes coexist with 479/483/485/489/493 in rc4. Historical
+> sibling evidence is identified below; it does not imply combined-tree validation. The exact
+> combined project/upstream gates and final artifact acceptance remain required.
+
+---
+
+## Part 1 — Verified working (capability map)
+
+| capability | evidence | executed route |
+|---|---|---|
+| element-wise (vector add) via compile_shader | exact | `vadd` |
+| fast matmul fp32 / fp16 | exact vs fp64 ref | `simdgroup_matmul_fast` |
+| int8 weight-only matmul | 3.05e-05 | `int8_matmul_fast` |
+| FlashAttention forward (MPS + host-tensor paths) | 4–6e-7 | tiled / host-marshalling |
+| biased / triangle attention (masked, `-inf`) | 4.8–7.2e-7 | `_biased_fa` |
+| NaN-row locality (row-local, no cross-contamination) | bitwise | — |
+| reduce (sum, max), cumsum, atomic_add | 6e-6 – 1e-5 | — |
+| signed-zero-preserving sum | `-0.0` retained | — |
+| grouped matmul (canonical signed-i32 cdiv mapping) | exact vs fp64, incl. partial grid | native coordinate-preserving template; evidence 459, integrated 475 |
+| equal Q64/K64, noncausal, HEAD_DIM=64 | fp16 2.44e-4; fp32 5.96e-7 | native launch witnessed in sibling 459; census 461 |
+| separate Q32/K64, HEAD_DIM=64 | fp32 only tested, causal/noncausal ≤5.75e-7 | native launch witnessed in sibling 459; census 461 |
+| separate Q8/K128, HEAD_DIM=64, BM=BN=32 | fp32 noncausal, 2.38e-7 | native launch witnessed in sibling 459; census 461 |
+
+Full upstream conformance on predecessor 479: 5,780 passed / 3,562 skipped, all statuses
+baseline-identical (9,342 nodes, zero failures). That run includes #8/#9 and assertion support,
+but predates 483/485/489/493. The final rc4 combined re-run remains owed.
+
+Current development recoveries (focused GPU and lowering-boundary evidence, final gates pending):
+
+| workload | qualified development envelope | pins |
+|---|---|---|
+| PR6 N-fastest flat-grid matmul | exact signed-i32 coordinate proof; source grid retained | `test_flat_matmul_mapping.py` |
+| Issue11 runtime alpha/beta, K-loop and column bias | fp32 32×32×32 tiles; partial output grids | `test_loop_matmul_epilogue.py`, `test_template_scalar_abi.py` |
+| PR7 independent query/key lengths, folded Q1 | fp16/fp32; 32-row generic and 8-/16-row tiled source spelling; widened P/V dot | `test_q1_decode_boundary.py` |
+| PR7 bias without LSE | 32×32 tiles, D32/64, fp16/fp32, independent lengths, causal/noncausal, strided bias | `test_biased_decode_replay.py` |
+
+---
+
+## Part 2 — Refusal-transition census (A)
+
+The rows below distinguish observed repairs, tighter rejection, and remaining capability limits.
+A census-only computation is not a recovery without a same-source baseline observation. "Pinned in" names the tree
+that carries the regression test; reviewer-sibling results remain attributed to their original
+tree until the combined gates complete.
+
+### 2a. RECOVERED — refusal (or silent-wrong) → computes the source
+
+| what | before | after | evidence / packet | pinned in |
+|---|---|---|---|---|
+| trifast #1 renamed reduction axis (K-by-name dropped the K-loop) | silent-wrong (err 23.8) | structural `scf.for` upper-bound trace | commit `5b8f815` | committed lineage (`test_issue4_trifast.py`) |
+| trifast #2 loop-carried pointer idiom | silent-wrong / compile-err | MEPT pointer-offset carry | `2758c1e`/`392ae75` | committed lineage |
+| trifast #4/#5 matmul extent | silent-wrong | structural `_K`/`_M`/`_N` | `8385e6f`/`cd80b44` | committed lineage |
+| trifast #6a constant QK-result score scale | refuse | capability (also closed a live varlen silent-wrong) | `b34627d` | committed lineage |
+| trifast #6b multi-output copy-back + loop-carried 1-D layout | silent-wrong (O never copied back) | computes (FA lse 4.8e-7; GEMV 3.8e-6) | `4c8cbbf`+`388d1cd` | committed lineage |
+| trifast #7 argument-buffer path | refuse | computes | `20d5c7c`→`aa279d1` | committed lineage |
+| PR5 1-D store after axis-1 reduce (offset dropped) | silent-wrong | computes (covered by reduce-store + #6b work) | triage 450, confirmed | committed lineage |
+| **#9 broadcast index collision — bare / arith / gather** | silent-wrong (2nd broadcast copied 1st's stride) | computes | packet 464 | **this sibling** (`test_broadcast_index_collision.py`) |
+| **#9 residual — comparison `(range>0).to(int32)` / select `where(range==0,7,3)`** | silent-wrong (on candidate AND baseline) | computes | packet 468 (this pass) | **this sibling** (`test_broadcast_index_collision.py`) |
+| PR6 grouped matmul (canonical cdiv mapping) | refuse | computes (full/short-final/column-tail/partial/overflow) | packet 459 | integrated 475: `test_grouped_matmul_mapping.py` |
+
+Historical 461 was capability evidence, not a measured transition. Subsequent 485/493 recover
+the previously refusing Q1/small-tile sources and biased-no-LSE source. Candidate pins copied to
+the exact pre-493 implementation bite; positive rows execute on 493. These recoveries do not
+establish arbitrary combinations of bias, tile sizes, score casts or attention recurrences.
+
+### 2b. TIGHTENED — silent behaviour → honest refusal
+
+| what | before | after | evidence / packet | pinned in |
+|---|---|---|---|---|
+| **#8 retained `tl.device_assert` (source or framework, including Inductor defaults)** | silently elided at direct generic lowering; blanket refusal in 475 broke 11 framework workloads | candidate 477 executes supported generic checks using a uniform threadgroup stop and launch-local host error; unsupported forms and callee regions still refuse | 466/472 refusal, 475 regression, 477 repair pending combined gates and independent review | `test_retained_device_assert_refuses.py`, `refusal_catalog.retained_device_assert`; see [assertion contract](DEVICE_ASSERTIONS.md) |
+| dispatch post-submit boundary (completed library call then a later raise) | fail-open → swallowed, fallback re-ran work | `PostSubmitError`, fail-loud, no double-apply | packet 457 | integrated 475; reviewed in 458 |
+
+(The broader silent-wrong→refuse lineage — uint64 max/min, reduce-combine classifier, dot/reduce
+stride families, bf16 FA dtype gate, 3-D reduce pre-op — is committed and catalogued as its own
+regression suites; it is summarised here, not re-enumerated.)
+
+### 2c. Remaining limits outside the recovered envelopes
+
+| family | representative reason | documented workaround |
+|---|---|---|
+| small-query decode beyond the source contract above | unsupported probability narrowing, dimensions or value graph | no blanket workaround claimed |
+| bias-without-LSE beyond 32×32 tiles / D32 or D64 | not covered by the replay admission proof | use only a source spelling whose complete semantics are supported; changing tile size alone is not universal equivalence |
+| runtime scale/bias on a `tt.dot` result | cannot prove finite constant multiply on the score path | scale Q pre-dot; bias as the dot accumulator |
+| two reductions of one loaded tile | second would reduce over the first's accumulator | load the tile separately per reduction |
+| narrow-dtype backward delta (`rowsum(O·dO)` in fp16) | order-dependent | `tl.sum((o*do).to(tl.float32), 1)` |
+| rank-≥3 `tt.trans` non-identity permutation; `nd` `cat`/`join`; `join`→`dot`; top-level `cf.br` | no proven safe lowering | see `refusal_catalog.py` messages |
+| C++ / MLX boundary | C++ route defect; MLX extraction gap | leave `TRITON_MSL_USE_CPP` off (default) |
+
+### 2d. Historical refusal site inventory (not re-counted for rc4)
+
+| family | sites | representative reason | working alternative |
+|---:|---:|---|---|
+| dot / matmul | ~54 | fused epilogue/bias on a `tt.dot` result; oversized cooperative staging; batched dot on host path | scale inputs pre-dot; tiles within the 1024-thread budget |
+| reduce / scan | ~53 | two reductions of one tile; unproved axis; in-loop reduction wider than the tile | load the tile separately per reduction |
+| attention fwd/bwd | ~36 | runtime scale/bias on score path; backward head_dim over budget; unresolved biased-FA bwd orientation | pre-scale Q + bias accumulator; smaller head_dim/block |
+| atomic | ~25 | oversized single-element RMW; unproved scope/ordering; 1-D CAS shape | fewer elements; supported sem/scope pairs |
+| pointer / marshalling | ~22 | value role unprovable from pointer provenance; negative strides from offset views (host) | distinct provable pointer roles |
+| layout / store | ~15 | conflicting 1-D layouts; store extent disagreement; reshape provenance | consistent declared layouts |
+| contract / integrity | ~19 | cache/toolchain identity changed mid-process | fresh process; stable toolchain |
+| gather / histogram / cat / split | — | output exceeds the 1024-thread cap; ragged/ unsupported axis | smaller tiles; supported axes |
+| C++ / MLX boundary | ~6 | C++ route defect; MLX extraction gap | leave `TRITON_MSL_USE_CPP` off |
+
+**A refusal is designed behaviour, not a crash.** Over-refusal is a real defect class here — report
+it. A **wrong number without a refusal** is a P0 and the most valuable thing to send us.
+
+---
+
+## Part 3 — Exceptional-value tests and supporting controls → test-ID map (B)
+
+This replaces the prior unquantified "exceptional-value contracts" claim with the concrete axes the
+suite pins, each mapped to its regression test(s). Rows distinguish exceptional-value behavior from finite capability controls and checker validation;
+not all are non-finite GPU coverage. "test ID" = `file::test`. Collection establishes existence,
+not execution. Counts for all tests in a file do not equal coverage of the specifically named rows.
+
+| # | axis (exceptional-value behaviour contracted) | test ID(s) |
+|--:|---|---|
+| 1 | forward NaN-row locality — a NaN query row stays row-local (dense / MLA / varlen) | `test_fa_nonfinite_data.py::test_dense_nan_q_row_is_row_local`, `::test_mla_nan_q_row_is_row_local`, `::test_varlen_nan_q_row_is_row_local` |
+| 2 | forward non-finite output stays rowwise (no cross-row contamination) | `test_fa_nonfinite_output.py::test_nonfinite_value_outputs_remain_rowwise` |
+| 3 | empty-K sequence preserves the zero-denominator semantics | `test_fa_nonfinite_data.py::test_varlen_empty_k_sequence_preserves_zero_denominator_semantics` |
+| 4 | matmul epilogue propagates NaN (does not clamp/mask it away) | `test_audit_2026_06_21_silent_wrongs.py::test_matmul_epilogue_propagates_nan` |
+| 5 | NaN-propagating `max` computes and propagates (not nan-skipping) | `test_triton_lens_silent_wrongs.py::test_nan_propagating_max_computes_and_propagates` |
+| 6 | FINITE control: `float >= max` not over-refused (random-normal input; no non-finite coverage) | `test_triton_lens_silent_wrongs.py::test_float_ge_max_not_over_refused` |
+| 7 | backward NaN-lse row locality + single shared sentinel | `test_fa_bwd_nan_rows.py::test_bwd_kv_nan_rows_match_the_source`, `::test_bwd_q_nan_rows_stay_row_local`, `::test_bwd_b_nan_lse_row_matches_the_source`, `::test_bwd_sentinel_must_be_one_shared_value` |
+| 8 | backward tail never reads masked-out padding | `test_fa_bwd_nan_rows.py::test_bwd_tail_never_reads_masked_out_padding` |
+| 9 | bf16/fp16 backward NaN-scale propagation + guard | `test_fa_bwd_rounding_replay.py::test_software_bf16_rounding_nan_is_guarded`, `::test_nan_scale_propagates_on_the_bf16_kv_route` |
+| 10 | biased-FA literal / loaded `-inf` sentinel is exact or refuses | `test_fa_biased_value_paths.py::test_literal_neg_inf_with_loaded_mask_is_exact`, `::test_loaded_neg_inf_bias_is_exact_or_refuses_before_dispatch`, `::test_runtime_nonfinite_sentinel_is_exact_or_refuses_before_dispatch` |
+| 11 | non-canonical NaN scalar stays NaN through the scale chain | `test_fa_scale_chain.py::test_gpu_noncanonical_nan_scalar_stays_nan` |
+| 12 | biased bf16 NaN scale covers all rows (tiled dispatch) | `test_fa_tiled_dispatch.py::test_biased_bf16_nan_scale_covers_all_rows` |
+| 13 | layernorm non-finite input → poisoned row is **all-NaN** (NaN/+Inf/-Inf), siblings bitwise-exact | `test_welford_nonfinite_inputs.py::test_layernorm_nonfinite_input_makes_row_all_nan_and_siblings_exact[nan|inf|-inf]` |
+| 14 | layernorm clean path matches a float64 oracle | `test_welford_nonfinite_inputs.py::test_layernorm_clean_matches_float64_oracle` |
+| 15 | Welford m2 under non-finite input is in {NaN, +Inf}, **never negative / -Inf**; mean non-finite | `test_welford_nonfinite_inputs.py::test_welford_nonfinite_input_mean_nonfinite_and_m2_never_negative[nan|inf|-inf]` |
+| 16 | Welford clean path matches a float64 reference | `test_welford_nonfinite_inputs.py::test_welford_clean_matches_float64_reference` |
+| 17 | checker self-validation rejects wrong classifications (all-+Inf row; m2 = -Inf) | `test_welford_nonfinite_inputs.py::test_checkers_reject_wrong_classifications` |
+| 18 | signed-zero preservation in sum identities (threadgroup + public/legacy makers; survives padding) | `test_reduce_zero_identity.py::test_threadgroup_sum_identity_preserves_both_zero_signs`, `::test_sum_zero_sign_survives_compiler_padding`, `::test_public_sum_makers_preserve_zero_and_empty_identities`, `::test_legacy_direct_sum_preserves_zero_and_empty_identities` |
+| 19 | KDA prefill preserves the exceptional recurrence | `test_kda.py::test_kda_prefill_preserves_exceptional_recurrence` |
+| 20 | INTEGER edge-value control: integer-exact reduce above 2^24 (no fp32 rounding) | `test_audit_2026_06_21_silent_wrongs.py::test_i32_reduce_exact_above_2_24` |
+| 21 | INTEGER edge-value control: i64 not truncated to i32 across gather / join / cat / scf.if / 2-D reduce | `test_triton_lens_silent_wrongs.py::test_gather_i64_not_truncated_to_i32`, `::test_join_i64_not_truncated`, `::test_cat_i64_not_truncated`, `::test_scf_if_i64_accumulator_not_truncated`, `::test_2d_int64_reduce_not_truncated_by_convert_layout` |
+| 22 | INTEGER edge-value control: unsigned uint32 / uint64 max/min computed unsigned (not signed) | `test_triton_lens_silent_wrongs.py::test_uint32_max_min_unsigned_not_signed`, `::test_uint64_max_min_unsigned_not_signed` |
+| 23 | signed-zero CAS comparison control; INTEGER tensor-CAS lane control (not NaN/Inf coverage) | `test_atomic_cas_strong.py::test_float_cas_compares_bits`, `::test_tensor_cas_swaps_each_lane_independently` |
+
+**Admissibility vs. exact-oracle.** Row 13 asserts exact all-NaN membership plus bitwise finite
+siblings; rows 14 and 16 compare clean results with float64 references within tolerance. Row 15
+asserts an order-robust admissible bound (mean non-finite; m2 NaN or +Inf, never negative/-Inf), not
+an exact recurrence oracle. Row 17 validates those checkers rather than running another kernel.
+These different strengths must not be collapsed into either universal exactness or universal bounds.
+
+---
+
+*Maintained by the correct-or-refuse campaign. The per-packet evidence for every row lives under
+`~/Documents/triton-validation-evidence/`. Combined-tree project + upstream gates on the final
+frozen tree remain owed before release.*

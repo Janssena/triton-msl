@@ -1,5 +1,21 @@
 # triton-msl
 
+> **⚠️ 0.3.0rc4 is an unpublished release candidate under verification.**
+> The published throughput and speedup claims below are **historical and unqualified on this
+> candidate** — they were measured on earlier trees and have not been re-established for
+> this build. The reported AlphaFold/trifast workload is **not validated end-to-end**, no
+> independent Apple Silicon validation has run (one M4 Max only), and the optional C++
+> route is **unaudited and off by default** — leaving it off is not the same as it being
+> validated. Correctness evidence for this candidate: see `CHANGELOG.md` and
+> `docs/RELEASE_CANDIDATE_LIMITATIONS.md` in the repository
+> (https://github.com/bledden/triton-msl/blob/main/docs/RELEASE_CANDIDATE_LIMITATIONS.md).
+
+> **Measured latency increases (2026-09-11):** paired tests against earlier candidate 439
+> found **+15.1% for a retained-assertion kernel** and **+11.9% for GPT-2 small** on this
+> M4 Max. The other nine tested workloads were within ±1.2%. These are bounded, uncensored
+> comparisons, not public-claim qualification or universal performance bounds. Assertion
+> checks remain synchronous; this GPT-2 workload has checks on **2 of 43** backend launches.
+
 Metal (Apple Silicon) backend for [Triton](https://github.com/triton-lang/triton) [\[1\]](REFERENCES.md)[\[2\]](REFERENCES.md). Write `@triton.jit` kernels and run them on your Mac's GPU.
 
 ```
@@ -18,6 +34,10 @@ GPU only for the performance pass.
 ## Status
 
 **Alpha**: actively developed, not yet production-ready.
+
+The counts below describe the earlier published tree, not this release candidate. The final
+candidate's exact-tree correctness, performance and installed-wheel results must be recorded in
+`docs/RELEASE_CANDIDATE_LIMITATIONS.md` before publication; earlier artifacts do not qualify rc4.
 
 - **0 failures** across the upstream Triton `test_core.py` suite: 5,560 kernels
   attempted and correct, 3,782 documented skips. Reconciled test by test, almost all
@@ -56,6 +76,11 @@ GPU only for the performance pass.
 See [`REFERENCES.md`](REFERENCES.md) for citations and
 [`docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md`](docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md)
 for the active pre-1.0 roadmap.
+
+The optional `TRITON_MSL_USE_CPP=1` route is unaudited and off by default.
+See [the C++ route contract](docs/CPP_ROUTE_CONTRACT.md) for its explicit fallback
+warnings, binary-production metadata, known-broken dot exclusion, and the
+difference between a compiled binary and the route actually executed.
 
 ## Portability: develop on Apple Silicon, run on NVIDIA or AMD
 
@@ -360,7 +385,7 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | `TRITON_MSL_MATMUL_AUTOTUNE=0` | Pin matmul tile selection to the fixed `(4,4)` blocking (M%32≠0 / N%32≠0 shapes drop to the generic path instead of the finer M%8/N%8 rescue tiles) |
 | `TRITON_MSL_MEPT=0` | Disable the multi-element-per-thread register-array model |
 | `TRITON_MSL_LEGACY=1` | Opt **in** to the heuristic legacy text parser (off by default, it can be silent-wrong) |
-| `TRITON_MSL_FA_HALF_ACCUM=1` | Opt **in** to fp16 (half) MMA accumulators in FlashAttention — ~4% faster at ~1% max-abs error (vs ~0.01% for the default fp32-accumulate). fp16 kernels only; a no-op for fp32. A latency/accuracy trade for inference, like the int8/int4 paths |
+| `TRITON_MSL_FA_HALF_ACCUM=1` | Opt **in** to fp16 (half) MMA accumulators in FlashAttention. Off by default; fp16 kernels only, a no-op for fp32. Accuracy depends on the inputs, shape and accumulation order; no universal maximum-error bound is provided. Validate it for your workload before enabling it. The historically reported ~4% speedup has not been revalidated on this tree. |
 
 ## What Works
 

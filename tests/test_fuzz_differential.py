@@ -19,6 +19,8 @@ torch is the reference (the semantics Triton targets); for the ops here (matmul,
 reduce, elementwise) the torch reference is unimpeachable.
 """
 
+from tests.cache_helpers import fresh_compiler_caches
+
 import math
 import random
 import pytest
@@ -38,13 +40,7 @@ _SENT = 2048.0  # exactly representable in fp32/fp16/bf16, far from any randn va
 
 
 def _clear():
-    import os, shutil
-
-    # Clear ONLY the triton-msl codegen cache (force re-codegen). Do NOT delete
-    # ~/.triton/cache: it is content-addressed and shared, and deleting it per-test
-    # races a sibling test's in-flight make_metallib pipeline -> nondeterministic
-    # FileNotFoundError mislabeled as a "cryptic crash" (2026-06-22 re-audit).
-    shutil.rmtree(os.path.expanduser("~/.cache/triton_msl"), ignore_errors=True)
+    fresh_compiler_caches(globals())
 
 
 # --------------------------------------------------------------------------- #

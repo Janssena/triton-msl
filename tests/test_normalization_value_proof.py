@@ -209,6 +209,49 @@ def test_normalization_address_fill_and_effect_near_misses(routes, mode):
     assert not routes
 
 
+@pytest.mark.parametrize("family", ["soft", "norm"])
+def test_normalization_type_proof_uses_native_value_metadata_not_legacy_strings(family):
+    from triton_msl.codegen._normalization_proof import prove_normalization
+    fn = _soft if family == "soft" else _norm
+    lowerer = _build_lowerer(fn, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 0})
+    info = lowerer._detect_softmax() if family == "soft" else lowerer._detect_layer_norm()
+    assert info is not None
+    def poison(ops):
+        for op in ops:
+            op.type_str = "unusable legacy type"
+            op.elem_type = "unusable legacy element"
+            poison(op.region_ops or [])
+            poison(op.else_ops or [])
+    poison(lowerer.graph.ops)
+    for arg in lowerer.graph.args:
+        arg.type_str = "unusable legacy type"
+        arg.elem_type = "unusable legacy element"
+    # Exercise this consumer directly: another detector/emitter's legacy reads
+    # remain migration work and must not masquerade as coverage of this slice.
+    prove_normalization(lowerer.graph, info, "softmax" if family == "soft" else "layer_norm")
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong_owner", "index_width", "projection"])
+def test_normalization_native_type_proof_rejects_unproved_facts(damage):
+    from triton_msl.codegen._normalization_proof import prove_normalization
+    lowerer = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 0})
+    info = lowerer._detect_softmax()
+    assert info is not None
+    load = next(op for op in lowerer.graph.ops if op.op == "tt.load")
+    vid = next(arg.id for arg in lowerer.graph.args if arg.name == "N") if damage == "index_width" else load.id
+    meta = lowerer.graph.result_meta[vid]
+    if damage == "missing":
+        del lowerer.graph.result_meta[vid]
+    elif damage == "wrong_owner":
+        lowerer.graph.result_meta[vid] = replace(meta, producer_id=meta.producer_id + 1)
+    elif damage == "index_width":
+        lowerer.graph.result_meta[vid] = replace(meta, type=replace(meta.type, width=64))
+    else:
+        lowerer.graph.result_meta[vid] = replace(meta, type=replace(meta.type, shape=(1, 64)))
+    with pytest.raises(MetalNonRecoverableError, match="native|metadata|projection"):
+        prove_normalization(lowerer.graph, info, "softmax")
+
+
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
 @pytest.mark.parametrize("mode", [6, 7, 8, 9, 10])
 def test_normalization_address_fill_and_effects_compute(routes, mode):

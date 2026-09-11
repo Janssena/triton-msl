@@ -10,9 +10,10 @@ replay them:
   q:  the same K [round_k] — and because that rounded, scaled K also feeds the dQ dot, no scale is
       applied at the store; dS rounded before the dQ dot [round_ds]; delta stored rounded, used in
       fp32; output cast. The UNMODIFIED trifast `_bwd_q` computes delta = tl.sum(o * do) IN the
-      input dtype (a bf16 / fp16 tree-sum: order-dependent rounding) — that still refuses, by name;
-      the one-line variant tl.sum((o * do).to(tl.float32), 1) rounds each product [round_dprod] and
-      sums in fp32, which is order-independent and computes.
+      input dtype (a bf16 / fp16 tree-sum: order-dependent rounding). The proved runtime D=32
+      specialization is replayed by the simdgroup maker; this file's direct-helper layout remains
+      a refusal control. The one-line variant tl.sum((o * do).to(tl.float32), 1) rounds each product
+      [round_dprod] and accumulates in fp32.
   b:  Q staged as dtype(Q * dtype(scale)) [round_q]; dS stays fp32 (db += dS); output cast.
 Exact widenings (the bias, the loaded delta) are transparent. Every other conversion refuses.
 
@@ -191,19 +192,21 @@ def test_b_replays_q_scale_rounding_and_keeps_ds_fp32(dt):
 
 
 @pytest.mark.parametrize("dt", ["bf16", "fp16"])
-def test_q_unmodified_refuses_the_narrow_delta_accumulation(dt):
-    """The unmodified trifast dq source sums O * dO IN the input dtype (bf16 / fp16 reduce):
-    an order-dependent rounding the fp32 template cannot replay. Refused by name, with the
-    one-line fp32-accumulation spelling in the message."""
-    with pytest.raises(MetalNonRecoverableError, match="accumulates it in (bf16|f16)") as ei:
+def test_q_direct_helper_layout_refuses_the_narrow_delta_accumulation(dt):
+    """The direct helper's one-value-per-lane layout is not the runtime specialization.
+
+    A narrow reduction is admitted only when its own result metadata proves the
+    eight-values-per-lane runtime tree; a source spelling and D=32 alone are insufficient.
+    """
+    with pytest.raises(MetalNonRecoverableError, match="eight-values-per-lane") as ei:
         _lower(_bwd_q, dt)
-    assert "to(tl.float32)" in str(ei.value)
+    assert "failed: source-layout,result-layout" in str(ei.value)
 
 
 @pytest.mark.parametrize("dt", ["bf16", "fp16"])
 def test_q_fp32_delta_variant_replays_product_k_and_ds_rounding(dt, tmp_path):
     """tl.sum((o * do).to(tl.float32), 1): each product rounded before the fp32 rowsum
-    (order-independent), delta stored rounded, K as the rounded scaled product feeding BOTH dots
+    (with fp32 accumulation), delta stored rounded, K as the rounded scaled product feeding BOTH dots
     (no store-time scale), dS rounded before the dQ dot, output cast."""
     e = _ELEM[dt]
     msl = _lower(_q_f32delta(tmp_path), dt)

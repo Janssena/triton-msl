@@ -1,3 +1,6 @@
+# _biased_mask adapts the TriFast-derived biased forward test kernel.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Other kernels in this file are separate tests; see docs/TRIFAST_PROVENANCE.md.
 """Packet 111/112: a replacement FA template's load/store masks must be EXACTLY the
 coordinates the template clips with — role by role, numerically — on every route.
 

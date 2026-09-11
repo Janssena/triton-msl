@@ -7,7 +7,6 @@ projections, effects and reduction returns cannot supply proof facts.
 
 import math
 
-from triton_msl.codegen.mlir_walker import _extract_shape
 from triton_msl.errors import MetalNonRecoverableError
 
 
@@ -87,25 +86,73 @@ def prove_normalization(graph, info, family):
         if not ok:
             raise _NotProven(why)
 
+    # Facts belong to a specific SSA result, including region-local combiners;
+    # the first-result fields on the legacy op are not a type authority here.
+    owners = {arg.id: ("entry_arg", None, i) for i, arg in enumerate(graph.args)}
+    def record_owners(region):
+        for op in region:
+            # SSAValue keeps result_ids only for multi-result ops; a native
+            # single-result producer uses op.id. Its ResultMeta must still
+            # independently match producer_id and result_index below.
+            for i, vid in enumerate(op.result_ids or [op.id]):
+                owners[vid] = ("result", op.id, i)
+            for i, vid in enumerate(op.attrs.get("block_arg_ids") or []):
+                owners[vid] = ("block_arg", None, i)
+            record_owners(op.region_ops or [])
+            record_owners(op.else_ops or [])
+    record_owners(graph.ops)
+    native_cache = {}
+
+    def native(vid):
+        if vid in native_cache:
+            return native_cache[vid]
+        meta = graph.result_meta.get(vid)
+        require(
+            meta is not None and meta.schema_version == 1 and meta.value_id == vid
+            and owners.get(vid) == (meta.kind, meta.producer_id, meta.result_index),
+            "missing or mismatched native value metadata ownership",
+        )
+        facts = meta.type
+        require(
+            not facts.unknown_reason and facts.shape in ((), (block,))
+            and facts.is_tensor == (facts.shape == (block,)),
+            "unproved native normalization projection",
+        )
+        element = facts
+        if facts.kind == "pointer":
+            require(
+                facts.address_space == 1 and facts.pointee is not None
+                and not facts.pointee.unknown_reason and not facts.pointee.is_tensor
+                and facts.pointee.shape == (),
+                "unproved native pointer representation",
+            )
+            element = facts.pointee
+        expected = {"f32": ("float", 32), "f16": ("float", 16),
+                    "bf16": ("float", 16), "i32": ("integer", 32), "i1": ("integer", 1)}
+        require(
+            element.elem in expected and (element.kind, element.width) == expected[element.elem],
+            "unproved native element kind or width",
+        )
+        native_cache[vid] = facts
+        return facts
+
     def shape(vid):
-        obj = ops.get(vid) or args.get(vid)
-        require(obj is not None, "missing operand type")
-        return _extract_shape(obj.type_str)
+        return native(vid).shape
 
     def elem(vid):
-        obj = ops.get(vid) or args.get(vid)
-        require(obj is not None, "missing operand element type")
-        return obj.elem_type
+        facts = native(vid)
+        return facts.pointee.elem if facts.kind == "pointer" else facts.elem
 
     def constant(op):
         value = op.attrs.get("value")
-        require(op.elem_type in ("f32", "i32", "i1"), "unreplayed constant precision")
+        element = elem(op.id)
+        require(element in ("f32", "i32", "i1"), "unreplayed constant precision")
         # The walker exposes hexadecimal nonfinite APFloat literals as bits.
-        if op.elem_type == "f32" and isinstance(value, int):
+        if element == "f32" and isinstance(value, int):
             value = {0: 0.0, 0xFF800000: -math.inf, 0x7F800000: math.inf}.get(value)
         require(isinstance(value, (int, float)), "unresolved/non-splat constant")
         require(not math.isnan(value), "NaN constant is not a normalization proof fact")
-        return ("constant", op.elem_type, value)
+        return ("constant", element, value)
 
     def expr(vid):
         if vid in cache:
@@ -121,6 +168,7 @@ def prove_normalization(graph, info, family):
 
     def expression(vid):
         if vid in args:
+            native(vid)
             return ("arg", vid)
         op = ops.get(vid)
         require(op is not None, "unresolved value")
@@ -155,13 +203,13 @@ def prove_normalization(graph, info, family):
             return _comm(name.removeprefix("arith."), a, b)
         if name == "arith.sitofp":
             require(
-                operands == [length_id] and op.elem_type == "f32" and out_shape == (),
+                operands == [length_id] and elem(vid) == "f32" and out_shape == (),
                 "unproved normalization divisor conversion",
             )
             return ("length_float", length)
         if name == "tt.load":
             require(
-                len(operands) == 3 and op.elem_type == "f32" and out_shape == (block,),
+                len(operands) == 3 and elem(vid) == "f32" and out_shape == (block,),
                 "load precision/mask/fill is not replayed",
             )
             address, condition, fill = map(expr, operands)
@@ -179,7 +227,7 @@ def prove_normalization(graph, info, family):
                 and op.attrs.get("axis") == 0
                 and out_shape == ()
                 and shape(operands[0]) == (block,)
-                and op.elem_type == "f32",
+                and elem(vid) == "f32",
                 "reduction axis/precision mismatch",
             )
             body = op.region_ops or []
@@ -188,7 +236,8 @@ def prove_normalization(graph, info, family):
             combine = body[0]
             require(
                 combine.op in ("arith.addf", "arith.maxnumf")
-                and combine.elem_type == "f32"
+                and elem(combine.id) == "f32" and shape(combine.id) == ()
+                and all(elem(x) == "f32" and shape(x) == () for x in bargs)
                 and sorted(combine.operand_ids or []) == sorted(bargs)
                 and op.attrs.get("return_ids") == [combine.id],
                 "reduction does not return its plain combiner",
@@ -198,7 +247,7 @@ def prove_normalization(graph, info, family):
             arity = 1 if name.startswith("math.") else 2
             require(
                 len(operands) == arity
-                and op.elem_type == "f32"
+                and elem(vid) == "f32"
                 and all(elem(x) == "f32" and shape(x) == out_shape for x in operands),
                 "unreplayed arithmetic precision or projection",
             )
@@ -207,14 +256,14 @@ def prove_normalization(graph, info, family):
             return _comm(tag, *values) if tag in ("addf", "mulf") else (tag, *values)
         if name == "arith.select":
             require(
-                len(operands) == 3 and op.elem_type == "f32" and all(shape(x) == out_shape for x in operands),
+                len(operands) == 3 and elem(vid) == "f32" and all(shape(x) == out_shape for x in operands),
                 "unproved select projection",
             )
             return ("select", *map(expr, operands))
         raise _NotProven(f"unreplayed operation {name}")
 
     try:
-        require(args[length_id].elem_type == "i32", "row length is not i32")
+        require(elem(length_id) == "i32" and shape(length_id) == (), "row length is not native scalar i32")
         stores = [op for op in graph.ops if op.op == "tt.store"]
         require(len(stores) == 1, "not exactly one store")
         store = stores[0]
@@ -237,10 +286,12 @@ def prove_normalization(graph, info, family):
             )
             value = cast.operand_ids[0]
             cast = ops.get(value)
-        output_type = args[arg_names[info["output_arg"]]].elem_type
+        output_pointer = native(arg_names[info["output_arg"]])
+        require(output_pointer.kind == "pointer", "output is not a native pointer")
+        output_type = output_pointer.pointee.elem
         if cast and cast.op == "arith.truncf":
             require(
-                cast.elem_type == output_type
+                elem(value) == output_type
                 and output_type in ("f16", "bf16")
                 and len(cast.operand_ids) == 1
                 and elem(cast.operand_ids[0]) == "f32"

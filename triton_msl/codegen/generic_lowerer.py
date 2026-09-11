@@ -37,7 +37,6 @@ from triton_msl.codegen._lowerer_helpers import (
     _mlir_to_triton_dtype,
     _msl_int_type,
     _shape_numel,
-    _extract_layout_signature,
     _alias_shared_memory,
 )
 from triton_msl.codegen._device_func_lowerer import _DeviceFuncLowerer
@@ -57,6 +56,12 @@ def _op_is_exp(op_name: str) -> bool:
     return op_name in ("math.exp", "math.exp2", "tt.exp")
 
 
+def _v_head_dim_of(info):
+    """A missing optional value width denotes symmetric attention (PR #7)."""
+    value = info.get("v_head_dim")
+    return info["head_dim"] if value is None else value
+
+
 def _simd_fa_eligible(info):
     """True if the detected FA can use the simdgroup template: head_dim in {64, 128},
     block 32x32, fp32/fp16, AND contiguous innermost (head-dim) stride for all of
@@ -72,9 +77,9 @@ def _simd_fa_eligible(info):
     BM*head_dim*elem bytes of threadgroup memory, so fp32 head_dim>128 overflows the 32KB
     budget -> head_dim>128 is fp16/bf16-only (192 validated, cap 256)."""
     qk = info.get("head_dim")
-    vd = info.get("v_head_dim")
-    if vd is None:
-        vd = qk
+    if qk is None:
+        return False
+    vd = _v_head_dim_of(info)
     out_dtype = info.get("out_dtype")
     if vd not in (64, 128):
         return False
@@ -402,6 +407,23 @@ class GenericLowerer(
         self._var_counter += 1
         return name
 
+    def _pointer_offset_expr(self, value_id: int) -> str:
+        """Preserve signed integer offsets at the MSL pointer boundary.
+
+        Index arithmetic may contain ``uint lid`` even when the MLIR result is
+        signless i32. C++ usual conversions otherwise turn ``start + lid``
+        into uint, so start=-2 indexes 2**32-2. Cast the completed expression
+        back to its received signed width before pointer addition/indexing.
+        Explicit unsigned values keep their unsigned contract.
+        """
+        expr = self._lookup(value_id)
+        dtype = self.env_types.get(value_id)
+        if dtype in ("i1", "i8", "i16", "i32"):
+            return f"int({expr})"
+        if dtype == "i64":
+            return f"long({expr})"
+        return expr
+
     def _var_array(self, prefix: str, exprs, ty: str) -> str:
         """Emit ``ty name[N];`` followed by ``name[i] = exprs[i];``.
 
@@ -449,6 +471,74 @@ class GenericLowerer(
         return RegVal(name=name, n_elems=1, ty=regval.ty, form=regval.form)
 
     # -- Shape tracking helpers --------------------------------------------------
+
+    def _native_result_ids_for_op(self, ssa: SSAValue) -> tuple[int, ...]:
+        """Return only native result ids owned by ``ssa``.
+
+        Void operations have neither ``result_ids`` nor a ResultMeta entry and
+        therefore contribute no value. Single-result operations from walkers
+        that omit the convenience list are keyed by ``ssa.id``.
+        """
+        result_ids = tuple(ssa.result_ids or ())
+        if result_ids:
+            return result_ids
+        # A non-empty printed result type is used only as an arity witness so
+        # a missing metadata record cannot make a real value disappear from
+        # the prescan. Its shape/type contents are never consumed here.
+        return (ssa.id,) if ssa.id in self.graph.result_meta or ssa.type_str else ()
+
+    def _native_shape(self, ssa_id: int, *, op_name: str) -> tuple:
+        """Return an ownership-checked, fully static native shape.
+
+        Kernel extent and coverage decisions cannot use mutable replay caches
+        or printed type summaries: either native metadata proves the logical
+        shape or lowering refuses before choosing a dispatch width.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        facts = self._native_value_facts(ssa_id, op_name=op_name)
+        shape = facts.shape
+        if facts.raw.strip().startswith("tensor<") != facts.is_tensor:
+            raise MetalNonRecoverableError(
+                f"{op_name} native metadata has contradictory tensor-kind facts for SSA value {ssa_id}",
+                op_name=op_name,
+            )
+        if facts.is_tensor:
+            if (
+                shape is None
+                or not shape
+                or any(type(dim) is not int or dim <= 0 for dim in shape)
+            ):
+                raise MetalNonRecoverableError(
+                    f"{op_name} native metadata does not prove a positive static tensor shape for SSA value {ssa_id}",
+                    op_name=op_name,
+                )
+            return tuple(shape)
+        if shape != ():
+            raise MetalNonRecoverableError(
+                f"{op_name} native scalar metadata carries a contradictory shape for SSA value {ssa_id}",
+                op_name=op_name,
+            )
+        return ()
+
+    def _native_shapes_for_op(self, ssa: SSAValue) -> tuple[tuple, ...]:
+        shapes = []
+        for result_id in self._native_result_ids_for_op(ssa):
+            meta = self.graph.result_meta.get(result_id)
+            if meta is None:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"{ssa.op} native per-result metadata is missing for SSA value {result_id}",
+                    op_name=ssa.op,
+                )
+            # Shared-memory descriptors and other non-register native values do
+            # not define the logical thread-tile extent. A malformed or unknown
+            # *tensor* still goes through the strict parser/ownership check.
+            if not meta.type.is_tensor and not meta.type.raw.strip().startswith("tensor<"):
+                continue
+            shapes.append(self._native_shape(result_id, op_name=ssa.op))
+        return tuple(shapes)
 
     def _get_shape(self, ssa_id: int) -> tuple:
         """Return the tracked shape for an SSA value.
@@ -787,6 +877,7 @@ class GenericLowerer(
             called_funcs=self.graph.called_funcs or [],
             find_op_type_str=self._find_op_type_str,
             extract_shape=_extract_shape,
+            supported_assert_ids=frozenset(self._assert_plan['ids']) if getattr(self, '_assert_plan', None) else frozenset(),
         )
         violation = _rc.check_all(ctx)
         if violation is not None:
@@ -794,6 +885,8 @@ class GenericLowerer(
 
     def lower(self) -> str:
         """Lower the IRGraph to MSL source code."""
+        from .assertions import prepare
+        self._assert_plan = prepare(self)
         # Integrity prescan (PR1): some ops have no correct lowering on this
         # backend AND the legacy fallback can't help — emitting anything for
         # them yields silently-wrong output (a kernel that runs and returns
@@ -803,16 +896,10 @@ class GenericLowerer(
         # never computed -> garbage (test_scaled_dot, ~all configs mismatch).
         self._refuse_unsafe_unsupported_ops()
 
-        # SYSTEMIC anti-silent-wrong gate (ONE chokepoint for all five matmul/FA
-        # template store sites): the simdgroup simple-dot, K-loop, strided-scalar,
-        # fused matmul+softmax, and simdgroup-FA templates all DROP a non-tile-boundary
-        # output ``tt.store`` mask (they clip only on the hard-coded tile boundary).
-        # A mask that restricts the output WITHIN the computed tile (rm < BOUND with
-        # BOUND < M, or a value mask) would be silently dropped -> clobbered rows.
-        # Refuse loudly here, before any template dispatch; the trivially-true
-        # tile-boundary mask ((rm < M) & (rn < N) / om < N_CTX) and the no-mask case
-        # are left untouched.
-        self._refuse_nontrivial_template_output_mask()
+        if self._assert_plan is not None:
+            # Templates do not replay assertions. The proved generic path below
+            # owns both the rendezvous and the sealed host-result check.
+            return self._lower_generic()
 
         # Integrity prescan (never silent-wrong): FlashAttention-style kernels
         # (>= 2 tt.dot with a softmax/exp between them) are validated only for
@@ -849,6 +936,16 @@ class GenericLowerer(
             _bwd_info = self._detect_biased_fa_backward()
             if _bwd_info is not None:
                 return self._lower_biased_fa_backward(_bwd_info)
+
+        # SYSTEMIC anti-silent-wrong gate for the remaining matmul/forward-FA
+        # template store sites. Run it after backward detection because that
+        # detector independently proves every backward output store mask and
+        # Triton's N_CTX==1 specialization replaces the boundary arg with a
+        # constant. Only a fully proved backward route bypasses this gate;
+        # an unrecognized or ambiguous graph still reaches the fail-closed
+        # matmul classification below.
+        self._refuse_nontrivial_template_output_mask()
+
         if len(_fa_dots) >= 2 and _fa_has_exp and _fa_has_max:
             # VARLEN (packed cu_seqlens) FA-2: the dominant real-world FA shape (flash-attn /
             # vLLM), which the dense [Z,H,N,D] templates can't express and the generic path
@@ -870,6 +967,11 @@ class GenericLowerer(
                         if _dims:
                             _fa_maxdim = max([_fa_maxdim] + _dims)
                             _fa_mindim = min([_fa_mindim] + _dims)
+            if _fa_mindim in (8, 16) and _fa_maxdim == 64:
+                from ._decode_template import detect as _detect_small_query
+                _decode_info = _detect_small_query(self)
+                if _decode_info is not None:
+                    return self._lower_flash_attention_template(_decode_info)
             # BIASED / triangle attention (trifast): a bias tile as the QK dot's C
             # operand + a loaded mask -> -inf + a per-row lse + a const result-scale
             # (inv_ln2) with exp2. Route to the tiled/simd template WITH bias/mask/lse
@@ -879,6 +981,18 @@ class GenericLowerer(
             # (loads promote bfloat->fp32; simd stays fp16/fp32). Returns None for a
             # non-biased FA (the QK dot's C is a zero/loop-acc, not a load), so
             # standard FA flows through to the gates below unchanged.
+            from ._biased_replay import lower_wide_rows as _lower_wide_biased_rows
+            from ._biased_replay import wide_row_plan as _wide_biased_row_plan
+
+            _wide_row_plan = _wide_biased_row_plan(self)
+            if _wide_row_plan is not None:
+                self._source_biased_replay = True
+                return _lower_wide_biased_rows(self, _wide_row_plan)
+
+            from ._biased_replay import eligible as _biased_replay_eligible
+            if _biased_replay_eligible(self):
+                self._source_biased_replay = True
+                return "// Source-replayed biased attention\n" + self._lower_generic()
             _biased_info = self._detect_biased_flash_attention()
             if _biased_info is not None:
                 return self._lower_biased_flash_attention_template(_biased_info)
@@ -945,8 +1059,18 @@ class GenericLowerer(
                 # The standard FA accumulation ``acc += tt.dot(p, v)`` adds the dot to a
                 # loop-carried TENSOR accumulator (not a scalar splat) -> NOT flagged, so
                 # the validated FA is unaffected; only a true scale/bias on the scores is.
+                _dot_ids = {_dot.id} | set(getattr(_dot, "result_ids", None) or [])
                 for _s in _fa_ops:
-                    if _dot.id not in (_s.operand_ids or []):
+                    if not _dot_ids.intersection(_s.operand_ids or []):
+                        continue
+                    # Triton's N_CTX==1 specialization erases the one-iteration K
+                    # loop.  The canonical P@V accumulator is then the second dot
+                    # itself and the source's final ``acc / l`` becomes a direct
+                    # tensor division of that dot.  It is not an unreplayed scalar
+                    # epilogue.  Admit only the exact terminal shape here; routing
+                    # below is mandatory and the dense value-path verifier still
+                    # proves the denominator recurrence and stored result.
+                    if _is_terminal_pv_normalization(_dot, _s):
                         continue
                     if _s.op in ("arith.mulf", "arith.divf", "arith.muli"):
                         return True
@@ -956,6 +1080,46 @@ class GenericLowerer(
                         _others = [o for o in (_s.operand_ids or []) if o != _dot.id]
                         if any(_is_scalar_splat(o) for o in _others):
                             return True
+                return False
+
+            def _is_terminal_pv_normalization(_dot, _consumer):
+                if _dot is not _fa_dots[-1] or _consumer.op != "arith.divf":
+                    return False
+                _dot_ids = {_dot.id} | set(getattr(_dot, "result_ids", None) or [])
+                _operands = list(_consumer.operand_ids or [])
+                if len(_operands) != 2 or _operands[0] not in _dot_ids:
+                    return False
+                # A scalar divisor is the P-side scale the guard exists to catch.
+                if _is_scalar_splat(_operands[1]):
+                    return False
+                _direct = [
+                    _op
+                    for _op in _fa_ops
+                    if _dot_ids.intersection(_op.operand_ids or [])
+                ]
+                if _direct != [_consumer]:
+                    return False
+                _stores = [_op for _op in _fa_ops if _op.op == "tt.store"]
+                if len(_stores) != 1 or len(_stores[0].operand_ids or []) < 2:
+                    return False
+                _cur = _stores[0].operand_ids[1]
+                _wrappers = {
+                    "ttg.convert_layout",
+                    "arith.extf",
+                    "arith.truncf",
+                    "tt.fp_to_fp",
+                }
+                _seen = set()
+                while _cur not in _seen:
+                    if _cur == _consumer.id or _cur in set(
+                        getattr(_consumer, "result_ids", None) or []
+                    ):
+                        return True
+                    _seen.add(_cur)
+                    _op = _fa_by_id.get(_cur)
+                    if _op is None or _op.op not in _wrappers or len(_op.operand_ids or []) != 1:
+                        return False
+                    _cur = _op.operand_ids[0]
                 return False
 
             def _refuse_dot_result_epilogue():
@@ -970,6 +1134,10 @@ class GenericLowerer(
                     op_name="tt.dot",
                 )
 
+            _terminal_pv_normalization = any(
+                _is_terminal_pv_normalization(_fa_dots[-1], _s)
+                for _s in _fa_ops
+            )
             _scaled_dots = [_d for _d in _fa_dots if _dot_result_scaled(_d)]
             _constant_result_scale = None
             if _scaled_dots:
@@ -1041,23 +1209,20 @@ class GenericLowerer(
                     # (contiguous, v in {64,128}, fp16 for qk>128); else fall through -> refuse.
                     if (
                         not info.get("is_mla")
-                        and info.get("v_head_dim") != info["head_dim"]
+                        and _v_head_dim_of(info) != info["head_dim"]
                         and _simd_fa_eligible(info)
                     ):
                         return self._lower_flash_attention_template(info)
 
             elif _fa_maxdim == 64:
-                # hd64: route to the simd MMA template ONLY when it detects cleanly AND is
-                # simd-eligible (contiguous, block 32x32, fp16/fp32). hd64 otherwise lowers
-                # through the generic path (fp32 works but slow ~0.19x SDPA; fp16 currently
-                # REFUSES -> CPU-fallback, since the generic K^T is a 32x64 tt.trans > the
-                # 1024-thread cap). We must NEVER regress that path, so ANY detection refusal
-                # or ineligibility falls through unchanged. When it does take over, the simd
-                # hd64 kernel is validated correct (err ~9e-7) and 1.9-3.0x SDPA — and it also
-                # gives fp16 hd64 a real GPU path for the first time. Unlike the hd128 branch
+                # hd64: route fp16/fp32 to the simd MMA template when eligible. A native,
+                # uniform-bf16 32x32 source instead uses the scalar/tiled template, whose
+                # bfloat ABI promotes loads and computes in fp32. Other hd64 graphs retain
+                # their generic path/refusal. We must NEVER regress that path, so detection
+                # ambiguity or ineligibility falls through unchanged. Unlike the hd128 branch
                 # (where a detect refusal is intentional -> the head_dim>64 refusal below), a
                 # refusal here is NOT a hard error: hd64 has a correct generic fallback.
-                if _constant_result_scale is not None:
+                if _constant_result_scale is not None or _terminal_pv_normalization:
                     # Once the generic-result guard is relaxed, detection/routing is
                     # mandatory: generic lowering is the GPU-confirmed silent-wrong.
                     _info64 = self._detect_flash_attention()
@@ -1068,15 +1233,51 @@ class GenericLowerer(
                         _info64 = None
                 if (
                     _info64 is not None
+                    and _constant_result_scale is None
+                    and not _terminal_pv_normalization
+                    and self._fa_single_query_generic_eligible(_info64)
+                ):
+                    # A folded query length does not make this a single-length
+                    # source. Keep its actual masks in generic lowering; never
+                    # weaken the template's own output-mask safety check.
+                    _info64 = None
+                _bf16_tiled64 = (
+                    _info64 is not None
+                    and _info64["head_dim"] == 64
+                    and _info64.get("v_head_dim", 64) == 64
                     and _info64["block_m"] == 32
                     and _info64["block_n"] == 32
+                    and _info64["out_dtype"] == "bf16"
+                    # This is the native-bf16 buffer ABI. Explicit bf16 dot
+                    # operands remain behind the integrity refusal above: the
+                    # source here promotes its loads before both dots, while
+                    # the tiled maker promotes the same bfloat loads to fp32.
+                    and not _fa_has_bf16
+                    and not _info64.get("is_mla")
+                    and all(
+                        str(self.graph.args[_info64[role]].elem_type) == "bf16"
+                        for role in ("q", "k", "v", "out")
+                    )
+                )
+                if (
+                    _info64 is not None
                     and _info64["head_dim"] == 64
-                    and _info64["out_dtype"] in ("f32", "f16")
-                    and _simd_fa_eligible(_info64)
+                    and (
+                        _simd_fa_eligible(_info64)
+                        or (
+                            _info64["out_dtype"] in ("f32", "f16")
+                            and _info64["block_m"] in (32, 64)
+                            and _info64["block_n"] in (32, 64)
+                            and (_info64["block_m"], _info64["block_n"]) != (32, 32)
+                            and _info64.get("v_head_dim", 64) == 64
+                            and not _info64.get("is_mla")
+                        )
+                        or _bf16_tiled64
+                    )
                 ):
                     return self._lower_flash_attention_template(_info64)
 
-            if _constant_result_scale is not None:
+            if _constant_result_scale is not None or _terminal_pv_normalization:
                 # Exact constant algebra alone is insufficient when the template's
                 # supported shape/ABI gates did not claim the kernel.
                 _refuse_dot_result_epilogue()
@@ -1203,6 +1404,13 @@ class GenericLowerer(
         # Check for simple dot (no stride args, no scf.for) — use inline
         # scalar matmul that loads from global into shared memory, then
         # does per-thread dot product.
+        from ._loop_epilogue import eligible as _loop_epilogue_eligible
+
+        if _loop_epilogue_eligible(self):
+            from ._loop_epilogue import deferred_wide_ops
+            self._source_epilogue_replay = True
+            self._skip_ids.update(deferred_wide_ops(self))
+            return "// Source-replayed K-loop epilogue\n" + self._lower_generic()
         simple_dot = self._detect_simple_dot()
         if simple_dot:
             return self._lower_simple_dot_inline(simple_dot)
@@ -1306,6 +1514,114 @@ class GenericLowerer(
             self.effective_block_size = reduce_3d_info["block_size"]
             return msl
 
+        return self._lower_generic()
+
+    def _fa_single_query_generic_eligible(self, info):
+        """Prove the narrow Q=1/K-runtime source which the dense detector conflates.
+
+        This selects operation-by-operation lowering, not a mask-dropping template.
+        The caller separately excludes both protected dot-result epilogue classes.
+        No name-based length guess or exception-driven fallback is used here.
+        """
+        if (info.get("head_dim") != 64 or info.get("v_head_dim", 64) != 64
+                or info.get("block_m") != 32 or info.get("block_n") != 32
+                or info.get("out_dtype") not in ("f16", "f32") or info.get("is_mla")
+                or type(info.get("N_CTX")) is not int):
+            return False
+
+        def walk(ops):
+            for op in ops:
+                yield op
+                yield from walk(op.region_ops or [])
+                yield from walk(op.else_ops or [])
+
+        ops = list(walk(self.graph.ops))
+        by_id = {op.id: op for op in ops}
+        args = {arg.id: arg for arg in self.graph.args}
+        if not 0 <= info["N_CTX"] < len(self.graph.args):
+            return False
+        length = self.graph.args[info["N_CTX"]]
+        if length.is_ptr:
+            return False
+        loops = [op for op in ops if op.op == "scf.for"]
+        if len(loops) != 1:
+            return False
+        loop = loops[0]
+        if (len(loop.operand_ids or []) < 3 or loop.operand_ids[1] != length.id
+                or self._const_int(loop.operand_ids[0], by_id) != 0
+                or self._const_int(loop.operand_ids[2], by_id) != 32):
+            return False
+        iv = (loop.attrs.get("block_arg_ids") or [None])[0]
+        if iv is None:
+            return False
+
+        wrappers = {"tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout"}
+        def core(vid):
+            seen = set()
+            while vid not in seen:
+                seen.add(vid)
+                op = by_id.get(vid)
+                if op is None or op.op not in wrappers:
+                    return vid
+                if len(op.operand_ids or []) != 1:
+                    return None
+                vid = op.operand_ids[0]
+            return None
+
+        def base(vid):
+            seen = set()
+            while vid not in seen:
+                seen.add(vid)
+                if vid in args:
+                    return args[vid].index if args[vid].is_ptr else None
+                op = by_id.get(vid)
+                if op is None or op.op not in ("tt.addptr", "tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout") or not op.operand_ids:
+                    return None
+                vid = op.operand_ids[0]
+            return None
+
+        def boundary(mask, row):
+            cmp = by_id.get(core(mask))
+            if (cmp is None or cmp.op != "arith.cmpi" or len(cmp.operand_ids or []) != 2
+                    or cmp.attrs.get("predicate_name") != "slt"):
+                return False
+            lhs, rhs = cmp.operand_ids
+            rhs = core(rhs)
+            if row:
+                if self._const_int(rhs, by_id) != 1:
+                    return False
+            elif rhs != length.id:
+                return False
+            sh = self._index_shape(lhs, by_id, args, iv, 1)
+            if sh["bad"] or sh["mod"] is not None or sh["index_casts"] or sh["range"] != 1 or sh["bounds"] != (0, 32):
+                return False
+            return (sh["iv"] == 0 and sh["pid"] == 0 and sh["pid_div"] is None and sh["coef"] == 32) if row else (sh["iv"] == 1 and sh["pid"] is None)
+
+        memory = [op for op in ops if op.op in ("tt.load", "tt.store")]
+        if len(memory) != 4:
+            return False
+        expected = {info["q"]: ("tt.load", True), info["k"]: ("tt.load", False),
+                    info["v"]: ("tt.load", False), info["out"]: ("tt.store", True)}
+        if len(expected) != 4:
+            return False
+        seen = set()
+        for op in memory:
+            role = base(op.operand_ids[0]) if op.operand_ids else None
+            if role not in expected or role in seen or op.op != expected[role][0]:
+                return False
+            seen.add(role)
+            mask_slot = 1 if op.op == "tt.load" else 2
+            if len(op.operand_ids) <= mask_slot or not boundary(op.operand_ids[mask_slot], expected[role][1]):
+                return False
+            if op.op == "tt.load":
+                if len(op.operand_ids) != 3:
+                    return False
+                other = by_id.get(core(op.operand_ids[2]))
+                if other is None or other.op != "arith.constant" or other.attrs.get("value") != 0:
+                    return False
+        return True
+
+    def _lower_generic(self) -> str:
         # Detect 2D kernel patterns (expand_dims + broadcast)
         self._prescan_2d_info()
 
@@ -1323,7 +1639,7 @@ class GenericLowerer(
 
         # For kernels with constant tensors (e.g. tl.full) but no make_range,
         # graph.block_size may be too small (defaults to num_warps*32).
-        # Scan tensor type_strs to find the actual max tensor size.
+        # Scan immutable native result shapes to find the actual max tensor size.
         # Walk nested regions too: a tensor living only inside an scf.for / scf.if body
         # is just as real, and missing it leaves the kernel sized for the narrower
         # top-level tiles -- the same silent truncation this scan exists to prevent.
@@ -1337,8 +1653,9 @@ class GenericLowerer(
 
         max_tensor_size = block_size
         for ssa in _scan_nested(self.graph.ops):
-            shape = _extract_shape(ssa.type_str)
-            if shape:
+            for shape in self._native_shapes_for_op(ssa):
+                if not shape:
+                    continue
                 total = 1
                 for d in shape:
                     total *= d
@@ -1407,7 +1724,7 @@ class GenericLowerer(
             None,
         )
         _staging_ops = _staging_op is not None
-        _dot_cooperative_mept = self._dot_cooperative_mept_eligible()
+        _dot_cooperative_mept = self._dot_cooperative_mept_eligible() or getattr(self, "_source_epilogue_replay", False)
         has_reduce_ops = any(ssa.op == "tt.reduce" for ssa in all_ops_iter)
         has_barrier_ops = any(
             ssa.op
@@ -1444,6 +1761,13 @@ class GenericLowerer(
         )
         num_threads = self.graph.num_warps * 32
 
+        if self._assert_plan is not None and block_size <= 1024:
+            # A rendezvous is not movable across multipass reduction phases.
+            # Use the existing one-logical-element-per-Metal-thread form when
+            # the complete tile fits, rather than splitting source assertions
+            # between passes or dropping them from a template.
+            num_threads = block_size
+
         # Phase 4c: is this kernel safe for single-pass MEPT? Default-deny —
         # every op must be array-wired and no fp8 dtype may appear (fp8
         # truncf emits a scalar conversion chain). Computed here; combined
@@ -1466,8 +1790,8 @@ class GenericLowerer(
             if not s.operand_ids:
                 return False
             src_t = self._find_op_type_str(s.operand_ids[0]) or ""
-            src_sh = _extract_shape(src_t)
-            dst_sh = _extract_shape(s.type_str or "")
+            src_sh = self._native_shape(s.operand_ids[0], op_name=s.op)
+            dst_sh = self._native_shape(s.id, op_name=s.op)
             if not src_sh or not dst_sh:
                 return False
             sll = self._resolve_linear_layout(src_t, src_sh)
@@ -1505,9 +1829,7 @@ class GenericLowerer(
                 return False  # multi-value (argmin/argmax/Welford)
             if not r.operand_ids:
                 return False
-            t = self._find_op_type_str(r.operand_ids[0])
-            shp = _extract_shape(t) if t else None
-            return shp is not None and len(shp) == 1
+            return len(self._native_shape(r.operand_ids[0], op_name=r.op)) == 1
 
         mept_reduce_eligible = (
             self.mept_enabled
@@ -1517,12 +1839,179 @@ class GenericLowerer(
             and not any(_op_is_fp8(s) for s in all_ops_iter)
         )
 
+        # Packet 325: a wide scan uses one exact flattened ownership map for
+        # its complete producer/consumer cone.  This is intentionally a
+        # separate, default-deny proof rather than adding shape operations to
+        # the general MEPT allowlist: expand/broadcast are only array-safe here
+        # because every make_range is projected from the same flat element
+        # index (row=e//N, col=e%N) by _lower_make_range.
+        _scan_ops = [s for s in _top_ops if s.op == "tt.scan"]
+        _scan_shape = None
+        self._scan_native_contracts = {}
+        self._scan_native_errors = {}
+        _scan_top_by_result = {}
+        for _s in _top_ops:
+            _scan_top_by_result[_s.id] = _s
+            for _rid in (_s.result_ids or []):
+                _scan_top_by_result[_rid] = _s
+
+        def _scan_region_is_exact(sc):
+            nonlocal _scan_shape
+            try:
+                contract = self._prove_scan_native_contract(sc)
+            except MetalNonRecoverableError as exc:
+                reason = str(exc).splitlines()[0]
+                self._scan_native_errors[sc.id] = reason.removeprefix(
+                    "Refusing to emit silently-wrong output: "
+                )
+                return False
+            self._scan_native_contracts[sc.id] = contract
+            _shape = contract["shape"]
+            if _scan_shape is None:
+                _scan_shape = tuple(_shape)
+            elif tuple(_shape) != _scan_shape:
+                return False
+            _n = len(sc.operand_ids)
+            _args = list((sc.attrs or {}).get("block_arg_ids") or [])
+            _returns = [b for b in (sc.region_ops or []) if b.op == "tt.scan.return"]
+            if len(_args) != 2 * _n or len(_returns) != 1:
+                return False
+            if len(_returns[0].operand_ids or []) != _n:
+                return False
+            return all(b.op == "tt.scan.return" or b.op in _MEPT_SAFE_OPS for b in (sc.region_ops or []))
+
+        _scan_arg_ids = {a.id for a in self.graph.args}
+
+        def _scan_value_proof(vid, seen=None):
+            """Return ``coordinate`` / ``uniform`` or None for a whole value DAG.
+
+            It is not enough for *one* operand path to reach a proved range: an
+            elementwise value may combine that path with a second tensor whose
+            ownership is unknown.  Every sibling must therefore prove either the
+            same flattened coordinate ownership or true scalar uniformity.
+            """
+            if seen is None:
+                seen = set()
+            if vid in seen:
+                return None
+            seen.add(vid)
+            try:
+                _facts = self._scan_native_value_facts(vid)
+            except MetalNonRecoverableError:
+                return None
+            if _facts.elem and _is_fp8(_mlir_to_triton_dtype(_facts.elem)):
+                return None
+            _op = _scan_top_by_result.get(vid)
+            if _op is None:
+                # Kernel arguments are scalar values or scalar pointer bases.
+                # Tensor uses of them must still pass through a proved splat,
+                # addptr or load before becoming a scan operand.
+                return (
+                    "uniform"
+                    if vid in _scan_arg_ids and not _facts.is_tensor and _facts.shape == ()
+                    else None
+                )
+            if _op.op == "tt.make_range":
+                return "coordinate"
+            if _op.op == "tt.scan":
+                return "coordinate"
+            if _op.op == "arith.constant":
+                # MLIR's ``dense<scalar>`` is a splat, but ``dense<[...]>`` is
+                # not.  The walker leaves a non-splat payload as a string; do
+                # not silently replay it as one scalar in every array slot.
+                return (
+                    "uniform"
+                    if isinstance((_op.attrs or {}).get("value"), (bool, int, float))
+                    else None
+                )
+            if _op.op in ("tt.get_program_id", "tt.get_num_programs"):
+                return "uniform"
+            if _op.op == "tt.splat":
+                if len(_op.operand_ids or []) != 1:
+                    return None
+                return (
+                    "uniform"
+                    if _scan_value_proof(_op.operand_ids[0], set(seen)) == "uniform"
+                    else None
+                )
+            if _op.op == "ttg.convert_layout":
+                if len(_op.operand_ids or []) != 1:
+                    return None
+                if not (_convert_resolves(_op) or _scan_convert_is_flat_noop(_op)):
+                    return None
+                return _scan_value_proof(_op.operand_ids[0], set(seen))
+            if _op.op in _MEPT_SAFE_OPS or _op.op in ("tt.expand_dims", "tt.broadcast"):
+                if not _op.operand_ids:
+                    return None
+                proofs = [
+                    _scan_value_proof(o, set(seen)) for o in _op.operand_ids
+                ]
+                if any(p is None for p in proofs):
+                    return None
+                return "coordinate" if "coordinate" in proofs else "uniform"
+            return None
+
+        def _scan_convert_is_flat_noop(op):
+            if len(op.operand_ids or []) != 1:
+                return False
+            if _scan_shape is None:
+                return False
+            try:
+                source_shape = self._scan_native_value_facts(op.operand_ids[0]).shape
+                dest_shape = self._scan_native_value_facts(op.id).shape
+            except MetalNonRecoverableError:
+                return False
+            # Packet 325 replaces every layout *inside the proved scan
+            # value cone* with one canonical flat ownership projection.
+            # A full-tile layout conversion is consequently a value
+            # identity whether it appears before or after the scan.  Both
+            # ends must name the exact proved tile: admitting a partial or
+            # reshaped conversion would silently invent element ownership.
+            return bool(
+                source_shape
+                and dest_shape
+                and tuple(source_shape) == tuple(_scan_shape)
+                and tuple(dest_shape) == tuple(_scan_shape)
+            )
+
+        _scan_allowed_top = _MEPT_SAFE_OPS | {
+            "tt.expand_dims", "tt.broadcast", "tt.scan", "ttg.convert_layout"
+        }
+        # Establish the common scan shape before asking whether layout
+        # conversions are identities with respect to that shape.  Doing this
+        # inside the later boolean expression made the answer depend on
+        # evaluation order: a conversion was queried while ``_scan_shape``
+        # was still None, over-refusing the four-warp bf16 layouts while the
+        # independently-resolvable sixteen-warp spellings happened to pass.
+        _scan_regions_exact = bool(_scan_ops) and all(
+            _scan_region_is_exact(s) for s in _scan_ops
+        )
+        mept_scan_eligible = (
+            self.mept_enabled
+            and bool(_scan_ops)
+            and not any(s.op == "tt.reduce" for s in all_ops_iter)
+            and all(s.op in _scan_allowed_top for s in _top_ops)
+            and all(
+                s.op != "ttg.convert_layout"
+                or _convert_resolves(s)
+                or _scan_convert_is_flat_noop(s)
+                for s in _top_ops
+            )
+            and _scan_regions_exact
+            and all(
+                _scan_value_proof(o) in ("coordinate", "uniform")
+                for s in _scan_ops
+                for o in (s.operand_ids or [])
+            )
+            and not any(_op_is_fp8(s) for s in all_ops_iter)
+        )
+
         # Phase 4f (MEPT M2): control-flow kernels that carry a multi-element
         # value across a data-dependent scf.for/while/if. The re-execution
         # wrap-loop cannot carry per-element state across the control-flow
         # boundary, so values hoisted before the loop (a tl.arange register
-        # array, a masked-load `other=` constant) fall back to UNKNOWN_ inside
-        # it and the integrity backstop refuses (tridec Bug 2, BLOCK>=256).
+        # array, a masked-load `other=` constant) used to be unresolved inside
+        # it (tridec Bug 2, BLOCK>=256).
         # Register arrays declared once before the loop persist into the body
         # naturally (env_array is instance state), so the existing array-wired
         # body handlers resolve them. Eligible iff: MEPT on; a control-flow op
@@ -1551,9 +2040,8 @@ class GenericLowerer(
             # reshapes. Stays conservative-False on any unresolvable shape.
             if not s.operand_ids:
                 return False
-            src_t = self._find_op_type_str(s.operand_ids[0])
-            in_sh = _extract_shape(src_t) if src_t else None
-            out_sh = _extract_shape(s.type_str or "")
+            in_sh = self._native_shape(s.operand_ids[0], op_name=s.op)
+            out_sh = self._native_shape(s.id, op_name=s.op)
             if not in_sh or not out_sh:
                 return False
             tin = 1
@@ -1584,13 +2072,15 @@ class GenericLowerer(
                     yield from _all_reduces(s.else_ops)
 
         def _value_is_multi(s):
-            shp = _extract_shape(getattr(s, "type_str", "") or "")
-            if not shp:
-                return False
-            tot = 1
-            for d in shp:
-                tot *= d
-            return tot > num_threads
+            for shp in self._native_shapes_for_op(s):
+                if not shp:
+                    continue
+                tot = 1
+                for d in shp:
+                    tot *= d
+                if tot > num_threads:
+                    return True
+            return False
 
         mept_arrayform_eligible = (
             self.mept_enabled
@@ -1612,9 +2102,9 @@ class GenericLowerer(
             for ssa in all_ops_iter:
                 if ssa.op == "tt.reduce" and ssa.operand_ids:
                     reduce_axis = ssa.attrs.get("axis", 0)
-                    # Extract shape from the reduce input's type_str in the IR
-                    inp_type = self._find_op_type_str(ssa.operand_ids[0])
-                    inp_shape = _extract_shape(inp_type) if inp_type else None
+                    inp_shape = self._native_shape(
+                        ssa.operand_ids[0], op_name=ssa.op
+                    )
                     # A true axis-specific reduce: multi-dim input where more
                     # than one non-reduced axis has size > 1. For N-D, check
                     # whether the non-reduced axes together have > 1 element.
@@ -1650,7 +2140,23 @@ class GenericLowerer(
         # the SAME count or it disagrees with the codegen (BLOCK=1024 was
         # rejected with size_per_thread=4 even though the array path emits 8).
         mept_elems_per_thread = block_size // num_threads if num_threads and block_size % num_threads == 0 else 0
-        if has_2d_axis_reduce and block_size <= 1024:
+        if (
+            mept_scan_eligible
+            and block_size > 1024
+            and mept_elems_per_thread > 1
+            and num_threads * mept_elems_per_thread == block_size
+            and _scan_shape is not None
+        ):
+            # The array is the multiplicity; no wrapping loop.  Every array
+            # slot owns flat element e=lid*width+slot and every 2-D coordinate
+            # derives from that same e.  _lower_scan validates staging budget,
+            # operand widths, slot types, block arguments and return arity.
+            self._total_elements = block_size
+            self._scan_mept_shape = _scan_shape
+            self._scan_mept_width = mept_elems_per_thread
+            block_size = num_threads
+            self._mept_single_pass = True
+        elif has_2d_axis_reduce and block_size <= 1024:
             # Skip multipass; use full block_size with one element per thread.
             # _lower_reduce_2d handles the sequential reduction internally.
             pass
@@ -1665,8 +2171,9 @@ class GenericLowerer(
                 nonlocal max_reduce_size
                 for op in ops:
                     if op.op == "tt.reduce" and op.operand_ids:
-                        inp_type = self._find_op_type_str(op.operand_ids[0])
-                        inp_shape = _extract_shape(inp_type) if inp_type else None
+                        inp_shape = self._native_shape(
+                            op.operand_ids[0], op_name=op.op
+                        )
                         if inp_shape:
                             rs = 1
                             for d in inp_shape:
@@ -1787,6 +2294,21 @@ class GenericLowerer(
         self._actual_dispatch_threads = actual_dispatch_threads
         self.effective_block_size = actual_dispatch_threads
 
+        if self._assert_plan is not None and not self._is_2d and any(
+            op.op == 'tt.make_range'
+            and op.attrs.get('end', 0) - op.attrs.get('start', 0) != self._total_elements
+            for op in all_ops_iter
+        ):
+            from .assertions import refuse
+            refuse('mixed 1-D tile widths lack a predicate ownership proof')
+
+        if self._assert_plan is not None and (
+            use_multipass or self._mept_single_pass
+            or (self._needs_wrapping and self._total_elements % actual_dispatch_threads != 0)
+        ):
+            from .assertions import refuse
+            refuse('execution multiplicity does not prove uniform assertion rendezvous')
+
         # COVERAGE BACKSTOP -- should be unreachable, and is kept because the thing it
         # guards already regressed once.
         #
@@ -1825,14 +2347,14 @@ class GenericLowerer(
         ):
             _widest, _widest_op = 0, None
             for _ssa in all_ops_iter:
-                _sh = _extract_shape(_ssa.type_str) if getattr(_ssa, "type_str", None) else None
-                if not _sh:
-                    continue
-                _t = 1
-                for _d in _sh:
-                    _t *= _d
-                if _t > _widest:
-                    _widest, _widest_op = _t, _ssa.op
+                for _sh in self._native_shapes_for_op(_ssa):
+                    if not _sh:
+                        continue
+                    _t = 1
+                    for _d in _sh:
+                        _t *= _d
+                    if _t > _widest:
+                        _widest, _widest_op = _t, _ssa.op
             if _widest > actual_dispatch_threads:
                 raise MetalNonRecoverableError(
                     f"kernel mixes tile widths: a {_widest}-element tensor (from "
@@ -1849,7 +2371,7 @@ class GenericLowerer(
         if getattr(self, "_flash_too_large", False):
             self.kb = KernelBuilder(self.graph.func_name, block_size=actual_dispatch_threads)
             self._register_args()
-            self.kb.comment("UNSUPPORTED: 2D kernel with cooperative ops exceeds 1024 elements")
+            self.kb.unsupported("UNSUPPORTED: 2D kernel with cooperative ops exceeds 1024 elements")
             return self.kb.build()
 
         self.kb = KernelBuilder(self.graph.func_name, block_size=actual_dispatch_threads)
@@ -1863,6 +2385,12 @@ class GenericLowerer(
 
         # Register function arguments
         self._register_args()
+
+        if self._assert_plan is not None:
+            self.kb.add_ptr_arg('_assert_status', dtype='u32')
+            self.kb.raw_line('    threadgroup atomic_uint _assert_group_failed;')
+            self.kb.raw_line('    if (lid == 0u) atomic_store_explicit(&_assert_group_failed, 0u, memory_order_relaxed);')
+            self.kb.raw_line('    threadgroup_barrier(mem_flags::mem_threadgroup);')
 
         if use_multipass:
             # Multi-pass reduction: split kernel into phases separated by
@@ -1892,7 +2420,8 @@ class GenericLowerer(
             self.kb._used_pid_axes = self._used_pid_axes
 
         msl = self.kb.build()
-        msl = _alias_shared_memory(msl)
+        allocation_aliases = {}
+        msl = _alias_shared_memory(msl, allocation_aliases=allocation_aliases)
 
         # Safety net: the generic op-by-op path must never silently emit a
         # kernel with an *empty body* when the graph clearly has a
@@ -1914,13 +2443,22 @@ class GenericLowerer(
         body_lines = getattr(self.kb, "_body_lines", [])
         body_has_stmt = any(";" in ln for ln in body_lines)
         if graph_has_store and not body_has_stmt:
-            self.kb.comment(
+            self.kb.unsupported(
                 "UNSUPPORTED: generic lowering produced an empty body for a "
                 "kernel that stores (e.g. an unhandled N-D permute/reduce) — "
                 "falling back to the legacy parser."
             )
             msl = self.kb.build()
-            msl = _alias_shared_memory(msl)
+            msl = _alias_shared_memory(msl, allocation_aliases=allocation_aliases)
+        if getattr(self, "_source_epilogue_replay", False) or getattr(self, "_source_biased_replay", False):
+            from ._lowerer_helpers import _check_replay_shared_memory_budget
+            # Every source op/proof has already lowered. Capacity must not hide
+            # an integrity failure. The bounded replay families use builder
+            # arrays; the assertion channel, if present, adds one atomic uint.
+            self._replay_shared_bytes = _check_replay_shared_memory_budget(
+                self.kb._threadgroup_arrays, allocation_aliases,
+                extra_bytes=4 if self._assert_plan is not None else 0,
+            )
         return msl
 
     def get_output_arg_indices(self):
@@ -2534,9 +3072,7 @@ class GenericLowerer(
 
         def _check_ops(ops):
             for ssa in ops:
-                if ssa.op in ("tt.make_range", "tt.splat", "tt.broadcast"):
-                    return True
-                if ssa.is_tensor:
+                if any(self._native_shapes_for_op(ssa)):
                     return True
                 if ssa.region_ops and _check_ops(ssa.region_ops):
                     return True
@@ -2632,11 +3168,12 @@ class GenericLowerer(
         for ssa in ops:
             op_by_id[ssa.id] = ssa
 
-        # Find the max 2D shape from any tensor type in the kernel
+        # Find the max 2D shape from immutable native results in this scope.
         max_2d_shape = None
         for ssa in ops:
-            shape = _extract_shape(ssa.type_str)
-            if len(shape) >= 2:
+            for shape in self._native_shapes_for_op(ssa):
+                if len(shape) < 2:
+                    continue
                 total = 1
                 for d in shape:
                     total *= d
@@ -2685,7 +3222,7 @@ class GenericLowerer(
                 if next_ed is None:
                     break
                 cur = next_ed
-            return _extract_shape(cur.type_str)
+            return self._native_shape(cur.id, op_name=cur.op)
 
         # Find expand_dims ops and trace back to make_range.
         # Also record expand_dims by parent layout to pair dim=0/dim=1 siblings
@@ -2711,8 +3248,9 @@ class GenericLowerer(
             best = None
             best_numel = 0
             for s_ssa in ops:
-                s_shape = _extract_shape(s_ssa.type_str)
-                if s_shape and len(s_shape) == rank:
+                for s_shape in self._native_shapes_for_op(s_ssa):
+                    if not s_shape or len(s_shape) != rank:
+                        continue
                     numel = 1
                     for d in s_shape:
                         numel *= d
@@ -2721,17 +3259,139 @@ class GenericLowerer(
                         best_numel = numel
             return best
 
+        # Per-make_range broadcast target: each make_range's stride_below must come
+        # from the broadcast IT actually feeds, not the largest same-rank tensor in the
+        # kernel. Two make_ranges of the same rank broadcast to different shapes (e.g.
+        # 1x2x1 -> 1x2x4 vs 1x2x1 -> 4x2x1) have different strides; the global-max
+        # heuristic silently gave both the same one (issue #9). Map each make_range to
+        # the distinct broadcast output shape(s) it reaches. A range feeding MULTIPLE
+        # distinct broadcast shapes (tl.sort indicator, etc.) records no per-range target
+        # and keeps the existing heuristic + reshape rewrite below; there is no
+        # conflict-refusal here.
+        if not hasattr(self, "_make_range_bcast_target"):
+            self._make_range_bcast_target = {}
+
+        # Elementwise/value ops that PRESERVE a make_range's per-axis coordinate: the
+        # result at axis-k position i is a function of range[i] alone, so the range still
+        # indexes the same axis in any broadcast of the result. Shape ops are consumed by
+        # the stage-1 walk below; these are the value-combining ops that can sit between a
+        # range and its broadcast (casts, comparisons, select, arithmetic, gather/load).
+        _VALUE_PRESERVING = (
+            "arith.extsi", "arith.extui", "arith.trunci", "arith.truncf",
+            "arith.index_cast", "arith.index_castui",
+            "arith.sitofp", "arith.uitofp", "arith.fptosi", "arith.fptoui",
+            "arith.bitcast", "tt.bitcast", "tt.fp_to_fp", "ttg.convert_layout",
+            "arith.cmpi", "arith.cmpf", "arith.select",
+            "arith.addi", "arith.subi", "arith.muli", "arith.divsi", "arith.divui",
+            "arith.remsi", "arith.remui", "arith.andi", "arith.ori", "arith.xori",
+            "arith.minsi", "arith.maxsi", "arith.minui", "arith.maxui",
+            "arith.shli", "arith.shrsi", "arith.shrui",
+            "arith.addf", "arith.subf", "arith.mulf", "arith.divf",
+            "arith.minnumf", "arith.maxnumf", "arith.minimumf", "arith.maximumf",
+            "tt.load", "tt.addptr",
+        )
+
+        def _is_coord_invariant(_vid):
+            # An operand is coordinate-invariant when it contributes the SAME value to
+            # every coordinate, so it cannot change which axis a sibling make_range
+            # indexes. A tt.splat always broadcasts one scalar. An arith.constant is
+            # invariant ONLY when proven uniform: a scalar/splat value parses to a Python
+            # number (int/float/bool), whereas a NONUNIFORM dense tensor constant
+            # (dense<[...]>) parses to a non-number and varies per coordinate -- op name
+            # alone does not prove uniformity. An all-ones/scalar shape is a single
+            # broadcast value regardless.
+            _o = op_by_id.get(_vid)
+            if _o is not None:
+                if _o.op == "tt.splat":
+                    return True
+                if _o.op == "arith.constant":
+                    _v = (_o.attrs or {}).get("value")
+                    if isinstance(_v, (int, float)):  # bool is an int subclass
+                        return True
+                    # else fall through to the shape check below
+            if _o is None:
+                return False
+            try:
+                _sh = self._native_shape(_vid, op_name=_o.op)
+            except Exception:
+                return False
+            return _sh is not None and (len(_sh) == 0 or all(_d == 1 for _d in _sh))
+
+        def _ranges_of(_vid, _seen):
+            # Frozenset of make_range ids this value is a PURE per-axis function of,
+            # following only coordinate-bearing operands; None when a coordinate-bearing
+            # operand's correspondence cannot be proven (unknown op, block arg, or a
+            # non-range coordinate-bearing leaf). An empty set = coordinate-invariant.
+            if _vid in _seen:
+                return frozenset()
+            _seen = _seen | {_vid}
+            if _is_coord_invariant(_vid):
+                return frozenset()
+            _o = op_by_id.get(_vid)
+            if _o is None:
+                return None
+            if _o.op == "tt.make_range":
+                return frozenset((_vid,))
+            if _o.op in _VALUE_PRESERVING:
+                _acc = frozenset()
+                for _oid in (_o.operand_ids or ()):
+                    if _is_coord_invariant(_oid):
+                        continue
+                    _sub = _ranges_of(_oid, _seen)
+                    if _sub is None:
+                        return None
+                    _acc = _acc | _sub
+                return _acc
+            return None
+
+        _bt = {}
+        for _b in ops:
+            if _b.op != "tt.broadcast" or not _b.operand_ids:
+                continue
+            # Stage 1: consume the leading shape-op chain down to the first value op.
+            _cur = _b.operand_ids[0]
+            _seen_shape = set()
+            while _cur in op_by_id and _cur not in _seen_shape:
+                _seen_shape.add(_cur)
+                _o = op_by_id[_cur]
+                if _o.op in ("tt.expand_dims", "tt.broadcast", "tt.reshape", "ttg.convert_layout") and _o.operand_ids:
+                    _cur = _o.operand_ids[0]
+                    continue
+                break
+            # Stage 2: prove the value under the broadcast is a pure per-axis function of
+            # exactly ONE make_range. Comparison-, select-, arithmetic- and gather-derived
+            # broadcasts (issue #9 residuals) are coordinate-preserving and resolve here;
+            # outer products (two distinct ranges) and unprovable inputs record nothing
+            # and keep the old heuristic. _trace_to_make_range is NOT used (it is shared
+            # with pointer/load consumers and does not traverse cmpi/select).
+            _rs = _ranges_of(_cur, set())
+            if not _rs or len(_rs) != 1:
+                continue
+            _mr = next(iter(_rs))
+            _bshape = self._native_shape(_b.id, op_name=_b.op)
+            if _bshape:
+                _bt.setdefault(_mr, set()).add(tuple(_bshape))
+        for _mr, _shapes in _bt.items():
+            if len(_shapes) == 1:
+                # Only when a make_range feeds a SINGLE broadcast is its target
+                # unambiguous. Multiple broadcasts (tl.sort indicator, etc.) keep the
+                # existing heuristic + slice-layout reshape rewrite, which handle them.
+                self._make_range_bcast_target[_mr] = next(iter(_shapes))
+
         for ssa in ops:
             if ssa.op != "tt.reshape" or not ssa.operand_ids:
                 continue
             src_id = ssa.operand_ids[0]
             mr_id = self._trace_to_make_range(src_id, ops, op_by_id)
             if mr_id is None:
+                _rs = _ranges_of(src_id, set())
+                mr_id = next(iter(_rs)) if (_rs and len(_rs) == 1) else None
+            if mr_id is None:
                 continue
             if mr_id in self._make_range_dim:
                 # Already assigned by an expand_dims chain; do not override.
                 continue
-            out_shape = _extract_shape(ssa.type_str)
+            out_shape = self._native_shape(ssa.id, op_name=ssa.op)
             if not out_shape or len(out_shape) < 2:
                 continue
             non_one = [i for i, s in enumerate(out_shape) if s != 1]
@@ -2743,8 +3403,12 @@ class GenericLowerer(
             # tl.sort, the reshape output is e.g. (1,1,1,2) and the broadcast
             # target is (2,2,2,2). Using the actual broadcast shape ensures
             # stride_below reflects the enclosing tensor's strides.
-            same_rank = _max_shape_with_rank(len(out_shape))
-            broadcast_shape = tuple(same_rank) if same_rank else tuple(out_shape)
+            own = self._make_range_bcast_target.get(mr_id)
+            if own is not None and len(own) == len(out_shape):
+                broadcast_shape = own
+            else:
+                same_rank = _max_shape_with_rank(len(out_shape))
+                broadcast_shape = tuple(same_rank) if same_rank else tuple(out_shape)
             self._make_range_full_shape[mr_id] = broadcast_shape
             stride_below = 1
             for s in broadcast_shape[dim + 1 :]:
@@ -2763,6 +3427,9 @@ class GenericLowerer(
                     continue
                 # Trace back through passthroughs to find the make_range
                 mr_id = self._trace_to_make_range(src_id, ops, op_by_id)
+                if mr_id is None:
+                    _rs = _ranges_of(src_id, set())
+                    mr_id = next(iter(_rs)) if (_rs and len(_rs) == 1) else None
                 if mr_id is not None:
                     # Walk forward through the expand_dims chain to find the
                     # final N-D shape (all dims are 1 except the make_range's
@@ -2787,35 +3454,39 @@ class GenericLowerer(
                     # sizes. The position `dim` is the make_range's axis in
                     # that shape; stride_below = product of broadcast dims
                     # after `dim`.
-                    broadcast_shape = (
-                        max_2d_shape if (max_2d_shape and len(max_2d_shape) == len(final_shape)) else final_shape
-                    )
+                    own = self._make_range_bcast_target.get(mr_id)
+                    if own is not None and final_shape and len(own) == len(final_shape):
+                        broadcast_shape = own
+                    else:
+                        broadcast_shape = (
+                            max_2d_shape if (max_2d_shape and len(max_2d_shape) == len(final_shape)) else final_shape
+                        )
                     self._make_range_full_shape[mr_id] = broadcast_shape
                     stride_below = 1
                     for s in broadcast_shape[dim + 1 :]:
                         stride_below *= s
                     self._make_range_stride_below[mr_id] = stride_below
 
-                    # Extract the parent layout from the expand_dims source type
+                    # Extract the parent layout from immutable native metadata
                     # e.g., "tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>"
                     # to pair with siblings from the same tile.
-                    src_type = ""
-                    if src_id in op_by_id and op_by_id[src_id].type_str:
-                        src_type = op_by_id[src_id].type_str
-                    elif mr_id in op_by_id and op_by_id[mr_id].type_str:
-                        src_type = op_by_id[mr_id].type_str
-                    import re as _re
-
+                    layout_value_id = src_id if src_id in self.graph.result_meta else mr_id
+                    src_layout = (
+                        self._native_value_facts(
+                            layout_value_id, op_name="2-D shape prescan"
+                        ).layout
+                        or ""
+                    )
                     # Extract the parent layout identifier. The type string
                     # may use aliases (#blocked, #blocked1) or inline defs
                     # (#ttg.blocked<{...}>).  Use a nested-brace-aware match.
                     parent_key = "default"
-                    pidx = src_type.find("parent")
+                    pidx = src_layout.find("parent")
                     if pidx >= 0:
                         # Find the `=` and the start of the layout spec
-                        eq_idx = src_type.find("=", pidx)
+                        eq_idx = src_layout.find("=", pidx)
                         if eq_idx >= 0:
-                            rest = src_type[eq_idx + 1 :].strip()
+                            rest = src_layout[eq_idx + 1 :].strip()
                             # Capture everything up to matching `>` or `}`
                             depth = 0
                             end_idx = 0
@@ -2986,7 +3657,7 @@ class GenericLowerer(
         """Look up MSL variable name for an SSA value."""
         if ssa_id in self.env:
             return self.env[ssa_id]
-        return f"UNKNOWN_{ssa_id}"
+        raise MetalNonRecoverableError(f"codegen encountered unresolved SSA value {ssa_id}")
 
     def _lookup_array(self, ssa_id: int):
         """Return ``(name, n_elems, ty)`` for an SSA value's MEPT storage.
@@ -3013,7 +3684,7 @@ class GenericLowerer(
         if ssa_id in getattr(self, "env_array", {}):
             name, n, ty = self.env_array[ssa_id]
             return RegVal(name=name, n_elems=n, ty=ty, form="array")
-        name = self.env.get(ssa_id, "UNKNOWN_%s" % ssa_id)
+        name = self._lookup(ssa_id)
         n = self.env_n_elems.get(ssa_id, 1)
         ty = self.env_types.get(ssa_id, "")
         return RegVal(name=name, n_elems=n, ty=ty, form="scalar")
@@ -3143,15 +3814,8 @@ class GenericLowerer(
         elif op == "tt.fp_to_fp":
             self._lower_fp_to_fp(ssa)
         elif op == "tt.assert":
-            # tl.device_assert: an output-NEUTRAL diagnostic side effect — it aborts
-            # the kernel ONLY when its condition is false; on the correct-program
-            # path (assertion holds) it changes nothing in the result buffers. Apple
-            # GPUs have no device-side trap/abort channel, so we elide it, matching
-            # CUDA's RELEASE behavior (Triton compiles device asserts out unless
-            # TRITON_DEBUG). This is NOT a silent-wrong: it never alters a computed
-            # value, it only forgoes a debug trap on already-out-of-contract inputs.
-            # (A store/atomic — an output-AFFECTING side effect — is refused below.)
-            pass  # intentional, documented elision (see test_device_assert skip note)
+            from .assertions import emit
+            emit(self, ssa)
         elif op in ("tt.print", "tt.device_print"):
             # Device-side print: Apple GPUs have no device printf channel. This
             # is an output-NEUTRAL diagnostic side effect, so dropping it is
@@ -3164,9 +3828,9 @@ class GenericLowerer(
             # SSAValue construction) is a side-effect / terminator the lowerer
             # doesn't model — store/atomic/scatter/cf variants — and dropping it
             # silently loses its effect (audit #165). Refuse loudly. A
-            # result-producing unknown op leaves its result undefined; any
-            # consumer reads UNKNOWN_<id> and fails loud at MSL compile (or it's
-            # dead -> harmless), so a comment is safe and tolerates dead-code ops.
+            # result-producing unknown op records an unsupported outcome even
+            # when dead. A consumer of its undefined result refuses at lookup;
+            # otherwise emit_msl handles the explicit unsupported outcome.
             if ssa.id is not None and ssa.id < 0:
                 from triton_msl.errors import MetalNonRecoverableError
 
@@ -3176,7 +3840,7 @@ class GenericLowerer(
                     f"and would be silently dropped, losing its effect. Add a "
                     f"handler or an explicit refusal for it."
                 )
-            self.kb.comment(f"UNSUPPORTED: {op}")
+            self.kb.unsupported(f"UNSUPPORTED: {op}")
 
     # -- Program ID and indexing --
 
@@ -3240,8 +3904,36 @@ class GenericLowerer(
         if self._is_2d and ssa.id in self._make_range_dim:
             dim = self._make_range_dim[ssa.id]
             range_size = end - start
-            var_name = self._next_var("idx")
             lid = self._lid_expr
+            scan_shape = getattr(self, "_scan_mept_shape", None)
+            scan_width = getattr(self, "_scan_mept_width", 0)
+            if getattr(self, "_mept_single_pass", False) and scan_shape is not None:
+                if (
+                    len(scan_shape) != 2
+                    or dim not in (0, 1)
+                    or range_size != scan_shape[dim]
+                    or scan_width <= 1
+                ):
+                    raise MetalNonRecoverableError(
+                        "tt.scan: a 2-D make_range is outside the proved flat "
+                        "row/column projection cone; refusing rather than inventing "
+                        "per-slot coordinates.",
+                        op_name="tt.make_range",
+                    )
+                inner = scan_shape[1]
+                exprs = []
+                for i in range(scan_width):
+                    flat = f"({lid} * {scan_width}u + {i}u)"
+                    coord = f"({flat} / {inner}u)" if dim == 0 else f"({flat} % {inner}u)"
+                    exprs.append(f"({coord} + {start}u)" if start else coord)
+                var_name = self._var_array("idx", exprs, "uint")
+                self.env[ssa.id] = var_name
+                self.env_array[ssa.id] = (var_name, scan_width, "uint")
+                self.env_types[ssa.id] = "i32"
+                self.env_shapes[ssa.id] = (range_size,)
+                return
+
+            var_name = self._next_var("idx")
             # Use _total_elements (not capped effective_block_size) for
             # correct index decomposition when wrapping loop is active.
             total = getattr(self, "_total_elements", self.effective_block_size)
@@ -3303,6 +3995,40 @@ class GenericLowerer(
         total = getattr(self, "_total_elements", self.effective_block_size)
         if self._is_2d and range_size < total:
             lid = self._lid_expr
+            scan_shape = getattr(self, "_scan_mept_shape", None)
+            scan_width = getattr(self, "_scan_mept_width", 0)
+            if getattr(self, "_mept_single_pass", False) and scan_shape is not None:
+                # Packet 325 option A: all 2-D scan indices are projections
+                # of the same flattened ownership coordinate.  Do not use
+                # the blocked layout's sizePerThread here (it is [1,1] for
+                # the upstream 2-D scans and therefore undercounts the tile).
+                # The prescan must have identified this make_range's axis and
+                # its extent must match that axis exactly.
+                dim = self._make_range_dim.get(ssa.id)
+                if (
+                    len(scan_shape) != 2
+                    or dim not in (0, 1)
+                    or range_size != scan_shape[dim]
+                    or scan_width <= 1
+                ):
+                    raise MetalNonRecoverableError(
+                        "tt.scan: a 2-D make_range is outside the proved flat "
+                        "row/column projection cone; refusing rather than inventing "
+                        "per-slot coordinates.",
+                        op_name="tt.make_range",
+                    )
+                inner = scan_shape[1]
+                exprs = []
+                for i in range(scan_width):
+                    flat = f"({lid} * {scan_width}u + {i}u)"
+                    coord = f"({flat} / {inner}u)" if dim == 0 else f"({flat} % {inner}u)"
+                    exprs.append(f"({coord} + {start}u)" if start else coord)
+                var_name = self._var_array("idx", exprs, "uint")
+                self.env[ssa.id] = var_name
+                self.env_array[ssa.id] = (var_name, scan_width, "uint")
+                self.env_types[ssa.id] = "i32"
+                self.env_shapes[ssa.id] = (range_size,)
+                return
             var_name = self._next_var("idx")
             if start != 0:
                 expr = f"({lid} % {range_size}u + {start}u)"
@@ -3328,7 +4054,7 @@ class GenericLowerer(
         # populated from the result's TTGIR layout here.
         if ssa.id not in self.env_n_elems and ssa.type_str:
             self._track_n_elems(ssa.id, ssa.type_str, (end - start,))
-        n_per_thread = self.env_n_elems.get(ssa.id, 1)
+        n_per_thread = getattr(self, "_scan_mept_width", 0) or self.env_n_elems.get(ssa.id, 1)
         # The MEPT array path activates ONLY when the prescan proved this
         # kernel is single-pass MEPT-safe (exact tile cover, no barriers,
         # every op array-wired, no fp8). That flag is the sole gate for
@@ -3340,7 +4066,16 @@ class GenericLowerer(
         # shape ops, ...).
         if n_per_thread > 1 and getattr(self, "_mept_single_pass", False):
             ll = self.env_layout.get(ssa.id)
-            if ll is not None and ll.num_registers_per_thread == n_per_thread:
+            if getattr(self, "_scan_mept_shape", None) is not None:
+                # Scan option A promises contiguous flattened ownership, not
+                # the source layout's register basis.
+                exprs = [
+                    f"{start}u + {lid} * {n_per_thread}u + {i}u"
+                    if start != 0
+                    else f"{lid} * {n_per_thread}u + {i}u"
+                    for i in range(n_per_thread)
+                ]
+            elif ll is not None and ll.num_registers_per_thread == n_per_thread:
                 # Compute lane / warp from lid:
                 #   lane = lid & 31u
                 #   warp = lid >> 5u
@@ -3474,6 +4209,10 @@ class GenericLowerer(
         only so downstream ops (like addptr emitting row*stride + col)
         can compose correctly with the broadcast dim.
         """
+        if getattr(self, "_source_biased_replay", False):
+            from ._biased_replay import emit_row_broadcast
+            if emit_row_broadcast(self, ssa):
+                return
         self._emit_passthrough(ssa)
         # Track shape from the result type (overrides passthrough shape)
         shape = _extract_shape(ssa.type_str)
@@ -3531,15 +4270,18 @@ class GenericLowerer(
         if not ssa.operand_ids:
             return False
 
-        # Only rewrite when the reshape output is in a slice layout.  Other
-        # reshapes (e.g. 1D → 9D parent) are canonical.
-        if not ssa.type_str or "#ttg.slice<" not in ssa.type_str:
+        native = self._native_value_facts(ssa.id, op_name=ssa.op)
+
+        # Only rewrite when the native reshape output is in a slice layout.
+        # Printed aliases and mutable summaries are not evidence that this
+        # result participates in the reduce's broadcast projection.
+        if native.layout is None or not native.layout.startswith("#ttg.slice<"):
             return False
 
         # The source must trace to a make_range, and the output shape must
         # have exactly one non-1 axis (so we can interpret it as a per-axis
         # range indicator).
-        out_shape = _extract_shape(ssa.type_str)
+        out_shape = self._native_shape(ssa.id, op_name=ssa.op)
         if not out_shape or len(out_shape) < 2:
             return False
         non_one = [i for i, s in enumerate(out_shape) if s != 1]
@@ -3555,33 +4297,16 @@ class GenericLowerer(
         if mr_id is None:
             return False
 
-        # Primary lookup: match by layout signature.  The reshape's output
+        # Match by exact native layout.  The reshape's output
         # layout (e.g. ``#ttg.slice<{dim = 5, parent = #blocked}>``) should
-        # exactly match a reduce output in the same bitonic stage.
-        consumer_layout = None
-        bcast_shape = None
+        # exactly match a reduce output in the same bitonic stage. Shape
+        # compatibility alone cannot identify that stage: chained sort
+        # reductions can have compatible shapes but different projections.
         layouts_by_layout = getattr(self, "_bcast_layouts_by_layout", {})
-        sig = _extract_layout_signature(ssa.type_str)
-        if sig is not None and sig in layouts_by_layout:
-            bcast_shape, consumer_layout = layouts_by_layout[sig]
-
-        # Fallback: match by shape compatibility.
-        if consumer_layout is None:
-            layouts_by_shape = getattr(self, "_bcast_layouts_by_shape", {})
-            for shape, layout in layouts_by_shape.items():
-                if len(shape) != len(out_shape):
-                    continue
-                compatible = True
-                for i in range(len(out_shape)):
-                    if out_shape[i] != 1 and out_shape[i] != shape[i]:
-                        compatible = False
-                        break
-                if compatible:
-                    if bcast_shape is None or _shape_numel(shape) > _shape_numel(bcast_shape):
-                        bcast_shape = shape
-                        consumer_layout = layout
-        if consumer_layout is None:
+        registered = layouts_by_layout.get(native.layout)
+        if registered is None:
             return False
+        bcast_shape, consumer_layout = registered
 
         stride_below = 1
         for s in bcast_shape[dim + 1 :]:
@@ -3609,7 +4334,7 @@ class GenericLowerer(
         if len(ssa.operand_ids) >= 2:
             ptr_id = ssa.operand_ids[0]
             offset_id = ssa.operand_ids[1]
-            offset_var = self._lookup(offset_id)
+            offset_var = self._pointer_offset_expr(offset_id)
 
             # Phase 4c: MEPT array-of-offsets. If the offset operand is
             # an env_array, record env_ptr_array so tt.load / tt.store
@@ -3625,8 +4350,16 @@ class GenericLowerer(
                     base_ptr, parent_arr, parent_n = parent_ptr_array
                     if parent_n == n:
                         # Both array: produce a combined-offset array.
-                        combined_exprs = [f"{parent_arr}[{i}] + {offset_arr}[{i}]" for i in range(n)]
-                        combined_name = self._var_array("off", combined_exprs, "uint")
+                        # Pointer differences are signed.  ``make_range`` is
+                        # represented as uint, but either side of a chained
+                        # addptr may contribute a negative runtime offset.
+                        # Widen before the addition so C++ usual conversions
+                        # cannot turn that offset into a huge unsigned index.
+                        combined_exprs = [
+                            f"long({parent_arr}[{i}]) + long({offset_arr}[{i}])"
+                            for i in range(n)
+                        ]
+                        combined_name = self._var_array("off", combined_exprs, "long")
                         self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
                         # env[ssa.id] is mostly informational here;
                         # tt.load reads env_ptr_array directly.
@@ -3635,8 +4368,11 @@ class GenericLowerer(
                         return
                 if parent_ptr_info:
                     base_ptr, existing_offset = parent_ptr_info
-                    combined_exprs = [f"{existing_offset} + {offset_arr}[{i}]" for i in range(n)]
-                    combined_name = self._var_array("off", combined_exprs, "uint")
+                    combined_exprs = [
+                        f"long({existing_offset}) + long({offset_arr}[{i}])"
+                        for i in range(n)
+                    ]
+                    combined_name = self._var_array("off", combined_exprs, "long")
                     self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
                     self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
                     self._propagate_shape_elementwise(ssa)
@@ -3659,8 +4395,11 @@ class GenericLowerer(
                 parent_ptr_array = self.env_ptr_array.get(ptr_id)
                 if parent_ptr_array:
                     base_ptr, parent_arr, parent_n = parent_ptr_array
-                    combined_exprs = [f"{parent_arr}[{i}] + {offset_var}" for i in range(parent_n)]
-                    combined_name = self._var_array("off", combined_exprs, "uint")
+                    combined_exprs = [
+                        f"long({parent_arr}[{i}]) + long({offset_var})"
+                        for i in range(parent_n)
+                    ]
+                    combined_name = self._var_array("off", combined_exprs, "long")
                     self.env_ptr_array[ssa.id] = (base_ptr, combined_name, parent_n)
                     self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
                     self._propagate_shape_elementwise(ssa)
@@ -3830,6 +4569,15 @@ class GenericLowerer(
 
         var_name = self._next_var("val")
 
+        # Source replay can use the widest operand's threadgroup.
+        # Lanes beyond this load's own flat tensor extent have NO source load.
+        # They must rendezvous at barriers, but must not read an adjacent tile.
+        if getattr(self, "_source_epilogue_replay", False) or getattr(self, "_source_biased_replay", False):
+            load_shape = self._native_shape(ssa.id, op_name="tt.load")
+            if len(load_shape) == 2 and load_shape[0] * load_shape[1] < self.effective_block_size:
+                extent = f"({self._lid_expr} < {load_shape[0] * load_shape[1]}u)"
+                mask_var = f"({extent} && ({mask_var}))" if mask_var else extent
+
         if fp8_load:
             # FP8: load as uchar, then convert to float
             to_float = fp8_to_float_func(dtype)
@@ -3879,6 +4627,65 @@ class GenericLowerer(
         ptr_id = ssa.operand_ids[0]
         val_id = ssa.operand_ids[1]
 
+        # Prove the native store relation before selecting *any* emission
+        # path, including the MEPT early return below.  Replay-derived array
+        # lengths may corroborate this relation, but cannot establish it.
+        native_ptr_shape = self._native_shape(ptr_id, op_name="tt.store")
+        native_val_shape = self._native_shape(val_id, op_name="tt.store")
+        if (
+            (not native_ptr_shape and native_val_shape)
+            or (
+                native_ptr_shape
+                and native_val_shape
+                and native_ptr_shape != native_val_shape
+            )
+        ):
+            raise MetalNonRecoverableError(
+                "tt.store native pointer/value shapes disagree "
+                f"({native_ptr_shape} vs {native_val_shape})",
+                op_name="tt.store",
+            )
+        native_mask_id = ssa.operand_ids[2] if len(ssa.operand_ids) >= 3 else None
+        if native_mask_id is not None:
+            mask_facts = self._native_value_facts(
+                native_mask_id, op_name="tt.store"
+            )
+            native_mask_shape = self._native_shape(
+                native_mask_id, op_name="tt.store"
+            )
+            if (
+                mask_facts.kind != "integer"
+                or mask_facts.elem != "i1"
+                or mask_facts.width != 1
+            ):
+                raise MetalNonRecoverableError(
+                    "tt.store native mask is not an i1 value",
+                    op_name="tt.store",
+                )
+            if (
+                (not native_ptr_shape and native_mask_shape)
+                or (
+                    native_ptr_shape
+                    and native_mask_shape
+                    and native_ptr_shape != native_mask_shape
+                )
+            ):
+                raise MetalNonRecoverableError(
+                    "tt.store native pointer/mask shapes disagree "
+                    f"({native_ptr_shape} vs {native_mask_shape})",
+                    op_name="tt.store",
+                )
+
+        if getattr(self, "_source_epilogue_replay", False):
+            from ._loop_epilogue import emit_store
+            if emit_store(self, ssa):
+                return
+
+        if getattr(self, "_source_biased_replay", False):
+            from ._biased_replay import emit_small_store
+            if emit_small_store(self, ssa):
+                return
+
         # Phase 4c: MEPT array scatter. When the pointer was assembled
         # via a tt.addptr with an array offset, emit per-position writes for
         # all n MEPT elements. The value is either an env_array of matching
@@ -3918,14 +4725,32 @@ class GenericLowerer(
             # Optional mask is the third operand if present.
             mask_var = None
             mask_is_array = False
-            if len(ssa.operand_ids) >= 3:
-                mid = ssa.operand_ids[2]
-                if mid in self.env_is_mask or self._is_mask(mid):
-                    if mid in self.env_array:
-                        mask_var, _mn, _ = self.env_array[mid]
-                        mask_is_array = True
-                    else:
-                        mask_var = self._lookup(mid)
+            if native_mask_id is not None:
+                if native_mask_id in self.env_array:
+                    mask_var, mask_n, _ = self.env_array[native_mask_id]
+                    if mask_n != n:
+                        raise MetalNonRecoverableError(
+                            "tt.store MEPT mask register-array width does not "
+                            "match the pointer/value width",
+                            op_name="tt.store",
+                        )
+                    mask_is_array = True
+                else:
+                    # Legal Triton IR requires a tensor mask for this tensor
+                    # pointer. A scalar emission value can represent that
+                    # tensor only when its producer proved a uniform splat;
+                    # otherwise one lane's predicate would be broadcast over
+                    # every register-array position.
+                    if (
+                        native_mask_shape
+                        and native_mask_id not in self._is_splat
+                    ):
+                        raise MetalNonRecoverableError(
+                            "tt.store MEPT tensor mask has no per-position "
+                            "array and is not a proved uniform splat",
+                            op_name="tt.store",
+                        )
+                    mask_var = self._lookup(native_mask_id)
             # Cast each value to the buffer element type, exactly as the
             # scalar store does. Values are computed in `float`; narrowing
             # to bf16 (and fp8) needs an explicit cast — MSL won't
@@ -3948,6 +4773,10 @@ class GenericLowerer(
                     self.kb.raw_line(f"    if ({cond}) {{ {write} }}")
             return
 
+        # Every remaining store decision that depends on logical extent uses
+        # immutable native pointer/value facts. ``env_shapes`` is a replay
+        # cache populated while emitting earlier ops; it is not an ownership
+        # or representation proof and must not select guards or refusals.
         # Check if the value to store is smem-backed with total > block_size
         smem_descs = getattr(self, "_shared_mem_descs", {})
         val_smem = smem_descs.get(val_id)
@@ -4007,11 +4836,7 @@ class GenericLowerer(
                 M, N = val_shape[0], val_shape[1]
 
                 # Get mask if provided
-                mask_id = None
-                if len(ssa.operand_ids) >= 3:
-                    mid = ssa.operand_ids[2]
-                    if mid in self.env_is_mask or self._is_mask(mid):
-                        mask_id = mid
+                mask_id = native_mask_id
 
                 # Get the pointer info
                 ptr_info = self.env_is_ptr.get(ptr_id)
@@ -4075,8 +4900,8 @@ class GenericLowerer(
         # is broken for this case, so we use guarded lid-based indexing instead.
         # Skip when dim_0 == 1 (triton_per_* pattern): the ptr already has
         # the row offset from addptr, and using base_ptr[idx] would lose it.
-        ptr_shape = self.env_shapes.get(ptr_id)
-        val_shape = self.env_shapes.get(val_id)
+        ptr_shape = native_ptr_shape
+        val_shape = native_val_shape
         if (
             self._is_2d
             and ptr_shape
@@ -4117,7 +4942,7 @@ class GenericLowerer(
         # above, and _loop_e-wrapped stores (_needs_wrapping); none apply here.
         # Refuse loudly: the user must launch with num_warps = BLOCK/32 so
         # num_threads == BLOCK (n=1), or reduce BLOCK.
-        _val_shape = self.env_shapes.get(val_id)
+        _val_shape = native_val_shape
         _num_threads = self.kb.block_size
         if (
             not self._mept_single_pass
@@ -4126,8 +4951,6 @@ class GenericLowerer(
             and len(_val_shape) >= 1
             and _val_shape[0] > _num_threads
         ):
-            from triton_msl.errors import MetalNonRecoverableError
-
             raise MetalNonRecoverableError(
                 f"Refusing a {_val_shape[0]}-element tensor store with only "
                 f"{_num_threads} threads: the base path stores one element per "
@@ -4154,10 +4977,8 @@ class GenericLowerer(
 
         # Get mask if provided
         mask_var = None
-        if len(ssa.operand_ids) >= 3:
-            mask_id = ssa.operand_ids[2]
-            if mask_id in self.env_is_mask or self._is_mask(mask_id):
-                mask_var = self._lookup(mask_id)
+        if native_mask_id is not None:
+            mask_var = self._lookup(native_mask_id)
 
         # In 2D kernels, 1D store tensors must be guarded to prevent
         # duplicate writes from extra threads (e.g. after 2D→1D reduce).
@@ -4168,12 +4989,7 @@ class GenericLowerer(
         # changed the thread-to-element mapping to simple (thread i = element i).
         val_converted = hasattr(self, "_converted_layout_ids") and bool(getattr(self, "_converted_layout_ids", set()))
         if self._is_2d and not self._is_scalar_ptr(ptr_id):
-            store_shape = self.env_shapes.get(ptr_id)
-            if not store_shape:
-                for op in self.graph.ops:
-                    if op.id == ptr_id and op.type_str:
-                        store_shape = _extract_shape(op.type_str)
-                        break
+            store_shape = native_ptr_shape
             if store_shape and len(store_shape) == 1 and store_shape[0] < self.effective_block_size:
                 store_1d_guard = store_shape[0]
 
@@ -4188,12 +5004,7 @@ class GenericLowerer(
         _idx_var = self._lid_expr
         _idx_driven = _idx_var == str(offsets) or _idx_var in re.findall(r"[A-Za-z_]\w*", str(offsets))
         if _idx_driven and not self._is_scalar_ptr(ptr_id):
-            wrap_shape = self.env_shapes.get(ptr_id)
-            if not wrap_shape:
-                for op in self.graph.ops:
-                    if op.id == ptr_id and op.type_str:
-                        wrap_shape = _extract_shape(op.type_str)
-                        break
+            wrap_shape = native_ptr_shape
             if wrap_shape:
                 wrap_total = 1
                 for _d in wrap_shape:
@@ -4565,7 +5376,7 @@ class GenericLowerer(
         elif op == "arith.shrui":
             self._emit_binary(ssa, ">>", force_unsigned=True)
         else:
-            self.kb.comment(f"UNSUPPORTED arith: {op}")
+            self.kb.unsupported(f"UNSUPPORTED arith: {op}")
 
     def _propagate_bcast_layout_binary(self, ssa: SSAValue) -> None:
         """Propagate `_bcast_layout` from operands to the result of an
@@ -4597,14 +5408,11 @@ class GenericLowerer(
                     self._is_splat.add(ssa.id)
                 return
             # Different layouts — pick broader (more elements).
-            layouts_by_shape = getattr(self, "_bcast_layouts_by_shape", {})
-            a_shape = None
-            b_shape = None
-            for shape, lay in layouts_by_shape.items():
-                if lay == a_lay and (a_shape is None or _shape_numel(shape) > _shape_numel(a_shape)):
-                    a_shape = shape
-                if lay == b_lay and (b_shape is None or _shape_numel(shape) > _shape_numel(b_shape)):
-                    b_shape = shape
+            shapes_by_expr = getattr(self, "_bcast_shapes_by_expr", {})
+            a_shapes = shapes_by_expr.get(a_lay, set())
+            b_shapes = shapes_by_expr.get(b_lay, set())
+            a_shape = max(a_shapes, key=_shape_numel) if a_shapes else None
+            b_shape = max(b_shapes, key=_shape_numel) if b_shapes else None
             if a_shape is not None and b_shape is not None:
                 self._bcast_layout[ssa.id] = a_lay if _shape_numel(a_shape) >= _shape_numel(b_shape) else b_lay
             else:
@@ -4619,8 +5427,8 @@ class GenericLowerer(
         if other_id in self._is_splat:
             self._bcast_layout[ssa.id] = lay
             return
-        other_shape = self.env_shapes.get(other_id)
-        if other_shape is None or other_shape == ():
+        other_shape = self._native_shape(other_id, op_name=ssa.op)
+        if other_shape == ():
             # Scalar — preserve layout.
             self._bcast_layout[ssa.id] = lay
             return
@@ -5218,20 +6026,39 @@ class GenericLowerer(
         if len(ssa.operand_ids) < 3:
             return
         if "!tt.ptr<" in (ssa.type_str or ""):
-            # _lookup on a tracked pointer produces a dereferenced value, not
-            # its address. The numeric select path below would therefore select
-            # loaded data and lose pointer provenance. A subsequent atomic can
-            # even cast that DATA back to a device address and execute it.
-            # Require an explicit address-preserving implementation before
-            # admitting scalar or tensor pointer selections to any consumer.
             from triton_msl.errors import MetalNonRecoverableError
-
-            raise MetalNonRecoverableError(
-                "pointer-valued arith.select requires address-preserving lowering; "
-                "the numeric select path dereferences its operands and cannot "
-                "preserve the selected address. Refusing before memory access.",
-                op_name="arith.select",
-            )
+            if (ssa.operand_ids[0] in self.env_array
+                    or any(oid in self.env_ptr_array for oid in ssa.operand_ids[1:])):
+                raise MetalNonRecoverableError(
+                    "pointer-valued arith.select has a per-thread register-array operand; "
+                    "address-array selection is not implemented and numeric fallback is unsafe",
+                    op_name="arith.select")
+            true_ptr = self._loop_pointer_parts(ssa.operand_ids[1])
+            false_ptr = self._loop_pointer_parts(ssa.operand_ids[2])
+            meta = self.graph.result_meta.get(ssa.id)
+            if (true_ptr is None or false_ptr is None or meta is None
+                    or meta.schema_version != 1 or meta.value_id != ssa.id
+                    or meta.kind != "result" or meta.producer_id != ssa.id
+                    or meta.result_index != 0 or meta.type.kind != "pointer"
+                    or meta.type.address_space != 1 or meta.type.pointee is None
+                    or meta.type.pointee.unknown_reason or meta.type.pointee.elem is None):
+                raise MetalNonRecoverableError(
+                    "pointer-valued arith.select lacks two proved addresses or native result metadata",
+                    op_name="arith.select")
+            cond = self._lookup(ssa.operand_ids[0])
+            def _address(info):
+                base, offset = info
+                return base if not offset or offset == "0" else f"({base} + {offset})"
+            dtype = _mlir_to_triton_dtype(meta.type.pointee.elem)
+            var_name = self._next_var("ptr")
+            self.kb.raw_line(
+                f"    volatile device {triton_type_to_msl(dtype)}* {var_name} = "
+                f"{cond} ? {_address(true_ptr)} : {_address(false_ptr)};")
+            self.env[ssa.id] = var_name
+            self.env_is_ptr[ssa.id] = (var_name, "0")
+            self.env_types[ssa.id] = dtype
+            self._propagate_shape_elementwise(ssa)
+            return
         cond = self._lookup(ssa.operand_ids[0])
         true_val = self._lookup(ssa.operand_ids[1])
         false_val = self._lookup(ssa.operand_ids[2])
@@ -5459,7 +6286,7 @@ class GenericLowerer(
             self.env_types[ssa.id] = "fp32"
 
         else:
-            self.kb.comment(f"UNSUPPORTED math: {op}")
+            self.kb.unsupported(f"UNSUPPORTED math: {op}")
             return
         # Shape: all math ops are element-wise — inherit from operands
         self._propagate_shape_elementwise(ssa)
@@ -5501,7 +6328,7 @@ class GenericLowerer(
             func_name = ssa.attrs.get("libname", "")
         if not func_name:
             # Fallback: try to extract from the raw_line or op string
-            self.kb.comment(f"UNSUPPORTED: tt.extern_elementwise (no symbol)")
+            self.kb.unsupported("UNSUPPORTED: tt.extern_elementwise (no symbol)")
             return
 
         # Sanitize function name for MSL (strip leading underscores from __nv_* etc.)
@@ -5620,6 +6447,9 @@ class GenericLowerer(
         # this generic path, are unaffected.)
         _TG_MAX = 1024
         if total > _TG_MAX:
+            from ._biased_replay import emit_loaded_transpose
+            if getattr(self, "_source_biased_replay", False) and emit_loaded_transpose(self, ssa):
+                return
             raise MetalNonRecoverableError(
                 f"2-D tt.trans of a {M}x{N} ({total}-element) block exceeds the "
                 f"{_TG_MAX}-thread threadgroup: the shared-memory transpose maps one "
@@ -5662,6 +6492,9 @@ class GenericLowerer(
         # Output is N×M. Thread lid in output maps to (lid/M, lid%M).
         # We want source value at (lid%M, lid/M) = source[(lid%M)*N + (lid/M)].
         self.kb.raw_line(f"    {msl_type} {result_var} = {shared_name}[(lid % {M}u) * {N}u + (lid / {M}u)];")
+        # Scratch may be reused by a subsequent staging operation. All lanes
+        # must finish the transposed read before any lane writes that storage.
+        self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = input_dtype
@@ -6608,7 +7441,7 @@ class GenericLowerer(
         self._prescan_stores()
         return msl
 
-    def _detect_flash_attention(self):
+    def _detect_flash_attention(self, *, sequence_index=None):
         """Recognize a FlashAttention forward kernel and extract its params.
 
         Returns ``None`` when the kernel is NOT an FA pattern (fewer than two
@@ -7117,7 +7950,7 @@ class GenericLowerer(
         z_arg = scalar_by_name.get("Z")
         h_arg = scalar_by_name.get("H")
         n_ctx_arg = scalar_by_name.get("N_CTX")
-        n_ctx_index = n_ctx_arg.index if n_ctx_arg is not None else None
+        n_ctx_index = sequence_index if sequence_index is not None else (n_ctx_arg.index if n_ctx_arg is not None else None)
         if n_ctx_index is None:
             # STRUCTURAL fallback (independent of the arg NAME, the trifast-#1
             # name-heuristic class): the bounds masks compare a make_range-derived
@@ -7219,6 +8052,40 @@ class GenericLowerer(
                 if (not _bound_args) or (_cand in _bound_args):
                     n_ctx_index = _cand
                 # else: the unique range-compared scalar is not the loop bound -> refuse
+            if n_ctx_index is None and not any(_s.op == "scf.for" for _s in all_ops):
+                # Equal-to-one specialization removes N_CTX and the one-trip KV
+                # loop.  Propose C1 only when a real tile coordinate is still
+                # bounded by the literal one.  The load/store/value verifier later
+                # requires this exact bound on every Q/K/V/output role; this is not
+                # a blanket "loop-free means singleton" inference.
+                def _is_const_one(_start):
+                    _cur, _seen = _start, set()
+                    while _cur not in _seen:
+                        _seen.add(_cur)
+                        _op = op_by_id.get(_cur)
+                        if _op is None:
+                            return False
+                        if _op.op == "arith.constant":
+                            try:
+                                return int((_op.attrs or {}).get("value")) == 1
+                            except (TypeError, ValueError):
+                                return False
+                        if _op.op not in _passthru or len(_op.operand_ids or []) != 1:
+                            return False
+                        _cur = _op.operand_ids[0]
+                    return False
+
+                _c1_bounds = 0
+                for _s in all_ops:
+                    if _s.op != "arith.cmpi" or len(_s.operand_ids or []) != 2 or not _is_lt(_s):
+                        continue
+                    _x, _y = _s.operand_ids
+                    if _cone_has_range(_x) and _is_const_one(_y):
+                        _c1_bounds += 1
+                    elif _cone_has_range(_y) and _is_const_one(_x):
+                        _c1_bounds += 1
+                if _c1_bounds:
+                    n_ctx_index = C1
         if n_ctx_index is None:
             _refuse("the N_CTX scalar arg")
         z_val = z_arg.index if z_arg is not None else C1
@@ -7271,6 +8138,33 @@ class GenericLowerer(
             return _mask_cone_has(start, lambda op: op.id in _qk_ids)
 
         def _mask_is_exact_arg(start, arg_index):
+            if arg_index == C1:
+                cur2, seen2 = start, set()
+                wrappers = {
+                    "tt.splat",
+                    "tt.broadcast",
+                    "tt.expand_dims",
+                    "tt.reshape",
+                    "ttg.convert_layout",
+                    "arith.extsi",
+                    "arith.extui",
+                    "arith.index_cast",
+                    "arith.index_castui",
+                }
+                while cur2 not in seen2:
+                    seen2.add(cur2)
+                    op2 = op_by_id.get(cur2)
+                    if op2 is None:
+                        return False
+                    if op2.op == "arith.constant":
+                        try:
+                            return int((op2.attrs or {}).get("value")) == 1
+                        except (TypeError, ValueError):
+                            return False
+                    if op2.op not in wrappers or len(op2.operand_ids or []) != 1:
+                        return False
+                    cur2 = op2.operand_ids[0]
+                return False
             target = next((a.id for a in self.graph.args if a.index == arg_index), None)
             if target is None:
                 return False
@@ -8090,6 +8984,12 @@ class GenericLowerer(
 
         def scalar_stride_from_muli(mid):
             op = op_by_id.get(mid)
+            # A stride specialised to one is folded out of ``pid * stride`` by
+            # Triton, leaving the program id itself. Admit only that exact
+            # unit-stride spelling; an arbitrary scalar expression remains
+            # unresolved and therefore fail-closed.
+            if op is not None and op.op in ("tt.get_program_id", "tt.program_id"):
+                return C1
             if op is None or op.op != "arith.muli":
                 return None
             for oid in op.operand_ids:
@@ -8446,8 +9346,20 @@ class GenericLowerer(
         _LOG2E = 1.4426950408889634
 
         def _arg_index(vid):
-            a_ = arg_by_id.get(_peel_ids(vid, _IDXW))
-            return None if (a_ is None or a_.is_ptr) else a_.index
+            core = _peel_ids(vid, _IDXW)
+            a_ = arg_by_id.get(core)
+            if a_ is not None:
+                return None if a_.is_ptr else a_.index
+            # Triton removes constexpr-equivalent runtime arguments. Preserve
+            # the same closed proof for the only singleton extent this route
+            # supports instead of treating every literal as an N_CTX bound.
+            c_ = op_by_id.get(core)
+            if c_ is not None and c_.op == "arith.constant":
+                try:
+                    return C1 if int(c_.attrs.get("value")) == 1 else None
+                except (TypeError, ValueError):
+                    return None
+            return None
 
         def _leaf_extent(cid, n_ctx_arg, extents):
             """One boundary leaf: cmpi slt|ult(<tile index>, N_CTX). Returns the tile extent."""
@@ -8464,7 +9376,10 @@ class GenericLowerer(
                 ext = sh["bounds"][1]
                 if sh["bounds"][0] != 0 or ext not in extents:
                     continue
-                if (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == ext) or (sh["pid"] is None and sh["iv"] == 1):
+                singleton_col = n_ctx_arg == C1 and not _ivs and sh["pid"] is None and sh["iv"] == 0
+                if ((sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == ext)
+                        or (sh["pid"] is None and sh["iv"] == 1)
+                        or singleton_col):
                     return ext
             _refuse("a bounds-select index that is exactly one tile of the source's row/col coordinate")
 
@@ -8480,7 +9395,10 @@ class GenericLowerer(
                 sh = self._index_shape(lhs, op_by_id, arg_by_id, iv_, 1)
                 if sh["bad"] is not None or sh["mod"] is not None or sh["range"] != 1 or not sh["bounds"] or sh["bounds"][0] != 0 or sh["bounds"][1] not in extents:
                     continue
-                if (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == sh["bounds"][1]) or (sh["pid"] is None and sh["iv"] == 1):
+                singleton_col = n_ctx_arg == C1 and not _ivs and sh["pid"] is None and sh["iv"] == 0
+                if ((sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == sh["bounds"][1])
+                        or (sh["pid"] is None and sh["iv"] == 1)
+                        or singleton_col):
                     return (n_ctx_arg, sh["pid"], sh["pid_div"], sh["coef"], sh["bounds"], sh["iv"], iv_ if sh["iv"] else None)
             _refuse("a boundary leaf index that is exactly one tile of a row/col coordinate")
 
@@ -8696,6 +9614,67 @@ class GenericLowerer(
             _rounded_truncf = {}
             _dS_holder = [None]
             _ELEM = {"f16": "half", "bf16": "bfloat"}
+
+            def _narrow_delta_layout_is_exact(reduce, product, elem):
+                """Prove the one narrow reduction layout the q maker can replay.
+
+                In the runtime D=32 specialization, each lane owns eight
+                contiguous D values, four adjacent lanes cooperate on one row,
+                and each of four warps owns eight rows.  The maker replays the
+                standard binary in-thread tree and then the lane XOR 2,1 tree,
+                rounding through the source combiner after every edge.  Any
+                shape/layout/axis variation stays refused: size alone is not
+                evidence of the reduction association.
+                """
+                source_meta = self.graph.result_meta.get(product.id)
+                result_meta = self.graph.result_meta.get(reduce.id)
+                if source_meta is None or result_meta is None:
+                    return False, "missing per-result metadata"
+                source_type = source_meta.type
+                result_type = result_meta.type
+                compact = lambda value: re.sub(r"\s+", "", value or "")
+                blocked = compact(
+                    "#ttg.blocked<{sizePerThread = [1, 8], "
+                    "threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], "
+                    "order = [1, 0]}>"
+                )
+                sliced = compact(f"#ttg.slice<{{dim = 1, parent = {blocked}}}>")
+                try:
+                    axis = int((reduce.attrs or {})["axis"])
+                except (KeyError, TypeError, ValueError):
+                    return False, "missing/invalid axis"
+                checks = {
+                    "axis": axis == 1,
+                    "metadata-kind": source_meta.kind == result_meta.kind == "result",
+                    "producer-identity": (
+                        source_meta.producer_id == product.id
+                        and result_meta.producer_id == reduce.id
+                    ),
+                    "known-types": (
+                        source_type.unknown_reason is None
+                        and result_type.unknown_reason is None
+                    ),
+                    "element": (
+                        source_type.kind == result_type.kind == "float"
+                        and source_type.elem == result_type.elem == elem
+                    ),
+                    "tensor-shapes": (
+                        source_type.is_tensor
+                        and result_type.is_tensor
+                        and source_type.shape == (32, 32)
+                        and result_type.shape == (32,)
+                    ),
+                    "source-layout": compact(source_type.layout) == blocked,
+                    "result-layout": compact(result_type.layout) == sliced,
+                }
+                failed = [name for name, passed in checks.items() if not passed]
+                detail = ",".join(failed)
+                if "source-layout" in failed or "result-layout" in failed:
+                    detail += (
+                        f"; source={compact(source_type.layout)!r}; "
+                        f"result={compact(result_type.layout)!r}"
+                    )
+                return not failed, detail
 
             def _elem_of(type_str):
                 t = (type_str or "")
@@ -9042,14 +10021,6 @@ class GenericLowerer(
             else:
                 if reduce_op is None or _bcast_source(sub.operand_ids[1]) != reduce_op.id:
                     _refuse("delta broadcast from the rowsum(O * dO) reduce")
-                _rel = _elem_of(reduce_op.type_str)
-                if _rel in _ELEM:
-                    # packet 174: `tl.sum(o * do)` on fp16 / bf16 inputs accumulates IN that dtype
-                    # (the reduce region adds narrow values in the backend's reduction order); the
-                    # template's sequential fp32 rowsum is a different, more precise value, and no
-                    # sequential emulation reproduces the tree bit-for-bit. Refuse rather than ship
-                    # a delta the source did not compute.
-                    _refuse(f"delta = rowsum(O * dO) accumulated in fp32 (the source accumulates it in {_rel}, an order-dependent rounding the template cannot replay; keep the reduce in fp32 — e.g. tl.sum((o * do).to(tl.float32), 1) — for this route)")
                 # packet 152 (151 F1/F2): the reduce INPUT must be exactly O-load * dO-load (either
                 # order, through value-preserving wrappers only) and the combiner exactly a + b.
                 rin = op_by_id.get(_peel_ids(reduce_op.operand_ids[0], _LAY + ("arith.extf",)))
@@ -9066,6 +10037,19 @@ class GenericLowerer(
                     _refuse("the delta reduce input being exactly the recognised O load VALUE times the recognised dO load VALUE (no other arithmetic)")
                 if not _plain_sum_reduce(reduce_op):
                     _refuse("the delta reduction combiner being exactly a + b (the template sums)")
+                _rel = _elem_of(reduce_op.type_str)
+                if _rel in _ELEM:
+                    _layout_ok, _layout_failure = _narrow_delta_layout_is_exact(
+                        reduce_op, rin, _rel
+                    )
+                    if not _layout_ok:
+                        _refuse(
+                            "the narrow delta reduction having the exact D=32 "
+                            "eight-values-per-lane blocked layout and axis-1 "
+                            "binary/XOR tree "
+                            f"(failed: {_layout_failure})"
+                        )
+                    _rounding["round_delta"] = _ELEM[_rel]
                 _need(reduce_op.id, ("j",), "delta = rowsum over d of O(j,d) * dO(j,d)")
 
             _output_casts = {}
@@ -9074,9 +10058,12 @@ class GenericLowerer(
             def _out_cast(st):
                 """Prove and record the conversion of THIS output role, including no conversion.
 
-                A sibling's dtype says nothing about this store. The source accumulator is
-                fp32: either store it to fp32, or replay its one narrowing to this pointer's
-                own element type. The surrounding proof still checks the underlying value.
+                A sibling's dtype says nothing about this store. The dot accumulators are
+                fp32: either store them to fp32, or replay their one narrowing to this
+                pointer's own element type. The one proved narrow-delta reduction is
+                already narrow at its result; its direct narrow store still requires the
+                maker's float carrier to narrow back to that same pointer element type.
+                The surrounding proof checks the underlying value in every case.
                 """
                 role = _store_roles[st.id]
                 v = st.operand_ids[1]
@@ -9084,6 +10071,12 @@ class GenericLowerer(
                 _po = op_by_id.get(st.operand_ids[0])
                 _pm = re.search(r"!tt\.ptr<([A-Za-z0-9_]+)", (_po.type_str or "") if _po is not None else "")
                 if o is None or o.op != "arith.truncf" or not o.operand_ids:
+                    source_el = _ELEM.get(_elem_of(o.type_str)) if o is not None else None
+                    pointer_el = _ELEM.get(_pm.group(1)) if _pm else None
+                    if (role == "delta" and _rounding.get("round_delta") is not None
+                            and source_el == pointer_el == _rounding["round_delta"]):
+                        _output_casts[role] = source_el
+                        return v
                     if _pm is None or _pm.group(1) != "f32":
                         _refuse(f"{role}: an unconverted fp32 accumulator stored to its own fp32 pointer")
                     _output_casts[role] = None
@@ -9135,6 +10128,10 @@ class GenericLowerer(
                 elif o is not None and o.op == "arith.mulf":
                     _refuse("an unscaled output store (this output is not scaled by the template)")
                 if v not in res_pos:
+                    if kind == "q" and n_ctx_arg == C1:
+                        direct = op_by_id.get(v)
+                        if direct is not None and direct.op == "tt.dot":
+                            return direct, None
                     _refuse("an output accumulated by the j/k loop")
                 lid, i = res_pos[v]
                 if not _is_zero_const(inits_of[(lid, i)]):
@@ -9156,7 +10153,9 @@ class GenericLowerer(
                         _refuse(f"{what}: the second operand being exactly the scaled K value used by the score dot")
                 else:
                     _raw_load(y.operand_ids[1], b_addr, f"{what}: the second operand")
-                if y.operand_ids[2] != ba:
+                if ba is None and not _is_zero_const(y.operand_ids[2]):
+                    _refuse(f"{what} accumulating from literal zero in the proved singleton specialization")
+                if ba is not None and y.operand_ids[2] != ba:
                     _refuse(f"{what} accumulating into ITS OWN loop carry (C is the block argument of the stored result's position)")
 
             if kind == "kv":
@@ -9195,6 +10194,11 @@ class GenericLowerer(
                 if a is not None:
                     return a.index if not a.is_ptr else None
                 op = op_by_id.get(sid)
+                if op is not None and op.op == "arith.constant":
+                    try:
+                        return C1 if int(op.attrs.get("value")) == 1 else None
+                    except (TypeError, ValueError):
+                        return None
                 if op is not None and op.op in ("arith.extsi", "arith.trunci", "arith.index_cast") and op.operand_ids:
                     sid = op.operand_ids[0]
                     continue
@@ -9202,12 +10206,17 @@ class GenericLowerer(
             return None
 
         def _resolve_n_ctx():
+            saw_loop = False
             for s in allops:
                 if s.op == "scf.for" and len(s.operand_ids or []) >= 2:
+                    saw_loop = True
                     r = _arg_through_casts(s.operand_ids[1])
                     if r is not None:
                         return r
-            return None
+            # N_CTX == 1 is constexpr-specialised and the one-iteration K loop
+            # disappears. The boundary/value proofs below still have to prove
+            # the exact constant-one Q/K coordinates before this can route.
+            return None if saw_loop else C1
 
         def _resolve_h_div():
             h = C1
@@ -9921,6 +10930,13 @@ class GenericLowerer(
                 "o_sz": _u(oo[0]), "o_sh": _u(oo[1]), "o_sm": _u(oo[2]), "o_sk": _u(oo[3]),
                 "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
             })
+            _q_rounding = info.get("rounding") or {}
+            if _q_rounding.get("round_delta") is not None and not simd_ok:
+                raise MetalNonRecoverableError(
+                    "Refusing biased-FA backward narrow delta reduction outside "
+                    "the proved D=32 simdgroup layout; the scalar template's "
+                    "sequential sum has a different association."
+                )
             q_maker = make_flash_attention_bwd_q_kernel_simd if simd_ok else make_flash_attention_bwd_q_kernel
             # scalar path j-subtiles so a large head_dim fits: TPG = JS*head_dim (JS==block_j
             # for head_dim<=32 -> unchanged). The J-independent K/V staging (2*BK*D) can make
@@ -10380,6 +11396,7 @@ class GenericLowerer(
         expected_score_scale=None,
         mla_rope=None,
         detected_n_ctx_index=None,
+        detected_query_index=None,
         load_mask_policy=None,
         q_rows=None,
         kv_cols=None,
@@ -10388,6 +11405,7 @@ class GenericLowerer(
         extra_stores=(),
         biased=None,
         biased_out=None,
+        dense_tail_out=None,
     ):
         """Verify every value boundary a forward-FA template replaces.
 
@@ -10459,6 +11477,8 @@ class GenericLowerer(
 
         from triton_msl.errors import MetalNonRecoverableError
 
+        C1 = "c1"
+
         def _walk(ops):
             for s in ops:
                 yield s
@@ -10468,6 +11488,41 @@ class GenericLowerer(
                     yield from _walk(s.else_ops)
 
         _all = list(_walk(self.graph.ops))
+        # A correct value-path proof does not account for an extra observable
+        # operation. Templates must never discard an atomic, call, synchronization
+        # or unknown op merely because it does not feed the main output. This is
+        # a closed vocabulary, not a denylist of the two atomics that exposed the
+        # hole. Membership is necessary, NOT semantic-equivalence proof: the
+        # role/value/address and loop checks below still apply independently.
+        _effect_vocabulary = {
+            "arith.constant", "arith.addi", "arith.subi", "arith.muli",
+            "arith.divsi", "arith.divui", "arith.remsi", "arith.remui",
+            "arith.minsi", "arith.minui", "arith.maxsi", "arith.maxui",
+            "arith.andi", "arith.ori", "arith.xori", "arith.shli",
+            "arith.shrsi", "arith.shrui", "arith.cmpi", "arith.cmpf",
+            "arith.select", "arith.extsi", "arith.extui", "arith.trunci",
+            "arith.index_cast", "arith.index_castui", "arith.bitcast",
+            "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.negf",
+            "arith.maximumf", "arith.minimumf", "arith.maxnumf", "arith.minnumf",
+            "arith.extf", "arith.truncf", "arith.sitofp", "arith.uitofp",
+            "arith.fptosi", "arith.fptoui",
+            "math.exp", "math.exp2", "math.log", "math.log2", "math.sqrt",
+            "math.rsqrt", "math.absf", "math.fma",
+            "scf.for", "scf.yield",
+            "tt.addptr", "tt.broadcast", "tt.dot", "tt.expand_dims", "tt.exp",
+            "tt.fp_to_fp", "tt.get_program_id", "tt.get_num_programs",
+            "tt.load", "tt.make_range", "tt.reduce", "tt.reduce.return",
+            "tt.reshape", "tt.return", "tt.splat", "tt.store", "tt.trans",
+            "ttg.convert_layout", "ttg.local_alloc", "ttg.local_load",
+            "ttg.memdesc_trans",
+        }
+        _foreign_effects = sorted({s.op for s in _all if s.op not in _effect_vocabulary})
+        if _foreign_effects:
+            raise MetalNonRecoverableError(
+                f"FlashAttention effect proof cannot replay {_foreign_effects}; "
+                "the template must not discard unproved operations or side effects.",
+                op_name=_foreign_effects[0],
+            )
         _dots = [s for s in _all if s.op == "tt.dot"]
         if len(_dots) < 2:
             raise MetalNonRecoverableError(
@@ -10685,6 +11740,11 @@ class GenericLowerer(
                 if arg is not None:
                     return arg.index if not arg.is_ptr else None
                 op = _by_id.get(cur)
+                if op is not None and op.op == "arith.constant":
+                    try:
+                        return C1 if int((op.attrs or {}).get("value")) == 1 else None
+                    except (TypeError, ValueError):
+                        return None
                 if op is None or op.op not in _scalar_wrappers or len(op.operand_ids or []) != 1:
                     return None
                 cur = op.operand_ids[0]
@@ -10804,6 +11864,8 @@ class GenericLowerer(
 
         def _bound_ok(rhs, role):
             if load_mask_policy == "boundary":
+                if detected_query_index is not None and role in _ROW_ROLES:
+                    return _const_value(rhs) == 1 if detected_query_index == "c1" else _scalar_arg_index(rhs) == detected_query_index
                 return detected_n_ctx_index is not None and _scalar_arg_index(rhs) == detected_n_ctx_index
             if load_mask_policy == "varlen":
                 core = _peel_to_core(rhs, _mask_wrappers)
@@ -10819,6 +11881,16 @@ class GenericLowerer(
                 return (
                     sh["bounds"] == (0, _BM) and sh["iv"] == 0 and sh["pid"] == 0
                     and sh["pid_div"] is None and sh["coef"] == _BM
+                )
+            if detected_n_ctx_index == C1 and _kv_iv is None:
+                # The one-trip KV loop folds to a direct range(0, BN).  It is
+                # still the exact column coordinate because the proved bound is
+                # literal one and there is no surviving loop IV or program axis.
+                return (
+                    sh["bounds"] == (0, _BN)
+                    and sh["iv"] == 0
+                    and sh["pid"] is None
+                    and sh["pid_div"] is None
                 )
             return sh["bounds"] == (0, _BN) and sh["iv"] == 1 and sh["pid"] is None and _kv_iv is not None
 
@@ -10866,6 +11938,8 @@ class GenericLowerer(
             if sorted(leaves) != sorted(leaf_roles):
                 _refuse(role, f"the store mask leaves {leaves} are not exactly the template's {list(leaf_roles)} boundary")
 
+        _verified_loads = {}
+
         def _verify_load_path(start_id, role, expected_index, *, scale=False, transposes=0):
             """Returns the scale constant applied on this path (None when arg-based or absent)."""
             cur, seen = start_id, set()
@@ -10892,8 +11966,20 @@ class GenericLowerer(
                             f"the load resolves to arg {ptr_index}, not detector arg {expected_index}",
                         )
                     _check_load_mask(op, role)
+                    _verified_loads[role] = op
                     return scale_value
                 if op.op in _representation and len(op.operand_ids or []) == 1:
+                    cur = op.operand_ids[0]
+                    continue
+                if (detected_query_index is not None and role == "Q" and op.op == "arith.truncf"
+                        and len(op.operand_ids or []) == 1 and "round_q" not in _rounding):
+                    dst = self._native_value_facts(op.id, op_name=op.op)
+                    src = self._native_value_facts(op.operand_ids[0], op_name=op.op)
+                    producer = _by_id.get(op.operand_ids[0])
+                    if (dst.elem != "f16" or src.elem != "f32" or dst.shape != src.shape
+                            or producer is None or producer.op != "arith.mulf"):
+                        _refuse(role, "decode Q narrowing is not the fp32 scale product rounded to fp16")
+                    _rounding["round_q"] = "half"
                     cur = op.operand_ids[0]
                     continue
                 if op.op in _transpose and len(op.operand_ids or []) == 1:
@@ -11244,9 +12330,17 @@ class GenericLowerer(
                 _out_stores.append(_store)
         if len(_out_stores) != 1:
             _refuse("Out", f"expected one store to detector arg {detected_out_index}, found {len(_out_stores)}")
+        _allowed_store_args = {detected_out_index} | {entry[0] for entry in extra_stores}
+        if biased is not None:
+            _allowed_store_args.add(biased["lse"])
+        for _store in (s for s in _all if s.op == "tt.store"):
+            if (not _store.operand_ids or
+                    not any(_pointer_base_indices(_store.operand_ids[0]) == {index}
+                            for index in _allowed_store_args)):
+                _refuse("effect", "a store targets memory outside the proved template outputs")
 
         _out_passthrough = _representation | {"arith.truncf", "tt.fp_to_fp"}
-        _out_loop, _out_den_id = None, None
+        _out_loop, _out_den_id, _out_num_id = None, None, None
         _cur = _out_stores[0].operand_ids[1]
         _seen = set()
         while _cur not in _seen and len(_seen) < 64:
@@ -11262,18 +12356,29 @@ class GenericLowerer(
                     _op.operand_ids[1],
                     _representation | {"tt.broadcast", "tt.expand_dims"},
                 )
-                if _num is None or _num.op != "scf.for" or _den is not _num:
+                _dot_pv_ids = {_dot_pv.id} | set(
+                    getattr(_dot_pv, "result_ids", None) or []
+                )
+                _singleton_direct = (
+                    detected_n_ctx_index == C1
+                    and not _fors
+                    and _num is not None
+                    and _num.id in _dot_pv_ids
+                    and _den is not None
+                    and _den.op == "arith.addf"
+                )
+                if not _singleton_direct and (
+                    _num is None or _num.op != "scf.for" or _den is not _num
+                ):
                     _refuse(
                         "Out",
                         "the division is not the canonical accumulator/denominator pair "
                         "from one attention loop",
                     )
-                _dot_pv_ids = {_dot_pv.id} | set(
-                    getattr(_dot_pv, "result_ids", None) or []
-                )
-                if not _depends_on(_num.id, _dot_pv_ids):
+                if not _singleton_direct and not _depends_on(_num.id, _dot_pv_ids):
                     _refuse("Out", "the attention loop does not yield the verified P@V dot")
-                _out_loop = _num
+                _out_loop = None if _singleton_direct else _num
+                _out_num_id = _peel_id(_op.operand_ids[0], _representation)
                 _out_den_id = _peel_id(_op.operand_ids[1], _b_bcast)
                 break
             if _op.op not in _out_passthrough or len(_op.operand_ids or []) != 1:
@@ -11281,6 +12386,427 @@ class GenericLowerer(
             _cur = _op.operand_ids[0]
         else:
             _refuse("Out", "the path is cyclic or exceeds the verification bound")
+
+        if dense_tail_out is not None:
+            # Load padding is NOT a score mask: zero K contributes score zero,
+            # and hence exp(0), through the source's last BN-wide iteration.
+            # Prove the LIVE score path and the very loop that yields Out. A
+            # dead select, query-only bound, or unrelated loop proves nothing.
+            if load_mask_policy != "boundary" or biased is not None or mla_rope is not None:
+                _refuse("Tail", "dense tail proof requested for a different route")
+            _singleton_tail = detected_n_ctx_index == C1 and not _fors and _out_loop is None
+            if not _singleton_tail:
+                if len(_fors) != 1 or _out_loop is not _fors[0] or _kv_iv is None:
+                    _refuse("Tail", "expected one identified KV loop yielding Out")
+                _body_ids = {op.id for op in (_out_loop.region_ops or [])}
+                if not {_dot_qk.id, _dot_pv.id} <= _body_ids:
+                    _refuse("Tail", "both dots must execute directly in the KV loop")
+
+            def _int_literal(oid, value):
+                op = _by_id.get(oid)
+                return (op is not None and op.op == "arith.constant"
+                        and (op.type_str or "") in ("i32", "index")
+                        and (op.attrs or {}).get("value") == value)
+
+            def _length(oid):
+                arg = _arg_by_id.get(oid)
+                return arg is not None and not arg.is_ptr and arg.index == detected_n_ctx_index
+
+            def _query_stop(oid):
+                # Exactly (pid0 + 1) * BM, not a cone containing pid0/BM.
+                op = _by_id.get(oid)
+                if op is None or op.op != "arith.muli" or len(op.operand_ids or []) != 2:
+                    return False
+                for factor, value in (op.operand_ids, op.operand_ids[::-1]):
+                    add = _by_id.get(value)
+                    if not _int_literal(factor, _BM) or add is None or add.op != "arith.addi":
+                        continue
+                    if len(add.operand_ids or []) != 2:
+                        continue
+                    for one, pid in (add.operand_ids, add.operand_ids[::-1]):
+                        p = _by_id.get(pid)
+                        if (_int_literal(one, 1) and p is not None
+                                and p.op == "tt.get_program_id" and (p.attrs or {}).get("axis") == 0):
+                            return True
+                return False
+
+            _causal_stop = False
+            if not _singleton_tail:
+                _lb, _ub, _step = _out_loop.operand_ids[:3]
+                if not _int_literal(_lb, 0) or not _int_literal(_step, _BN):
+                    _refuse("Tail", "KV loop must start at zero and step by the source BLOCK_N")
+                _upper = _by_id.get(_ub)
+                _causal_stop = (
+                    _upper is not None and _upper.op in ("arith.minsi", "arith.minui")
+                    and len(_upper.operand_ids or []) == 2
+                    and any(_length(a) and _query_stop(b)
+                            for a, b in (_upper.operand_ids, _upper.operand_ids[::-1]))
+                )
+                if not (_length(_ub) or _causal_stop):
+                    _refuse("Tail", "KV loop upper bound is not N_CTX or min(query tile end, N_CTX)")
+
+            def _mask_axis(oid):
+                # The integer coordinate proves WHAT varies; this proves WHERE
+                # it varies in the consuming matrix. Square scores do not expose
+                # a swapped broadcast through a shape check alone.
+                seen = set()
+                while oid not in seen and len(seen) < 64:
+                    seen.add(oid)
+                    op = _by_id.get(oid)
+                    if op is None or not op.operand_ids:
+                        return None
+                    if op.op in ("tt.broadcast", "ttg.convert_layout") and len(op.operand_ids) == 1:
+                        oid = op.operand_ids[0]
+                    elif op.op == "tt.expand_dims" and len(op.operand_ids) == 1:
+                        axis = (op.attrs or {}).get("axis")
+                        if len(_shape_of(op.operand_ids[0])) == 1 and axis in (0, 1):
+                            return 1 - axis
+                        return None
+                    elif op.op == "arith.cmpi" and len(op.operand_ids) == 2:
+                        oid = op.operand_ids[0]
+                    elif op.op in ("arith.addi", "arith.muli") and len(op.operand_ids) == 2:
+                        def uniform(x):
+                            c = _peel_to_core(x, {"tt.broadcast", "ttg.convert_layout"})
+                            return c is not None and (c.op == "tt.splat" or
+                                (c.op == "arith.constant" and
+                                 isinstance((c.attrs or {}).get("value"), (int, float))))
+                        varying = [x for x in op.operand_ids if not uniform(x)]
+                        if len(varying) != 1:
+                            return None
+                        oid = varying[0]
+                    else:
+                        return None
+                return None
+
+            _tail_key_mask, _tail_causal = False, False
+            _cur, _seen = _p_core.operand_ids[0], set()
+            while _cur not in _dot0_ids:
+                if _cur in _seen or len(_seen) >= 128:
+                    _refuse("Tail", "cyclic or overlong live score path")
+                _seen.add(_cur)
+                _op = _by_id.get(_cur)
+                if _op is None:
+                    _refuse("Tail", "unknown live score value")
+                if _op.op in _representation and len(_op.operand_ids or []) == 1:
+                    _cur = _op.operand_ids[0]
+                elif _op.op in ("arith.mulf", "arith.divf") and _op.id in _score_scale["op_ids"]:
+                    _cur = next(x for x in _op.operand_ids if _depends_on_dot0(x))
+                elif _op.op == "arith.select" and len(_op.operand_ids or []) == 3:
+                    cond, yes, no = _op.operand_ids
+                    _sentinel = _peel_to_core(no, _mask_wrappers)
+                    if (not _depends_on_dot0(yes) or _depends_on_dot0(no)
+                            or _sentinel is None or _sentinel.op != "arith.constant"
+                            or (_sentinel.attrs or {}).get("value") not in
+                            (float("-inf"), 0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000)):
+                        _refuse("Tail", "live score select must keep the score or supply negative infinity")
+                    cmp = _peel_to_core(cond, _mask_wrappers)
+                    if cmp is None or cmp.op != "arith.cmpi" or len(cmp.operand_ids or []) != 2:
+                        _refuse("Tail", "unproved live score predicate")
+                    a, b = cmp.operand_ids
+                    pred = (cmp.attrs or {}).get("predicate_name")
+                    if pred in ("slt", "ult"):
+                        role = _boundary_leaf(cond, "Score", ("Q", "K"))
+                        if _mask_axis(cond) != (0 if role == "Q" else 1):
+                            _refuse("Tail", "score boundary is broadcast along the wrong matrix axis")
+                        _tail_key_mask |= role == "K"
+                    elif pred in ("sge", "uge") and _coord_ok(a, "Q") and _coord_ok(b, "K"):
+                        if _mask_axis(a) != 0 or _mask_axis(b) != 1:
+                            _refuse("Tail", "causal boundary has unproved query/key broadcast axes")
+                        _tail_causal = True
+                    else:
+                        _refuse("Tail", "unreplayed live score mask")
+                    _cur = yes
+                else:
+                    _refuse("Tail", f"unproved live score operation {_op.op}")
+            if _tail_causal != dense_tail_out["causal"] or (_causal_stop and not _tail_causal):
+                _refuse("Tail", "detected causal policy or loop stop disagrees with the live score path")
+            _padding_contributes = not (_tail_key_mask or _tail_causal)
+            _plain = []
+            for role in ("K", "V"):
+                load = _verified_loads[role]
+                if len(load.operand_ids or []) == 1:
+                    # The source reads the padded tile itself. Never invent zero
+                    # fill for this role, even if its sibling has a masked load.
+                    _plain.append(role)
+                else:
+                    _check_load_mask(load, role, exact_leaves=(role,))
+                    if _mask_axis(load.operand_ids[1]) != 0:
+                        _refuse("Tail", f"{role} boundary is not broadcast along its load rows")
+
+            # The same loop IV must drive the ADDRESS, not just its load mask.
+            # Detection extracts stride slots but historically did not prove the
+            # index multiplying each stride (e.g. K[(iv+range+32)*stride]).
+            # Account for every addptr term, including scalar batch/head offsets.
+            def _pid1(oid):
+                op = _by_id.get(_peel_id(oid, _mask_wrappers))
+                return op is not None and op.op == "tt.get_program_id" and (op.attrs or {}).get("axis") == 1
+
+            def _batch_index(oid, slot):
+                oid = _peel_id(oid, _mask_wrappers)
+                h = dense_tail_out["H"]
+                if h == "c1":
+                    return _pid1(oid) if slot == 0 else _int_literal(oid, 0)
+                op = _by_id.get(oid)
+                allowed = ("arith.divsi", "arith.divui") if slot == 0 else ("arith.remsi", "arith.remui")
+                return (op is not None and op.op in allowed and len(op.operand_ids or []) == 2
+                        and _pid1(op.operand_ids[0]) and
+                        (_arg_by_id.get(op.operand_ids[1]) is not None and
+                         _arg_by_id[op.operand_ids[1]].index == h))
+
+            for role, load in list(_verified_loads.items()) + [("Out", _out_stores[0])]:
+                if role not in ("Q", "K", "V", "Out"):
+                    _refuse("Tail", "unexpected dense pointer role")
+                strides = dense_tail_out["strides"]["o" if role == "Out" else role.lower()]
+                ptr = load.operand_ids[0]
+                offsets, seen = [], set()
+                while ptr not in _arg_by_id:
+                    if ptr in seen or len(seen) >= 64:
+                        _refuse("Tail", f"{role} has a cyclic address")
+                    seen.add(ptr)
+                    op = _by_id.get(ptr)
+                    if op is None:
+                        _refuse("Tail", f"{role} address has an unknown root")
+                    if op.op in _mask_wrappers and len(op.operand_ids or []) == 1:
+                        ptr = op.operand_ids[0]
+                    elif op.op == "tt.addptr" and len(op.operand_ids or []) == 2:
+                        offsets.append(op.operand_ids[1])
+                        ptr = op.operand_ids[0]
+                    else:
+                        _refuse("Tail", f"{role} address contains unreplayed {op.op}")
+                expected = {"Q": detected_q_index, "K": detected_k_index,
+                            "V": detected_v_index, "Out": detected_out_index}[role]
+                if _arg_by_id[ptr].index != expected:
+                    _refuse("Tail", f"{role} address root disagrees with detection")
+                shape = _shape_of(load.operand_ids[0])
+                if len(shape) != 2:
+                    _refuse("Tail", f"{role} address is not a matrix")
+                found = set()
+                for offset in offsets:
+                    core = _by_id.get(_peel_id(offset, {"tt.broadcast", "ttg.convert_layout"}))
+                    matches = []
+                    for slot, stride in enumerate(strides):
+                        indices = []
+                        if stride == "c1":
+                            indices.append(offset)
+                        elif core is not None and core.op == "arith.muli" and len(core.operand_ids or []) == 2:
+                            for a, b in (core.operand_ids, core.operand_ids[::-1]):
+                                arg = _arg_by_id.get(_peel_id(a, _mask_wrappers))
+                                if arg is not None and not arg.is_ptr and arg.index == stride:
+                                    indices.append(b)
+                        for index in indices:
+                            if slot < 2:
+                                ok = not _shape_of(index) and _batch_index(index, slot)
+                            elif slot == 2:
+                                ok = _coord_ok(index, role) and _mask_axis(index) == 0
+                            else:
+                                sh = self._index_shape(index, _by_id, _arg_by_id, _kv_iv, 1)
+                                ok = (sh["bad"] is None and sh["mod"] is None and sh["range"] == 1
+                                      and sh["bounds"] == (0, shape[1]) and sh["pid"] is None
+                                      and sh["iv"] == 0 and _mask_axis(index) == 1)
+                            if ok:
+                                matches.append(slot)
+                    if len(matches) != 1 or matches[0] in found:
+                        _refuse("Tail", f"{role} address term is not an exact, unique source coordinate times its stride")
+                    found.add(matches[0])
+                required = {0, 2, 3} if dense_tail_out["H"] == "c1" else {0, 1, 2, 3}
+                if found != required:
+                    _refuse("Tail", f"{role} address does not cover exactly the replayed batch/head/row/column terms")
+            dense_tail_out.update(source_kv_block=_BN, mask_tail_scores=not _padding_contributes,
+                                  unmasked_kv=tuple(_plain), source_causal_stop=_causal_stop)
+
+        # Prove the actual returned recurrence on EVERY forward caller. Belonging
+        # to one loop does not prove which result is the numerator/denominator,
+        # nor that its updates are the source operations the maker replays.
+        # In particular, alpha*2 or max(P) used to emit unchanged canonical MSL.
+        _rr_layout = {"ttg.convert_layout", "ttg.local_load", "ttg.local_alloc"}
+
+        def _rr_id(sid):
+            return _peel_id(sid, _rr_layout)
+
+        def _rr_f32(op, shape):
+            return (op is not None and _extract_shape(op.type_str or "") == tuple(shape)
+                    and (op.type_str or "").split(",", 1)[0].rstrip(">").endswith("xf32"))
+
+        def _rr_binary(sid, kinds, shape):
+            op = _by_id.get(_rr_id(sid))
+            return op if (_rr_f32(op, shape) and op.op in kinds
+                          and len(op.operand_ids or []) == 2) else None
+
+        def _rr_row(sid, target, cols):
+            # A row's alpha/max must project across columns, never across rows.
+            op = _by_id.get(_rr_id(sid))
+            if op is not None and op.op == "tt.broadcast" and _rr_f32(op, (_BM, cols)):
+                op = _by_id.get(_rr_id(op.operand_ids[0])) if len(op.operand_ids or []) == 1 else None
+            return (op is not None and op.op == "tt.expand_dims" and _rr_f32(op, (_BM, 1))
+                    and (op.attrs or {}).get("axis") == 1 and len(op.operand_ids or []) == 1
+                    and _rr_id(op.operand_ids[0]) == target)
+
+        def _rr_reduce(sid, value, kinds):
+            red = _by_id.get(_rr_id(sid))
+            if (red is None or red.op != "tt.reduce" or not _rr_f32(red, (_BM,))
+                    or (red.attrs or {}).get("axis") != 1
+                    or len(red.operand_ids or []) != 1 or _rr_id(red.operand_ids[0]) != value):
+                return False
+            bids = list((red.attrs or {}).get("block_arg_ids") or [])
+            returned = list((red.attrs or {}).get("return_ids") or [])
+            body = {o.id: o for o in (red.region_ops or [])}
+            combiner = body.get(returned[0]) if len(returned) == 1 else None
+            return (len(bids) == 2 and len(set(bids)) == 2 and combiner is not None
+                    and combiner.op in kinds and combiner.type_str == "f32"
+                    and len(combiner.operand_ids or []) == 2
+                    and set(combiner.operand_ids) == set(bids))
+
+        def _rr_constant(sid, value, shape):
+            op = _by_id.get(_rr_id(sid))
+            if op is None or op.op != "arith.constant" or not _rr_f32(op, shape):
+                return False
+            actual = (op.attrs or {}).get("value")
+            if value == -float("inf") and actual == 0xFF800000:
+                actual = -float("inf")
+            return actual == value
+
+        _singleton_recurrence = (
+            detected_n_ctx_index == C1
+            and not _fors
+            and dense_tail_out is not None
+            and biased is None
+            and mla_rope is None
+        )
+        if _singleton_recurrence:
+            # Triton fully unrolls the one-trip KV loop at N_CTX==1.  Prove the
+            # same recurrence directly rather than assuming that disappearance
+            # of scf.for makes any two-dot graph canonical.
+            if _out_num_id != _dot_pv.id:
+                _refuse("recurrence", "singleton numerator is not the verified P@V dot result")
+            _rr_max = _rr_binary(_p_max.id, {"arith.maxnumf", "arith.maximumf"}, (_BM,))
+            _rr_max_ok = False
+            if _rr_max is not None:
+                for initial, reduced in (
+                    _rr_max.operand_ids,
+                    _rr_max.operand_ids[::-1],
+                ):
+                    if (
+                        _rr_constant(initial, -float("inf"), (_BM,))
+                        and _rr_reduce(
+                            reduced,
+                            _rr_id(_p_core.operand_ids[0]),
+                            {"arith.maxnumf", "arith.maximumf"},
+                        )
+                    ):
+                        _rr_max_ok = True
+            if (
+                not _rr_max_ok
+                or _rr_id(_alpha_core.operand_ids[1]) != _p_max.id
+                or not _rr_constant(_alpha_core.operand_ids[0], -float("inf"), (_BM,))
+                or not _rr_row(_p_core.operand_ids[1], _p_max.id, _BN)
+            ):
+                _refuse("recurrence", "singleton maximum/alpha is not the exact unrolled first iteration")
+
+            _rr_den = _rr_binary(_out_den_id, {"arith.addf"}, (_BM,))
+            _rr_den_ok = False
+            if _rr_den is not None:
+                for scaled_initial, reduced in (
+                    _rr_den.operand_ids,
+                    _rr_den.operand_ids[::-1],
+                ):
+                    mul = _rr_binary(scaled_initial, {"arith.mulf"}, (_BM,))
+                    if mul is None:
+                        continue
+                    alpha_and_zero = any(
+                        _rr_id(alpha) == _alpha_exps[0].id
+                        and _rr_constant(zero, 0.0, (_BM,))
+                        for alpha, zero in (mul.operand_ids, mul.operand_ids[::-1])
+                    )
+                    if alpha_and_zero and _rr_reduce(reduced, _p_exp.id, {"arith.addf"}):
+                        _rr_den_ok = True
+            if not _rr_den_ok:
+                _refuse("recurrence", "singleton denominator is not 0 * alpha + returned sum(P)")
+
+            if len(_dot_pv.operand_ids or []) != 3:
+                _refuse("recurrence", "singleton P@V dot has no proved accumulator")
+            acc = _peel_to_core(
+                _dot_pv.operand_ids[2],
+                _rr_layout | {"tt.broadcast", "tt.expand_dims"},
+            )
+            if (
+                acc is None
+                or acc.op != "arith.mulf"
+                or len(acc.operand_ids or []) != 2
+                or not any(
+                    _rr_row(alpha, _alpha_exps[0].id, 1)
+                    and _rr_constant(zero, 0.0, (_BM, 1))
+                    for alpha, zero in (acc.operand_ids, acc.operand_ids[::-1])
+                )
+            ):
+                _refuse("recurrence", "singleton P@V accumulator is not 0 * row-broadcast(alpha)")
+            dense_tail_out["initial_values"] = (0.0, 0.0)
+            return _p_multiplier
+
+        _rr_rids = list(getattr(_out_loop, "result_ids", None) or [])
+        _rr_bids = list((_out_loop.attrs or {}).get("block_arg_ids") or [])
+        _rr_inits = list(_out_loop.operand_ids or [])[3:]
+        _rr_yields = [o for o in (_out_loop.region_ops or []) if o.op == "scf.yield"]
+        if (len(_rr_yields) != 1 or len(_rr_bids) != len(_rr_rids) + 1
+                or len(_rr_inits) != len(_rr_rids)
+                or len(_rr_yields[0].operand_ids or []) != len(_rr_rids)
+                or _out_num_id not in _rr_rids or _out_den_id not in _rr_rids
+                or _out_num_id == _out_den_id):
+            _refuse("recurrence", "Out does not select two distinct, completely recorded loop results")
+        _rr_yids = [_rr_id(x) for x in _rr_yields[0].operand_ids]
+        _rr_a, _rr_l = _rr_rids.index(_out_num_id), _rr_rids.index(_out_den_id)
+        _rr_m_candidates = [i for i, x in enumerate(_rr_yids) if x == _p_max.id]
+        if len(_rr_m_candidates) != 1 or _rr_m_candidates[0] in (_rr_a, _rr_l):
+            _refuse("recurrence", "the loop does not yield the exact online maximum in its own slot")
+        _rr_m = _rr_m_candidates[0]
+        _rr_marg, _rr_larg, _rr_aarg = (_rr_bids[i+1] for i in (_rr_m, _rr_l, _rr_a))
+        _rr_initial_values = {}
+        for index, value in ((_rr_m, -float("inf")), (_rr_l, 0.0), (_rr_a, 0.0)):
+            initial = _by_id.get(_rr_id(_rr_inits[index]))
+            initial_value = (initial.attrs or {}).get("value") if initial is not None else None
+            # MLIR's dense hexadecimal f32 -inf is retained as its bit pattern
+            # by the walker; do not decode an arbitrary integer as a float.
+            if value == -float("inf") and initial_value == 0xFF800000:
+                initial_value = -float("inf")
+            replay_finite = (index != _rr_m and dense_tail_out is not None
+                             and (type(initial_value) is float or initial_value == 0)
+                             and _math.isfinite(initial_value))
+            if (initial is None or initial.op != "arith.constant"
+                    or initial.elem_type != "f32" or (initial_value != value and not replay_finite)):
+                _refuse("recurrence", "the max/denominator/numerator initial values are not the replayed -inf/0/0")
+            _rr_initial_values[index] = float(initial_value)
+        if dense_tail_out is not None:
+            # Replay finite initializers explicitly. Do not over-refuse a
+            # numerically correct init-one spelling, or assume alpha erases it
+            # without proving every empty/nonfinite-loop case.
+            dense_tail_out["initial_values"] = (_rr_initial_values[_rr_a], _rr_initial_values[_rr_l])
+
+        _rr_max = _rr_binary(_p_max.id, {"arith.maxnumf", "arith.maximumf"}, (_BM,))
+        if (_rr_max is None or _rr_id(_alpha_core.operand_ids[0]) != _rr_marg
+                or not _rr_row(_p_core.operand_ids[1], _p_max.id, _BN)):
+            _refuse("recurrence", "the maximum/alpha pair or its row projection is not the carried source value")
+        if not any(_rr_id(a) == _rr_marg and _rr_reduce(b, _rr_id(_p_core.operand_ids[0]),
+                                                    {"arith.maxnumf", "arith.maximumf"})
+                   for a, b in (_rr_max.operand_ids, _rr_max.operand_ids[::-1])):
+            _refuse("recurrence", "the online maximum is not max(carried max, returned row-max(score))")
+        _rr_den = _rr_binary(_rr_yids[_rr_l], {"arith.addf"}, (_BM,))
+        _rr_den_ok = False
+        if _rr_den is not None:
+            for a, b in (_rr_den.operand_ids, _rr_den.operand_ids[::-1]):
+                mul = _rr_binary(a, {"arith.mulf"}, (_BM,))
+                if (mul is not None and {_rr_id(x) for x in mul.operand_ids} == {_rr_larg, _alpha_exps[0].id}
+                        and _rr_reduce(b, _p_exp.id, {"arith.addf"})):
+                    _rr_den_ok = True
+        if not _rr_den_ok:
+            _refuse("recurrence", "the denominator is not carried denominator * alpha + returned sum(P)")
+        if _rr_yids[_rr_a] != _dot_pv.id or len(_dot_pv.operand_ids or []) != 3:
+            _refuse("recurrence", "the numerator is not the verified P@V dot result")
+        _rr_pv_shape = _extract_shape(_dot_pv.type_str or "")
+        if len(_rr_pv_shape) != 2 or _rr_pv_shape[0] != _BM:
+            _refuse("recurrence", "the numerator has an unproved output shape")
+        _rr_acc = _rr_binary(_dot_pv.operand_ids[2], {"arith.mulf"}, _rr_pv_shape)
+        if (_rr_acc is None or not any(_rr_id(a) == _rr_aarg and _rr_row(b, _alpha_exps[0].id, _rr_pv_shape[1])
+                                      for a, b in (_rr_acc.operand_ids, _rr_acc.operand_ids[::-1]))):
+            _refuse("recurrence", "the P@V accumulator is not carried numerator * row-broadcast(alpha)")
 
         # ---- biased route (packet 114): the max reduce reads the certified select; the Lse value ----
         if biased is not None:
@@ -11356,9 +12882,9 @@ class GenericLowerer(
     def _lower_flash_attention_template(self, info: dict) -> str:
         """Emit the head-dim-tiled FA2 MSL (Task 1) for a detected FA kernel.
 
-        Called from ``lower()`` only for the validated configs: head_dim=128,
-        BLOCK_M=BLOCK_N=32, causal OR non-causal, fp32 OR fp16 output. ``info``
-        comes from
+        Called from ``lower()`` only for validated configs: the head_dim=128
+        fp32/fp16 routes and the uniform-bf16 head_dim=64, 32x32 tiled route.
+        ``info`` comes from
         ``_detect_flash_attention`` (which refuses on any ambiguity).
 
         ABI reconciliation (the crux). The launcher binds the flat non-constexpr
@@ -11384,7 +12910,7 @@ class GenericLowerer(
         )
 
         head_dim = info["head_dim"]
-        v_head_dim = info.get("v_head_dim", head_dim)  # != head_dim for asymmetric MLA
+        v_head_dim = _v_head_dim_of(info)  # != head_dim for asymmetric MLA
         block_m = info["block_m"]
         block_n = info["block_n"]
         C1 = "c1"
@@ -11399,9 +12925,9 @@ class GenericLowerer(
         # rows. So the mask-dropping templates refuse such a mask THEMSELVES here, using
         # the SAME shared triviality check as the chokepoint (so the two cannot diverge).
         # A trivially-true tile-boundary mask (om < N_CTX) / the no-mask case pass through.
-        if self._template_output_mask_nontrivial(is_fa=True, fa_ctx_index=info.get("N_CTX")):
+        if self._template_output_mask_nontrivial(is_fa=True, fa_ctx_index=info.get("query_length", info.get("N_CTX"))):
             raise MetalNonRecoverableError(
-                "FlashAttention (head_dim=128) with a non-tile-boundary output store "
+                f"FlashAttention (head_dim={head_dim}) with a non-tile-boundary output store "
                 "mask is not supported: the simdgroup / tiled FA templates compute the "
                 "FULL output tile and gate writes only on the N_CTX boundary, silently "
                 "DROPPING any tighter store mask (e.g. tl.store(o, acc, mask=om < BOUND) "
@@ -11454,6 +12980,7 @@ class GenericLowerer(
                     "Refusing rather than risk a mis-bound buffer."
                 )
 
+        _dense_tail = {"causal": info["causal"], "H": info["H"], "strides": info["strides"]}
         info["scale"] *= self._fa_verify_value_paths(
             detected_q_index=info["q"],
             detected_k_index=info["k"],
@@ -11464,9 +12991,11 @@ class GenericLowerer(
             verify_score_path=info.get("verify_score_path", True),
             expected_score_scale=info.get("score_scale"),
             detected_n_ctx_index=info.get("N_CTX"),
+            detected_query_index=info.get("query_length"),
             load_mask_policy="boundary",  # packet 110: the simd template gates at N_CTX itself
             q_rows=info["block_m"],
             kv_cols=info["block_n"],
+            dense_tail_out=_dense_tail,
         )
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the
@@ -11537,11 +13066,11 @@ class GenericLowerer(
         # Emit under the kernel's real (sanitized) name so it matches
         # metadata["name"] the driver loads from the metallib (emit_msl sets
         # name = _sanitize_msl_name(graph.func_name) before lower()).
-        # out_dtype comes from the detector as an MLIR spelling ("f32"/"f16");
-        # the template accepts both spellings. fp16 emits half Q/K/V/Out (the
-        # arg_decls above already use the args' real elem_type, so the pointer
-        # types match) and applies the promote-on-load / cast-on-store epilogue.
-        if _simd_fa_eligible(info):
+        # out_dtype comes from the detector as an MLIR spelling. fp16 emits half
+        # Q/K/V/Out; the narrow native-bf16 route emits bfloat Q/K/V/Out. The
+        # arg_decls above use each argument's proved real element type, and both
+        # tiled paths promote on load, compute in fp32 and cast on store.
+        if _simd_fa_eligible(info) and "query_length" not in info:
             msl = make_flash_attention_kernel_simdgroup(
                 head_dim,
                 32,
@@ -11554,6 +13083,11 @@ class GenericLowerer(
                 scale=info["scale"],
                 v_head_dim=v_head_dim,
                 half_accumulate=_fa_half_accumulate(info["out_dtype"]),
+                source_kv_block=_dense_tail["source_kv_block"],
+                mask_tail_scores=_dense_tail["mask_tail_scores"],
+                unmasked_kv=_dense_tail["unmasked_kv"],
+                source_causal_stop=_dense_tail["source_causal_stop"],
+                initial_values=_dense_tail["initial_values"],
             )
             # 256 threads/threadgroup (8 SIMD groups x 32 threads/group).
             self.effective_block_size = 256
@@ -11580,13 +13114,25 @@ class GenericLowerer(
                 head_dim,
                 block_m,
                 block_n,
-                Dc=64,
+                # Source BN is unchanged; only resident query storage and D
+                # staging shrink. The maker checks the exact five-array budget.
+                # 32x64/Dc32 = 24832 bytes; 32x32/Dc64 = 20736 bytes.
+                Dc=32 if head_dim == 64 and block_n == 64 else 64,
                 causal=info["causal"],
                 out_dtype=info["out_dtype"],
                 arg_decls=arg_decls,
                 bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
+                source_kv_block=_dense_tail["source_kv_block"],
+                mask_tail_scores=_dense_tail["mask_tail_scores"],
+                unmasked_kv=_dense_tail["unmasked_kv"],
+                source_causal_stop=_dense_tail["source_causal_stop"],
+                query_tile=32 if head_dim == 64 and block_m >= 32 and (block_m, block_n) != (32, 32) else None,
+                initial_values=_dense_tail["initial_values"],
+                query_length=_expr(info["query_length"]) if "query_length" in info else None,
+                round_q=getattr(self, "_fa_rounding", {}).get("round_q") if "query_length" in info else None,
+                round_p=getattr(self, "_fa_rounding", {}).get("round_p") if "query_length" in info else None,
             )
             # Match every cooperative loop's physical stride, even for >1024 scores.
             self.effective_block_size = flash_attention_tiled_threads(block_m, block_n)
@@ -11641,7 +13187,7 @@ class GenericLowerer(
           result = (lid < N) ? a_val : b_val
         """
         if len(ssa.operand_ids) < 2:
-            self.kb.comment("UNSUPPORTED: tt.join with < 2 operands")
+            self.kb.unsupported("UNSUPPORTED: tt.join with < 2 operands")
             return
 
         a_id, b_id = ssa.operand_ids[0], ssa.operand_ids[1]
@@ -11755,7 +13301,7 @@ class GenericLowerer(
         have valid loaded values. Use shared memory to stage and redistribute.
         """
         if len(ssa.operand_ids) < 2:
-            self.kb.comment("UNSUPPORTED: tt.cat with < 2 operands")
+            self.kb.unsupported("UNSUPPORTED: tt.cat with < 2 operands")
             return
 
         a_id, b_id = ssa.operand_ids[0], ssa.operand_ids[1]
@@ -11831,10 +13377,10 @@ class GenericLowerer(
         from the flat input. Stage to shared memory, then read even/odd.
         """
         if not ssa.operand_ids:
-            self.kb.comment("UNSUPPORTED: tt.split with no operands")
+            self.kb.unsupported("UNSUPPORTED: tt.split with no operands")
             return
         if not ssa.result_ids or len(ssa.result_ids) < 2:
-            self.kb.comment("UNSUPPORTED: tt.split with < 2 results")
+            self.kb.unsupported("UNSUPPORTED: tt.split with < 2 results")
             return
 
         src_id = ssa.operand_ids[0]
@@ -11940,7 +13486,7 @@ class GenericLowerer(
         Uses threadgroup atomic_int array for thread-safe counting.
         """
         if not ssa.operand_ids:
-            self.kb.comment("UNSUPPORTED: tt.histogram with no operands")
+            self.kb.unsupported("UNSUPPORTED: tt.histogram with no operands")
             return
 
         input_var = self._lookup(ssa.operand_ids[0])
@@ -12329,7 +13875,7 @@ class GenericLowerer(
         Stage src to shared memory, each thread reads shared[indices[lid]].
         """
         if len(ssa.operand_ids) < 2:
-            self.kb.comment("UNSUPPORTED: tt.gather with < 2 operands")
+            self.kb.unsupported("UNSUPPORTED: tt.gather with < 2 operands")
             return
 
         src_var = self._lookup(ssa.operand_ids[0])
@@ -12630,24 +14176,6 @@ class GenericLowerer(
 
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = ssa.elem_type or "i32"
-
-    def _register_bcast_layout_by_type(self, type_str: str, shape: tuple, layout_expr: str) -> None:
-        """Register a reduce output's bcast_layout, keyed both by shape and
-        by the layout signature extracted from its type_str.
-
-        This enables downstream reshape-of-make_range rewrites to find the
-        layout matching the reshape's slice layout (rather than just any
-        same-rank reduce, which may differ during chained compare-and-swaps
-        within a single bitonic stage).
-        """
-        if not hasattr(self, "_bcast_layouts_by_shape"):
-            self._bcast_layouts_by_shape = {}
-        self._bcast_layouts_by_shape[shape] = layout_expr
-        if not hasattr(self, "_bcast_layouts_by_layout"):
-            self._bcast_layouts_by_layout = {}
-        sig = _extract_layout_signature(type_str)
-        if sig is not None:
-            self._bcast_layouts_by_layout[sig] = (shape, layout_expr)
 
     # -- Prefix scan (tt.scan) --
 
@@ -13171,13 +14699,14 @@ class GenericLowerer(
                     const_terms.append(r[1])
 
         cur = addptr_id
+        reached_base = False
         for _ in range(64):
             op = op_by_id.get(cur)
             if op is None:
-                break
+                _refuse()
             if op.op == "tt.addptr":
                 if len(op.operand_ids) < 2:
-                    break
+                    _refuse()
                 _add(self._staged_fill_terms(op.operand_ids[1], None, axis_dim_hint, op_by_id))
                 cur = op.operand_ids[0]
                 continue
@@ -13188,15 +14717,80 @@ class GenericLowerer(
                 # Reached the splatted base pointer. If that base pointer
                 # carries a scalar (block-constant, program-id/batch-stride)
                 # addptr offset, fold it in as a constant term.
-                if op.operand_ids:
-                    sp = self.env_is_ptr.get(op.operand_ids[0])
-                    if sp and isinstance(sp[1], str) and sp[1] not in ("", "0"):
-                        const_terms.append(sp[1])
+                if not op.operand_ids:
+                    _refuse()
+                # Raw pointer arguments are not themselves entries in
+                # ``env_is_ptr``; the splat result is.  A scalar addptr below
+                # the splat is propagated there as well, so this is the
+                # complete base-address fact to validate and fold.
+                sp = self.env_is_ptr.get(op.id)
+                if sp is None or sp[0] != base_ptr:
+                    _refuse()
+                if isinstance(sp[1], str) and sp[1] not in ("", "0"):
+                    const_terms.append(sp[1])
+                reached_base = True
                 break
-            break
+            # A value such as a pointer-valued select can have a valid
+            # per-thread address in ``env_is_ptr`` while still lacking a
+            # proof that reconstructs that address for every cooperative
+            # fill coordinate.  Stopping here and returning offset zero used
+            # to smear ptr[0] across the staged tile (GPU-confirmed silent
+            # wrong).  Only the complete addptr/broadcast/splat proof above
+            # may authorize reconstruction.
+            _refuse()
+
+        if not reached_base:
+            _refuse()
 
         all_parts = parts + const_terms
         return " + ".join(all_parts) if all_parts else "0"
+
+    def _rebuild_staged_fill_load(self, ptr_id, op_by_id, M, N, axis_dim_hint=None, depth=4):
+        """Rebuild one cooperative fill's source load at ``(_fill_row, _fill_col)``.
+
+        Ordinary pointer tensors reduce to ``base[proved_offset]``.  A pointer-valued
+        select is also exact when its condition is kernel-uniform: rebuild BOTH arm
+        addresses independently and select their loaded values.  The per-thread pointer
+        variable emitted by ``_lower_select`` cannot be reused here because it contains
+        only the current lane's offset; doing so used ``ptr[0]`` for every additional
+        cooperative slot and silently smeared one element across the staged tile.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        def _refuse(reason):
+            raise MetalNonRecoverableError(
+                "triton-msl: cannot reconstruct a shared-memory-staged tt.dot "
+                f"load for every cooperative fill coordinate ({reason}). Refusing "
+                "rather than change pointer-selection semantics.",
+                op_name="tt.load",
+            )
+
+        if depth <= 0:
+            _refuse("pointer expression nesting exceeds the proved limit")
+        op = op_by_id.get(ptr_id)
+        if op is not None and op.op == "arith.select":
+            if len(op.operand_ids or []) != 3:
+                _refuse("pointer select does not have exactly three operands")
+            cond_id, true_id, false_id = op.operand_ids
+            if cond_id in self.env_array:
+                _refuse("pointer select condition is a per-element register array")
+            cond_shape = self.env_shapes.get(cond_id)
+            if cond_shape != () and cond_id not in self._is_splat:
+                _refuse("pointer select condition is not proved kernel-uniform")
+            true_expr = self._rebuild_staged_fill_load(
+                true_id, op_by_id, M, N, axis_dim_hint, depth - 1
+            )
+            false_expr = self._rebuild_staged_fill_load(
+                false_id, op_by_id, M, N, axis_dim_hint, depth - 1
+            )
+            return f"({self._lookup(cond_id)} ? ({true_expr}) : ({false_expr}))"
+
+        ptr_info = self.env_is_ptr.get(ptr_id)
+        if ptr_info is None:
+            _refuse("pointer provenance is absent")
+        base_ptr = ptr_info[0]
+        offset = self._rebuild_staged_fill_offset(ptr_id, op_by_id, base_ptr, M, N, axis_dim_hint)
+        return f"{base_ptr}[{offset}]"
 
     def _lower_local_alloc(self, ssa: SSAValue):
         """ttg.local_alloc -> write tensor to threadgroup shared memory.
@@ -13404,7 +14998,7 @@ class GenericLowerer(
                 _src_desc = getattr(self, "_shared_mem_descs", {}).get(_cur_src)
                 if _src_desc is not None:
                     break
-        if _src_desc is not None and load_ptr_info is None:
+        if _src_desc is not None and (load_ptr_info is None or getattr(self, "_source_biased_replay", False)):
             _src_smem, _src_shape, _ = _src_desc
             _src_total = 1
             for _d in _src_shape:
@@ -13426,16 +15020,17 @@ class GenericLowerer(
             self.kb.raw_line(f"    }}")
         elif total > dispatch_threads and self._is_2d:
             if load_ptr_info is not None:
-                base_ptr = load_ptr_info[0]
                 # Per-load structural rebuild of each staged element's global
-                # address (correct-or-refuse for transposed/strided operands).
-                new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
+                # address (correct-or-refuse for transposed/strided/selected
+                # operands).  This returns a complete load expression because
+                # a selected pointer may have a different base in each arm.
+                load_expr = self._rebuild_staged_fill_load(load_addptr_id, op_by_id, M, N)
                 self.kb.raw_line(
                     f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
                 )
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                _emit_staged_fill(f"{base_ptr}[{new_offset}]")
+                _emit_staged_fill(load_expr)
                 self.kb.raw_line(f"    }}")
             else:
                 # No load pointer and not smem-backed: the per-thread scalar holds ONE
@@ -13457,14 +15052,13 @@ class GenericLowerer(
                 # total <= block_size. The flat base_ptr[_sa] copy assumes a
                 # contiguous row-major source; rebuild structurally so a
                 # transposed/strided source stages correctly (or refuses).
-                base_ptr = load_ptr_info[0]
-                new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
+                load_expr = self._rebuild_staged_fill_load(load_addptr_id, op_by_id, M, N)
                 self.kb.raw_line(
                     f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
                 )
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                _emit_staged_fill(f"{base_ptr}[{new_offset}]")
+                _emit_staged_fill(load_expr)
                 self.kb.raw_line(f"    }}")
             else:
                 # Flat contiguous copy: the element address is _sa itself, so there is
@@ -13612,7 +15206,7 @@ class GenericLowerer(
         _lower_dot_via_prebuilt_template() instead.
         """
         if len(ssa.operand_ids) < 3:
-            self.kb.comment("UNSUPPORTED: tt.dot with < 3 operands")
+            self.kb.unsupported("UNSUPPORTED: tt.dot with < 3 operands")
             return
         if self._lower_dot_kchunk(ssa):
             return
@@ -13844,6 +15438,7 @@ class GenericLowerer(
         # Generate the body using a sub-lowerer
         sub = _DeviceFuncLowerer(cfunc, self.options)
         body_lines = sub.lower_body()
+        self.kb.unsupported_reasons.extend(sub.unsupported_reasons)
 
         # Assemble the function
         lines = []
@@ -13875,7 +15470,19 @@ class GenericLowerer(
         """
         callee = ssa.attrs.get("callee", "unknown_fn")
         safe_callee = self._sanitize_func_name(callee)
-        args = [self._lookup(oid) for oid in ssa.operand_ids]
+        # A tt.call pointer operand is an address, not a load. `_lookup` alone
+        # loses addptr provenance and produced `callee(A[offset])` where MSL
+        # requires `callee(A + offset)`.
+        args = []
+        for oid in ssa.operand_ids:
+            pointer = self.env_is_ptr.get(oid)
+            if pointer is not None:
+                base, offset = pointer
+                args.append(base if not offset else f"({base} + {offset})")
+            elif self._is_scalar_ptr(oid):
+                args.append(self._lookup(oid))
+            else:
+                args.append(self._lookup(oid))
         args_str = ", ".join(args)
 
         # Find the callee function definition to determine return types
@@ -13953,7 +15560,7 @@ class GenericLowerer(
             )
         else:
             # Other (value-producing) ttg ops: passthrough. An undefined result
-            # surfaces as UNKNOWN_<id> -> loud MSL compile error if consumed.
+            # refuses at lookup if consumed.
             self._emit_passthrough(ssa)
 
     def _lower_convert_layout_mept_shuffle(self, ssa, src_type, dest_type, src_shape, N) -> bool:
@@ -14065,6 +15672,24 @@ class GenericLowerer(
         # variant change that doesn't affect thread mapping in our model.
         dest_type = ssa.type_str or ""
         needs_redistribute = "ttg.slice" in src_type and "ttg.slice" not in dest_type
+
+        # Packet 325: wide scans deliberately replace every participating
+        # blocked layout with one canonical contiguous flat ownership map.
+        # A full-tile convert inside that proved cone is therefore a logical
+        # type annotation, not a physical redistribution: pre-scan values,
+        # scan outputs, and independently rebuilt pointers all use
+        # e=lid*width+slot.
+        # Admit only an exact full-shape/width match; anything else continues
+        # through the ordinary layout resolver (and fails closed if unresolved).
+        if (
+            getattr(self, "_scan_mept_shape", None) is not None
+            and ssa.operand_ids[0] in self.env_array
+            and tuple(src_shape) == tuple(self._scan_mept_shape)
+            and self.env_array[ssa.operand_ids[0]][1] == self._scan_mept_width
+        ):
+            self._emit_passthrough(ssa)
+            self._propagate_shape_from_type(ssa)
+            return
 
         # Phase 4d: MEPT array shuffle. When the source value is a per-thread
         # register array and both layouts resolve to LinearLayouts, redistribute

@@ -1,3 +1,6 @@
+# _alibi_fa adapts the TriFast-derived biased forward test kernel.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Local test adaptations and provenance: docs/TRIFAST_PROVENANCE.md.
 """Maskless biased attention (ALiBi / T5-style additive bias, NO boolean mask):
 scores = sm_scale*Q@Kᵀ + bias, softmax, P@V. The biased-FA detector previously
 required exactly one boolean mask load (refused no-mask — correctly, since falling

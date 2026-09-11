@@ -215,19 +215,79 @@ def _extract_layout_signature(type_str):
 # ---------------------------------------------------------------------------
 
 
-def _alias_shared_memory(msl: str) -> str:
+def _shared_memory_phases(msl: str):
+    """Conservative synchronization epochs for generated MSL, not a CFG proof.
+
+    Record standalone threadgroup-memory barriers and their lexical scopes.
+    Callers must check both the forward handoff and every common loop backedge.
+    Conditional/unknown scopes cannot certify synchronization. We don't insert
+    barriers; unrecognized spellings merely prevent reuse.
+    """
+    # Strip comments and literals without moving line boundaries. In particular,
+    # comments/strings containing braces or a barrier cannot certify anything.
+    lexical = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+    code = lexical.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), msl)
+    # A preprocessor branch or line splice needs preprocessing, not text proof.
+    if (
+        re.search(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif|define|undef)\b", code, re.M)
+        or "\\\n" in msl
+        or re.search(r"\bgoto\b", code)
+    ):
+        return None
+    barrier = re.compile(r"\s*threadgroup_barrier\(\s*([\w:|\s]+)\s*\)\s*;\s*")
+    stack, blocks, barriers = [], {}, []
+    transfers = set()
+    previous = ""
+    contexts = []
+    for i, line in enumerate(code.split("\n")):
+        contexts.append(tuple(stack))
+        if stack and re.search(r"\b(?:break|continue|return)\b", line):
+            # An early exit may bypass a lexically unconditional barrier. Until
+            # this post-pass has a CFG, do not reuse arrays in that function.
+            transfers.add(stack[0])
+        match = barrier.fullmatch(line)
+        # Reject an unbraced control header on the preceding nonempty line.
+        # Known generated statements/blocks end with these delimiters.
+        if stack and match and previous.endswith((";", "{", "}")) and all(
+            blocks[b][0] in ("function", "for") for b in stack
+        ):
+            flags = {f.strip() for f in match.group(1).split("|")}
+            if "mem_flags::mem_threadgroup" in flags and flags <= {
+                "mem_flags::mem_threadgroup", "mem_flags::mem_device"
+            }:
+                barriers.append(i)
+        for char in line:
+            if char == "{":
+                # Multiple opens on a line are unknown structured control, so
+                # never credit a barrier in those bodies.
+                kind = "function" if not stack else "for" if re.match(r"\s*for\s*\(", line) else "unknown"
+                if i in blocks:
+                    return None
+                blocks[i] = [kind, None]
+                stack.append(i)
+            elif char == "}":
+                if not stack:
+                    return None
+                blocks[stack.pop()][1] = i
+        if line.strip():
+            previous = line.rstrip()
+    return (contexts, blocks, barriers, transfers) if not stack else None
+
+
+def _alias_shared_memory(msl: str, *, allocation_aliases=None) -> str:
     """Rewrite threadgroup array declarations to reuse memory.
 
     After the lowerer generates MSL with one threadgroup array per allocation,
-    this pass finds arrays with non-overlapping lifetimes and aliases them to
-    the same physical array, reducing total threadgroup memory usage.
+    this pass finds arrays with non-overlapping, synchronization-separated
+    lifetimes and aliases them to the same physical array. Textual last-use is
+    NOT read completion across threads (reduce/scan/split/atomic consumers).
 
     The algorithm:
     1. Parse all `threadgroup float NAME[SIZE];` declarations.
     2. For each, scan the MSL body for first and last LINE where NAME appears
        (excluding the declaration itself).
-    3. Build a conflict graph: two arrays conflict if their [first, last] line
-       ranges overlap.
+    3. Build a conflict graph: overlapping lifetimes OR absence of a proven
+       scope-correct threadgroup-memory barrier makes two arrays conflict.
     4. Greedily assign arrays to "physical" slots. For each array (sorted by
        size descending), try to reuse a physical slot whose current occupants
        don't conflict. If none, create a new slot.
@@ -236,7 +296,13 @@ def _alias_shared_memory(msl: str) -> str:
        size to the group maximum.
     """
 
+    if allocation_aliases is not None:
+        allocation_aliases.clear()
     lines = msl.split("\n")
+    synchronization = _shared_memory_phases(msl)
+    if synchronization is None:
+        return msl
+    contexts, blocks, barriers, transfers = synchronization
 
     # 1. Parse declarations: name -> (size, decl_line_idx, dtype)
     # Handle common threadgroup types: float, int, uint, half, etc.
@@ -246,6 +312,8 @@ def _alias_shared_memory(msl: str) -> str:
         m = decl_re.match(line)
         if m:
             dtype, name, size = m.group(1), m.group(2), int(m.group(3))
+            if name in decls:
+                return msl  # repeated local names need scope-aware rewriting
             decls[name] = (size, i, dtype)
 
     if len(decls) < 2:
@@ -275,6 +343,7 @@ def _alias_shared_memory(msl: str) -> str:
 
     # 2b. Compute live ranges: name -> (first_use_line, last_use_line)
     live = {}
+    raw_live = {}
     for name in decls:
         decl_line = decls[name][1]
         first_use = None
@@ -288,6 +357,7 @@ def _alias_shared_memory(msl: str) -> str:
                     first_use = i
                 last_use = i
         if first_use is not None:
+            raw_live[name] = (first_use, last_use)
             # Expand range to cover enclosing loop ONLY if the array is
             # used both outside and inside the loop (persistent across
             # iterations, like Q). Arrays first allocated inside the loop
@@ -305,12 +375,66 @@ def _alias_shared_memory(msl: str) -> str:
             live[name] = (first_use, last_use)
         else:
             live[name] = (decl_line, decl_line)
+            raw_live[name] = (decl_line, decl_line)
 
-    # 3. Check overlap: two arrays conflict if their ranges overlap.
+    def separates(first, last, scope):
+        # A barrier inside a nested loop might execute zero times. Only one in
+        # the same unconditional scope (or an enclosing scope) can certify this
+        # transition. Conditional scopes were excluded when collecting barriers.
+        return any(first < i < last and scope[:len(contexts[i])] == contexts[i]
+                   for i in barriers)
+
+    # 3. Textual separation alone is not cross-thread read completion.
     def overlaps(a, b):
         a0, a1 = live[a]
         b0, b1 = live[b]
-        return a0 <= b1 and b0 <= a1
+        if a0 <= b1 and b0 <= a1:
+            return True
+        if a0 > b0:
+            a, b = b, a
+        a0, a1 = raw_live[a]
+        b0, b1 = raw_live[b]
+        common = []
+        for left, right in zip(contexts[a1], contexts[b0]):
+            if left != right:
+                break
+            common.append(left)
+        if not common or common[0] in transfers:
+            return True
+        forward = separates(a1, b0, tuple(common))
+        if not forward:
+            # An array used ONLY inside a loop can finish its last reads at an
+            # unconditional barrier in that loop before exiting. Zero iterations
+            # access no such array. Likewise a barrier at the beginning of B's
+            # loop protects its first write. Do not credit an unrelated zero-trip
+            # loop, or an array whose lifetime extends outside that loop.
+            for i in barriers:
+                scope = contexts[i]
+                if not a1 < i < b0 or scope[:len(common)] != tuple(common):
+                    continue
+                extra = scope[len(common):]
+                if extra and all(
+                    blocks[block][0] == "for" and (
+                        block < a0 <= a1 < blocks[block][1]
+                        or block < b0 <= b1 < blocks[block][1]
+                    ) for block in extra
+                ):
+                    forward = True
+                    break
+        if not forward:
+            return True
+        if not all(contexts[i] and contexts[i][0] == common[0] for i in (a0, a1, b0, b1)):
+            return True
+        # A->B in iteration n is insufficient: B(n)->A(n+1) must also be safe.
+        # For every loop enclosing both whole lifetimes, require a barrier at
+        # that loop's scope before A or after B. Inner zero-trip loops don't count.
+        for level, block in enumerate(common):
+            kind, end = blocks[block]
+            if kind == "for" and block < a0 <= a1 < b0 <= b1 < end:
+                scope = tuple(common[:level + 1])
+                if not (separates(block, a0, scope) or separates(b1, end, scope)):
+                    return True
+        return False
 
     # 4. Greedy coloring: assign arrays to physical slots.
     # Sort by size descending so large arrays get first pick.
@@ -383,6 +507,8 @@ def _alias_shared_memory(msl: str) -> str:
         for m in members:
             assignment[m] = phys_name
     renames = {n: assignment[n] for n in decls if assignment.get(n) != n}
+    if allocation_aliases is not None:
+        allocation_aliases.update(assignment)
     if not renames:
         return msl
 
@@ -408,3 +534,41 @@ def _alias_shared_memory(msl: str) -> str:
             new_lines.append(new_line)
 
     return "\n".join(new_lines)
+
+
+def _check_replay_shared_memory_budget(allocations, aliases, *, extra_bytes=0, limit=32768):
+    """Check typed allocations AFTER the emitter's actual reuse plan.
+
+    Do not infer capacity from a compiler diagnostic or count pre-alias logical
+    arrays: the former can hide defects, the latter rejects legal shared reuse.
+    Unknown facts fail as integrity errors, never prunable resource failures.
+    This covers builder-owned arrays in the bounded source replay paths, not
+    arbitrary hand-written MSL or every template's memory footprint.
+    """
+    from .msl_emitter import _msl_compute_type
+    from triton_msl.errors import MetalNonRecoverableError, MetalResourceError
+
+    widths = {"bool": 1, "char": 1, "uchar": 1, "short": 2, "ushort": 2,
+              "half": 2, "bfloat": 2, "int": 4, "uint": 4, "float": 4,
+              "long": 8, "ulong": 8}
+    logical = {}
+    for name, dtype, count in allocations:
+        ty = _msl_compute_type(dtype)
+        if name in logical or ty not in widths or type(count) is not int or count <= 0:
+            raise MetalNonRecoverableError("source replay has an unproved threadgroup allocation", op_name="threadgroup")
+        logical[name] = (ty, count)
+    if any(name not in logical or target not in logical for name, target in aliases.items()):
+        raise MetalNonRecoverableError("source replay scratch alias has no typed allocation", op_name="threadgroup")
+    physical = {}
+    for name, (ty, count) in logical.items():
+        target = aliases.get(name, name)
+        if aliases.get(target, target) != target or logical[target][0] != ty:
+            raise MetalNonRecoverableError("source replay scratch alias has incompatible storage", op_name="threadgroup")
+        previous = physical.get(target, (ty, 0))
+        physical[target] = (ty, max(previous[1], count))
+    if type(extra_bytes) is not int or extra_bytes < 0:
+        raise MetalNonRecoverableError("source replay has unproved extra scratch storage", op_name="threadgroup")
+    required = extra_bytes + sum(widths[ty] * count for ty, count in physical.values())
+    if required > limit:
+        raise MetalResourceError(required, limit, "threadgroup memory bytes")
+    return required

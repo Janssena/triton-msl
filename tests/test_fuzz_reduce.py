@@ -13,8 +13,11 @@ never silent-wrong (computed-but-wrong) and never a cryptic crash (any other exc
 Run deep:  TRITON_MSL_FALLBACK=error python tests/test_fuzz_reduce.py 3
 """
 
-import os
-import shutil
+if __name__ == "__main__" and not __package__:
+    from cache_helpers import fresh_compiler_caches
+else:
+    from tests.cache_helpers import fresh_compiler_caches
+
 import sys
 
 import pytest
@@ -29,8 +32,7 @@ requires = pytest.mark.skipif(not HAS, reason="MPS + compile_shader needed")
 
 
 def _clear_cache():
-    for d in (os.path.expanduser("~/.cache/triton_msl"), os.path.expanduser("~/.triton/cache")):
-        shutil.rmtree(d, ignore_errors=True)
+    fresh_compiler_caches(globals())
 
 
 def _is_float(dt):
@@ -213,15 +215,6 @@ def _run_cell(form, dims, dtype, seed):
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
-    except FileNotFoundError:
-        # transient on-disk cache race (Triton in-memory<->disk); retry once cleanly
-        _clear_cache()
-        try:
-            return _run_cell(form, dims, dtype, seed + 100000)
-        except MetalNonRecoverableError:
-            return ("refused", None)
-        except Exception as e:  # noqa: BLE001
-            return (f"crash:{type(e).__name__}", str(e)[:80])
     except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     ref = _ref(form, A)

@@ -55,6 +55,7 @@ class RefusalContext:
     called_funcs: list  # graph.called_funcs or []
     find_op_type_str: Callable[[object], Optional[str]]  # ssa_id -> type str
     extract_shape: Callable[[str], Sequence]  # type str -> shape
+    supported_assert_ids: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,36 @@ def _check_join_into_dot(ctx: RefusalContext) -> Optional[Violation]:
     return None
 
 
+def _check_retained_assert(ctx: RefusalContext) -> Optional[Violation]:
+    # Frameworks such as Inductor retain bounds assertions by default. Only a
+    # positively proved generic assertion plan may admit an entry-function check.
+    # Callee checks remain unsupported, including checks nested inside regions.
+    msg = (
+        "tl.device_assert is retained by the source or framework, but this form is "
+        "outside the backend's supported uniform-control assertion path. Refusing "
+        "rather than silently dropping a retained assertion."
+    )
+
+    def _walk_cf(ops):
+        # A callee body carries nested scf.if/for regions too, so a retained assert can
+        # live inside a callee's region_ops/else_ops, not only at its top level. The
+        # main kernel's regions are already covered by ctx.all_ops (walked recursively).
+        for o in ops or ():
+            yield o
+            if getattr(o, "region_ops", None):
+                yield from _walk_cf(o.region_ops)
+            if getattr(o, "else_ops", None):
+                yield from _walk_cf(o.else_ops)
+
+    for s in ctx.all_ops:
+        if s.op == "tt.assert" and s.id not in ctx.supported_assert_ids:
+            return Violation(msg, "tt.assert")
+    for cf in ctx.called_funcs:
+        if any(o.op == "tt.assert" for o in _walk_cf(cf.ops)):
+            return Violation(msg, "tt.assert")
+    return None
+
+
 def _check_unstructured_cf(ctx: RefusalContext) -> Optional[Violation]:
     # Only TOP-LEVEL ops: tt.map_elementwise bodies also use cf.cond_br but
     # those live in region_ops and ARE handled
@@ -249,6 +280,17 @@ REFUSAL_CASES: List[RefusalCase] = [
         examples=("test_nested_if_else_return", "test_constexpr_if_return"),
         trigger_ops=("cf.cond_br", "cf.br"),
         check=_check_unstructured_cf,
+    ),
+    RefusalCase(
+        name="retained_device_assert",
+        summary="Retained assertions outside the proved generic execution envelope",
+        rationale="Sources and frameworks can retain tt.assert. The generic path "
+        "admits only checks with a uniform rendezvous and a sealed host-result "
+        "check. All other forms refuse, including nested callee regions "
+        "(region_ops/else_ops); no check may be silently elided.",
+        examples=("issue #8",),
+        trigger_ops=("tt.assert",),
+        check=_check_retained_assert,
     ),
 ]
 

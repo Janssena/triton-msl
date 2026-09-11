@@ -14,6 +14,7 @@ from typing import List
 from triton_msl.codegen.mlir_walker import CalledFunc, SSAValue
 from triton_msl.codegen.msl_emitter import _msl_compute_type
 from triton_msl.codegen.msl_types import triton_type_to_msl
+from triton_msl.errors import MetalNonRecoverableError
 
 from triton_msl.codegen._lowerer_helpers import (
     _mlir_to_triton_dtype,
@@ -39,6 +40,7 @@ class _DeviceFuncLowerer:
         self.env_is_ptr = {}
         self._var_counter = 0
         self._lines = []
+        self.unsupported_reasons = []
 
     def _next_var(self, prefix="r") -> str:
         name = f"{prefix}_{self._var_counter}"
@@ -48,10 +50,22 @@ class _DeviceFuncLowerer:
     def _lookup(self, ssa_id: int) -> str:
         if ssa_id in self.env:
             return self.env[ssa_id]
-        return f"UNKNOWN_{ssa_id}"
+        raise MetalNonRecoverableError(f"device-function codegen encountered unresolved SSA value {ssa_id}")
+
+    def _pointer_expr(self, ssa_id: int):
+        """Return a scalar device-pointer expression, or None for a value."""
+        info = self.env_is_ptr.get(ssa_id)
+        if info is None:
+            return None
+        base, offset = info
+        return base if not offset else f"({base} + {offset})"
 
     def _emit(self, line: str):
         self._lines.append(f"    {line}")
+
+    def _unsupported(self, reason):
+        self.unsupported_reasons.append(reason)
+        self._emit(reason)
 
     def lower_body(self) -> List[str]:
         """Lower all ops and return lines of MSL body code."""
@@ -108,7 +122,7 @@ class _DeviceFuncLowerer:
         elif op.startswith("ttg.") or op in ("tt.reshape", "tt.expand_dims", "tt.unsplat", "tt.make_range"):
             self._emit_passthrough(ssa)
         else:
-            self._emit(f"// UNSUPPORTED in device func: {op}")
+            self._unsupported(f"// UNSUPPORTED in device func: {op}")
 
     def _lower_return(self, ssa: SSAValue):
         """tt.return with value(s) in a device function."""
@@ -128,7 +142,7 @@ class _DeviceFuncLowerer:
         """tt.call in a device function (nested calls)."""
         callee = ssa.attrs.get("callee", "unknown_fn")
         safe_callee = callee.replace(".", "_")
-        args = [self._lookup(oid) for oid in ssa.operand_ids]
+        args = [self._pointer_expr(oid) or self._lookup(oid) for oid in ssa.operand_ids]
         args_str = ", ".join(args)
 
         n_results = len(ssa.result_ids) if ssa.result_ids else (1 if ssa.type_str else 0)
@@ -312,6 +326,28 @@ class _DeviceFuncLowerer:
 
         if op == "arith.select" and len(ids) >= 3:
             cond = self._lookup(ids[0])
+            if "!tt.ptr" in (ssa.type_str or ""):
+                a = self._pointer_expr(ids[1])
+                b = self._pointer_expr(ids[2])
+                meta = self.cfunc.result_meta.get(ssa.id)
+                if (a is None or b is None or meta is None or meta.schema_version != 1
+                        or meta.value_id != ssa.id or meta.kind != "result"
+                        or meta.producer_id != ssa.id or meta.result_index != 0
+                        or meta.type.kind != "pointer" or meta.type.address_space != 1
+                        or meta.type.pointee is None or meta.type.pointee.unknown_reason
+                        or meta.type.pointee.elem is None):
+                    from triton_msl.errors import MetalNonRecoverableError
+                    raise MetalNonRecoverableError(
+                        "device-function pointer select lacks two addresses or native result metadata",
+                        op_name="arith.select")
+                dtype = _mlir_to_triton_dtype(meta.type.pointee.elem)
+                var = self._next_var("ptr")
+                self._emit(
+                    f"volatile device {triton_type_to_msl(dtype)}* {var} = {cond} ? {a} : {b};")
+                self.env[ssa.id] = var
+                self.env_types[ssa.id] = dtype
+                self.env_is_ptr[ssa.id] = (var, None)
+                return
             a = self._lookup(ids[1])
             b = self._lookup(ids[2])
             var = self._next_var("sel")
@@ -339,7 +375,7 @@ class _DeviceFuncLowerer:
                 self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type)
             return
 
-        self._emit(f"// UNSUPPORTED arith in device func: {op}")
+        self._unsupported(f"// UNSUPPORTED arith in device func: {op}")
 
     def _lower_math(self, ssa: SSAValue):
         """Lower math.* ops."""
@@ -400,7 +436,7 @@ class _DeviceFuncLowerer:
         if not func_name:
             func_name = ssa.attrs.get("libname", "")
         if not func_name:
-            self._emit(f"// UNSUPPORTED: tt.extern_elementwise (no symbol)")
+            self._unsupported("// UNSUPPORTED: tt.extern_elementwise (no symbol)")
             return
 
         # Sanitize __nv_* CUDA libdevice names to Metal equivalents
@@ -452,9 +488,17 @@ class _DeviceFuncLowerer:
         # Declare and initialize iter_arg variables
         iter_vars = []
         iter_dtypes = []
+        pointer_indices = set()
         result_elem = ssa.elem_type or "f32"
         for i, init_id in enumerate(init_ids):
             var_name = self._next_var("iter")
+            pointer = self._pointer_expr(init_id)
+            if pointer is not None:
+                self._emit(f"auto {var_name} = {pointer};")
+                iter_vars.append(var_name)
+                iter_dtypes.append(self.env_types.get(init_id, "fp32"))
+                pointer_indices.add(i)
+                continue
             init_val = self._lookup(init_id)
             init_type = self.env_types.get(init_id, "fp32")
             if result_elem in ("i64",) and init_type in ("i32", "fp32"):
@@ -490,14 +534,31 @@ class _DeviceFuncLowerer:
                 if i + 1 < len(block_arg_ids):
                     self.env[block_arg_ids[i + 1]] = var
                     self.env_types[block_arg_ids[i + 1]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    if i in pointer_indices:
+                        self.env_is_ptr[block_arg_ids[i + 1]] = (var, None)
 
         # Process body ops
         if ssa.region_ops:
             for body_op in ssa.region_ops:
                 if body_op.op == "scf.yield":
+                    pointer_next = {}
+                    for i, yield_id in enumerate(body_op.operand_ids):
+                        if i in pointer_indices:
+                            pointer = self._pointer_expr(yield_id)
+                            if pointer is None:
+                                from triton_msl.errors import MetalNonRecoverableError
+                                raise MetalNonRecoverableError(
+                                    "device-function loop pointer yield has no address representation",
+                                    op_name="scf.for")
+                            next_var = self._next_var("next_ptr")
+                            self._emit(f"    auto {next_var} = {pointer};")
+                            pointer_next[i] = next_var
                     # Update iter_arg variables from yield operands
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(iter_vars):
+                            if i in pointer_indices:
+                                self._emit(f"    {iter_vars[i]} = {pointer_next[i]};")
+                                continue
                             yield_val = self._lookup(yield_id)
                             self._emit(f"    {iter_vars[i]} = {yield_val};")
                 else:
@@ -511,9 +572,13 @@ class _DeviceFuncLowerer:
                 if i < len(ssa.result_ids):
                     self.env[ssa.result_ids[i]] = var
                     self.env_types[ssa.result_ids[i]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    if i in pointer_indices:
+                        self.env_is_ptr[ssa.result_ids[i]] = (var, None)
         elif n_iter_args == 1 and iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
+            if 0 in pointer_indices:
+                self.env_is_ptr[ssa.id] = (iter_vars[0], None)
         elif iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
@@ -533,17 +598,40 @@ class _DeviceFuncLowerer:
         # result_ids may be None for single-result scf.if (walker stores in ssa.id)
         rids = ssa.result_ids if ssa.result_ids else ([ssa.id] if ssa.type_str else [])
         result_vars = []
+        pointer_results = {}
+        for i, rid in enumerate(rids):
+            meta = self.cfunc.result_meta.get(rid)
+            if meta is not None and meta.type.kind == "pointer":
+                pointee = meta.type.pointee
+                if (meta.schema_version != 1 or meta.value_id != rid
+                        or meta.kind != "result" or meta.producer_id != ssa.id
+                        or meta.result_index != i or meta.type.address_space != 1
+                        or pointee is None or pointee.unknown_reason or pointee.elem is None):
+                    from triton_msl.errors import MetalNonRecoverableError
+                    raise MetalNonRecoverableError(
+                        "device-function scf.if pointer result has incomplete native metadata",
+                        op_name="scf.if")
+                pointer_results[i] = _mlir_to_triton_dtype(pointee.elem)
+        if "!tt.ptr" in (ssa.type_str or "") and not pointer_results:
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "device-function scf.if pointer result lacks native per-result metadata",
+                op_name="scf.if")
         if rids:
             for i, rid in enumerate(rids):
                 var = self._next_var("if_res")
                 # Determine type from elem_type or default to float
                 msl_ty = "float"
-                if ssa.elem_type and ssa.elem_type.startswith("i"):
+                if i in pointer_results:
+                    msl_ty = f"volatile device {triton_type_to_msl(pointer_results[i])}*"
+                elif ssa.elem_type and ssa.elem_type.startswith("i"):
                     msl_ty = triton_type_to_msl(_mlir_to_triton_dtype(ssa.elem_type))
                 self._emit(f"{msl_ty} {var};")
                 result_vars.append(var)
                 self.env[rid] = var
                 self.env_types[rid] = _mlir_to_triton_dtype(ssa.elem_type or "f32")
+                if i in pointer_results:
+                    self.env_is_ptr[rid] = (var, None)
 
         self._emit(f"if ({cond}) {{")
 
@@ -552,8 +640,13 @@ class _DeviceFuncLowerer:
                 if sub_op.op == "scf.yield":
                     # Assign yielded values to pre-declared result variables
                     if result_vars and sub_op.operand_ids:
-                        for var, yid in zip(result_vars, sub_op.operand_ids):
-                            val = self._lookup(yid)
+                        for i, (var, yid) in enumerate(zip(result_vars, sub_op.operand_ids)):
+                            val = self._pointer_expr(yid) if i in pointer_results else self._lookup(yid)
+                            if val is None:
+                                from triton_msl.errors import MetalNonRecoverableError
+                                raise MetalNonRecoverableError(
+                                    "device-function scf.if pointer branch has no address representation",
+                                    op_name="scf.if")
                             self._emit(f"    {var} = {val};")
                 else:
                     self._lower_op(sub_op)
@@ -564,8 +657,13 @@ class _DeviceFuncLowerer:
                 if sub_op.op == "scf.yield":
                     # Assign yielded values to pre-declared result variables
                     if result_vars and sub_op.operand_ids:
-                        for var, yid in zip(result_vars, sub_op.operand_ids):
-                            val = self._lookup(yid)
+                        for i, (var, yid) in enumerate(zip(result_vars, sub_op.operand_ids)):
+                            val = self._pointer_expr(yid) if i in pointer_results else self._lookup(yid)
+                            if val is None:
+                                from triton_msl.errors import MetalNonRecoverableError
+                                raise MetalNonRecoverableError(
+                                    "device-function scf.if pointer branch has no address representation",
+                                    op_name="scf.if")
                             self._emit(f"    {var} = {val};")
                 else:
                     self._lower_op(sub_op)

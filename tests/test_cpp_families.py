@@ -40,12 +40,16 @@ def test_coverage_report_matches_enabled():
         assert sorted(json.load(f)["enabled"]) == sorted(ENABLED)
 
 
-def test_use_cpp_optin_keeps_legacy_surface(monkeypatch):
-    """TRITON_MSL_USE_CPP=1 preserves the pre-Phase-1 opt-in surface
-    (reduce/dot/shared-mem) that test_cpp_backend.py exercises."""
+def test_use_cpp_optin_excludes_known_unsafe_dot(monkeypatch):
+    """Explicit opt-in does not override a known-broken operation.
+
+    The remaining historical operations are unchanged; this is not a claim
+    that those operations have a complete C++ correctness audit.
+    """
     from triton_msl.backend.cpp_families import FAMILIES, enabled_ops
 
     monkeypatch.setenv("TRITON_MSL_USE_CPP", "1")
     legacy = set().union(*FAMILIES.values())
-    assert enabled_ops() == legacy
-    assert {"tt.dot", "tt.reduce", "ttg.local_alloc"} <= enabled_ops()
+    assert enabled_ops() == legacy - {"tt.dot"}
+    assert "tt.dot" not in enabled_ops()
+    assert {"tt.reduce", "ttg.local_alloc"} <= enabled_ops()

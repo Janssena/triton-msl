@@ -150,6 +150,7 @@ class KernelBuilder:
         self._threadgroup_arrays = []  # (name, dtype, size) for static tg memory
         self._prebuilt_msl = None  # Raw MSL string when using pre-made kernels
         self._device_functions = []  # List of MSL device function source strings
+        self.unsupported_reasons = []  # Explicit lowering outcomes, never inferred from MSL text.
 
     def set_prebuilt_msl(self, msl_source):
         """Set a pre-generated MSL string, bypassing the builder's code gen."""
@@ -297,6 +298,11 @@ class KernelBuilder:
         """Emit a comment."""
         self._emit(f"// {text}")
 
+    def unsupported(self, reason):
+        """Record an unlowered operation while retaining its diagnostic comment."""
+        self.unsupported_reasons.append(reason)
+        self.comment(reason)
+
     # -- Indentation control --
 
     def indent(self):
@@ -380,7 +386,10 @@ class KernelBuilder:
         _nan_prop = op in ("nanmax", "nanmin")
         if _is_float:
             identity = {
-                "sum": "0.0f",
+                # Compiler-added padding must be neutral for both zero signs.
+                # +0 changes an all-negative-zero sum to +0; -0 preserves -0
+                # and still yields +0 when any source term is positive zero.
+                "sum": "-0.0f",
                 "prod": "1.0f",
                 "max": "-INFINITY",
                 "min": "INFINITY",
@@ -659,7 +668,12 @@ def emit_msl(mod, metadata, options):
     Returns:
         MSL source code as a string.
     """
-    from triton_msl.errors import MetalNonRecoverableError
+    from triton_msl.errors import MetalNonRecoverableError, MetalResourceError
+
+    # Native operation identity, including callees: no legacy fallback is allowed
+    # to erase an assertion if walking, planning, or generic emission fails.
+    retained_asserts = []
+    mod.walk(lambda op: retained_asserts.append(op) if op.get_name() == 'tt.assert' else None)
 
     # Primary path: new walker + generic lowerer
     try:
@@ -677,28 +691,11 @@ def emit_msl(mod, metadata, options):
         # Use lowerer's effective block_size (may differ from graph for matmul templates)
         metadata["block_size"] = lowerer.effective_block_size
 
-        # Integrity backstop: an UNKNOWN_<id> in the emitted source is an
-        # UNRESOLVED SSA reference (e.g. _lookup of a value not in env). It is
-        # never valid MSL — it would fail xcrun with a cryptic compile error.
-        # Refuse loudly with an actionable message instead. The common cause is
-        # a value defined OUTSIDE a runtime-bound loop referenced INSIDE it in
-        # the multi-element-per-thread regime (BLOCK > threadgroup size, e.g.
-        # the tl.arange / other= constant in a tl.sum-in-loop at BLOCK>=256) —
-        # the register-array spine (roadmap Phase 2). (downstream tridec bug 2)
-        if "UNKNOWN_" in msl_src and "UNSUPPORTED" not in msl_src:
-            from triton_msl.errors import MetalNonRecoverableError
-
-            raise MetalNonRecoverableError(
-                f"codegen left an unresolved value (UNKNOWN_<id>) in kernel "
-                f"'{metadata.get('name', '?')}'. This usually means a value defined "
-                f"outside a runtime-bound loop is used inside it when BLOCK "
-                f"exceeds the threadgroup size (multi-element-per-thread). "
-                f"Use BLOCK <= 128, or restructure the loop, until the "
-                f"register-array spine lands."
-            )
-
-        # Verify no UNSUPPORTED markers in output
-        if "UNSUPPORTED" not in msl_src:
+        # Unresolved SSA references raise at lookup. Unsupported operations are
+        # recorded by their lowering sites, including noinline callees. Searching
+        # the emitted text confuses legal kernel names/comments with diagnostics.
+        # Template paths may return without constructing a KernelBuilder.
+        if lowerer.kb is None or not lowerer.kb.unsupported_reasons:
             metadata["output_arg_indices"] = lowerer.get_output_arg_indices()
             # Flag whether the kernel uses multi-axis program_id (needs 2D/3D grid)
             used_axes = getattr(lowerer, "_used_pid_axes", {0})
@@ -714,11 +711,21 @@ def emit_msl(mod, metadata, options):
             # Batched-dot host-roundtrip address-bounds descriptor; None for
             # other kernels. Runtime strides must stay inside each view mirror.
             metadata["batched_dot_bounds"] = getattr(lowerer, "_batched_dot_bounds", None)
+            plan = lowerer._assert_plan
+            metadata['device_assert'] = ({'schema': 1, 'messages': plan['messages'],
+                                          'buffer_index': len(graph.args)} if plan is not None else None)
             _mept_path_log("primary", metadata.get("name", "?"))
             return msl_src
 
+        if retained_asserts:
+            raise MetalNonRecoverableError('retained assertion kernel has unsupported generic operations', op_name='tt.assert')
         # Fall through to legacy parser if unsupported ops remain
         _mept_path_log("fallback-unsupported", metadata.get("name", "?"))
+    except MetalResourceError:
+        # A concrete capacity failure is terminal for this configuration, even
+        # with legacy opt-in. Keep its type for the compiler/autotuner boundary.
+        _mept_path_log("refused-resource", metadata.get("name", "?"))
+        raise
     except MetalNonRecoverableError:
         # Deliberate refusal: the lowerer recognized a kernel it cannot lower
         # correctly AND knows the legacy parser can't either. Re-raise instead
@@ -727,6 +734,8 @@ def emit_msl(mod, metadata, options):
         _mept_path_log("refused-nonrecoverable", metadata.get("name", "?"))
         raise
     except Exception as e:
+        if retained_asserts:
+            raise MetalNonRecoverableError('retained assertion lowering failed; no legacy fallback is safe: ' + str(e), op_name='tt.assert') from e
         import warnings
 
         warnings.warn(

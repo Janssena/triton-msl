@@ -17,8 +17,6 @@ Run deep:  TRITON_MSL_FALLBACK=error python tests/test_fuzz_matmul.py 400
 """
 
 import math
-import os
-import shutil
 import sys
 
 import pytest
@@ -30,15 +28,6 @@ from triton_msl.errors import MetalNonRecoverableError
 
 HAS = torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")
 requires = pytest.mark.skipif(not HAS, reason="MPS + compile_shader needed")
-
-_CACHE = os.path.expanduser("~/.cache/triton_msl")
-_TCACHE = os.path.expanduser("~/.triton/cache")
-
-
-def _clear_cache():
-    for d in (_CACHE, _TCACHE):
-        shutil.rmtree(d, ignore_errors=True)
-
 
 def _tol(dtype):
     if dtype == torch.float32:
@@ -272,7 +261,8 @@ def _run_cell(form, M, N, K, dtype, seed):
 
     Cache is NOT cleared per cell — Triton/triton-msl key by dtype + constexpr shape, so
     cells never collide, and clearing on-disk mid-session races the in-memory<->disk cache
-    (spurious FileNotFoundError under heavy load). A FileNotFoundError is retried once.
+    (spurious FileNotFoundError under heavy load). A missing file is a recorded
+    crash on this exact seed, never a retry with replacement inputs.
     """
     torch.manual_seed(seed)
     A = torch.randn(M, K, device="mps", dtype=dtype)
@@ -300,14 +290,6 @@ def _run_cell(form, M, N, K, dtype, seed):
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
-    except FileNotFoundError:
-        _clear_cache()  # transient cache race; retry
-        try:
-            return _run_cell(form, M, N, K, dtype, seed + 100000)
-        except MetalNonRecoverableError:
-            return ("refused", None)
-        except Exception as e:  # noqa: BLE001
-            return (f"crash:{type(e).__name__}", str(e)[:80])
     except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     got = C.float()
@@ -379,14 +361,6 @@ def _run_strided_cell(form, M, N, K, dtype, a_lay, b_lay, c_lay, seed):
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
-    except FileNotFoundError:
-        _clear_cache()
-        try:
-            return _run_strided_cell(form, M, N, K, dtype, a_lay, b_lay, c_lay, seed + 100000)
-        except MetalNonRecoverableError:
-            return ("refused", None)
-        except Exception as e:  # noqa: BLE001
-            return (f"crash:{type(e).__name__}", str(e)[:80])
     except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     got = C.float()
@@ -500,14 +474,6 @@ def _run_batched_cell(Bz, M, N, K, dtype, seed):
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
-    except FileNotFoundError:
-        _clear_cache()
-        try:
-            return _run_batched_cell(Bz, M, N, K, dtype, seed + 100000)
-        except MetalNonRecoverableError:
-            return ("refused", None)
-        except Exception as e:  # noqa: BLE001
-            return (f"crash:{type(e).__name__}", str(e)[:80])
     except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     err = (C.float() - ref).abs().max().item()

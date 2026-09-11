@@ -9,9 +9,8 @@ Signature:
     dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
                          launch_metadata=None) -> bool
 
-    Returns True if the fast path dispatched successfully, False otherwise.
-    On any error the function returns False (no exception escapes); the caller
-    falls through to the generic Metal/CPU path.
+    Returns True on success, False on a miss before caller-workload invocation.
+    Once invocation is attempted, errors propagate; the caller must not replay.
 """
 
 import math as _math
@@ -25,15 +24,20 @@ _VARIANT_MSL_CACHE = {}
 _SPLITK_MSL = None
 
 
-def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, rr=4, rc=2, bk=32):
+from triton_msl.autotuning._submission import SubmissionState
+
+
+def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, rr=4, rc=2, bk=32, submission_state=None):
     """Deterministic two-pass split-K for a SKINNY/DEEP fp32 matmul, or False.
 
     Fires only when the output-tile count is small (occupancy-starved) AND K is deep
     enough to amortize the reduce pass AND a split factor G divides K/bk. Returns True
     after dispatching both passes; False (fall through to the regular fast path) on any
-    non-fit or error. Row-major strides are verified by the caller. Deterministic
+    non-fit or pre-invocation error. After the first invocation, any error is loud.
+    Row-major strides are verified by the caller. Deterministic
     run-to-run (no atomics), so it preserves the byte-identical story.
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         tile_m, tile_n = 8 * rr, 8 * rc  # 32, 16
         if M % tile_m or N % tile_n or K % bk:
@@ -70,17 +74,21 @@ def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata
         P = torch.empty((G, M, N), device=A.device, dtype=torch.float32)
         lib = rt.get_library(_SPLITK_MSL)
         n_groups = n_tiles * G
+        _submission.begin()
         rt.dispatch(lib, "mm_sk_partial", [A, B, P, M, N, K, G], threads=n_groups * 32, group_size=32)
         MN = M * N
+        _submission.begin()
         rt.dispatch(lib, "mm_sk_reduce", [P, C, MN, G], threads=((MN + 255) // 256) * 256, group_size=256)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             if _SPLITK_MSL is not None:
                 rt.mark_unsupported(_SPLITK_MSL)
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False
 
@@ -118,7 +126,7 @@ def _fast_grid_ok(grid, spec, M, N):
     return False
 
 
-def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Attempt to dispatch via the simdgroup fast-matmul template.
 
     Parameters
@@ -139,10 +147,12 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
     -------
     bool
         True  — fast path dispatched; caller should return immediately.
-        False — fast path skipped or failed; caller falls through to generic path.
+        False — pre-invocation miss; caller may use the generic path.
+        Errors after attempted invocation propagate, including post-launch hooks.
     """
     # Unpack descriptor defensively (6/8/9-element; older descriptors lack dtype
     # / stride-check fields).
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         fast_msl = descriptor[0]
         m_idx, n_idx, k_idx = descriptor[1], descriptor[2], descriptor[3]
@@ -191,7 +201,7 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         # row-major above. Any non-fit returns from _maybe_splitk_dispatch → falls
         # through to the regular fast dispatch below (unchanged).
         if msl_dtype in ("fp32", "f32", "float") and msl_out in ("fp32", "f32", "float"):
-            if _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata):
+            if _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, submission_state=_submission):
                 return True
 
         # --- Per-shape deterministic tile selection (safe: every CANDIDATES config
@@ -216,7 +226,8 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
                         sel_msl = make_simdgroup_matmul_kernel_fast(msl_dtype, rr, rc, msl_out)
                         _VARIANT_MSL_CACHE[vkey] = sel_msl
                     sel_tm, sel_tn = 8 * rr, 32 * rc
-            except Exception:
+            except Exception as _error:
+                _submission.reraise_if_attempted(_error)
                 # Autotuning failed -> fall back to the baked (4,4) variant.
                 sel_msl = fast_msl
                 sel_tm, sel_tn = tile_m, tile_n
@@ -249,17 +260,20 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         # The fast template declares exactly 6 buffers (A,B,C,M,N,K = kargs[:6]);
         # pass only those so we don't rely on compile_shader silently ignoring
         # trailing stride args.
+        _submission.begin()
         rt.dispatch(lib, "simdgroup_matmul_fast", kargs[:6], threads=n_groups * 128, group_size=128)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
 
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         # Fast path failed -> mark the SELECTED variant (sel_msl) unsupported,
         # NOT fast_msl (the (4,4) default).  Marking fast_msl would permanently
         # disable the (4,4) fallback for any shape, not just the failing variant.
         try:
             rt.mark_unsupported(sel_msl)
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False

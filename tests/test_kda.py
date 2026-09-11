@@ -97,9 +97,11 @@ def test_kda_attention_op_rejects_bad_shape():
 
 
 @requires
-def test_kda_decode_step_matches_recurrent():
+def test_kda_decode_step_matches_recurrent(monkeypatch):
     """Autoregressive decode (state threaded across steps in place) matches the recurrent form."""
-    from triton_msl.kda import kda_decode_step
+    from tests.cache_helpers import patch_live_singleton_method
+    import triton_msl.kda as op
+    kda_decode_step = op.kda_decode_step
 
     ZH, D, T = 8, 64, 48
     torch.manual_seed(2)
@@ -112,17 +114,41 @@ def test_kda_decode_step_matches_recurrent():
 
     S = torch.zeros(ZH, D, D, device="mps")
     out = torch.empty(ZH, T, D)
+    poisoned_state = torch.zeros_like(S)
+    poisoned_out = torch.empty_like(out)
+    poison_at = T // 2
+    runtime, library = op._decode_kernel()
+    hits = []
+
+    def observe(instance, dispatch):
+        assert instance is runtime
+
+        def wrapped(lib, name, args, **kwargs):
+            assert lib is library and name == "kda_decode"
+            result = dispatch(lib, name, args, **kwargs)
+            hits.append(name)
+            return result
+
+        return wrapped
+
+    patch_live_singleton_method(monkeypatch, lambda: op._decode_kernel()[0], "dispatch", observe)
     for t in range(T):
-        o = kda_decode_step(
-            q[:, t].to("mps"),
-            k[:, t].to("mps"),
-            v[:, t].to("mps"),
-            a[:, t].to("mps"),
-            beta[:, t].to("mps"),
-            S,
-        )
+        args = [x[:, t].to("mps") for x in (q, k, v, a, beta)]
+        o = kda_decode_step(*args, S)
+        poisoned_q = args[0].clone()
+        if t == poison_at:
+            poisoned_q[0, 0] = float("nan")
+        p = kda_decode_step(poisoned_q, *args[1:], poisoned_state)
         torch.mps.synchronize()
         out[:, t] = o.cpu()
+        poisoned_out[:, t] = p.cpu()
+        # Q only reads state: even the poisoned step cannot change it.
+        assert torch.equal(S.cpu(), poisoned_state.cpu())
+    assert hits == ["kda_decode"] * (2 * T)
+    assert torch.equal(poisoned_out[:, :poison_at], out[:, :poison_at])
+    assert torch.equal(poisoned_out[1:], out[1:])
+    assert torch.equal(poisoned_out[0, poison_at + 1:], out[0, poison_at + 1:])
+    assert torch.isnan(poisoned_out[0, poison_at]).all()
     rel = (out - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-4, f"kda_decode_step rel err {rel:.2e}"
 
@@ -147,3 +173,73 @@ def test_kda_attention_fp16():
     assert out.dtype == torch.float16
     rel = (out.float().cpu() - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 2e-2, f"fp16 KDA rel {rel:.2e}"
+
+
+@requires
+@pytest.mark.parametrize("case,dtype", [
+    ("query_inf", torch.float32), ("query_inf", torch.float16),
+    ("future_value_nan", torch.float32), ("gate_underflow", torch.float32),
+    ("chunk_dot_overflow", torch.float32), ("key_quotient_overflow", torch.float32),
+])
+def test_kda_prefill_preserves_exceptional_recurrence(case, dtype, monkeypatch):
+    """Chunk algebra must not invent Inf*0 or read a future poisoned token."""
+    from tests.cache_helpers import patch_live_singleton_method
+    import triton_msl.kda as op
+
+    q = torch.full((2, 16, 64), 1 / 64, dtype=dtype)
+    k, v = q.clone(), torch.full_like(q, 1 / 8)
+    a = torch.full_like(q, 1 / 2)
+    beta = torch.full((2, 16), 1 / 4, dtype=dtype)
+    clean_inputs = [x.clone() for x in (q, k, v, a, beta)]
+    if case == "query_inf":
+        q[0, 7, 0] = float("inf")
+    elif case == "future_value_nan":
+        v[0, 7, 0] = float("nan")
+    elif case == "gate_underflow":
+        a[0] = 2 ** -20  # Valid (0,1) gates; the eight-term product underflows.
+    else:
+        k[0] = 1e20 if case == "chunk_dot_overflow" else 1e38
+        v[0] = 0  # State stays exactly zero; no source k*k or k/B exists.
+    ref = _gdn_recurrent(*(x.float() for x in (q, k, v, a, beta))).to(dtype)
+    if case == "query_inf":
+        # Analytic witness: state is strictly positive; q is not a state input.
+        assert torch.isposinf(ref[0, 7]).all()
+        assert torch.isfinite(ref[0, :7]).all() and torch.isfinite(ref[0, 8:]).all()
+    if case == "future_value_nan":
+        assert torch.isfinite(ref[0, :7]).all()
+    if case in ("chunk_dot_overflow", "key_quotient_overflow"):
+        assert torch.equal(ref[0], torch.zeros_like(ref[0]))
+    rt, lib = op._kernel(fp16=dtype == torch.float16)
+    hits = []
+
+    def observe(runtime, dispatch):
+        assert runtime is rt
+
+        def wrapped(actual_lib, name, args, **kwargs):
+            assert actual_lib is lib and name == "kda_prefill"
+            assert kwargs == dict(threads=(512, 1, 1), group_size=(256, 1, 1))
+            result = dispatch(actual_lib, name, args, **kwargs)
+            hits.append(name)
+            return result
+
+        return wrapped
+
+    patch_live_singleton_method(monkeypatch, lambda: op._kernel(dtype == torch.float16)[0], "dispatch", observe)
+    clean_gpu = [x.to("mps") for x in clean_inputs]
+    control = op.kda_attention(*clean_gpu).cpu()
+    repeated_control = op.kda_attention(*clean_gpu).cpu()
+    assert torch.equal(control, repeated_control), "all-finite repeated execution changed bits"
+    control_ref = _gdn_recurrent(*(x.float() for x in clean_inputs)).to(dtype)
+    torch.testing.assert_close(control, control_ref, atol=2e-5, rtol=2e-5)
+    actual = op.kda_attention(*(x.to("mps") for x in (q, k, v, a, beta))).cpu()
+    assert hits == ["kda_prefill"] * 3
+    for classify in (torch.isnan, torch.isposinf, torch.isneginf):
+        assert torch.equal(classify(actual), classify(ref)), case
+    # Only head 0 changes algorithm. Do not let the approximate source check
+    # excuse even a one-ULP perturbation of the unreplayed sibling head.
+    assert torch.equal(actual[1], control[1]), "unreplayed sibling head changed bits"
+    finite = torch.isfinite(ref[0])
+    assert finite.any() and torch.isfinite(ref[1]).all()
+    torch.testing.assert_close(actual[0][finite], ref[0][finite], atol=2e-5, rtol=2e-5)
+    if case in ("chunk_dot_overflow", "key_quotient_overflow"):
+        assert torch.equal(actual[0], torch.zeros_like(actual[0]))

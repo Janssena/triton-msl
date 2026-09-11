@@ -1,3 +1,6 @@
+# _biased_value adapts the TriFast-derived biased forward test kernel.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Local test adaptations and provenance: docs/TRIFAST_PROVENANCE.md.
 """Packet 113/114: the biased (trifast) replacement must prove the VALUES it reconstructs,
 not only the masks on the memory operations that feed them.
 

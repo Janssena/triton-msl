@@ -40,10 +40,13 @@ not a new cross-program barrier, a guarantee of program scheduling, or a livenes
 guarantee for spin waits. Existing unsupported dtype and multi-element scatter
 contracts remain in force.
 
-The compiler's internal histogram atomics and standalone template helpers are
-not source `tt.atomic_*` operations; this mapping applies to source atomic
-lowering. The direct-IR 16-bit exchange tests exercise the existing word-CAS
-emitter, not a claim that Triton's Python frontend accepts 16-bit exchange.
+The compiler's internal histogram atomics and the atomics used by the
+permute-chained-reduce template are not source `tt.atomic_*` operations; this
+mapping applies only to source atomic lowering. Those implementation-detail
+atomics remain relaxed and are ordered within their threadgroup by the
+templates' explicit barriers before and after accumulation. The direct-IR
+16-bit exchange tests exercise the existing word-CAS emitter, not a claim that
+Triton's Python frontend accepts 16-bit exchange.
 
 ## Evidence limits
 

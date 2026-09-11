@@ -3,6 +3,7 @@ beat the generic ~2.8 TFLOP/s floor by >=2x for both dtypes. Records to
 reports/perf_baseline.json. Serial GPU."""
 
 import os, json, pytest
+from triton_msl.profiling.cache_session import private_directory
 
 try:
     import torch, triton, triton.language as tl
@@ -56,12 +57,25 @@ def mm_f16(
     tl.store(c_ptrs, acc.to(tl.float16))
 
 
+@pytest.fixture(autouse=True)
+def private_compiler_caches(monkeypatch, tmp_path):
+    """Cold compiler state without deleting another session's home caches."""
+    root = private_directory(tmp_path, prefix="matmul-")
+    monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(root / "msl"))
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(root / "triton"))
+    for kernel in (mm, mm_f16):
+        kernel.device_caches.clear()
+    yield
+    for kernel in (mm, mm_f16):
+        kernel.device_caches.clear()
+
+
 @requires
+@pytest.mark.performance_sentinel
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_fast_matmul_throughput(dtype, monkeypatch):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
     M = N = K = 2048
     A = torch.randn(M, K, device="mps", dtype=dtype)
     B = torch.randn(K, N, device="mps", dtype=dtype)
@@ -106,10 +120,10 @@ def test_fast_matmul_throughput(dtype, monkeypatch):
 
 
 @requires
+@pytest.mark.performance_sentinel
 def test_fast_matmul_fp16out_throughput(monkeypatch):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
     M = N = K = 2048
     A = torch.randn(M, K, device="mps", dtype=torch.float16)
     B = torch.randn(K, N, device="mps", dtype=torch.float16)

@@ -1,3 +1,6 @@
+# _bwd_kv_vshift is adapted from TriFast's _bwd_kv.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Source revision and local adaptations: docs/TRIFAST_PROVENANCE.md.
 """Regression tests for the 2026-08-25 adversarial re-review of the FA routing guards.
 Confirmed bypass classes, all now correct-or-refuse:
 

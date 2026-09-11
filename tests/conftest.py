@@ -9,6 +9,8 @@ import tempfile
 
 import pytest
 
+from triton_msl.profiling.cache_session import private_directory
+
 
 def _has_metal():
     try:
@@ -37,50 +39,50 @@ requires_metal = pytest.mark.skipif(
 )
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--project-lane", choices=("correctness", "performance", "all"), default="correctness",
+        help="Separate hardware throughput floors from correctness (default). 'all' is diagnostic only.",
+    )
+
+
 def pytest_configure(config):
     """Give each pytest process a private Inductor cache before collection imports.
 
     Separate project/baseline sessions may run concurrently.  If both use PyTorch's
-    default ``torchinductor_$USER`` directory, either session's startup cleanup can
-    delete generated wrappers while the other is compiling a model.  Set the cache
-    before test-module collection (which itself imports torch/Inductor), while honoring
-    an explicit caller-provided directory.
+    default ``torchinductor_$USER`` directory, stale wrappers can hide codegen
+    regressions. Always allocate a new directory before collection, never delete
+    an existing one. An explicit caller directory is a placement parent, not a
+    cache we own or may erase. This also isolates two sessions sharing that parent.
+    Inductor's cache key omits our CODEGEN_VERSION; fresh disk state prevents an
+    old generated wrapper from hiding a lowering regression in a new session.
     """
-    if not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = tempfile.mkdtemp(
-            prefix="triton_msl_pytest_inductor_"
-        )
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(private_directory(
+        os.environ.get("TORCHINDUCTOR_CACHE_DIR"), prefix="triton_msl_pytest_inductor_"
+    ))
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip GPU tests on non-macOS platforms."""
+    """Schedule, do not skip or weaken, the independent performance obligation."""
+    lane = config.getoption("--project-lane")
+    if lane != "all":
+        deselected = [i for i in items if bool(i.get_closest_marker("performance_sentinel")) != (lane == "performance")]
+        excluded = set(deselected)
+        items[:] = [i for i in items if i not in excluded]
+        config.hook.pytest_deselected(items=deselected)
     if platform.system() != "Darwin":
         skip = pytest.mark.skip(reason="Metal tests require macOS")
         for item in items:
             item.add_marker(skip)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _fresh_inductor_cache():
-    """Clear this pytest process's private PyTorch Inductor cache once at startup.
-
-    Inductor caches compiled kernels keyed by ITS own
-    hash (Triton source + config) — NOT by triton-msl's CODEGEN_VERSION. So a triton-msl
-    lowering change does NOT invalidate inductor's cache, and a torch.compile test can
-    silently run kernels a PRIOR session compiled before the change. That masked a
-    reduce-classifier regression (it refused inductor's NaN-propagating max -> broke
-    softmax/training) behind a green suite. ``pytest_configure`` isolates concurrent
-    sessions before collection; clearing once here makes the torch.compile tests
-    exercise the CURRENT codegen rather than stale cached kernels.
-    """
-    try:
-        import shutil
-        import torch._inductor.runtime.cache_dir_utils as _cdu
-
-        shutil.rmtree(_cdu.cache_dir(), ignore_errors=True)
-    except Exception:
-        pass
-    yield
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    lane = config.getoption("--project-lane")
+    terminalreporter.write_line(
+        f"Project lane: {lane}. This is NOT release/performance qualification. "
+        "Correctness and the dedicated performance job are separate required results; "
+        "skipped, unrun or unqualified sentinels do not pass that obligation."
+    )
 
 
 class MetalKernelRunner:

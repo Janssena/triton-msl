@@ -1,24 +1,47 @@
 """Per-family op coverage for the C++ MLIR path (Phase 1 spec).
 
 Routing contract:
-- Default-on (no env vars): kernels route through C++ only when every op
-  in their TTGIR belongs to a family in ``ENABLED``. Phase 1 ships only
-  the ``elementwise`` family — it is validated by the differential
-  harness (tests/test_diff_cpp_python.py) including multi-dim grids.
-- ``TRITON_MSL_USE_CPP=1`` (legacy explicit opt-in): the full C++
-  surface — union of ALL families — is admitted, preserving the
-  pre-Phase-1 behavior that tests/test_cpp_backend.py exercises
-  (reductions, dot, flash attention). The dot path is only validated
-  for the single-tile grids those tests use; it is NOT default-on
-  (a 2D-grid tt.dot kernel produces wrong output: pid_n tiles never
-  written — see test_integration.py::test_triton_jit_matmul).
+- C++ is OFF by default; the attempted elementwise default flip was reverted.
+  ENABLED is the family-table selection, not a switch enabling C++ compilation.
+- TRITON_MSL_USE_CPP=1 is an unaudited development opt-in. The known-broken
+  dot route is refused even under that opt-in; the independently generated MSL
+  route may compute it instead, with an explicit disposition/warning.
+- Runtime grid dimensions are unavailable at compilation. The old single-tile
+  observation cannot prove that a produced C++ binary will only get one tile.
+  Until that contract is implemented/audited, no C++ dot capability is claimed.
 - ``TRITON_MSL_FORCE_PYTHON=1`` bypasses C++ entirely (compiler.py).
 """
 
 import os
+import re
+
+
+KNOWN_UNSAFE_OPS = frozenset({"tt.dot"})
+
+
+def cpp_refusal_reason(ttgir_text):
+    # Also covers quoted generic MLIR spelling. This is deliberately a
+    # conservative known-broken-op guard, NOT a proof of all other C++ semantics.
+    if re.search(r"(?<![\w.])tt\.dot(?![\w.])", ttgir_text):
+        return "tt.dot has known-broken multi-tile/grid and loop-carry semantics; a single-program launch is unproved"
+    # The C++ annotation/block-size rewrites and operation census understand
+    # custom assembly, not generic quoted operation syntax. An empty census is
+    # not evidence that every operation is allowed. Decline this entire spelling
+    # envelope until it is structurally parsed, rather than guessing its operands.
+    # Quoted module attribute keys/values do not have an operation's following '('.
+    # Restrict the match to an operation position. Named debug locations such
+    # as loc("x_ptr"(#loc)) also contain a quoted name followed by '(' but
+    # are not operations; rejecting them would de-route ordinary vector add.
+    if re.search(r'(?m)(?:^|[={])\s*"[^"\n]+"\s*\(', ttgir_text):
+        return "generic quoted operation spelling is outside the proved C++ text-rewrite envelope"
+    # Native run_to_llvm asserts on a scalar load. Keep this at the COMMON
+    # boundary so direct make_llir callers cannot bypass the ordinary router.
+    if re.search(r"tt\.load\b[^\n]*:\s*!tt\.ptr<", ttgir_text):
+        return "scalar tt.load is unsupported by C++ native lowering; use the MSL path"
+    return None
 
 FAMILIES = {
-    # Validated default-on: differential harness + project suite.
+    # Historical default-on candidate; actual compilation is opt-in only.
     "elementwise": {
         # -- Triton ops (custom patterns in ElementwiseOpToLLVM.cpp) --
         "tt.get_program_id",
@@ -119,9 +142,9 @@ FAMILIES = {
         "ttg.local_store",
         "ttg.local_dealloc",
     },
-    # Opt-in only (TRITON_MSL_USE_CPP=1): simdgroup-matrix dot;
-    # validated only for single-tile grids (test_cpp_backend.py, FA).
-    # Known-broken for multi-tile 2D grids — do not enable by default.
+    # Historical simdgroup-dot coverage, retained for the recovery census.
+    # tt.dot itself is excluded below even under opt-in until its launch and
+    # loop-carry contracts are proved. Shared-memory ops also serve reductions.
     "dot": {
         "tt.dot",
         "ttg.local_alloc",
@@ -135,7 +158,7 @@ FAMILIES = {
     },
 }
 
-# Families safe to route through C++ without explicit opt-in.
+# Historical default candidate; compiler.add_stages still requires explicit opt-in.
 ENABLED = {"elementwise"}
 
 
@@ -143,8 +166,8 @@ def enabled_ops():
     """Union of allowed ops across the families currently admitted.
 
     Default: only ``ENABLED`` families (Phase 1: elementwise).
-    With ``TRITON_MSL_USE_CPP=1`` the legacy opt-in surface (all
-    families) is preserved for the explicit C++ test suite.
+    With TRITON_MSL_USE_CPP=1 all historical families are considered, minus
+    explicitly known-unsafe operations. This table is not a correctness proof.
     """
     if os.environ.get("TRITON_MSL_USE_CPP", "") == "1":
         families = set(FAMILIES)
@@ -153,15 +176,25 @@ def enabled_ops():
     out = set()
     for fam in families:
         out |= FAMILIES[fam]
-    return out
+    return out - KNOWN_UNSAFE_OPS
 
 
 # Dtypes the C++ AIR pipeline miscompiles or AGX rejects today (Phase 1 burn-in:
 # int8+float16 mixes crash AGXMetalG16X with "internal error" at pipeline
-# creation, repeated crashes wedge the corpus run). Kernels whose TTGIR mentions
-# any of these dtypes route to Python until the C++ lowering is fixed per dtype.
-UNSAFE_DTYPE_PAT = ("f16", "i8", "i16", "i1,", "i1>")  # coarse: over-routing safe
+# creation, repeated crashes wedge the corpus run). Kernels whose semantic TTGIR
+# mentions any of these dtypes route to Python until the C++ lowering is fixed.
+# Quoted strings and comments are not semantic type evidence: source locations
+# contain arbitrary paths (including worktrees named ``bf16``), and scanning the
+# raw text made routing depend on the checkout directory.
+UNSAFE_DTYPE_RE = re.compile(
+    r"(?:(?<=x)|(?<![A-Za-z0-9_]))(?:bf16|f16|i1|i8|i16)(?![A-Za-z0-9_])"
+)
+
+
+def _without_mlir_strings_and_comments(ttgir_text):
+    without_strings = re.sub(r'"(?:\\.|[^"\\])*"', '""', ttgir_text)
+    return re.sub(r"//[^\n]*", "", without_strings)
 
 
 def cpp_safe_text(ttgir_text):
-    return not any(p in ttgir_text for p in UNSAFE_DTYPE_PAT)
+    return UNSAFE_DTYPE_RE.search(_without_mlir_strings_and_comments(ttgir_text)) is None

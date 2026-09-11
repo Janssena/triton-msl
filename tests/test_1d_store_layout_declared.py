@@ -166,15 +166,10 @@ def test_histogram_declares_layout(strict_layout):
     M, N, B = 8, 8, 8
     x = torch.full((M, N), 3, device="mps", dtype=torch.int32)
     o = torch.zeros(B, device="mps", dtype=torch.int32)
-    try:
-        _hist_2d[(1,)](x, o, M=M, N=N, B=B)
-        torch.mps.synchronize()
-    except Exception as exc:  # noqa: BLE001
-        # A refusal for an unrelated reason is acceptable; an UNDECLARED-LAYOUT failure
-        # is not — that is precisely what this file exists to prevent.
-        assert "was not declared by its producer" not in str(exc), str(exc)
-        pytest.skip(f"histogram+reshape refused for an unrelated reason: {str(exc)[:80]}")
-        return
+    # This supported source must reach the layout/store and compute. An error
+    # elsewhere cannot supply evidence that the producer declared its layout.
+    _hist_2d[(1,)](x, o, M=M, N=N, B=B)
+    torch.mps.synchronize()
     exp = [0] * B
     exp[3] = M * N
     assert o.cpu().tolist() == exp

@@ -9,6 +9,8 @@ import struct
 import pytest
 import torch
 
+from tests.cache_helpers import patch_live_singleton_method
+
 from triton_msl.codegen import _msl_templates as makers
 
 gpu = pytest.mark.skipif(
@@ -89,6 +91,7 @@ def test_tiled_finite_scores_cover_tail(dtype, bn, causal, strided, n):
 @pytest.mark.parametrize("bits", [0x7FFFFFFF, 0xFFC00001])
 def test_biased_bf16_nan_scale_covers_all_rows(bits, monkeypatch, tmp_path):
     import test_fa_forward_rounding as source
+    from triton_msl.backend.driver import _get_compile_shader_runtime
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
@@ -98,13 +101,33 @@ def test_biased_bf16_nan_scale_covers_all_rows(bits, monkeypatch, tmp_path):
     expected, expected_lse = source._faithful(p, torch.bfloat16)
     assert bool(torch.isnan(expected).all()) and bool(torch.isnan(expected_lse).all())
     hits = []
+    dispatches = []
     real = makers.make_flash_attention_kernel_tiled
     def spy(*args, **kwargs):
         src = real(*args, **kwargs)
         hits.append(src)
         return src
+    def observe_dispatch(_runtime, real_dispatch):
+        def dispatch_spy(lib, kernel_name, args, *, threads, group_size):
+            dispatches.append((threads, group_size))
+            return real_dispatch(
+                lib, kernel_name, args, threads=threads, group_size=group_size
+            )
+
+        return dispatch_spy
     monkeypatch.setattr(makers, "make_flash_attention_kernel_tiled", spy)
+    # Patch the exact singleton consumed by MetalLauncher. Earlier randomized
+    # tests may leave an instance-bound dispatch attribute, in which case a
+    # class-level patch observes nothing even though the real dispatch occurs.
+    patch_live_singleton_method(
+        monkeypatch, _get_compile_shader_runtime, "dispatch", observe_dispatch
+    )
     out, lse = source._launch(p, torch.bfloat16)
     assert len(hits) == 1
+    assert "const uint TPG = 1024u;" in hits[0]  # logical score tile is 32 * 64 = 2048
+    assert len(dispatches) == 1
+    threads, group_size = dispatches[0]
+    assert group_size == (1024, 1, 1)
+    assert threads[0] % group_size[0] == 0
     print("TILED_NAN", hex(bits), int(torch.isnan(out).sum()), out.numel(), flush=True)
     assert bool(torch.isnan(out).all()) and bool(torch.isnan(lse).all())

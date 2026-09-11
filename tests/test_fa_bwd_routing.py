@@ -1,3 +1,6 @@
+# _bwd_kv, _bwd_q and _bwd_b are copied from TriFast.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Source revision and local adaptations: docs/TRIFAST_PROVENANCE.md.
 """End-to-end: trifast's UNMODIFIED backward `_bwd_kv` @triton.jit is detected,
 routed to the biased-FA backward dK/dV template, and computes correct gradients on
 Metal — where the generic path used to fail-closed (no `max` op -> the forward FA

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,14 @@ build-backend = "setuptools.build_meta"
 # PEP 541 confusability check, so this ships as `triton-msl` — a distinct stem
 # (MSL = Metal Shading Language, which this backend emits). Import name: triton_msl.
 name = "triton-msl"
-version = "0.2.0"
+version = "0.3.0rc4"
 description = "Metal (Apple Silicon) backend for Triton"
 readme = "README.md"
 # PEP 639 SPDX expression (Metadata-Version 2.4). Do NOT also add a
 # `License :: OSI Approved :: ...` classifier — PyPI rejects the combination of
 # a license expression and a license classifier (400 Bad Request).
 license = "MIT"
+license-files = ["LICENSE", "third_party/trifast/LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Blake Ledden", email = "bledden@users.noreply.github.com"},
@@ -73,6 +74,7 @@ include = ["triton_msl*"]
 
 [tool.pytest.ini_options]
 markers = [
+    "performance_sentinel: hardware throughput floor; run separately from randomized correctness",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "stress: marks stress tests (deselect with '-m \"not stress\"')",
     "benchmark: marks benchmark tests",

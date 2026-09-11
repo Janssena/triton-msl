@@ -1,9 +1,11 @@
-import functools
 import hashlib
 import os
+import re
 import sys
 import subprocess
 import tempfile
+import threading
+import warnings
 from dataclasses import dataclass, field, MISSING
 from typing import Dict
 
@@ -18,6 +20,31 @@ from types import ModuleType
 # import BaseBackend directly from the compiler submodule without going
 # through triton.backends.__init__.
 from triton.backends.compiler import BaseBackend, GPUTarget
+
+
+_cpp_warning_emitted = False
+_cpp_warning_lock = threading.Lock()
+_compilation_runtime_lock = threading.RLock()
+
+
+def _warn_cpp_unaudited():
+    global _cpp_warning_emitted
+    with _cpp_warning_lock:
+        if _cpp_warning_emitted:
+            return
+        _cpp_warning_emitted = True
+    warnings.warn(
+        "C++ lowering is an unaudited development route; its binaries are not covered "
+        "by the Python/MSL correctness proofs. binary_route records compilation, not GPU dispatch.",
+        UserWarning, stacklevel=3,
+    )
+
+
+def _warn_cpp_fallback(metadata, reason):
+    warnings.warn(
+        f"C++ route for {metadata.get('name', 'kernel')}: {reason}; using MSL instead.",
+        UserWarning, stacklevel=3,
+    )
 
 
 # Content-key -> MSL source, populated when MSL is emitted so the driver's
@@ -45,64 +72,106 @@ def _stash_msl(msl_src, key, block_size=None):
     parsed entry-point name prevents cross-graph name collisions from serving
     one kernel's launcher the wrong shader source.
 
+    Both memory and disk records bind the current package/policy, source bytes
+    and a proved 1..1024 threadgroup size. This source stash is NOT the separate
+    binary/SDK identity or an already-resident launcher's validation backstop.
+
     ``block_size`` is the MSL kernel's OWN threadgroup size, captured BEFORE the
     C++ LLVM path may clobber ``metadata["block_size"]`` with its different
     ("one thread per element") value. compile_shader launches the stashed MSL,
     so it must use this size — using the clobbered metadata size silently
     mis-launches MEPT kernels (MSL sizePerThread>1 uses fewer threads).
     """
-    if not key:
+    if (not _valid_stash_key(key) or not isinstance(msl_src, str) or not msl_src
+            or type(block_size) is not int or not 1 <= block_size <= 1024):
         return
-    _MSL_BY_KEY[key] = (msl_src, block_size)
-    # Persist the stash to disk keyed by the content-unique cache_key. Inductor
-    # caches compiled kernels in ITS OWN cache; on every torch.compile run after
-    # the first it RESTORES them without re-running make_msl — the only thing
-    # that populates the in-memory _MSL_BY_KEY. Without a persistent copy the
-    # launcher then finds an empty stash, self._msl is None, and EVERY kernel
-    # takes the slow host-round-trip path (measured ~23x slower than the zero-copy
-    # compile_shader fast-path on GPT-2). The key is a content hash (incl.
-    # CODEGEN_VERSION + the MEPT flag), so a later hit is the EXACT MSL for this
-    # kernel — never stale, never a collision.
-    try:
-        import json
+    import json
+    from triton_msl.backend._cache_contract import metadata_record
 
-        path = os.path.join(_get_cache_dir(), f"{key}.mslstash")
-        if not os.path.exists(path):
-            tmp = f"{path}.{os.getpid()}.tmp"
-            with open(tmp, "w") as f:
-                json.dump({"msl": msl_src, "block_size": block_size}, f)
-            os.replace(tmp, path)
-    except Exception:
-        pass  # disk-stash is a perf optimization; never fail compilation over it
+    record = json.loads(metadata_record(msl_src, {"block_size": block_size}, key, kind="msl-stash"))
+    record["msl"] = msl_src
+    payload = json.dumps(record, sort_keys=True, allow_nan=False)
+    # Immutable serialized payload: memory hits receive the same validation as
+    # disk hits, including a CURRENT policy check. No trusted legacy tuple.
+    _MSL_BY_KEY[key] = payload
+    tmp = None
+    try:
+        directory = _get_cache_dir()
+        path = os.path.join(directory, f"{key}.mslstash")
+        # Unique per writer, including threads in the same process. Always
+        # replace a stale/corrupt old product when a legitimate compile finishes.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=f"{key}.", suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Disk persistence is optional; the memory envelope is still valid.
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _valid_stash_key(key):
+    # Every producer uses the SHA256 content key. Reject unknown identities and
+    # path components before any disk lookup, rather than trusting restored data.
+    return isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key) is not None
+
+
+def _decode_stash(payload, key):
+    import json
+    from triton_msl.backend._cache_contract import decode_metadata
+
+    if not isinstance(payload, str):
+        return None
+    try:
+        record = json.loads(payload)
+        if not isinstance(record, dict):
+            return None
+        source = record.get("msl")
+        if not isinstance(source, str) or not source:
+            return None
+        metadata = decode_metadata(source, record, key, kind="msl-stash")
+        size = metadata.get("block_size") if metadata is not None else None
+        if type(size) is int and 1 <= size <= 1024:
+            return source, size
+    except (ValueError, TypeError):
+        pass
+    return None
 
 
 def _load_stashed_msl(key):
     """Resolve a stashed ``(msl_src, block_size)`` by content-key for the
     launcher's compile_shader fast-path: in-memory ``_MSL_BY_KEY`` first, then the
     persistent disk stash written by ``_stash_msl``. Returns ``None`` if neither
-    has it (-> the launcher uses the always-correct host path).
+    has a currently valid envelope. The caller must independently validate the
+    compiled binary/launch contract; a stash miss does not certify a fallback.
 
     The disk fallback is what lets the zero-copy fast-path engage after inductor
     restores a compiled kernel from its own cache (bypassing make_msl, so the
     in-memory stash is empty this process). The key is a content hash, so a hit is
     the exact MSL for this kernel.
     """
-    if not key:
+    if not _valid_stash_key(key):
         return None
-    hit = _MSL_BY_KEY.get(key)
-    if hit is not None:
-        return hit
+    payload = _MSL_BY_KEY.get(key)
+    if payload is not None:
+        hit = _decode_stash(payload, key)
+        if hit is not None:
+            return hit
+        _MSL_BY_KEY.pop(key, None)
     try:
-        import json
-
         path = os.path.join(_get_cache_dir(), f"{key}.mslstash")
-        if os.path.exists(path):
-            with open(path) as f:
-                d = json.load(f)
-            val = (d["msl"], d.get("block_size"))
-            _MSL_BY_KEY[key] = val  # repopulate in-memory; later launches skip the disk read
-            return val
-    except Exception:
+        with open(path, encoding="utf-8") as f:
+            payload = f.read()
+        hit = _decode_stash(payload, key)
+        if hit is not None:
+            _MSL_BY_KEY[key] = payload
+            return hit
+    except (OSError, UnicodeError):
         pass
     return None
 
@@ -124,30 +193,16 @@ def _get_cache_dir():
     return cache_dir
 
 
-def _msl_cache_key(mod_text, options_hash):
-    """Persistent-cache key for emitted MSL.
+def _msl_cache_key(mod_text, options_hash, input_metadata=None):
+    """Source identity plus current codegen policy (not the outer-cache key)."""
+    from triton_msl.backend._cache_contract import source_key
 
-    Includes CODEGEN_VERSION and the MEPT flag alongside TTGIR text + options:
-    without them, emitter/lowerer changes (or toggling TRITON_MSL_MEPT)
-    silently replay stale compiled kernels (Phase 0, audit debt #1/#2).
-    TRITON_MSL_FA_HALF_ACCUM changes the emitted FA MSL (fp16 accumulators), so
-    it must key the cache too — else toggling it replays a stale float-accum kernel.
-    """
-    from triton_msl import CODEGEN_VERSION
-
-    # Effective MEPT flag (default ON as of M5): no-env and "1" share a key;
-    # "0" (escape hatch) is distinct. Must match generic_lowerer's default.
-    mept = "0" if os.environ.get("TRITON_MSL_MEPT") == "0" else "1"
-    # FA half-accumulate opt-in (default OFF): only "1"/"true" diverge from the key.
-    fa_ha = "1" if os.environ.get("TRITON_MSL_FA_HALF_ACCUM", "0") in ("1", "true", "True") else "0"
-    return hashlib.sha256((mod_text + options_hash + CODEGEN_VERSION + mept + fa_ha).encode("utf-8")).hexdigest()[:16]
+    return source_key(mod_text, options_hash, input_metadata)
 
 
-# Number of attempts for the metal→air→metallib pipeline.
-# Transient toolchain flakes (e.g. xcrun metal -c exits 0 but the .air
-# is not yet durable) are retried up to this many times.  Genuine MSL/IR
-# compile errors (CalledProcessError from the metal -c step) are raised
-# immediately on the first attempt without retrying.
+# Maximum attempts for observed missing-artifact races in the binary pipeline.
+# A nonzero compiler OR linker exit always raises on the first attempt, regardless
+# of diagnostic wording. No text pattern certifies an error as transient.
 _METALLIB_COMPILE_ATTEMPTS = 3
 
 # macOS 26 / Xcode 26 ship the Metal shader compiler as a separate on-demand
@@ -304,6 +359,13 @@ class MetalBackend(BaseBackend):
         except Exception:
             pass
 
+        # The AST frontend requires this module map. Importing its owning
+        # package can load native dependencies (Inductor/NumPy) on first use.
+        # Initialize it before hash()/add_stages capture cache/producer identity,
+        # not halfway through the first compilation under an older stamp.
+        # Do not suppress failure or exempt those providers from the inventory.
+        self.get_module_map()
+
     def parse_options(self, opts: dict) -> MetalOptions:
         result = {}
         for k, f in MetalOptions.__dataclass_fields__.items():
@@ -331,38 +393,11 @@ class MetalBackend(BaseBackend):
         return MetalOptions(**result)
 
     def pack_metadata(self, metadata):
-        block_size = getattr(metadata, "block_size", None) or metadata.num_warps * 32
-        output_arg_indices = getattr(metadata, "output_arg_indices", None)
-        needs_2d_grid = getattr(metadata, "needs_2d_grid", False)
-        # IRSource-loaded kernels skip the codegen stage that sets
-        # ``shared``; fall back to 0 instead of raising. The Metal
-        # driver doesn\'t use this value (threadgroup allocs are
-        # baked into the MSL), but unpacking still expects a tuple
-        # of fixed shape (test_irsource::test_mlir_attribute_parsing).
-        shared = getattr(metadata, "shared", 0)
-        # Two-kernel-split matmul descriptor (#159); None for other kernels.
-        mm_two_kernel = getattr(metadata, "mm_two_kernel", None)
-        # Fast-matmul runtime-dispatch descriptor (Phase 4); None for other kernels.
-        fast_matmul = getattr(metadata, "fast_matmul", None)
-        # Quantized-matmul runtime-dispatch descriptor; None for other kernels.
-        quant_matmul = getattr(metadata, "quant_matmul", None)
-        # FlashAttention zero-copy-dispatch descriptor; None for other kernels.
-        flash_attention = getattr(metadata, "flash_attention", None)
-        # Batched-dot host-roundtrip address-bounds descriptor; None otherwise.
-        batched_dot_bounds = getattr(metadata, "batched_dot_bounds", None)
-        return (
-            metadata.num_warps,
-            metadata.num_ctas,
-            shared,
-            block_size,
-            output_arg_indices,
-            needs_2d_grid,
-            mm_two_kernel,
-            fast_matmul,
-            quant_matmul,
-            flash_attention,
-            batched_dot_bounds,
-        )
+        from triton_msl.backend._cache_contract import validate_execution_contract
+        from triton_msl.backend._launch_contract import pack_launch_metadata
+
+        validate_execution_contract(getattr(metadata, "execution_contract", None))
+        return pack_launch_metadata(metadata)
 
     def get_codegen_implementation(self, options):
         return {
@@ -383,6 +418,11 @@ class MetalBackend(BaseBackend):
 
     def add_stages(self, stages, options, language=None):
         from triton.compiler.compiler import Language
+
+        # Stage-only callers need the same lifecycle boundary as outer-cache
+        # lookup. Initialization may load providers; it must precede capture,
+        # never be tolerated as a superset of an already captured identity.
+        self._initialize_compilation_runtime()
 
         if language == Language.GLUON:
             # Gluon: skip TTIR, use gluon-specific passes to reach TTGIR.
@@ -416,7 +456,14 @@ class MetalBackend(BaseBackend):
                 The MSL is always available (from the msl stage) for MLX.
                 """
                 ttgir_text = metadata.pop("cpp_ttgir", None)
-                if ttgir_text and not MetalBackend._has_complex_ops(ttgir_text):
+                from triton_msl.backend.cpp_families import cpp_refusal_reason
+
+                reason = cpp_refusal_reason(ttgir_text) if ttgir_text else "saved TTGIR unavailable"
+                if metadata.get('device_assert') is not None:
+                    reason = 'retained assertions require the checked MSL launch ABI'
+                if reason is None and MetalBackend._has_complex_ops(ttgir_text):
+                    reason = "operations, dtype or layout outside the experimental C++ envelope"
+                if reason is None:
                     # C++ per-thread model: one thread per element.
                     # For kernels with >1024 elements, make_llir injects a
                     # wrapping loop so 1024 threads cover all elements.
@@ -426,6 +473,7 @@ class MetalBackend(BaseBackend):
                         # compute the correct value from make_range end.
                         cpp_meta = dict(metadata)
                         cpp_meta.pop("block_size", None)
+                        _warn_cpp_unaudited()
                         llir = MetalBackend.make_llir(ttgir_text, cpp_meta, options)
                         cpp_meta["name"] = metadata["name"]
                         # Compile metallib FIRST — only then commit the
@@ -434,8 +482,11 @@ class MetalBackend(BaseBackend):
                         # compilation fails.
                         result = MetalBackend.make_metallib_from_llir(llir, cpp_meta, options)
                         metadata["block_size"] = cpp_meta["block_size"]
+                        metadata["binary_route"] = "cpp"
+                        metadata["cpp_fallback_reason"] = None
                         return result
                     except Exception as _e:
+                        reason = f"{type(_e).__name__}: {_e}"
                         # Debug: expose the silently-swallowed error when
                         # TRITON_MSL_CPP_TRACE=1 is set.
                         if os.environ.get("TRITON_MSL_CPP_TRACE"):
@@ -446,12 +497,16 @@ class MetalBackend(BaseBackend):
                                 file=sys.stderr,
                             )
                             traceback.print_exc(file=sys.stderr)
-                # Complex kernels or C++ failure: use MSL metallib
-                return MetalBackend.make_metallib(src, metadata, options)
+                # The unsafe C++ route is refused explicitly; a separately
+                # generated/proved MSL kernel remains usable. No dot capability
+                # is claimed for C++ just because this fallback computes.
+                _warn_cpp_fallback(metadata, reason)
+                result = MetalBackend.make_metallib(src, metadata, options)
+                metadata["binary_route"] = "msl"
+                metadata["cpp_fallback_reason"] = reason
+                return result
 
             # Override the msl stage to ALSO generate LLVM IR
-            orig_make_msl = stages["msl"]
-
             def _msl_with_cpp(src, metadata):
                 """Generate MSL and save TTGIR for C++ metallib compilation."""
                 # Save TTGIR text before MSL generation mutates the module
@@ -462,7 +517,35 @@ class MetalBackend(BaseBackend):
             stages["msl"] = _msl_with_cpp
             stages["metallib"] = _metallib_via_cpp
         else:
-            stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
+            def _metallib_msl(src, metadata):
+                reason = "optional extension unavailable" if use_cpp else None
+                if reason:
+                    _warn_cpp_fallback(metadata, reason)
+                result = self.make_metallib(src, metadata, options)
+                metadata["binary_route"] = "msl"
+                metadata["cpp_fallback_reason"] = reason
+                return result
+            stages["metallib"] = _metallib_msl
+
+        # Only a successful compile under an unchanged policy may stamp a
+        # runnable product. Restored metadata cannot receive today's stamp in
+        # pack_metadata or in the launcher (which would recertify old code).
+        from triton_msl.backend._cache_contract import execution_contract, validate_execution_contract
+
+        producer_contract = execution_contract()
+        final_stage = stages["metallib"]
+
+        def _with_execution_contract(src, metadata):
+            validate_execution_contract(producer_contract)
+            result = final_stage(src, metadata)
+            validate_execution_contract(producer_contract)
+            metadata["execution_contract"] = producer_contract
+            from triton_msl.backend._launch_contract import seal_launch_metadata
+
+            seal_launch_metadata(metadata)
+            return result
+
+        stages["metallib"] = _with_execution_contract
 
     @staticmethod
     def _has_complex_ops(ttgir_text):
@@ -476,20 +559,18 @@ class MetalBackend(BaseBackend):
         # Only use C++ metallib for kernels using ONLY these ops.
         # The per-family op table lives in cpp_families.py (Phase 1 spec).
         import re
-        from triton_msl.backend.cpp_families import enabled_ops
+        from triton_msl.backend.cpp_families import enabled_ops, cpp_refusal_reason
+
+        if cpp_refusal_reason(ttgir_text) is not None:
+            return True
 
         allowed_ops = enabled_ops()
         from triton_msl.backend.cpp_families import cpp_safe_text
 
         if not cpp_safe_text(ttgir_text):
             return True  # unsafe dtype for C++ AIR path -> Python route
-        # The C++ run_to_llvm pass aborts (assertion) on a SCALAR (0-D) load —
-        # a `tt.load %p : !tt.ptr<T>` whose result is a scalar, not a tensor of
-        # pointers `tensor<Nx!tt.ptr<T>>` (e.g. batchnorm's i64
-        # num_batches_tracked increment: `tt.load %in : !tt.ptr<i64>`). The MSL
-        # path handles these; route them there rather than crash the process.
-        if re.search(r"tt\.load\b[^\n]*:\s*!tt\.ptr<", ttgir_text):
-            return True
+        # Scalar loads and generic quoted operation syntax are checked by the
+        # shared boundary above, including for direct make_llir callers.
         # Extract actual MLIR operations from the TTGIR text.
         # Operations appear as either:
         #   %result = tt.load %ptr   (result-producing op)
@@ -1392,6 +1473,11 @@ class MetalBackend(BaseBackend):
         tt.dot, tt.trans), raises RuntimeError to trigger fallback to the
         Python/MSL path.
         """
+        from triton_msl.backend.cpp_families import cpp_refusal_reason
+        reason = cpp_refusal_reason(str(mod))
+        if reason is not None:
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(f"C++ route: {reason}; use the independently generated MSL path")
         import triton_msl._triton_msl_cpp as cpp
         from triton_msl.debug import _debug_level, _dump_dir
 
@@ -1747,34 +1833,29 @@ class MetalBackend(BaseBackend):
 
         try:
             cache_dir = _get_cache_dir()
-            src_hash = _msl_cache_key(src, "")  # versioned (Phase 0)
+            from triton_msl.backend._cache_contract import binary_key, read_binary_product, publish_binary_record
+
+            compile_flags = ("-c", "-x", "ir")
+            src_hash = binary_key(src, options.hash(), "llir", compile_flags)
             base = f"{kernel_name}_{src_hash}"
 
             metallib_path = os.path.join(cache_dir, f"{base}.metallib")
 
-            # Skip compilation if cached metallib exists.  The read is wrapped:
-            # a concurrent cache clear (or external rm -rf) can delete the file
-            # between os.path.exists and open() (TOCTOU).  Treat a vanished file
-            # as a cache miss and fall through to (re)compile rather than raising.
-            if os.path.exists(metallib_path):
+            cached = read_binary_product(metallib_path, src, src_hash)
+            if cached is not None:
                 if level >= 2:
                     print(
                         f"[triton-msl] make_metallib_from_llir({kernel_name}): cache hit",
                         file=sys.stderr,
                     )
-                try:
-                    with open(metallib_path, "rb") as f:
-                        return f.read()
-                except FileNotFoundError:
-                    pass  # cached metallib vanished mid-read → recompile below
+                return cached
 
             # Bounded retry loop: each attempt gets a fresh private work dir so
             # intermediates from failed attempts never interfere with the next.
-            # A CalledProcessError from the IR→AIR step is a REAL deterministic
-            # compile error → raised immediately (no retry).  All other failures
-            # (missing .air after exit-0, metallib link error, os.replace
-            # FileNotFoundError) are treated as transient toolchain flakes and
-            # retried; the last attempt re-raises as MetalCompilationError.
+            # A failed compiler OR linker stays loud: its diagnostic cannot prove
+            # a transient failure. Retry only the observed missing-artifact races
+            # below (including a missing .air after exit zero), never a nonzero
+            # tool exit. The last missing-artifact attempt also raises.
             _last_transient_exc: Exception | None = None
             for _attempt in range(_METALLIB_COMPILE_ATTEMPTS):
                 # Per-call private work directory: each concurrent invocation of the
@@ -1793,8 +1874,8 @@ class MetalBackend(BaseBackend):
 
                     # Compile LLVM IR → AIR using Metal's compiler
                     # Our IR uses typed pointers (Metal's GPU JIT requires them).
-                    # CalledProcessError here = real deterministic IR error → raise
-                    # immediately, no retry (retrying a syntax error wastes time).
+                    # A nonzero tool exit is not a proved resource/race condition.
+                    # Preserve it even if its diagnostic lacks a source location.
                     try:
                         subprocess.run(
                             [
@@ -1802,9 +1883,7 @@ class MetalBackend(BaseBackend):
                                 "-sdk",
                                 "macosx",
                                 "metal",
-                                "-c",
-                                "-x",
-                                "ir",
+                                *compile_flags,
                                 ll_path,
                                 "-o",
                                 air_path,
@@ -1864,10 +1943,6 @@ class MetalBackend(BaseBackend):
                         )
                     except subprocess.CalledProcessError as e:
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-                        _last_transient_exc = subprocess.CalledProcessError(e.returncode, e.cmd, e.output, e.stderr)
-                        if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
-                            time.sleep(0.05 * (_attempt + 1))
-                            continue
                         from triton_msl.errors import MetalCompilationError
 
                         raise MetalCompilationError(
@@ -1876,6 +1951,12 @@ class MetalBackend(BaseBackend):
                             stderr=stderr,
                         ) from None
 
+                    # Private output is authoritative. A concurrent writer must
+                    # not replace the public file and have us certify its bytes.
+                    with open(tmp_metallib_path, "rb") as f:
+                        fresh_data = f.read()
+                    if not fresh_data:
+                        raise RuntimeError("Metal linker produced an empty binary")
                     try:
                         os.replace(tmp_metallib_path, metallib_path)
                     except (FileNotFoundError, OSError) as e:
@@ -1898,7 +1979,8 @@ class MetalBackend(BaseBackend):
                     # as a bare FileNotFoundError.
                     try:
                         with open(metallib_path, "rb") as f:
-                            data = f.read()
+                            f.read()  # retain existing vanished-file retry contract
+                        data = fresh_data
                     except FileNotFoundError as e:
                         _last_transient_exc = e
                         if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
@@ -1925,6 +2007,7 @@ class MetalBackend(BaseBackend):
                     file=sys.stderr,
                 )
 
+            publish_binary_record(metallib_path, src, src_hash, data)
             return data
 
         except Exception as e:
@@ -1933,7 +2016,7 @@ class MetalBackend(BaseBackend):
                 warnings.warn(
                     f"triton-msl: Metal IR compilation failed for kernel "
                     f"'{kernel_name}': {e}. "
-                    f"Kernel will fall back to CPU.",
+                    f"Compilation failed; the error is propagated to the caller.",
                     stacklevel=2,
                 )
             elif mode == "error":
@@ -2045,6 +2128,7 @@ class MetalBackend(BaseBackend):
         import time
         import warnings
         from triton_msl.codegen.msl_emitter import emit_msl
+        from triton_msl.errors import MetalResourceError
         from triton_msl.debug import _debug_level, _dump_dir, _fallback_mode
 
         level = _debug_level()
@@ -2061,49 +2145,34 @@ class MetalBackend(BaseBackend):
         # Check persistent MSL cache (TTGIR text + options + codegen version
         # + MEPT flag → MSL string).
         mod_text = str(mod)
-        cache_key = _msl_cache_key(mod_text, options.hash())
+        cacheable_input = True
+        try:
+            cache_key = _msl_cache_key(mod_text, options.hash(), metadata)
+        except (TypeError, ValueError):
+            # Unknown native metadata is not permission to omit a field. Compile
+            # normally, but neither read nor publish a source/stash cache record.
+            cacheable_input = False
+            cache_key = _msl_cache_key(mod_text, options.hash())
         cache_dir = _get_cache_dir()
         msl_cache_path = os.path.join(cache_dir, f"{kernel_name}_{cache_key}.msl")
 
-        if os.path.exists(msl_cache_path):
-            with open(msl_cache_path, "r") as f:
-                msl_src = f.read()
+        if cacheable_input and os.path.exists(msl_cache_path):
+            from triton_msl.backend._cache_contract import read_metadata
 
-            # Populate metadata that emit_msl would normally set.
-            # Extract kernel name from MSL: "kernel void NAME("
-            import re as _re
-
-            m = _re.search(r"kernel\s+void\s+(\w+)\s*\(", msl_src)
-            if m:
-                metadata["name"] = m.group(1)
-            else:
-                metadata["name"] = kernel_name
-            # block_size and output_arg_indices default if not cached
-            metadata.setdefault("block_size", options.num_warps * 32)
-            metadata.setdefault("needs_2d_grid", False)
-
-            # Try to load cached metadata alongside the MSL
+            try:
+                with open(msl_cache_path, "r") as f:
+                    msl_src = f.read()
+            except (OSError, UnicodeError):
+                msl_src = None
             meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
-            if os.path.exists(meta_cache_path):
-                import json
-
-                with open(meta_cache_path, "r") as f:
-                    cached_meta = json.load(f)
+            cached_meta = read_metadata(msl_src, meta_cache_path, cache_key) if msl_src is not None else None
+            if cached_meta is not None:
                 metadata.update(cached_meta)
-
-            if level >= 2:
-                print(
-                    f"[triton-msl] make_msl({kernel_name}): cache hit",
-                    file=sys.stderr,
-                )
-
-            # Stash MSL keyed on the kernel's content hash (cache_key) and
-            # expose that key to the launcher via metadata for the launcher's
-            # compile_shader fast-path (Phase 4). Content-keyed so a later
-            # compile in the same process can't clobber this kernel's MSL.
-            metadata["msl_hash"] = cache_key
-            _stash_msl(msl_src, cache_key, metadata.get("block_size"))
-            return msl_src
+                if level >= 2:
+                    print(f"[triton-msl] make_msl({kernel_name}): cache hit", file=sys.stderr)
+                metadata["msl_hash"] = cache_key
+                _stash_msl(msl_src, cache_key, metadata.get("block_size"))
+                return msl_src
 
         # Level 2: time the MSL emission
         if level >= 2:
@@ -2111,18 +2180,26 @@ class MetalBackend(BaseBackend):
 
         try:
             msl_src = emit_msl(mod, metadata, options)
+        except MetalResourceError as e:
+            # This narrow type carries an explicit allocation/budget proof.
+            # Never translate correctness refusals or inspect exception text:
+            # autotuning must not turn a compiler-integrity failure into pruning.
+            from triton.runtime.errors import OutOfResources
+
+            raise OutOfResources(e.required, e.limit, e.resource) from e
         except Exception as e:
             mode = _fallback_mode()
             if mode == "warn":
                 warnings.warn(
-                    f"triton-msl: MSL codegen failed for kernel '{kernel_name}': {e}. Kernel will fall back to CPU.",
+                    f"triton-msl: MSL codegen failed for kernel '{kernel_name}': {e}. "
+                    f"Compilation failed; the error is propagated to the caller.",
                     stacklevel=2,
                 )
             elif mode == "error":
                 # Re-raise without fallback hint — user wants hard errors.
                 raise
-            # "silent" and "warn" both re-raise so Triton/torch.compile
-            # can route to CPU fallback.
+            # Every mode propagates the failure. A higher-level caller may
+            # implement fallback, but this compiler neither does nor promises it.
             raise
 
         if level >= 2:
@@ -2132,29 +2209,35 @@ class MetalBackend(BaseBackend):
                 file=sys.stderr,
             )
 
-        # Cache the generated MSL and metadata atomically.
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".msl.tmp")
+        # Metadata is the commit record for the source/launch product. The two
+        # renames are individually atomic; readers accept the pair only when
+        # the record's schema, key, contract and source digest all agree.
+        tmp_path = tmp_meta_path = None
         try:
+            from triton_msl.backend._cache_contract import metadata_record
+
+            if not cacheable_input:
+                raise TypeError("source input metadata has no complete cache encoding")
+            # Serialize ALL metadata before publishing either member. An
+            # unsupported field must not silently become a partial record.
+            record = metadata_record(msl_src, metadata, cache_key)
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".msl.tmp")
             with os.fdopen(tmp_fd, "w") as f:
                 f.write(msl_src)
             os.replace(tmp_path, msl_cache_path)
-            # Cache metadata (name, block_size, etc.) alongside the MSL.
-            import json
-
             meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
-            cacheable = {
-                k: v for k, v in metadata.items() if isinstance(v, (str, int, float, bool, type(None), list, tuple))
-            }
             tmp_meta_fd, tmp_meta_path = tempfile.mkstemp(dir=cache_dir, suffix=".meta.tmp")
             with os.fdopen(tmp_meta_fd, "w") as f:
-                json.dump(cacheable, f)
+                f.write(record)
             os.replace(tmp_meta_path, meta_cache_path)
         except Exception:
             # Best-effort cleanup on failure; compilation still succeeds.
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            for path in (tmp_path, tmp_meta_path):
+                if path is not None:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
         # Level 1+: dump generated MSL
         if level >= 1:
@@ -2167,7 +2250,8 @@ class MetalBackend(BaseBackend):
         # compile_shader fast-path (Phase 4). Content-keyed so a later compile
         # in the same process can't clobber this kernel's MSL.
         metadata["msl_hash"] = cache_key
-        _stash_msl(msl_src, cache_key, metadata.get("block_size"))
+        if cacheable_input:
+            _stash_msl(msl_src, cache_key, metadata.get("block_size"))
         return msl_src
 
     @staticmethod
@@ -2187,45 +2271,39 @@ class MetalBackend(BaseBackend):
         try:
             # Persistent cache directory (survives reboots).
             cache_dir = _get_cache_dir()
+            from triton_msl.backend._cache_contract import binary_key, read_binary_product, publish_binary_record
 
-            # Use content hash for deterministic naming.
-            src_hash = _msl_cache_key(src, "")  # versioned (Phase 0)
-            base = f"{kernel_name}_{src_hash}"
-
-            metallib_path = os.path.join(cache_dir, f"{base}.metallib")
-
-            # Skip compilation if cached metallib exists.  The read is wrapped:
-            # a concurrent cache clear (or external rm -rf) can delete the file
-            # between os.path.exists and open() (TOCTOU).  Treat a vanished file
-            # as a cache miss and fall through to (re)compile rather than raising.
-            if os.path.exists(metallib_path):
-                if level >= 2:
-                    print(
-                        f"[triton-msl] make_metallib({kernel_name}): cache hit",
-                        file=sys.stderr,
-                    )
-                try:
-                    with open(metallib_path, "rb") as f:
-                        return f.read()
-                except FileNotFoundError:
-                    pass  # cached metallib vanished mid-read → recompile below
-
-            # Resolve Metal standard version for compilation (done once, outside
-            # the retry loop — it's deterministic and has no side-effects).
+            # The effective standard must be resolved BEFORE looking up a
+            # binary; otherwise a cache hit silently bypasses this input.
             if options.target_metal_version == "auto":
                 from triton_msl.backend.device_detect import get_device_info
 
                 metal_std_flag = get_device_info().metal_std_flag
             else:
                 metal_std_flag = f"-std=metal{options.target_metal_version}"
+            compile_flags = ("-c", metal_std_flag, "-mmacosx-version-min=15.0", "-O2", "-fno-fast-math")
+
+            # Use content hash for deterministic naming.
+            src_hash = binary_key(src, options.hash(), "msl", compile_flags)
+            base = f"{kernel_name}_{src_hash}"
+
+            metallib_path = os.path.join(cache_dir, f"{base}.metallib")
+
+            cached = read_binary_product(metallib_path, src, src_hash)
+            if cached is not None:
+                if level >= 2:
+                    print(
+                        f"[triton-msl] make_metallib({kernel_name}): cache hit",
+                        file=sys.stderr,
+                    )
+                return cached
 
             # Bounded retry loop: each attempt gets a fresh private work dir so
             # intermediates from failed attempts never interfere with the next.
-            # A CalledProcessError from the MSL→AIR step is a REAL deterministic
-            # compile error → raised immediately (no retry).  All other failures
-            # (missing .air after exit-0, metallib link error, os.replace
-            # FileNotFoundError) are treated as transient toolchain flakes and
-            # retried; the last attempt re-raises as MetalCompilationError.
+            # A failed compiler OR linker stays loud: its diagnostic cannot prove
+            # a transient failure. Retry only the observed missing-artifact races
+            # below (including a missing .air after exit zero), never a nonzero
+            # tool exit. The last missing-artifact attempt also raises.
             _last_transient_exc: Exception | None = None
             for _attempt in range(_METALLIB_COMPILE_ATTEMPTS):
                 # Per-call private work directory: each concurrent invocation of the
@@ -2248,8 +2326,8 @@ class MetalBackend(BaseBackend):
                     # The Triton test suite (test_conversions.py) relies on this
                     # idiom for round-to-nearest-even emulation; with fast-math the
                     # add/sub gets folded away, breaking rounding correctness.
-                    # CalledProcessError here = real deterministic MSL error → raise
-                    # immediately, no retry (retrying a syntax error wastes time).
+                    # A nonzero tool exit is not a proved resource/race condition.
+                    # Preserve it even if its diagnostic lacks a source location.
                     try:
                         subprocess.run(
                             [
@@ -2257,20 +2335,15 @@ class MetalBackend(BaseBackend):
                                 "-sdk",
                                 "macosx",
                                 "metal",
-                                "-c",
+                                *compile_flags,
                                 metal_path,
                                 "-o",
                                 air_path,
-                                metal_std_flag,
-                                "-mmacosx-version-min=15.0",
-                                "-O2",
-                                "-fno-fast-math",
                             ],
                             capture_output=True,
                             check=True,
                         )
                     except subprocess.CalledProcessError as e:
-                        import re
                         from triton_msl.errors import MetalCompilationError
 
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
@@ -2283,29 +2356,8 @@ class MetalBackend(BaseBackend):
                                 msl_source=metal_path,
                                 stderr=stderr,
                             ) from None
-                        # Distinguish a REAL deterministic MSL error from a
-                        # TRANSIENT toolchain flake. A genuine compile error
-                        # carries a source-location diagnostic
-                        # (`file:line:col: error:`) — raise it immediately
-                        # (retrying a syntax error wastes time). A nonzero exit
-                        # WITHOUT such a diagnostic (empty stderr, a spawn/signal
-                        # failure, or an SDK/temp race under heavy parallel load)
-                        # is transient: retry like the other metallib steps so a
-                        # flaky `metal -c` doesn't surface as a failed (NaN)
-                        # kernel in the torch.compile / training path.
-                        if re.search(r":\d+:\d+:\s+(error|fatal error):", stderr):
-                            raise MetalCompilationError(
-                                f"Metal shader compilation failed (exit {e.returncode})",
-                                msl_source=metal_path,
-                                stderr=stderr,
-                            ) from None
-                        _last_transient_exc = e
-                        if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
-                            time.sleep(0.05 * (_attempt + 1))
-                            continue
                         raise MetalCompilationError(
-                            f"Metal shader compilation failed (exit {e.returncode}; "
-                            f"transient, all {_METALLIB_COMPILE_ATTEMPTS} attempts failed)",
+                            f"Metal shader compilation failed (exit {e.returncode})",
                             msl_source=metal_path,
                             stderr=stderr,
                         ) from None
@@ -2346,10 +2398,6 @@ class MetalBackend(BaseBackend):
                         )
                     except subprocess.CalledProcessError as e:
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-                        _last_transient_exc = subprocess.CalledProcessError(e.returncode, e.cmd, e.output, e.stderr)
-                        if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
-                            time.sleep(0.05 * (_attempt + 1))
-                            continue
                         from triton_msl.errors import MetalCompilationError
 
                         raise MetalCompilationError(
@@ -2358,6 +2406,12 @@ class MetalBackend(BaseBackend):
                             stderr=stderr,
                         ) from None
 
+                    # As on the LLVM route, return/seal our PRIVATE linker
+                    # output, never a concurrent replacement of the cache path.
+                    with open(tmp_metallib_path, "rb") as f:
+                        fresh_data = f.read()
+                    if not fresh_data:
+                        raise RuntimeError("Metal linker produced an empty binary")
                     try:
                         os.replace(tmp_metallib_path, metallib_path)
                     except (FileNotFoundError, OSError) as e:
@@ -2380,7 +2434,8 @@ class MetalBackend(BaseBackend):
                     # as a bare FileNotFoundError.
                     try:
                         with open(metallib_path, "rb") as f:
-                            data = f.read()
+                            f.read()  # retain existing vanished-file retry contract
+                        data = fresh_data
                     except FileNotFoundError as e:
                         _last_transient_exc = e
                         if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
@@ -2407,6 +2462,7 @@ class MetalBackend(BaseBackend):
                     file=sys.stderr,
                 )
 
+            publish_binary_record(metallib_path, src, src_hash, data)
             return data
 
         except Exception as e:
@@ -2415,32 +2471,50 @@ class MetalBackend(BaseBackend):
                 warnings.warn(
                     f"triton-msl: Metal compilation failed for kernel "
                     f"'{kernel_name}': {e}. "
-                    f"Kernel will fall back to CPU.",
+                    f"Compilation failed; the error is propagated to the caller.",
                     stacklevel=2,
                 )
             elif mode == "error":
                 # Re-raise without fallback hint -- user wants hard errors.
                 raise
-            # "silent" and "warn" both re-raise so Triton/torch.compile
-            # can route to CPU fallback.
+            # Every mode propagates the failure. A higher-level caller may
+            # implement fallback, but this compiler neither does nor promises it.
             raise
 
-    @functools.lru_cache()
-    def hash(self):
-        try:
-            sdk_version = (
-                subprocess.check_output(
-                    ["xcrun", "--show-sdk-version"],
-                    stderr=subprocess.DEVNULL,
-                )
-                .decode()
-                .strip()
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            sdk_version = "unknown"
-        # Include CODEGEN_VERSION so a codegen change invalidates the Triton-level
-        # compile cache too, not only the MSL-text cache (_msl_cache_key). Closes the
-        # dev-time in-place-edit replay window (re-audit #13 hardening).
-        from triton_msl import CODEGEN_VERSION
+    def _initialize_compilation_runtime(self):
+        """Finish required native initialization before lookup/producer identity.
 
-        return f"metal-{sdk_version}-{self.target.arch}-{CODEGEN_VERSION}"
+        This creates the device, not a dummy kernel or a compilation retry.
+        MetalUtils owns the initialized device; repeated calls do not recreate
+        it. Requested C++ passes must likewise load before their producer stamp.
+        Later provider/policy changes still invalidate exact contracts normally.
+        """
+        from triton_msl.backend.driver import _get_utils
+
+        with _compilation_runtime_lock:
+            _get_utils().device
+            if (os.environ.get("TRITON_MSL_USE_CPP") == "1"
+                    and os.environ.get("TRITON_MSL_FORCE_PYTHON") != "1"):
+                self._has_cpp_passes()
+
+    def hash(self):
+        # Triton's persistent compile lookup calls this on reused backend
+        # objects. A cached method result would conceal a live policy change.
+        # This key does NOT protect the earlier in-memory JIT lookup; resident
+        # launcher validation is a separate required boundary.
+        self._initialize_compilation_runtime()
+        from triton_msl.backend._cache_contract import _digest, source_contract, toolchain_identity
+        # Actual package content (including native artifacts), source schema,
+        # and CURRENT effective policy supplement the human version label.
+        # Both persistent Triton and inner binary caches bind the selected actual
+        # compiler bundle/SDK bytes. No shared "unknown" toolchain identity.
+        return "metal-" + _digest({
+            "kind": "triton-backend-source-contract",
+            "contract": source_contract(),
+            "target": {
+                "backend": self.target.backend,
+                "arch": self.target.arch,
+                "warp_size": self.target.warp_size,
+            },
+            "toolchain": toolchain_identity(),
+        })

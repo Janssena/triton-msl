@@ -116,7 +116,7 @@ class _Meta:
         self.__dict__.update(kw)
 
 
-@pytest.mark.parametrize("name", ["flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds"])
+@pytest.mark.parametrize("name", ["flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds", "device_assert"])
 def test_each_unsupported_descriptor_is_named(monkeypatch, cold_caches, no_launch, name):
     """Each descriptor the table names refuses, with the descriptor in the message (the compile is
     stubbed to return metadata carrying just that descriptor)."""

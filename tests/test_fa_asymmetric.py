@@ -342,7 +342,7 @@ def test_mla_two_dot_is_correct_or_refuse():
                 False,
             )
         torch.mps.synchronize()
-    except (MetalNonRecoverableError, RuntimeError):
+    except MetalNonRecoverableError:
         return  # clean refusal -> safe
     # If it ran, it MUST be correct (CPU-fallback), not silently wrong.
     ref = F.scaled_dot_product_attention(

@@ -1,0 +1,105 @@
+"""Declared source positions and scalar byte widths; no Python-value width guess.
+
+This is not yet the full dynamic argument/pipeline certificate. Pointer storage,
+tuple-copyback mapping and pre-hook validation are separate consumers to audit.
+"""
+import struct
+
+from triton_msl.errors import MetalNonRecoverableError
+
+
+def _refuse(reason):
+    raise MetalNonRecoverableError("source signature: " + reason)
+
+
+def _canonical_type(ty):
+    if isinstance(ty, tuple):
+        return tuple(_canonical_type(t) for t in ty)
+    if not isinstance(ty, str):
+        _refuse("unknown declared type")
+    if ty.startswith("*"):
+        return "*" + _canonical_type(ty[1:])
+    return {"f16": "fp16", "f32": "fp32", "f64": "fp64"}.get(ty, ty)
+
+
+def ordered_source_signature(src):
+    signature = getattr(src, "signature", None)
+    if not isinstance(signature, dict):
+        _refuse("missing signature map")
+    fn = getattr(src, "fn", None)
+    if fn is not None and hasattr(fn, "arg_names"):
+        original = list(fn.arg_names)
+        if (len(set(original)) != len(original)
+                or any(type(k) is not str or k not in original for k in signature)):
+            _refuse("AST signature does not match the declared parameter names")
+        # JIT signatures include constexpr entries; direct ASTSource signatures
+        # may omit them. Do not insert an omitted parameter into runtime positions.
+        names = [name for name in original if name in signature]
+    else:
+        if (any(type(k) is not int for k in signature)
+                or sorted(signature) != list(range(len(signature)))):
+            _refuse("IRSource positions must be dense integers starting at zero")
+        names = list(range(len(signature)))
+    return names, {name: _canonical_type(signature[name]) for name in names}
+
+
+_INTEGER = {"i1": "?", "u1": "?", "i8": "b", "u8": "B", "i16": "h", "u16": "H",
+            "i32": "i", "u32": "I", "i64": "q", "u64": "Q"}
+
+
+def scalar_bytes(value, declared_type):
+    """Pack exactly the declared scalar width, or refuse an unproved conversion."""
+    ty = _canonical_type(declared_type)
+    try:
+        if ty in _INTEGER:
+            if not isinstance(value, (int, bool)) or (ty in ("i1", "u1") and value not in (0, 1)):
+                _refuse(f"{ty} requires a representable integer value")
+            return struct.pack("<" + _INTEGER[ty], value)
+        if ty in ("fp16", "fp32", "bf16"):
+            if not isinstance(value, (float, int, bool)):
+                _refuse(f"{ty} requires a numeric scalar")
+            if ty == "bf16":
+                # Preserve the existing host bf16 rounding/NaN behavior.
+                import torch
+                bits = torch.tensor([value], dtype=torch.float32).to(torch.bfloat16).view(torch.int16).item()
+                return struct.pack("<h", bits)
+            return struct.pack("<" + ("e" if ty == "fp16" else "f"), value)
+    except (struct.error, OverflowError, ValueError) as exc:
+        _refuse(f"value cannot be represented as {ty}: {exc}")
+    _refuse(f"unsupported or missing scalar declaration {ty!r}; no width is inferred from the Python value")
+
+
+def bind_arguments(args, names, signature):
+    """Exact tuple shape and constexpr-free TTGIR positions, before hooks.
+
+    Return source-ordered leaves and prepacked scalar payloads. Tensor storage
+    validation remains the driver's responsibility; this does not guess types
+    from tensors or claim a foreign pipeline's identity.
+    """
+    if len(args) != len(names):
+        _refuse(f"expected {len(names)} runtime parameter positions, got {len(args)}")
+    leaves, types, origins, payloads = [], [], [], []
+    def bind(value, ty, origin):
+        if isinstance(ty, tuple):
+            if not isinstance(value, tuple) or len(value) != len(ty):
+                _refuse("tuple argument structure does not match its declaration")
+            for child, child_ty in zip(value, ty):
+                bind(child, child_ty, origin)
+            return
+        if ty == "constexpr":
+            return
+        if isinstance(value, tuple):
+            _refuse("tuple value in a scalar/pointer parameter")
+        if ty.startswith("*"):
+            if value is not None and not callable(getattr(value, "data_ptr", None)):
+                _refuse("pointer parameter requires a tensor/pointer wrapper or None")
+            payload = None
+        else:
+            payload = scalar_bytes(value, ty)
+        leaves.append(value)
+        types.append(ty)
+        origins.append(origin)
+        payloads.append(payload)
+    for index, (value, name) in enumerate(zip(args, names)):
+        bind(value, signature[name], index)
+    return leaves, types, origins, payloads

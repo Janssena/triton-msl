@@ -52,10 +52,10 @@ def test_half_accumulate_emits_half(causal):
     msl = mk(128, 32, 64, causal=causal, out_dtype="fp16", kernel_name="fa", half_accumulate=True)
     assert "simdgroup_half8x8 s0(0.0h)" in msl
     assert "simdgroup_half8x8 o[4][TPG];" in msl
-    assert "simdgroup_half8x8 ad0, ad1, ad2, ad3, tmp;" in msl
-    assert "simdgroup_half8x8 ld, on;" in msl
+    assert "half(on_scratch[sgitg*64u+e] * half(isfinite(a) ? a : 0.0f))" in msl
+    assert "half(on_scratch[sgitg*64u+e] * half((tg_l[rb*8u+dr]>0.0f)" in msl
     assert "threadgroup half  tg_S[" in msl
-    assert "threadgroup half  adiag[" in msl
+    assert "adiag" not in msl  # row scaling must not invent off-diagonal 0*Inf
     assert "threadgroup half on_scratch[" in msl
     assert "simdgroup_float8x8" not in msl  # no fp32 accumulators remain
 

@@ -1,3 +1,6 @@
+# _bwd_kv_gqa and _bwd_kv_2d are adapted from TriFast's _bwd_kv.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Source revision and local adaptations: docs/TRIFAST_PROVENANCE.md.
 """Backward GQA/MQA guard (parity with the forward paths): a biased-attention backward
 _bwd_kv where K/V have FEWER heads than Q (grouped-query: off_h_kv = pid_h // GROUP) must
 NOT be routed to the dK/dV template — that template applies Q's head offset to K/V and would

@@ -24,6 +24,9 @@ import math as _math
 _BK = 32
 
 
+from triton_msl.autotuning._submission import SubmissionState
+
+
 def _cdiv(a, b):
     return (int(a) + int(b) - 1) // int(b)
 
@@ -69,7 +72,7 @@ def _gemv_grid_ok(grid, bn, N):
     return _launch_grid_ok(grid, (_cdiv(N, bn), 1, 1))
 
 
-def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Attempt to dispatch the fast quantized-matmul kernel.
 
     Parameters
@@ -84,27 +87,33 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=
 
     Returns
     -------
-    bool : True if dispatched; False if skipped/failed (misaligned shape,
-           runtime stride mismatch, or any error).
+    bool : True if dispatched; False on a pre-invocation miss (misaligned shape,
+           runtime stride mismatch, or library failure). Attempted-invocation
+           errors propagate; fast-to-scalar fallback cannot replay caller work.
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     # Tagged descriptors: "gemv_int4" (per-group int4 decode) / "gemv" (int8 decode).
     # The GEMM's index 0 is its MSL string (starts with "#include"), never these tags.
     if isinstance(descriptor, (tuple, list)) and len(descriptor):
         if descriptor[0] == "gemv_int4":
             return _dispatch_int4_gemv(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                submission_state=_submission,
             )
         if descriptor[0] == "gemv":
             return _dispatch_gemv(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                submission_state=_submission,
             )
         if descriptor[0] in ("pergroup_int8", "pergroup_int4"):
             return _dispatch_pergroup_int8(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                submission_state=_submission,
             )
         if descriptor[0] == "sym_int8":
             return _dispatch_sym_int8(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                submission_state=_submission,
             )
 
     try:
@@ -145,26 +154,30 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=
         lib = rt.get_library(fast_msl)
         # The kernel declares exactly 8 buffers (input,weight,output,scale,zero,M,N,K);
         # pass only those (kargs[:8]) — trailing stride args have no buffer slot.
+        _submission.begin()
         rt.dispatch(lib, "int8_matmul_fast", kargs[:8], threads=n_groups * 32, group_size=32)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
 
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             rt.mark_unsupported(fast_msl)
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False
 
 
-def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Dispatch make_int4_gemv (weight-only int4 per-group decode GEMV).
 
     descriptor = ("gemv_int4", int4_msl, in, w, out, scale, zero, n_idx, k_idx,
                   swn_idx, ssn_idx, ng_idx, group). Buffer order (input, weight,
                   output, scales, zeros, K, N); N simdgroups; K % 4 == 0, K % group == 0.
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         int4_msl = descriptor[1]
         in_idx, w_idx, out_idx, scale_idx, zero_idx = descriptor[2:7]
@@ -196,19 +209,22 @@ def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=No
         threads = ((N * 32 + gsz - 1) // gsz) * gsz
         buffers = [kargs[in_idx], kargs[w_idx], kargs[out_idx], kargs[scale_idx], kargs[zero_idx], K, N]
         lib = rt.get_library(int4_msl)
+        _submission.begin()
         rt.dispatch(lib, "int4_gemv", buffers, threads=threads, group_size=gsz)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             rt.mark_unsupported(int4_msl)
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False
 
 
-def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Dispatch a SYMMETRIC int8 GEMM (no zero-point) via make_int8_matmul_pergroup.
 
     descriptor = ("sym_int8", pg_msl, m_idx, n_idx, k_idx,
@@ -217,6 +233,7 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=Non
     Synthesize an all-zero zeros buffer and set ssg=0/zsg=0/zsn=0 so the per-group
     template reads scale[col*ssn] and subtracts 0 -> w = weight*scale (per-N symmetric).
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         pg_msl = descriptor[1]
         m_idx, n_idx, k_idx = descriptor[2], descriptor[3], descriptor[4]
@@ -260,15 +277,17 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=Non
         lib = rt.get_library(pg_msl)
         _grp = 256
         threads = _math.ceil((M * N) / _grp) * _grp
+        _submission.begin()
         rt.dispatch(lib, "int8_matmul_pergroup", buffers, threads=threads, group_size=_grp)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as _error:  # noqa: BLE001
+        _submission.reraise_if_attempted(_error)
         return False
 
 
-def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Dispatch the scalar per-group int8 GEMM (make_int8_matmul_pergroup).
 
     descriptor = ("pergroup_int8"|"pergroup_int4", pg_msl, m_idx, n_idx, k_idx,
@@ -278,6 +297,7 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hoo
     make_int4_matmul_pergroup (uchar weight, byte//2 index) — same buffer layout, and
     buffer 10 is the packed weight's byte-row stride.
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         pg_msl = descriptor[1]
         m_idx, n_idx, k_idx = descriptor[2], descriptor[3], descriptor[4]
@@ -344,32 +364,37 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hoo
                     flib = rt.get_library(_fast)
                     fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
                     fthreads = (M // tm) * (N // tn) * 32
+                    _submission.begin()
                     rt.dispatch(flib, _fkname, fbuf, threads=fthreads, group_size=32)
                     if launch_exit_hook:
                         launch_exit_hook(launch_metadata)
                     return True
-            except Exception:  # noqa: BLE001
+            except Exception as _error:  # noqa: BLE001
+                _submission.reraise_if_attempted(_error)
                 # A fast-path failure (e.g. compile error) must not kill the launch: mark
                 # the fast MSL unsupported (no per-launch retry) and fall through to the
                 # scalar per-group kernel in the same descriptor (correct for any layout).
                 try:
                     rt.mark_unsupported(_fast)
-                except Exception:  # noqa: BLE001
+                except Exception as _error:  # noqa: BLE001
+                    _submission.reraise_if_attempted(_error)
                     pass
 
         buffers = list(kargs[0:5]) + [M, N, K] + strides
         lib = rt.get_library(pg_msl)
         _grp = 256
         threads = _math.ceil((M * N) / _grp) * _grp
+        _submission.begin()
         rt.dispatch(lib, _kname, buffers, threads=threads, group_size=_grp)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as _error:  # noqa: BLE001
+        _submission.reraise_if_attempted(_error)
         return False
 
 
-def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None):
+def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
     """Dispatch the dedicated make_int8_gemv kernel (weight-only int8 decode GEMV).
 
     descriptor = ("gemv", gemv_msl, in_idx, w_idx, out_idx, scale_idx, zero_idx,
@@ -377,6 +402,7 @@ def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, l
     make_int8_gemv buffer order is (input, weight, output, scales, zeros, K, N) with
     one simdgroup per output column (N*32 threads); K % 4 == 0.
     """
+    _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         gemv_msl = descriptor[1]
         in_idx, w_idx, out_idx, scale_idx, zero_idx = descriptor[2:7]
@@ -420,14 +446,17 @@ def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, l
             N,
         ]
         lib = rt.get_library(gemv_msl)
+        _submission.begin()
         rt.dispatch(lib, "int8_gemv", buffers, threads=threads, group_size=group)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True
 
-    except Exception:
+    except Exception as _error:
+        _submission.reraise_if_attempted(_error)
         try:
             rt.mark_unsupported(gemv_msl)
-        except Exception:
+        except Exception as _error:
+            _submission.reraise_if_attempted(_error)
             pass
         return False

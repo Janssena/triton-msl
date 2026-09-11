@@ -606,16 +606,6 @@ def pytest_collection_modifyitems(config, items):
                     reason="Metal: 2D tensor broadcast not supported (size > 1)"))
                 continue
 
-        # Skip scan2d shapes that exceed Metal's 1024 thread limit
-        if func_name == "test_scan2d":
-            callspec = getattr(item, "callspec", None)
-            if callspec:
-                shape = callspec.params.get("shape", None)
-                if shape and len(shape) >= 2 and shape[0] * shape[1] > 1024:
-                    item.add_marker(pytest.mark.skip(
-                        reason=f"Metal: scan shape {shape} needs {shape[0]*shape[1]} threads (max 1024)"))
-                    continue
-
         # Skip 3D index1d variants (need >1024 threads: 32x32x32 = 32768)
         if func_name == "test_index1d":
             if "none, :, :" in test_id or ":, :, none" in test_id:

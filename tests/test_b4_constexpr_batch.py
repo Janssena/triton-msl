@@ -10,6 +10,8 @@ The fuzzer only spelled the batch offset with a runtime stride arg, so this form
 was structurally untested.
 """
 
+from tests.cache_helpers import fresh_compiler_caches
+
 import pytest
 import torch
 
@@ -63,9 +65,7 @@ if _HAS:
 
 @requires
 def test_constexpr_folded_batched_matmul_refuses():
-    import os
-
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     Z = M = N = K = 32
     A = torch.randn(Z, M, K, device="mps")
     B = torch.randn(Z, K, N, device="mps")

@@ -28,6 +28,583 @@ from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 class _ReduceScanMixin:
     """``tt.reduce`` and ``tt.scan`` lowering for ``GenericLowerer``."""
 
+    def _native_value_facts(self, value_id, *, op_name):
+        """Return ownership-checked native facts for one SSA value.
+
+        ResultMeta is keyed by the native value id, but a key match alone is
+        not an ownership proof: a damaged record could claim another producer,
+        result position, region, or function. Build the expected ownership
+        graph from explicit result/block-argument lists and bind each
+        structural block to the native ``owner_id`` shared by its values.
+        Consumers get no legacy ``type_str`` fallback from this helper.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        if not hasattr(self, "_native_value_owners"):
+            owners = {}
+            for index, arg in enumerate(self.graph.args):
+                owners[arg.id] = ("entry_arg", None, index, ("entry",))
+
+            def record(ops, block_token):
+                for op in ops:
+                    result_ids = list(op.result_ids or [])
+                    if not result_ids and op.id in self.graph.result_meta:
+                        result_ids = [op.id]
+                    for index, result_id in enumerate(result_ids):
+                        owners[result_id] = ("result", op.id, index, block_token)
+
+                    region_args = list((op.attrs or {}).get("block_arg_ids") or [])
+                    region_token = ("region", op.id)
+                    for index, arg_id in enumerate(region_args):
+                        owners[arg_id] = ("block_arg", None, index, region_token)
+                    if op.region_ops:
+                        record(op.region_ops, region_token)
+
+                    # scf.if/while else regions have a distinct native block.
+                    else_token = ("else", op.id)
+                    if op.else_ops:
+                        record(op.else_ops, else_token)
+
+            record(self.graph.ops, ("entry",))
+            self._native_value_owners = owners
+            self._native_owner_ids = {}
+
+        expected = self._native_value_owners.get(value_id)
+        meta = self.graph.result_meta.get(value_id)
+        if expected is None or meta is None:
+            raise MetalNonRecoverableError(
+                f"native per-result metadata is missing for SSA value {value_id}",
+                op_name=op_name,
+            )
+        kind, producer_id, result_index, block_token = expected
+        valid = (
+            meta.schema_version == 1
+            and meta.value_id == value_id
+            and meta.kind == kind
+            and meta.producer_id == producer_id
+            and meta.result_index == result_index
+            and meta.owner_id is not None
+            and meta.function_name == self.graph.func_name
+            and meta.type.unknown_reason is None
+        )
+        known_owner = self._native_owner_ids.get(block_token)
+        if known_owner is None:
+            self._native_owner_ids[block_token] = meta.owner_id
+        elif known_owner != meta.owner_id:
+            valid = False
+        if not valid:
+            raise MetalNonRecoverableError(
+                f"native per-result metadata ownership is contradictory for SSA value {value_id}",
+                op_name=op_name,
+            )
+        return meta.type
+
+    def _scan_native_value_facts(self, value_id):
+        return self._native_value_facts(value_id, op_name="tt.scan")
+
+    @staticmethod
+    def _native_element_signature(facts):
+        return (facts.kind, facts.elem, facts.width, facts.signed)
+
+    def _prove_scan_native_contract(self, ssa):
+        """Prove the typed SSA boundary consumed by a scan lowering.
+
+        The proof is deliberately per slot. A multi-result scan may combine
+        unrelated widths (for example fp32 values and i64 indices), so neither
+        result zero nor the mutable ``env_types`` map is an authority for its
+        siblings. Region arguments and returned values must be scalar
+        instances of the corresponding tensor slot.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        operand_ids = list(ssa.operand_ids or [])
+        result_ids = list(ssa.result_ids or [ssa.id])
+        block_arg_ids = list((ssa.attrs or {}).get("block_arg_ids") or [])
+        returns = [op for op in (ssa.region_ops or []) if op.op == "tt.scan.return"]
+        n_values = len(operand_ids)
+        if (
+            n_values == 0
+            or len(result_ids) != n_values
+            or len(block_arg_ids) != 2 * n_values
+            or len(returns) != 1
+            or len(returns[0].operand_ids or []) != n_values
+        ):
+            raise MetalNonRecoverableError(
+                "tt.scan native contract requires exact operand, result, block-argument, and return arity",
+                op_name="tt.scan",
+            )
+
+        operand_types = [self._scan_native_value_facts(value_id) for value_id in operand_ids]
+        shape = operand_types[0].shape
+        if (
+            not operand_types[0].is_tensor
+            or shape is None
+            or len(shape) not in (1, 2)
+            or any(not isinstance(dim, int) or dim <= 0 for dim in shape)
+        ):
+            raise MetalNonRecoverableError(
+                "tt.scan native metadata does not prove a positive rank-1/rank-2 tensor shape",
+                op_name="tt.scan",
+            )
+
+        allowed_kinds = {"float", "integer"}
+        for slot, facts in enumerate(operand_types):
+            if (
+                not facts.is_tensor
+                or facts.shape != shape
+                or facts.kind not in allowed_kinds
+                or facts.elem is None
+                or not isinstance(facts.width, int)
+                or facts.width <= 0
+            ):
+                raise MetalNonRecoverableError(
+                    f"tt.scan native metadata does not prove tensor slot {slot}'s shape and width",
+                    op_name="tt.scan",
+                )
+
+        result_types = [self._scan_native_value_facts(value_id) for value_id in result_ids]
+        for slot, (source, result) in enumerate(zip(operand_types, result_types)):
+            if (
+                not result.is_tensor
+                or result.shape != shape
+                or self._native_element_signature(result) != self._native_element_signature(source)
+            ):
+                raise MetalNonRecoverableError(
+                    f"tt.scan result {slot} does not preserve its native slot shape and type",
+                    op_name="tt.scan",
+                )
+
+        block_types = [self._scan_native_value_facts(value_id) for value_id in block_arg_ids]
+        return_ids = list(returns[0].operand_ids or [])
+        return_types = [self._scan_native_value_facts(value_id) for value_id in return_ids]
+        for slot, source in enumerate(operand_types):
+            signature = self._native_element_signature(source)
+            for facts in (block_types[slot], block_types[n_values + slot], return_types[slot]):
+                if facts.is_tensor or facts.shape != () or self._native_element_signature(facts) != signature:
+                    raise MetalNonRecoverableError(
+                        f"tt.scan combine region does not preserve scalar slot {slot}'s native type",
+                        op_name="tt.scan",
+                    )
+
+        # Check every typed body result as well as the values returned from it.
+        # This catches a damaged intermediate record before an emitter can use
+        # its legacy spelling to select an overload.
+        for body_op in ssa.region_ops or []:
+            if body_op.op == "tt.scan.return":
+                continue
+            body_results = list(body_op.result_ids or [])
+            if not body_results and body_op.id in self.graph.result_meta:
+                body_results = [body_op.id]
+            for value_id in body_results:
+                facts = self._scan_native_value_facts(value_id)
+                if facts.kind not in allowed_kinds or facts.elem is None or facts.width is None:
+                    raise MetalNonRecoverableError(
+                        "tt.scan combine body has an unproved native result representation",
+                        op_name="tt.scan",
+                    )
+
+        axis = (ssa.attrs or {}).get("axis", 0)
+        if type(axis) is not int or not 0 <= axis < len(shape):
+            raise MetalNonRecoverableError(
+                "tt.scan native contract has an invalid axis for its operand rank",
+                op_name="tt.scan",
+            )
+        return {
+            "shape": tuple(shape),
+            "axis": axis,
+            "slot_dtypes": [_mlir_to_triton_dtype(facts.elem) for facts in operand_types],
+        }
+
+    def _prove_reduce_native_contract(self, ssa):
+        """Prove every typed boundary consumed by a reduce.
+
+        Single- and multi-result reductions pair corresponding logical
+        elements. Every operand must have the same shape/layout, every result
+        must have the axis removed, and both halves of every combine slot must
+        preserve that slot's scalar representation through the returned value.
+        None of these facts may come from mutable ``env_types``/``env_shapes``
+        or printed type strings.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        operand_ids = list(ssa.operand_ids or [])
+        result_ids = list(ssa.result_ids or [ssa.id])
+        block_arg_ids = list((ssa.attrs or {}).get("block_arg_ids") or [])
+        return_ids = list((ssa.attrs or {}).get("return_ids") or [])
+        n_values = len(operand_ids)
+        if (
+            n_values < 1
+            or len(result_ids) != n_values
+            or len(block_arg_ids) != 2 * n_values
+            or len(return_ids) != n_values
+        ):
+            raise MetalNonRecoverableError(
+                "tt.reduce native contract requires exact operand, result, "
+                "block-argument, and return arity",
+                op_name="tt.reduce",
+            )
+
+        operand_types = [
+            self._native_value_facts(value_id, op_name="tt.reduce")
+            for value_id in operand_ids
+        ]
+        shape = operand_types[0].shape
+        layout = operand_types[0].layout
+        allowed_kinds = {"float", "integer"}
+        if (
+            not operand_types[0].is_tensor
+            or shape is None
+            or not shape
+            or any(not isinstance(dim, int) or dim <= 0 for dim in shape)
+        ):
+            raise MetalNonRecoverableError(
+                "tt.reduce native metadata does not prove a positive-rank tensor shape",
+                op_name="tt.reduce",
+            )
+        for slot, facts in enumerate(operand_types):
+            if (
+                not facts.is_tensor
+                or facts.shape != shape
+                or facts.layout != layout
+                or facts.kind not in allowed_kinds
+                or facts.elem is None
+                or not isinstance(facts.width, int)
+                or facts.width <= 0
+            ):
+                raise MetalNonRecoverableError(
+                    f"tt.reduce native metadata does not prove tensor slot {slot}'s "
+                    "shape, layout, and representation",
+                    op_name="tt.reduce",
+                )
+
+        axis = (ssa.attrs or {}).get("axis", 0)
+        if type(axis) is not int or not 0 <= axis < len(shape):
+            raise MetalNonRecoverableError(
+                "tt.reduce native contract has an invalid axis for its operand rank",
+                op_name="tt.reduce",
+            )
+        output_shape = tuple((*shape[:axis], *shape[axis + 1 :]))
+
+        result_types = [
+            self._native_value_facts(value_id, op_name="tt.reduce")
+            for value_id in result_ids
+        ]
+        result_layout = result_types[0].layout
+        for slot, (source, result) in enumerate(zip(operand_types, result_types)):
+            if (
+                result.shape != output_shape
+                or result.is_tensor != bool(output_shape)
+                or result.layout != result_layout
+                or self._native_element_signature(result)
+                != self._native_element_signature(source)
+            ):
+                raise MetalNonRecoverableError(
+                    f"tt.reduce result {slot} does not preserve its native slot "
+                    "type and reduced shape",
+                    op_name="tt.reduce",
+                )
+
+        block_types = [
+            self._native_value_facts(value_id, op_name="tt.reduce")
+            for value_id in block_arg_ids
+        ]
+        return_types = [
+            self._native_value_facts(value_id, op_name="tt.reduce")
+            for value_id in return_ids
+        ]
+        for slot, source in enumerate(operand_types):
+            signature = self._native_element_signature(source)
+            for facts in (
+                block_types[slot],
+                block_types[n_values + slot],
+                return_types[slot],
+            ):
+                if (
+                    facts.is_tensor
+                    or facts.shape != ()
+                    or self._native_element_signature(facts) != signature
+                ):
+                    raise MetalNonRecoverableError(
+                        f"tt.reduce combine region does not preserve scalar "
+                        f"slot {slot}'s native representation",
+                        op_name="tt.reduce",
+                    )
+
+        for body_op in ssa.region_ops or []:
+            body_results = list(body_op.result_ids or [])
+            if not body_results and body_op.id in self.graph.result_meta:
+                body_results = [body_op.id]
+            for value_id in body_results:
+                facts = self._native_value_facts(value_id, op_name="tt.reduce")
+                if facts.kind not in allowed_kinds or facts.elem is None or facts.width is None:
+                    raise MetalNonRecoverableError(
+                        "tt.reduce combine body has an unproved native result "
+                        "representation",
+                        op_name="tt.reduce",
+                    )
+
+        return {
+            "shape": tuple(shape),
+            "output_shape": output_shape,
+            "axis": axis,
+            "slot_facts": operand_types,
+            "result_facts": result_types,
+            "slot_dtypes": [
+                _mlir_to_triton_dtype(facts.elem) for facts in operand_types
+            ],
+            "result_dtypes": [
+                _mlir_to_triton_dtype(facts.elem) for facts in result_types
+            ],
+        }
+
+    def _register_bcast_layout_by_native(self, facts, shape, layout_expr):
+        """Register a reduce broadcast using its proved native result layout."""
+        shape = tuple(shape)
+        if facts.layout is not None:
+            if not hasattr(self, "_bcast_layouts_by_layout"):
+                self._bcast_layouts_by_layout = {}
+            registration = (shape, layout_expr)
+            existing = self._bcast_layouts_by_layout.get(facts.layout)
+            if existing is not None and existing != registration:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "tt.reduce native slice layout was registered by multiple "
+                    "stages with conflicting shape or projection",
+                    op_name="tt.reduce",
+                )
+        # Shape is not a stage identity: chained sort reductions legitimately
+        # produce the same logical shape with different projections. Index in
+        # the direction the binary consumer actually queries, retaining every
+        # shape for an expression instead of overwriting shape -> expression.
+        if not hasattr(self, "_bcast_shapes_by_expr"):
+            self._bcast_shapes_by_expr = {}
+        self._bcast_shapes_by_expr.setdefault(layout_expr, set()).add(shape)
+        if facts.layout is not None:
+            self._bcast_layouts_by_layout[facts.layout] = registration
+
+    @staticmethod
+    def _reduce_body_result_id(op):
+        result_ids = list(op.result_ids or [])
+        if result_ids:
+            return result_ids[0] if len(result_ids) == 1 else None
+        return op.id
+
+    def _classify_exact_welford_recurrence(self, ssa):
+        """Return the source's ratio mode for the recurrence we re-emit.
+
+        Merely finding ``arith.divf`` is not evidence of Welford: a weighted
+        mean tuple has a division too, and replaying it as Welford changes its
+        independent second result into an M2 accumulator.  Match the complete
+        returned value DAG with the same operand order and association the
+        template emits; algebraic equivalence alone would not preserve floating
+        rounding, signed zero, or NaN payload behavior.
+        """
+        block_args = list((ssa.attrs or {}).get("block_arg_ids") or [])
+        return_ids = list((ssa.attrs or {}).get("return_ids") or [])
+        if len(block_args) != 6 or len(return_ids) != 3:
+            return None
+        mean_a, m2_a, weight_a, mean_b, m2_b, weight_b = block_args
+        mean_out, m2_out, weight_out = return_ids
+
+        producers = {}
+        for op in ssa.region_ops or []:
+            result_id = self._reduce_body_result_id(op)
+            if result_id is None or result_id in producers:
+                return None
+            producers[result_id] = op
+
+        def exact_binary(value_id, op_name, left, right, *, commutative=False):
+            op = producers.get(value_id)
+            if op is None or op.op != op_name or len(op.operand_ids or []) != 2:
+                return False
+            operands = tuple(op.operand_ids)
+            return operands == (left, right) or (
+                commutative and operands == (right, left)
+            )
+
+        def unique_binary(op_name, left, right, *, commutative=False):
+            matches = [
+                value_id
+                for value_id in producers
+                if exact_binary(
+                    value_id,
+                    op_name,
+                    left,
+                    right,
+                    commutative=commutative,
+                )
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        if not exact_binary(
+            weight_out, "arith.addf", weight_a, weight_b
+        ):
+            return None
+        delta = unique_binary("arith.subf", mean_b, mean_a)
+        raw_ratio = unique_binary("arith.divf", weight_b, weight_out)
+        if delta is None or raw_ratio is None:
+            return None
+
+        ratio = None
+        ratio_mode = "unguarded"
+        for value_id, select in producers.items():
+            if select.op != "arith.select" or len(select.operand_ids or []) != 3:
+                continue
+            condition_id, zero_id, false_id = select.operand_ids
+            if false_id != raw_ratio:
+                continue
+            condition = producers.get(condition_id)
+            zero_facts = self._native_value_facts(zero_id, op_name="tt.reduce")
+            if (
+                condition is not None
+                and condition.op == "arith.cmpf"
+                and tuple(condition.operand_ids or []) == (weight_out, zero_id)
+                and condition.attrs.get("predicate_name") == "oeq"
+                and zero_facts.kind == "float"
+                and zero_facts.shape == ()
+            ):
+                # The external zero constant is part of the returned DAG but
+                # not the reduce region. Verify its producer/value directly.
+                def find_zero(ops):
+                    for op in ops:
+                        result_ids = list(op.result_ids or [op.id])
+                        if zero_id in result_ids and op.op == "arith.constant":
+                            return op
+                        found = find_zero(op.region_ops or []) or find_zero(op.else_ops or [])
+                        if found is not None:
+                            return found
+                    return None
+
+                zero_op = find_zero(self.graph.ops)
+                if zero_op is not None and zero_op.attrs.get("value") == 0.0:
+                    ratio = value_id
+                    ratio_mode = "guarded"
+                    break
+        if ratio is None:
+            # Triton's public generic-reduction test spells the same Welford
+            # recurrence without the zero-weight select.  Preserve that exact
+            # source behavior rather than either refusing it or silently adding
+            # a guard: the emitter below is parameterized by this classification.
+            ratio = raw_ratio
+
+        mean_correction = unique_binary("arith.mulf", delta, ratio)
+        if mean_correction is None or not exact_binary(
+            mean_out, "arith.addf", mean_a, mean_correction
+        ):
+            return None
+
+        m2_base = unique_binary("arith.addf", m2_a, m2_b)
+        delta_squared = unique_binary("arith.mulf", delta, delta)
+        weighted_delta = (
+            unique_binary("arith.mulf", delta_squared, weight_a)
+            if delta_squared is not None
+            else None
+        )
+        m2_correction = (
+            unique_binary("arith.mulf", weighted_delta, ratio)
+            if weighted_delta is not None
+            else None
+        )
+        if (
+            m2_base is None
+            or m2_correction is None
+            or not exact_binary(m2_out, "arith.addf", m2_base, m2_correction)
+        ):
+            return None
+        return ratio_mode
+
+    def _classify_exact_argminmax_recurrence(self, ssa, value_kind):
+        """Return ``(is_max, unsigned)`` only for the tuple DAG we emit.
+
+        A body containing a comparison is not necessarily argmin/argmax.  For
+        example, lexicographic max-by-key compares slot one and returns its
+        associated slot zero; replaying that body as argmax compares slot zero
+        instead.  Require the canonical value comparison, equality/index
+        tie-break, shared condition, and per-slot selects all the way to the
+        region's returned values.
+        """
+        block_args = list((ssa.attrs or {}).get("block_arg_ids") or [])
+        return_ids = list((ssa.attrs or {}).get("return_ids") or [])
+        if len(block_args) != 4 or len(return_ids) != 2:
+            return None
+        value_a, index_a, value_b, index_b = block_args
+        value_out, index_out = return_ids
+
+        producers = {}
+        for op in ssa.region_ops or []:
+            result_id = self._reduce_body_result_id(op)
+            if result_id is None or result_id in producers:
+                return None
+            producers[result_id] = op
+
+        value_select = producers.get(value_out)
+        index_select = producers.get(index_out)
+        if (
+            value_select is None
+            or index_select is None
+            or value_select.op != "arith.select"
+            or index_select.op != "arith.select"
+            or len(value_select.operand_ids or []) != 3
+            or len(index_select.operand_ids or []) != 3
+            or tuple(value_select.operand_ids[1:]) != (value_a, value_b)
+            or tuple(index_select.operand_ids[1:]) != (index_a, index_b)
+            or value_select.operand_ids[0] != index_select.operand_ids[0]
+        ):
+            return None
+
+        condition = producers.get(value_select.operand_ids[0])
+        if condition is None or condition.op != "arith.ori" or len(condition.operand_ids or []) != 2:
+            return None
+        condition_children = [producers.get(value_id) for value_id in condition.operand_ids]
+        tie = next((op for op in condition_children if op is not None and op.op == "arith.andi"), None)
+        winner = next((op for op in condition_children if op is not None and op.op in ("arith.cmpf", "arith.cmpi")), None)
+        if tie is None or winner is None or len(tie.operand_ids or []) != 2:
+            return None
+
+        tie_children = [producers.get(value_id) for value_id in tie.operand_ids]
+        if any(op is None for op in tie_children):
+            return None
+        value_eq = next(
+            (
+                op
+                for op in tie_children
+                if tuple(op.operand_ids or []) in ((value_a, value_b), (value_b, value_a))
+            ),
+            None,
+        )
+        index_lt = next(
+            (
+                op
+                for op in tie_children
+                if tuple(op.operand_ids or []) == (index_a, index_b)
+            ),
+            None,
+        )
+        expected_value_op = "arith.cmpf" if value_kind == "float" else "arith.cmpi"
+        expected_eq = "oeq" if value_kind == "float" else "eq"
+        if (
+            value_eq is None
+            or index_lt is None
+            or value_eq is index_lt
+            or value_eq.op != expected_value_op
+            or value_eq.attrs.get("predicate_name") != expected_eq
+            or index_lt.op != "arith.cmpi"
+            or index_lt.attrs.get("predicate_name") != "slt"
+            or winner.op != expected_value_op
+            or tuple(winner.operand_ids or []) != (value_a, value_b)
+        ):
+            return None
+
+        predicate = winner.attrs.get("predicate_name")
+        if value_kind == "float":
+            if predicate not in ("ogt", "olt"):
+                return None
+            return predicate == "ogt", False
+        if predicate not in ("sgt", "slt", "ugt", "ult"):
+            return None
+        return predicate in ("sgt", "ugt"), predicate in ("ugt", "ult")
+
     def _mept_reduce_fold(self, arr_name: str, n: int, combine_op: str, msl_type: str) -> str:
         """Phase 4e: fold a per-thread register array to a scalar partial.
 
@@ -466,7 +1043,7 @@ class _ReduceScanMixin:
             )
         combine_op = _res[0]
         identities = {
-            "sum": "0.0f",
+            "sum": "-0.0f",
             "prod": "1.0f",
             "max": "-INFINITY",
             "min": "INFINITY",
@@ -490,12 +1067,13 @@ class _ReduceScanMixin:
         max identities: float→(-INFINITY); long→LONG_MIN; ulong→0; int→INT_MIN
         min identities: float→INFINITY; long→LONG_MAX; ulong→ULONG_MAX;
                         int→INT_MAX
-        sum identity is 0 (0.0f for float). LONG_MIN/LONG_MAX/ULONG_MAX are
+        sum identity is 0 (-0.0f for float, preserving either source zero sign).
+        LONG_MIN/LONG_MAX/ULONG_MAX are
         provided by metal_stdlib (same as the multipass-accumulator path).
         """
         is_float = msl_type == "float"
         if combine_op == "sum":
-            identity = "0.0f" if is_float else "0"
+            identity = "-0.0f" if is_float else "0"
             combine_expr = "acc + val"
         elif combine_op == "prod":
             identity = "1.0f" if is_float else "1"
@@ -589,6 +1167,11 @@ class _ReduceScanMixin:
             next_reduce = None
             if phase_idx + 1 < len(phases) and phases[phase_idx + 1][1]:
                 next_reduce = phases[phase_idx + 1][0][0]
+            next_reduce_native = (
+                self._prove_reduce_native_contract(next_reduce)
+                if next_reduce is not None
+                else None
+            )
 
             # Separate scalar ops (hoist before loop) from tensor ops (inside loop)
             scalar_ops = [op for op in phase_ops if self._is_scalar_op(op)]
@@ -683,14 +1266,10 @@ class _ReduceScanMixin:
             if next_reduce:
                 combine_op, identity = self._get_reduce_combine_info(next_reduce)
                 acc_var = f"_local_acc_{self._shared_counter}"
-                # Determine accumulator type from the reduce input. The operand
-                # may not be in env_types after multipass replay/reordering (a
-                # reshape between load and reduce can drop the type), so fall
-                # back to the reduce op's own element type (reliable from IR).
-                reduce_input_dtype = self.env_types.get(next_reduce.operand_ids[0]) if next_reduce.operand_ids else None
-                if reduce_input_dtype is None:
-                    _et = getattr(next_reduce, "elem_type", None)
-                    reduce_input_dtype = _mlir_to_triton_dtype(_et) if _et else "fp32"
+                # The accumulator must match the reduce operand's immutable native
+                # representation. Mutable replay caches and the result-zero summary
+                # cannot authorize a type at this boundary.
+                reduce_input_dtype = next_reduce_native["slot_dtypes"][0]
                 is_int_reduce = not (reduce_input_dtype.startswith("fp") or reduce_input_dtype.startswith("bf"))
                 is_i64_reduce = reduce_input_dtype in ("i64", "u64", "ui64")
                 # unsigned 32-bit max/min compares UNSIGNED; the final cross-thread simd
@@ -746,7 +1325,7 @@ class _ReduceScanMixin:
                 # kernel summed every element exactly TWICE, silently. No correct kernel
                 # can currently hit this (the result was always wrong); refuse loudly until
                 # the phase loop runs per-input extents.
-                _rin_shape = self.env_shapes.get(reduce_input_id)
+                _rin_shape = next_reduce_native["shape"]
                 _rin_total = 1
                 for _d in _rin_shape or ():
                     _rin_total *= _d
@@ -963,8 +1542,9 @@ class _ReduceScanMixin:
             self._lower_reduce_multi_value(ssa)
             return
 
+        native = self._prove_reduce_native_contract(ssa)
         input_var = self._lookup(ssa.operand_ids[0])
-        axis = ssa.attrs.get("axis", 0)
+        axis = native["axis"]
 
         # Determine the combine via the structural classifier (single source of truth).
         # The 1-D path supports sum/max/min (signed+unsigned) + and/or/xor; a custom /
@@ -987,15 +1567,10 @@ class _ReduceScanMixin:
         combine_op, _signed = _res
         has_unsigned_minmax = combine_op in ("max", "min") and not _signed
 
-        # Determine type from input operand. After a multipass wrap-loop the
-        # operand is rebound to a freshly-typed accumulator whose env_type is
-        # set; but if the operand is missing from env_types (e.g. a reshape
-        # between load and reduce dropped it), fall back to the reduce op's own
-        # element type so 64-bit reduces still route to the i64 tree.
-        input_dtype = self.env_types.get(ssa.operand_ids[0])
-        if input_dtype is None:
-            _et = getattr(ssa, "elem_type", None)
-            input_dtype = _mlir_to_triton_dtype(_et) if _et else "fp32"
+        # The input and result representation/shape are native per-value facts.
+        # Multipass may rebind the input's runtime expression to a local
+        # accumulator, but it cannot change the logical operand contract.
+        input_dtype = native["slot_dtypes"][0]
         is_int_reduce = not (input_dtype.startswith("fp") or input_dtype.startswith("bf"))
         is_i64 = input_dtype in ("i64", "u64", "ui64")
         is_u64 = input_dtype in ("u64", "ui64")
@@ -1004,9 +1579,7 @@ class _ReduceScanMixin:
         )
 
         # Check if this is a 2D axis-specific reduction
-        input_shape = self.env_shapes.get(ssa.operand_ids[0])
-        if not input_shape:
-            input_shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
+        input_shape = native["shape"]
 
         # Phase 4e: MEPT array operand. Fold this thread's register array to
         # a scalar partial with the combine op, then run the existing 1-D
@@ -1022,14 +1595,32 @@ class _ReduceScanMixin:
             input_shape = None  # already folded to one element per thread
 
         if input_shape and len(input_shape) == 3:
-            self._lower_reduce_3d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
+            self._lower_reduce_3d(
+                ssa,
+                input_var,
+                axis,
+                combine_op,
+                msl_type,
+                shared_dtype,
+                input_shape,
+                native["result_facts"][0],
+            )
             return
 
         # N-D axis-specific reduce (n >= 4). Used by e.g. tl.sort's bitonic
         # decomposition, which reshapes to (2,)*n and reduces along a specific
         # axis per compare-and-swap step.
         if input_shape and len(input_shape) >= 4:
-            self._lower_reduce_nd(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
+            self._lower_reduce_nd(
+                ssa,
+                input_var,
+                axis,
+                combine_op,
+                msl_type,
+                shared_dtype,
+                input_shape,
+                native["result_facts"][0],
+            )
             return
 
         if self._is_2d and input_shape and len(input_shape) >= 2:
@@ -1080,7 +1671,16 @@ class _ReduceScanMixin:
                         "tl.dot(a, w). Correct-or-refuse: refused, not mis-computed.",
                         op_name="tt.reduce",
                     )
-                self._lower_reduce_2d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
+                self._lower_reduce_2d(
+                    ssa,
+                    input_var,
+                    axis,
+                    combine_op,
+                    msl_type,
+                    shared_dtype,
+                    input_shape,
+                    input_dtype,
+                )
                 return
 
         # Stage B (in-loop reduction coverage): a 1-D full reduce whose tile
@@ -1143,7 +1743,7 @@ class _ReduceScanMixin:
 
             _is_float = msl_type in ("float", "half", "bfloat")
             if combine_op == "sum":
-                _ident = "0"
+                _ident = "-0.0f" if _is_float else "0"
             elif combine_op == "prod":
                 _ident = "1.0f" if _is_float else "1"
             elif combine_op == "max" and _is_float:
@@ -1188,7 +1788,7 @@ class _ReduceScanMixin:
 
         # Narrow-type masking: when reducing in wider type but output is narrow,
         # apply modular arithmetic (i1 sum = XOR, i8 sum = mod 256, etc.)
-        out_elem = ssa.elem_type
+        out_elem = native["result_facts"][0].elem
         if out_elem == "i1":
             masked_var = self._next_var("masked")
             self.kb.raw_line(f"    float {masked_var} = (float)((int){result_var} & 1);")
@@ -1263,6 +1863,17 @@ class _ReduceScanMixin:
         For 2 inputs: argmax/argmin (value + index) via SIMD shuffle + shared memory.
         For 3 inputs: Welford online variance (mean + m2 + weight) via SIMD shuffle + shared memory.
         """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        native = self._prove_reduce_native_contract(ssa)
+        n_values = len(native["slot_facts"])
+        if n_values not in (2, 3) or len(native["shape"]) not in (1, 2):
+            raise MetalNonRecoverableError(
+                "multi-result tt.reduce is implemented only for rank-1/rank-2 argmin/argmax "
+                "pairs and rank-1/rank-2 three-slot Welford reductions",
+                op_name="tt.reduce",
+            )
+
         # Guard (2026-06-21 audit sibling-divergence): a multi-value reduce
         # (argmax/argmin/Welford) over a 1-D tile WIDER than the threadgroup,
         # INSIDE control flow, would have its tail dropped by the SIMD-shuffle tree
@@ -1275,10 +1886,8 @@ class _ReduceScanMixin:
         # and emits uncompilable MSL (an undeclared per-iteration var) -> a cryptic
         # MetalCompilationError instead of a clean refusal (re-audit #3). Either way,
         # a 1-D multi-value reduce wider than the threadgroup is unsupported: refuse.
-        _ishape = self.env_shapes.get(ssa.operand_ids[0]) or _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
+        _ishape = native["shape"]
         if _ishape is not None and len(_ishape) == 1 and _ishape[0] > self.kb.block_size:
-            from triton_msl.errors import MetalNonRecoverableError
-
             raise MetalNonRecoverableError(
                 f"Multi-value reduce (argmax/argmin/Welford) over a 1-D tile of "
                 f"{_ishape[0]} elements exceeds the {self.kb.block_size}-thread "
@@ -1288,60 +1897,74 @@ class _ReduceScanMixin:
             )
 
         # Dispatch Welford (3-value) vs argmax/argmin (2-value)
-        if len(ssa.operand_ids) >= 3 and ssa.result_ids and len(ssa.result_ids) >= 3:
-            # Route to Welford ONLY if the body is the online-variance recurrence (it divides
-            # by the running count — arith.divf). A custom 3-tuple combine (triple-max,
-            # triple-sum, ...) has no division and would be SILENTLY computed as the Welford
-            # mean/m2/weight math (Triton-lens re-audit 2026-06-25: a triple-max returned
-            # Welford output). Refuse it rather than mis-compute, mirroring the 2-value
-            # comparison-presence guard below.
-            _has_div = any((bop.op or "").startswith("arith.div") for bop in (ssa.region_ops or []))
-            if not _has_div:
-                from triton_msl.errors import MetalNonRecoverableError
-
+        if n_values == 3:
+            if any(
+                facts.kind != "float" or facts.elem != "f32" or facts.width != 32
+                for facts in native["slot_facts"]
+            ):
                 raise MetalNonRecoverableError(
-                    "multi-value tl.reduce with a 3+ element tuple body that is not the "
-                    "Welford online-variance recurrence (it does not divide by a running "
-                    "count) is not supported — it would be silently computed as variance. "
+                    "the Welford tuple lowering requires three native fp32 slots; a narrower "
+                    "or mixed representation would be silently widened by its float temporaries",
+                    op_name="tt.reduce",
+                )
+            # Route to Welford only when the complete returned value DAG is the recurrence
+            # emitted below.  A division-presence heuristic silently misclassified a valid
+            # weighted-mean tuple and replaced its independent second result with M2.
+            welford_ratio_mode = self._classify_exact_welford_recurrence(ssa)
+            if welford_ratio_mode is None:
+                raise MetalNonRecoverableError(
+                    "multi-value tl.reduce with a three-element tuple body whose returned "
+                    "value DAG is not the exact Welford online-variance recurrence is not "
+                    "supported — replaying a merely division-containing tuple as Welford "
+                    "would silently change its results. "
                     "Refusing. Only tl.var/tl.std (Welford) 3-tuples and value+index "
                     "argmax/argmin 2-tuples are handled.",
                     op_name="tt.reduce",
                 )
-            self._lower_reduce_welford(ssa)
+            self._lower_reduce_welford(
+                ssa, native, guarded_ratio=welford_ratio_mode == "guarded"
+            )
             return
 
-        # A 2-value reduce is handled ONLY as argmax/argmin (value+index). Verify the body
-        # has a COMPARISON (cmpf/cmpi) — argmin/argmax compare values. A custom 2-value
-        # combine (e.g. (x+y, i+j)) has no comparison and would be SILENTLY mis-computed
-        # by the argminmax path (reduce-probe finding). Refuse it.
-        if len(ssa.operand_ids) >= 2 and not any(
-            bop.op in ("arith.cmpf", "arith.cmpi") for bop in (ssa.region_ops or [])
+        value_facts, index_facts = native["slot_facts"]
+        value_widths = {16, 32} if value_facts.kind == "float" else {8, 16, 32, 64}
+        if (
+            value_facts.kind not in {"float", "integer"}
+            or value_facts.width not in value_widths
+            or index_facts.kind != "integer"
+            or index_facts.width != 32
         ):
-            from triton_msl.errors import MetalNonRecoverableError
-
             raise MetalNonRecoverableError(
-                "multi-value tl.reduce whose body is not argmax/argmin (no comparison) "
-                "is not supported — only value+index argmax/argmin 2-tuples are handled. "
-                "Refusing.",
+                "argmin/argmax tuple lowering requires a native f16/f32 or i8/i16/i32/i64 "
+                "value slot and an i32 index slot",
+                op_name="tt.reduce",
+            )
+
+        argminmax = self._classify_exact_argminmax_recurrence(ssa, value_facts.kind)
+        if argminmax is None:
+            raise MetalNonRecoverableError(
+                "multi-value tl.reduce whose returned value DAG is not the exact "
+                "argmin/argmax value comparison plus smaller-index tie-break is not "
+                "supported — comparison presence alone cannot prove the tuple semantics. "
+                "Refusing rather than replay a different pair reduction as argmin/argmax.",
                 op_name="tt.reduce",
             )
 
         # Check for 2D argmin/argmax
-        if len(ssa.operand_ids) >= 2:
-            input_shape = self.env_shapes.get(ssa.operand_ids[0])
-            if not input_shape:
-                input_shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
-            if input_shape and len(input_shape) == 2 and self._is_2d:
-                axis = ssa.attrs.get("axis", 0)
-                # Skip 2D dispatch when first dim is 1 and axis is 1
-                # (really a 1D reduction, same logic as _lower_reduce)
-                if not (input_shape[0] == 1 and axis == 1):
-                    self._lower_reduce_2d_argminmax(ssa, axis, input_shape)
-                    return
+        input_shape = native["shape"]
+        if len(input_shape) == 2 and self._is_2d:
+            axis = native["axis"]
+            # Skip 2D dispatch when first dim is 1 and axis is 1
+            # (really a 1D reduction, same logic as _lower_reduce)
+            if not (input_shape[0] == 1 and axis == 1):
+                self._lower_reduce_2d_argminmax(
+                    ssa, axis, input_shape, native, argminmax
+                )
+                return
 
-        self._lower_reduce_argminmax(ssa)
+        self._lower_reduce_argminmax(ssa, native, argminmax)
 
-    def _lower_reduce_welford(self, ssa: SSAValue):
+    def _lower_reduce_welford(self, ssa: SSAValue, native, *, guarded_ratio):
         """Welford online variance reduction: (mean, m2, weight) via SIMD shuffle + shared memory."""
         mean_var = self._lookup(ssa.operand_ids[0])
         m2_var = self._lookup(ssa.operand_ids[1])
@@ -1379,7 +2002,8 @@ class _ReduceScanMixin:
         self.kb.raw_line(f"        float _ow = simd_shuffle_down({ww}, _d);")
         self.kb.raw_line(f"        float _delta = _om - {wm};")
         self.kb.raw_line(f"        float _nw = {ww} + _ow;")
-        self.kb.raw_line(f"        float _ratio = (_nw == 0.0f) ? 0.0f : _ow / _nw;")
+        ratio_expr = "(_nw == 0.0f) ? 0.0f : _ow / _nw" if guarded_ratio else "_ow / _nw"
+        self.kb.raw_line(f"        float _ratio = {ratio_expr};")
         self.kb.raw_line(f"        {wm} = {wm} + _delta * _ratio;")
         self.kb.raw_line(f"        {wv} = {wv} + _ov + _delta * _delta * {ww} * _ratio;")
         self.kb.raw_line(f"        {ww} = _nw;")
@@ -1405,7 +2029,7 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"            float _ow = {sh_w}[_s];")
             self.kb.raw_line(f"            float _delta = _om - {wm};")
             self.kb.raw_line(f"            float _nw = {ww} + _ow;")
-            self.kb.raw_line(f"            float _ratio = (_nw == 0.0f) ? 0.0f : _ow / _nw;")
+            self.kb.raw_line(f"            float _ratio = {ratio_expr};")
             self.kb.raw_line(f"            {wm} = {wm} + _delta * _ratio;")
             self.kb.raw_line(f"            {wv} = {wv} + _ov + _delta * _delta * {ww} * _ratio;")
             self.kb.raw_line(f"            {ww} = _nw;")
@@ -1432,13 +2056,13 @@ class _ReduceScanMixin:
             self.env[ssa.result_ids[2]] = rw
             self.env_types[ssa.result_ids[2]] = "fp32"
 
-    def _lower_reduce_argminmax(self, ssa: SSAValue):
+    def _lower_reduce_argminmax(self, ssa: SSAValue, native, argminmax):
         """Argmax/argmin: value + index via SIMD shuffle + shared memory."""
         val_var = self._lookup(ssa.operand_ids[0])
         idx_var = self._lookup(ssa.operand_ids[1])
 
         # Determine value type
-        val_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
+        val_dtype = native["slot_dtypes"][0]
         is_int = not (val_dtype.startswith("fp") or val_dtype.startswith("bf"))
         # A 64-bit int value cannot go through this SIMD-shuffle reduction — simd_shuffle_down
         # has NO 64-bit overload, and staging as 32-bit would silently truncate the high word
@@ -1458,12 +2082,11 @@ class _ReduceScanMixin:
         # uint8/16/32 are the SIGNLESS i8/i16/i32 in Triton — a signed compare picks the
         # wrong arg index above the sign bit. Stage + compare as uint when the combine is
         # unsigned (arith.cmpi ugt/ult). 64-bit already refused above.
-        _unsigned = is_int and self._reduce_is_unsigned_minmax(ssa.region_ops)
+        is_max, proved_unsigned = argminmax
+        _unsigned = is_int and proved_unsigned
         msl_val_type = "uint" if _unsigned else ("int" if is_int else "float")
         val_shared_dtype = "u32" if _unsigned else ("i32" if is_int else "fp32")
 
-        # Detect argmax vs argmin from body ops
-        is_max = self._detect_reduce_direction(ssa)
         cmp_op = ">" if is_max else "<"
 
         # Allocate shared memory for values and indices
@@ -1553,7 +2176,9 @@ class _ReduceScanMixin:
         for _rid in ssa.result_ids or []:
             self._register_1d_layout(_rid, "direct")
 
-    def _lower_reduce_2d_argminmax(self, ssa, axis, input_shape):
+    def _lower_reduce_2d_argminmax(
+        self, ssa, axis, input_shape, native, argminmax
+    ):
         """Lower 2D argmin/argmax: find min/max value and index along axis.
 
         For axis=1 on (M, N): each row finds min/max among N values → (M,) values + indices.
@@ -1581,7 +2206,7 @@ class _ReduceScanMixin:
         val_var = self._lookup(ssa.operand_ids[0])
         idx_var = self._lookup(ssa.operand_ids[1])
 
-        val_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
+        val_dtype = native["slot_dtypes"][0]
         is_int = not (val_dtype.startswith("fp") or val_dtype.startswith("bf"))
         is_i64 = val_dtype in ("i64", "u64", "ui64")
         # uint8/16/32/64 are the SIGNLESS i8/i16/i32/i64 in Triton — a signed compare picks the
@@ -1590,7 +2215,8 @@ class _ReduceScanMixin:
         # ALL widths incl. 64-bit (the earlier `not is_i64` gate here was itself the un-fixed
         # 64-bit twin: uint64 argmax/argmin computed signed). The `or val_dtype in (u64,ui64)`
         # keeps any literal-name path unsigned too.
-        _unsigned = is_int and self._reduce_is_unsigned_minmax(ssa.region_ops)
+        is_max, proved_unsigned = argminmax
+        _unsigned = is_int and proved_unsigned
         _u64 = is_i64 and (_unsigned or val_dtype in ("u64", "ui64"))
         # 64-bit int values compare at full width (else the high word truncates and the
         # arg index is wrong) — Triton-lens re-audit 2026-06-25.
@@ -1603,7 +2229,6 @@ class _ReduceScanMixin:
         else:
             msl_val_type, val_shared_dtype = "int", "i32"
 
-        is_max = self._detect_reduce_direction(ssa)
         cmp_op = ">" if is_max else "<"
         identity = "(-INFINITY)" if is_max and not is_int else "INFINITY"
         if is_int:
@@ -1792,7 +2417,17 @@ class _ReduceScanMixin:
                     return True
         return False
 
-    def _lower_reduce_2d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
+    def _lower_reduce_2d(
+        self,
+        ssa,
+        input_var,
+        axis,
+        combine_op,
+        msl_type,
+        shared_dtype,
+        input_shape,
+        input_dtype,
+    ):
         """Lower a 2D axis-specific reduction.
 
         For axis=1 on (M, N): each of M rows sums its N values.
@@ -1834,8 +2469,7 @@ class _ReduceScanMixin:
         # shared-memory staging/result reuse corrupts iterations 2+ so every row collapses
         # to the first row's value (reduce-fuzzer: T=1 fp16 correct, T>=2 WRONG; fp32 fine
         # at any T). Refuse fp16/bf16 in-loop 2-D reduces; fp32 + no-loop are unaffected.
-        _in_dt = self.env_types.get(ssa.operand_ids[0], "fp32") if ssa.operand_ids else "fp32"
-        if getattr(self, "_control_flow_depth", 0) > 0 and _in_dt in ("fp16", "bf16"):
+        if getattr(self, "_control_flow_depth", 0) > 0 and input_dtype in ("fp16", "bf16"):
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
@@ -1917,12 +2551,16 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[lid * {N}u + j];")
             self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
-            self.kb.raw_line(f"        {result_shared}[lid] = acc;")
+            self.kb.raw_line(f"        {result_var} = acc;")
             self.kb.raw_line(f"    }}")
+            # The scratch allocator may alias input and result storage. A
+            # completed read in ONE row is not completion in every other row.
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    if (lid < {M}u) {result_shared}[lid] = {result_var};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # All threads read their row's result.
             # Row-major: threads [0..N-1] in row 0, [N..2N-1] in row 1.
-            self.kb.raw_line(f"    {result_var} = {result_shared}[lid / {N}u];")
+            self.kb.raw_line(f"    {result_var} = (lid < {total}u) ? {result_shared}[lid / {N}u] : {identity};")
             # Barrier AFTER the broadcast read: result_shared may alias the input shared
             # array (existing_shared reuse), and a following op that re-stages it (e.g. a
             # fused tt.scan's `shared[lid] = ...`) would otherwise race this read and a tail
@@ -1939,11 +2577,13 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[i * {N}u + lid];")
             self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
-            self.kb.raw_line(f"        {result_shared}[lid] = acc;")
+            self.kb.raw_line(f"        {result_var} = acc;")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    if (lid < {N}u) {result_shared}[lid] = {result_var};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # All threads read their column's result
-            self.kb.raw_line(f"    {result_var} = {result_shared}[lid % {N}u];")
+            self.kb.raw_line(f"    {result_var} = (lid < {total}u) ? {result_shared}[lid % {N}u] : {identity};")
             # Barrier after the broadcast read — see the axis==1 branch (guards the
             # result_shared/input-shared alias against a following re-stage, e.g. a scan).
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -1964,7 +2604,17 @@ class _ReduceScanMixin:
         for _rid in ssa.result_ids or []:
             self._register_1d_layout(_rid, _layout)
 
-    def _lower_reduce_3d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
+    def _lower_reduce_3d(
+        self,
+        ssa,
+        input_var,
+        axis,
+        combine_op,
+        msl_type,
+        shared_dtype,
+        input_shape,
+        result_facts,
+    ):
         """Lower a 3D axis-specific reduction.
 
         For (M, N, K) tensor reducing along axis:
@@ -2102,9 +2752,21 @@ class _ReduceScanMixin:
         # Downstream reduces/stores use this to re-stage data correctly when
         # the logical mapping is not lid → lid.
         self._bcast_layout[ssa.id] = f"({read_idx})"
-        self._register_bcast_layout_by_type(ssa.type_str, tuple(result_dims), f"({read_idx})")
+        self._register_bcast_layout_by_native(
+            result_facts, tuple(result_dims), f"({read_idx})"
+        )
 
-    def _lower_reduce_nd(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
+    def _lower_reduce_nd(
+        self,
+        ssa,
+        input_var,
+        axis,
+        combine_op,
+        msl_type,
+        shared_dtype,
+        input_shape,
+        result_facts,
+    ):
         """Lower an axis-specific reduction for N-D tensors (N >= 4).
 
         Used by tl.sort's bitonic decomposition, which reshapes to (2,)*n and
@@ -2297,7 +2959,9 @@ class _ReduceScanMixin:
         # store, make_range rewrite) use this to re-stage data correctly.
         if result_read_idx is not None and nr >= 2:
             self._bcast_layout[ssa.id] = f"({result_read_idx})"
-            self._register_bcast_layout_by_type(ssa.type_str, tuple(result_shape), f"({result_read_idx})")
+            self._register_bcast_layout_by_native(
+                result_facts, tuple(result_shape), f"({result_read_idx})"
+            )
 
     def _lower_scan(self, ssa: SSAValue):
         """tt.scan → prefix scan via shared memory.
@@ -2320,11 +2984,21 @@ class _ReduceScanMixin:
         if not ssa.operand_ids:
             return
 
-        # Get input shape from type string
+        # The wide register-array route is authorized by native per-result
+        # metadata, never by a first-result type string or mutable env_types.
+        # The legacy <=1024 path remains available while the broader consumer
+        # migration proceeds one call site at a time.
+        native_contract = getattr(self, "_scan_native_contracts", {}).get(ssa.id)
+
+        # Get the legacy-path input shape. For a proved wide scan, replace it
+        # with the native contract below before any dimensions are consumed.
         is_1d = False
         input_shape = _extract_shape(ssa.type_str)
         if not input_shape or len(input_shape) < 2:
             input_shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
+        if native_contract is not None:
+            input_shape = native_contract["shape"]
+            axis = native_contract["axis"]
         if not input_shape or len(input_shape) < 2:
             # 1D tensor: treat as (1, size) and scan along axis=1
             sz = input_shape[0] if input_shape else self.effective_block_size
@@ -2335,6 +3009,21 @@ class _ReduceScanMixin:
         M, N = input_shape[0], input_shape[1]
         total = M * N
 
+        # Packet 325: the prescan may have proved an exact flattened
+        # multi-element-per-thread ownership map for this whole scan cone.
+        # The array path validates every remaining dynamic contract itself;
+        # the legacy one-thread-per-element path below stays byte-untouched.
+        _arrays = (
+            [self.env_array.get(o) for o in ssa.operand_ids]
+            if getattr(self, "_scan_mept_shape", None) is not None
+            else [None] * n_values
+        )
+        if any(a is not None for a in _arrays):
+            self._lower_scan_array(
+                ssa, input_shape, axis, reverse, n_values, _arrays, native_contract
+            )
+            return
+
         # The scan stages every element through threadgroup memory with one thread
         # per element (`if (lid < total) shared[lid] = ...` below) and then reads it
         # back in the prefix sweep. Metal caps a threadgroup at 1024 threads, so for
@@ -2344,6 +3033,14 @@ class _ReduceScanMixin:
         # The MSL scan has no multi-element-per-thread path, so refuse loudly.
         if total > 1024:
             from triton_msl.errors import MetalNonRecoverableError
+
+            native_error = getattr(self, "_scan_native_errors", {}).get(ssa.id)
+            if native_error is not None:
+                raise MetalNonRecoverableError(
+                    f"Refusing wide tt.scan because its native per-result metadata "
+                    f"contract is unproved: {native_error}",
+                    op_name="tt.scan",
+                ) from None
 
             raise MetalNonRecoverableError(
                 f"Refusing a {total}-element scan (tl.cumsum / associative_scan): "
@@ -2508,5 +3205,244 @@ class _ReduceScanMixin:
             self.env[ssa.id] = acc_vars_out[0]
             self.env_types[ssa.id] = slot_shared[0]
             self.env_shapes[ssa.id] = input_shape
+
+    def _lower_scan_array(
+        self, ssa, input_shape, axis, reverse, n_values, arrays, native_contract
+    ):
+        """Lower a proved wide scan over contiguous flat register ownership.
+
+        Each physical thread owns ``width`` adjacent flattened elements.
+        Values are staged once per slot, then a Hillis-Steele sweep replays
+        the source region at power-of-two distances.  All shape, ownership,
+        type, arity, uniformity and total-threadgroup-memory checks fail
+        closed here before an incomplete shader can be emitted.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        if native_contract is None:
+            raise MetalNonRecoverableError(
+                "tt.scan register-array lowering requires a native per-result contract",
+                op_name="tt.scan",
+            )
+
+        M, N = input_shape[0], input_shape[1]
+        total = M * N
+        width = getattr(self, "_scan_mept_width", 0)
+        dispatch = self.kb.block_size
+        if width <= 1 or dispatch * width != total:
+            raise MetalNonRecoverableError(
+                f"tt.scan: {total} logical elements are not an exact "
+                f"{dispatch}-thread x {width}-slot flattened cover; refusing.",
+                op_name="tt.scan",
+            )
+        proved_shape = tuple(getattr(self, "_scan_mept_shape", ()))
+        shape_matches = tuple(input_shape) == proved_shape or (
+            len(proved_shape) == 1 and tuple(input_shape) == (1, proved_shape[0])
+        )
+        if not shape_matches:
+            raise MetalNonRecoverableError(
+                "tt.scan: the operand shape differs from the shape whose flat "
+                "ownership was proved; refusing.",
+                op_name="tt.scan",
+            )
+        if axis not in (0, 1):
+            raise MetalNonRecoverableError(
+                f"tt.scan: wide rank-2 scan axis {axis} is unsupported; refusing.",
+                op_name="tt.scan",
+            )
+
+        # Every tensor slot must either carry the exact register-array width,
+        # or be a syntactic splat (uniform across every logical element).
+        for operand, array in zip(ssa.operand_ids, arrays):
+            if array is not None and array[1] != width:
+                raise MetalNonRecoverableError(
+                    "tt.scan: operand register arrays disagree on the proved "
+                    "per-thread width; refusing.",
+                    op_name="tt.scan",
+                )
+            if array is None and operand not in self._is_splat:
+                raise MetalNonRecoverableError(
+                    "tt.scan: a non-array operand is not proven uniform across "
+                    "the tile; refusing.",
+                    op_name="tt.scan",
+                )
+
+        block_args = list((ssa.attrs or {}).get("block_arg_ids") or [])
+        returns = [b for b in (ssa.region_ops or []) if b.op == "tt.scan.return"]
+        if len(block_args) != 2 * n_values or len(returns) != 1:
+            raise MetalNonRecoverableError(
+                "tt.scan: combine-region block-argument/terminator arity is not exact; refusing.",
+                op_name="tt.scan",
+            )
+        return_ids = list(returns[0].operand_ids or [])
+        if len(return_ids) != n_values:
+            raise MetalNonRecoverableError(
+                "tt.scan: combine-region return arity does not match its slots; refusing.",
+                op_name="tt.scan",
+            )
+
+        known_dtypes = {
+            "fp16", "bf16", "fp32", "fp64",
+            "i1", "i8", "u8", "ui8", "i16", "u16", "ui16",
+            "i32", "u32", "ui32", "i64", "u64", "ui64",
+        }
+        slot_dtypes = []
+        slot_msl = []
+        slot_shared = []
+        for dtype in native_contract["slot_dtypes"]:
+            if dtype not in known_dtypes:
+                raise MetalNonRecoverableError(
+                    f"tt.scan: slot dtype {dtype!r} has no proved staging width; refusing.",
+                    op_name="tt.scan",
+                )
+            msl_type, shared_type = self._reduce_acc_msl_type(dtype)
+            slot_dtypes.append(dtype)
+            slot_msl.append(msl_type)
+            slot_shared.append(shared_type)
+
+        # Static threadgroup arrays coexist for the entire kernel.  Account
+        # for arrays already declared by earlier operations and for alignment
+        # padding; equality is refused because the 32 KiB limit leaves no
+        # margin for an unmodelled compiler allocation.
+        type_layout = {
+            "bool": (1, 1), "char": (1, 1), "uchar": (1, 1),
+            "i1": (1, 1), "i8": (1, 1), "u8": (1, 1), "ui8": (1, 1),
+            "half": (2, 2), "short": (2, 2), "ushort": (2, 2),
+            "fp16": (2, 2), "i16": (2, 2), "u16": (2, 2), "ui16": (2, 2),
+            "float": (4, 4), "int": (4, 4), "uint": (4, 4),
+            "fp32": (4, 4), "i32": (4, 4), "u32": (4, 4), "ui32": (4, 4),
+            "long": (8, 8), "ulong": (8, 8), "double": (8, 8),
+            "fp64": (8, 8), "i64": (8, 8), "u64": (8, 8), "ui64": (8, 8),
+        }
+
+        def _allocation_bytes(entries):
+            cursor = 0
+            for _name, dtype, count in entries:
+                layout = type_layout.get(dtype)
+                if layout is None or not isinstance(count, int) or count < 0:
+                    raise MetalNonRecoverableError(
+                        f"tt.scan: cannot prove threadgroup allocation for {dtype!r}[{count!r}]; refusing.",
+                        op_name="tt.scan",
+                    )
+                size, alignment = layout
+                cursor = ((cursor + alignment - 1) // alignment) * alignment
+                cursor += size * count
+            return cursor
+
+        prospective = list(getattr(self.kb, "_threadgroup_arrays", []))
+        prospective.extend((f"scan-slot-{i}", slot_shared[i], total) for i in range(n_values))
+        allocation = _allocation_bytes(prospective)
+        if allocation >= 32768:
+            raise MetalNonRecoverableError(
+                f"Refusing a {total}-element scan: all live static threadgroup "
+                f"arrays need {allocation} bytes, meeting or exceeding the 32 KiB "
+                "budget. Reduce the tile or slot count.",
+                op_name="tt.scan",
+            )
+
+        shared_names = []
+        for i in range(n_values):
+            name = f"scan_shared_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(name, dtype=slot_shared[i], size=total)
+            shared_names.append(name)
+
+        for i, array in enumerate(arrays):
+            cast = f"({slot_msl[i]})" if slot_dtypes[i] == "bf16" else ""
+            source = array[0] if array is not None else self._lookup(ssa.operand_ids[i])
+            for k in range(width):
+                value = f"{source}[{k}]" if array is not None else source
+                self.kb.raw_line(
+                    f"    {shared_names[i]}[lid * {width}u + {k}u] = {cast}{value};"
+                )
+        self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        if axis == 1:
+            length, stride = N, 1
+            position = lambda index: f"({index} % {N}u)"
+        else:
+            length, stride = M, N
+            position = lambda index: f"({index} / {N}u)"
+
+        temporary = [self._next_var("scan_tmp") for _ in range(n_values)]
+        for i in range(n_values):
+            self.kb.raw_line(f"    {slot_msl[i]} {temporary[i]}[{width}];")
+        left = [self._next_var("scan_lhs") for _ in range(n_values)]
+        right = [self._next_var("scan_rhs") for _ in range(n_values)]
+
+        self.kb.raw_line(f"    for (uint scan_d = 1u; scan_d < {length}u; scan_d <<= 1u) {{")
+        self.kb.raw_line(f"        for (uint scan_k = 0u; scan_k < {width}u; scan_k++) {{")
+        self.kb.raw_line(f"            uint scan_idx = lid * {width}u + scan_k;")
+        pos = position("scan_idx")
+        if reverse:
+            self.kb.raw_line(f"            bool scan_has = ({length - 1}u - {pos}) >= scan_d;")
+            self.kb.raw_line(f"            uint scan_src = scan_idx + scan_d * {stride}u;")
+        else:
+            self.kb.raw_line(f"            bool scan_has = {pos} >= scan_d;")
+            self.kb.raw_line(f"            uint scan_src = scan_idx - scan_d * {stride}u;")
+        for i in range(n_values):
+            current = self._next_var("scan_cur")
+            neighbour = self._next_var("scan_neighbour")
+            self.kb.raw_line(
+                f"            {slot_msl[i]} {current} = ({slot_msl[i]}){shared_names[i]}[scan_idx];"
+            )
+            self.kb.raw_line(
+                f"            {slot_msl[i]} {neighbour} = scan_has ? "
+                f"({slot_msl[i]}){shared_names[i]}[scan_src] : {current};"
+            )
+            # Reverse means scan the reversed sequence and flip the result
+            # back.  At either direction's Hillis-Steele step the earlier
+            # value in traversal order is therefore the neighbour.  This is
+            # observable for associative but noncommutative combiners such as
+            # get-first (reverse must repeat the original row's last value).
+            self.kb.raw_line(f"            {slot_msl[i]} {left[i]} = {neighbour};")
+            self.kb.raw_line(f"            {slot_msl[i]} {right[i]} = {current};")
+            self.kb.raw_line(f"            {temporary[i]}[scan_k] = {current};")
+        self.kb.raw_line("            if (scan_has) {")
+        for i in range(n_values):
+            self.env[block_args[i]] = left[i]
+            self.env_types[block_args[i]] = slot_dtypes[i]
+            self.env[block_args[n_values + i]] = right[i]
+            self.env_types[block_args[n_values + i]] = slot_dtypes[i]
+        for body_op in ssa.region_ops or []:
+            if body_op.op != "tt.scan.return":
+                self._lower_op(body_op)
+        for i, return_id in enumerate(return_ids):
+            self.kb.raw_line(
+                f"                {temporary[i]}[scan_k] = {self._lookup(return_id)};"
+            )
+        self.kb.raw_line("            }")
+        self.kb.raw_line("        }")
+        self.kb.raw_line("        threadgroup_barrier(mem_flags::mem_threadgroup);")
+        for i in range(n_values):
+            self.kb.raw_line(
+                f"        for (uint scan_k = 0u; scan_k < {width}u; scan_k++) "
+                f"{shared_names[i]}[lid * {width}u + scan_k] = {temporary[i]}[scan_k];"
+            )
+        self.kb.raw_line("        threadgroup_barrier(mem_flags::mem_threadgroup);")
+        self.kb.raw_line("    }")
+
+        outputs = []
+        for i in range(n_values):
+            expressions = [
+                f"({slot_msl[i]}){shared_names[i]}[lid * {width}u + {k}u]"
+                for k in range(width)
+            ]
+            outputs.append(self._var_array("scan_res", expressions, slot_msl[i]))
+        self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        result_ids = list(ssa.result_ids or [])
+        if not result_ids and n_values == 1:
+            result_ids = [ssa.id]
+        if len(result_ids) != n_values:
+            raise MetalNonRecoverableError(
+                "tt.scan: result arity does not match the proved slot count; refusing.",
+                op_name="tt.scan",
+            )
+        for i, result_id in enumerate(result_ids):
+            self.env[result_id] = outputs[i]
+            self.env_array[result_id] = (outputs[i], width, slot_msl[i])
+            self.env_types[result_id] = slot_dtypes[i]
+            self.env_shapes[result_id] = input_shape
 
     # -- Shared memory ops (ttg.local_alloc / ttg.local_load) --

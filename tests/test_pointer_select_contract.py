@@ -1,8 +1,7 @@
-"""Do not turn selected addresses into loaded data and cast it back to a pointer.
+"""Select addresses without turning them into loaded values.
 
-Baseline bites are LOWERING ONLY: its emitted atomic addresses are unsafe to
-execute. The GPU witness was already recorded in review203. Numerical select
-controls remain required capability; pointer selection is an explicit refusal.
+The previous numeric fallback could feed loaded data to a memory consumer. The
+contract covers lowering independently and executes every consumer family.
 """
 import importlib
 from pathlib import Path
@@ -12,7 +11,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton_msl.errors import MetalNonRecoverableError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_fa_bwd_routing import _build_lowerer
@@ -50,12 +48,11 @@ def _selected_value(X, Y, O, N: tl.constexpr):
 
 @pytest.mark.parametrize('dtype', ['i32', 'fp32'])
 @pytest.mark.parametrize('scalar', [False, True], ids=['tensor', 'scalar'])
-@pytest.mark.parametrize('consumer', range(4), ids=['load', 'store', 'rmw', 'cas'])
-def test_pointer_select_lowering_refuses(dtype, scalar, consumer):
+def test_pointer_select_lowering_preserves_address(dtype, scalar):
     signature = {name: '*' + dtype for name in ('X', 'Y', 'O')}
-    lowerer = _build_lowerer(_selected_pointer, signature, {'N': 8, 'SCALAR': scalar, 'CONSUMER': consumer})
-    with pytest.raises(MetalNonRecoverableError, match='pointer-valued arith.select'):
-        lowerer.lower()
+    text = _build_lowerer(
+        _selected_pointer, signature, {'N': 8, 'SCALAR': scalar, 'CONSUMER': 0}).lower()
+    assert 'volatile device' in text and '?' in text and 'UNSUPPORTED' not in text
 
 
 @pytest.mark.parametrize('dtype', ['i32', 'fp32'])
@@ -91,4 +88,34 @@ def test_value_select_gpu_computes_exactly(fresh, dtype):
     _selected_value[(1,)](x_cpu.to('mps'), y_cpu.to('mps'), out, N=8)
     torch.mps.synchronize()
     assert torch.equal(out.cpu(), torch.where(torch.arange(8) % 2 == 0, x_cpu, y_cpu))
+    assert fresh == ['select']
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='Metal GPU required')
+@pytest.mark.parametrize('consumer', range(4), ids=['load', 'store', 'rmw', 'cas'])
+def test_pointer_select_gpu_targets_selected_address(fresh, consumer):
+    if consumer == 3:
+        x_cpu = torch.ones(8, dtype=torch.int32)
+        y_cpu = torch.ones(8, dtype=torch.int32)
+    else:
+        x_cpu = torch.arange(8, dtype=torch.int32)
+        y_cpu = x_cpu + 20
+    x, y = x_cpu.to('mps'), y_cpu.to('mps')
+    out = torch.full((8,), -99, dtype=torch.int32, device='mps')
+    _selected_pointer[(1,)](x, y, out, N=8, SCALAR=False, CONSUMER=consumer)
+    torch.mps.synchronize()
+    selected = torch.where(torch.arange(8) % 2 == 0, x_cpu, y_cpu)
+    if consumer == 0:
+        assert torch.equal(out.cpu(), selected)
+    elif consumer == 1:
+        assert torch.equal(x.cpu(), torch.where(torch.arange(8) % 2 == 0, 7, x_cpu))
+        assert torch.equal(y.cpu(), torch.where(torch.arange(8) % 2 != 0, 7, y_cpu))
+    elif consumer == 2:
+        assert torch.equal(out.cpu(), selected)
+        assert torch.equal(x.cpu(), torch.where(torch.arange(8) % 2 == 0, x_cpu + 3, x_cpu))
+        assert torch.equal(y.cpu(), torch.where(torch.arange(8) % 2 != 0, y_cpu + 3, y_cpu))
+    else:
+        assert torch.equal(out.cpu(), selected)
+        assert torch.equal(x.cpu(), torch.where(torch.arange(8) % 2 == 0, 2, x_cpu))
+        assert torch.equal(y.cpu(), torch.where(torch.arange(8) % 2 != 0, 2, y_cpu))
     assert fresh == ['select']

@@ -2,7 +2,9 @@
 square + non-square incl. N a multiple of 32 but not 128, K a non-128 multiple
 of 8) match torch AND match the flag-off (generic) result. Serial GPU."""
 
-import os, pytest
+from tests.cache_helpers import fresh_compiler_caches
+
+import pytest
 
 try:
     import torch, triton, triton.language as tl
@@ -36,7 +38,7 @@ def mm(
 def _run(M, N, K, dtype, flag, monkeypatch):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", flag)
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     torch.manual_seed(0)
     A = torch.randn(M, K, device="mps", dtype=dtype)
     B = torch.randn(K, N, device="mps", dtype=dtype)
@@ -103,7 +105,7 @@ def mm_f16(
 def _run_f16out(M, N, K, flag, monkeypatch):
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", flag)
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     torch.manual_seed(0)
     A = torch.randn(M, K, device="mps", dtype=torch.float16)
     B = torch.randn(K, N, device="mps", dtype=torch.float16)

@@ -29,6 +29,40 @@ requires_triton = pytest.mark.skipif(not HAS_TRITON, reason="Triton not installe
 requires_metal = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 
 
+def _attach_native_test_results(lowerer, raw_types):
+    """Give direct-lowering fixtures the native facts a real walker supplies."""
+    from triton_msl.codegen.mlir_walker import SSAValue
+    from triton_msl.codegen.result_metadata import ResultMeta, parse_type_facts
+
+    owner_id = 1
+    for value_id, raw_type in raw_types.items():
+        op = SSAValue(
+            id=value_id,
+            name=f"r{value_id}",
+            op="test.native_value",
+            operand_ids=[],
+            attrs={},
+            type_str=raw_type,
+            elem_type="f32",
+            is_tensor=raw_type.startswith("tensor<"),
+            result_ids=[value_id],
+        )
+        lowerer.graph.ops.append(op)
+        lowerer.graph.result_meta[value_id] = ResultMeta(
+            value_id=value_id,
+            type=parse_type_facts(raw_type),
+            kind="result",
+            producer_id=value_id,
+            result_index=0,
+            owner_id=owner_id,
+            function_name=lowerer.graph.func_name,
+        )
+    # A fixture may attach facts after exercising an earlier direct-lowering
+    # helper. Rebuild the ownership index just as a fresh lower() call would.
+    lowerer.__dict__.pop("_native_value_owners", None)
+    lowerer.__dict__.pop("_native_owner_ids", None)
+
+
 def _compile_to_ttgir(kernel_fn, sig, constexprs=None):
     """Compile a @triton.jit kernel through TTIR and TTGIR stages."""
     from triton.compiler import ASTSource
@@ -2187,9 +2221,9 @@ def test_lower_addptr_combines_scalar_parent_with_array_offset():
         assert base == "x_ptr"
         assert n == 3
         body = "\n".join(lowerer.kb._body_lines)
-        assert f"uint {off_name}[3];" in body
+        assert f"long {off_name}[3];" in body
         for i in range(3):
-            assert f"{off_name}[{i}] = base_off + off[{i}];" in body
+            assert f"{off_name}[{i}] = long(base_off) + long(off[{i}]);" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -2465,6 +2499,10 @@ def test_lower_store_array_path_scatters_to_env_ptr_array():
         lowerer.env_ptr_array[100] = ("out_ptr", "off", 3)
         lowerer.env[101] = "vals"
         lowerer.env_array[101] = ("vals", 3, "float")
+        _attach_native_test_results(
+            lowerer,
+            {100: "tensor<768x!tt.ptr<f32>>", 101: "tensor<768xf32>"},
+        )
 
         store_ssa = SSAValue(
             id=200,
@@ -2599,6 +2637,10 @@ def test_mept_round_trip_load_op_store():
             elem_type="f32",
             is_tensor=False,
         )
+        _attach_native_test_results(
+            lowerer,
+            {14: "tensor<512x!tt.ptr<f32>>", 13: "tensor<512xf32>"},
+        )
         lowerer._lower_store(store)
 
         body = "\n".join(lowerer.kb._body_lines)
@@ -2624,6 +2666,7 @@ def test_lower_store_array_path_with_array_mask():
     from triton_msl.codegen.generic_lowerer import GenericLowerer
     from triton_msl.codegen.mlir_walker import IRGraph, SSAValue
     from triton_msl.codegen.msl_emitter import KernelBuilder
+    from triton_msl.errors import MetalNonRecoverableError
 
     class _Options:
         num_warps = 4
@@ -2641,6 +2684,14 @@ def test_lower_store_array_path_with_array_mask():
         lowerer.env[102] = "msk"
         lowerer.env_array[102] = ("msk", 3, "bool")
         lowerer.env_is_mask[102] = True
+        _attach_native_test_results(
+            lowerer,
+            {
+                100: "tensor<768x!tt.ptr<f32>>",
+                101: "tensor<768xf32>",
+                102: "tensor<768xi1>",
+            },
+        )
 
         store = SSAValue(
             id=200,
@@ -2652,6 +2703,12 @@ def test_lower_store_array_path_with_array_mask():
             elem_type="f32",
             is_tensor=False,
         )
+        lowerer.env_array[102] = ("msk", 2, "bool")
+        with pytest.raises(
+            MetalNonRecoverableError, match="mask register-array width"
+        ):
+            lowerer._lower_store(store)
+        lowerer.env_array[102] = ("msk", 3, "bool")
         lowerer._lower_store(store)
 
         body = "\n".join(lowerer.kb._body_lines)
@@ -2665,12 +2722,13 @@ def test_lower_store_array_path_with_array_mask():
             os.environ["TRITON_MSL_MEPT"] = saved
 
 
-def test_lower_store_array_path_with_scalar_mask():
-    """Scalar mask broadcasts across all per-position writes."""
+def test_lower_store_array_path_with_uniform_tensor_mask():
+    """Only a proved tensor splat broadcasts across MEPT writes."""
     import os
     from triton_msl.codegen.generic_lowerer import GenericLowerer
     from triton_msl.codegen.mlir_walker import IRGraph, SSAValue
     from triton_msl.codegen.msl_emitter import KernelBuilder
+    from triton_msl.errors import MetalNonRecoverableError
 
     class _Options:
         num_warps = 4
@@ -2687,6 +2745,14 @@ def test_lower_store_array_path_with_scalar_mask():
         lowerer.env_array[101] = ("vals", 2, "float")
         lowerer.env[102] = "mask_scalar"
         lowerer.env_is_mask[102] = True
+        _attach_native_test_results(
+            lowerer,
+            {
+                100: "tensor<512x!tt.ptr<f32>>",
+                101: "tensor<512xf32>",
+                102: "tensor<512xi1>",
+            },
+        )
 
         store = SSAValue(
             id=200,
@@ -2698,6 +2764,12 @@ def test_lower_store_array_path_with_scalar_mask():
             elem_type="f32",
             is_tensor=False,
         )
+        with pytest.raises(
+            MetalNonRecoverableError, match="not a proved uniform splat"
+        ):
+            lowerer._lower_store(store)
+
+        lowerer._is_splat.add(102)
         lowerer._lower_store(store)
 
         body = "\n".join(lowerer.kb._body_lines)
@@ -3285,6 +3357,7 @@ def test_mept_reduce_uses_fold_when_operand_is_array():
     from triton_msl.codegen.generic_lowerer import GenericLowerer
     from triton_msl.codegen.mlir_walker import IRGraph, SSAValue
     from triton_msl.codegen.msl_emitter import KernelBuilder
+    from triton_msl.codegen.result_metadata import ResultMeta, parse_type_facts
 
     class _Options:
         num_warps = 4
@@ -3327,6 +3400,27 @@ def test_mept_reduce_uses_fold_when_operand_is_array():
             is_tensor=False,
             region_ops=[add_body],
         )
+        source = SSAValue(
+            id=50,
+            name="v50",
+            op="tt.load",
+            operand_ids=[],
+            attrs={},
+            type_str="tensor<512xf32, #ttg.blocked<{sizePerThread = [4], order = [0]}>>",
+            elem_type="f32",
+            is_tensor=True,
+        )
+        # This is a direct-lowering fixture rather than a walked module. Model
+        # the exact native ownership/type records that the walker always gives
+        # a real reduce; omitting them would test an impossible graph.
+        graph.ops = [source, red]
+        graph.result_meta = {
+            50: ResultMeta(50, parse_type_facts(source.type_str), "result", 50, 0, 1, "t"),
+            52: ResultMeta(52, parse_type_facts("f32"), "result", 52, 0, 1, "t"),
+            60: ResultMeta(60, parse_type_facts("f32"), "block_arg", None, 0, 2, "t"),
+            61: ResultMeta(61, parse_type_facts("f32"), "block_arg", None, 1, 2, "t"),
+            51: ResultMeta(51, parse_type_facts("f32"), "result", 51, 0, 2, "t"),
+        }
         lowerer._lower_reduce(red)
 
         body = "\n".join(lowerer.kb._body_lines)

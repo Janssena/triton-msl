@@ -10,6 +10,8 @@ on core language semantics the matmul/reduce campaign never touched:
       Now derives the dtype from the IR result type + has a long/ulong branch.
 """
 
+from tests.cache_helpers import fresh_compiler_caches
+
 import pytest
 import numpy as np
 import torch
@@ -72,9 +74,7 @@ if _HAS:
 
 
 def _clear():
-    import os
-
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
 
 
 @requires

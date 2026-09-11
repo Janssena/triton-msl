@@ -81,6 +81,27 @@ class MetalNotImplementedError(MetalCodegenError):
         super().__init__(full_msg, op_name=op_name, ssa_id=ssa_id, type_str=type_str)
 
 
+class MetalResourceError(MetalCodegenError):
+    """A numerically proved allocation exceeds this backend's hardware budget.
+
+    This is deliberately NOT a MetalNonRecoverableError. Only explicit resource
+    checks may construct it; message text, missing lowering support, unwritten
+    elements and unknown compiler/pipeline failures are not resource proofs.
+    The Triton compiler boundary maps this type alone to OutOfResources. Keeping
+    that dependency out of this module preserves standalone emitter use.
+    """
+
+    def __init__(self, required, limit, resource):
+        if type(required) is not int or type(limit) is not int or limit <= 0 or required <= limit:
+            raise ValueError("A resource failure requires integer required > positive limit")
+        if not isinstance(resource, str) or not resource:
+            raise ValueError("A resource failure requires an explicit resource name/unit")
+        self.required = required
+        self.limit = limit
+        self.resource = resource
+        super().__init__(f"Resource capacity exceeded: {resource}, required {required}, limit {limit}")
+
+
 class MetalNonRecoverableError(MetalCodegenError):
     """The lowerer recognized a kernel it cannot lower CORRECTLY, and knows
     the legacy fallback parser cannot either, so it refuses rather than emit
@@ -125,3 +146,23 @@ class MetalLaunchError(RuntimeError):
         if reason:
             parts.append(f"  reason: {reason}")
         super().__init__("\n".join(parts))
+
+
+class PostSubmitError(RuntimeError):
+    """A fast-path failure after invocation was attempted (enqueue may be uncertain).
+
+    Once a kernel is enqueued on the MPS stream its side effects (atomics, in-place
+    accumulation) are applied when the stream runs. Falling through to the host path
+    then RE-EXECUTES the kernel and double-applies those effects -- a silent wrong.
+    So a failure at or after submission must fail loud (propagate) rather than fall
+    through; only PRE-submission misses may safely fall through to the host path.
+    Wraps the original exception as ``__cause__``.
+    """
+
+
+class MetalDeviceAssertionError(PostSubmitError):
+    """A completed launch recorded a failed source assertion; outputs are invalid.
+
+    It is already a post-submission error, so dispatch may neither retry nor
+    replace its source message with an uncertain-submission diagnostic.
+    """

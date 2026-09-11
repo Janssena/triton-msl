@@ -44,6 +44,10 @@ def kda_attention(q, k, v, a, beta):
     Constraints: head dim is fixed at 64, ``T % 8 == 0`` (chunk size 8). One threadgroup
     per head. Accumulate and state are always fp32; fp16 inputs use a half-I/O kernel that
     casts on load and converts the MMA output on store (rel ~6e-4 vs an fp64 reference).
+    A head with non-finite inputs or exceptional chunk intermediates is recomputed
+    from zero by the scalar recurrence, within the same dispatch. This also covers
+    underflowed cumulative gate products. Its finite values can round differently
+    from the chunked path; neither path promises bitwise equality to the other.
     """
     import torch
 

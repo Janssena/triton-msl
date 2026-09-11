@@ -3,10 +3,12 @@ name: CI
 # GPU / Metal correctness is validated LOCALLY, not in hosted CI. Triton publishes no
 # macOS wheels, and building it from source on a GitHub-hosted macOS runner exceeds the
 # runner time limit (>60 min — it never finishes), so the Triton-dependent suite can't run
-# on hosted runners. Before pushing, run `pytest tests/` on Apple Silicon with a
-# source-built Triton (the suite is 1,968 / 0). See CONTRIBUTING.md "Testing". Hosted CI
-# therefore gates on lint only; for automated GPU coverage, register a self-hosted macOS
-# runner and add a `runs-on: [self-hosted, macOS, ARM64]` test job that runs `pytest tests/`.
+# on hosted runners. Before pushing, run BOTH local jobs on Apple Silicon with a
+# source-built Triton: python scripts/run_project_tests.py --output /absolute/new/evidence
+# Bare `pytest tests/` is correctness-only; floor success is not controlled performance
+# qualification. See CONTRIBUTING.md "Running Tests" and docs/VALIDATION_LANES.md.
+# Hosted CI gates on lint only. GPU runner deployment/qualification is separate;
+# a future trusted GPU job must schedule both lanes and keep their outcomes distinct.
 
 on:
   push:

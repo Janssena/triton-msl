@@ -1,3 +1,6 @@
+# _biased_fa and _biased_tri_fa adapt TriFast's forward kernel.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Local test adaptations and provenance: docs/TRIFAST_PROVENANCE.md.
 """End-to-end: a trifast-style BIASED / triangle-attention @triton.jit kernel is
 detected, routed to the biased tiled template, and computes correctly on Metal —
 where the generic path used to refuse (dot-result-scale guard). Plus correct-or-

@@ -82,7 +82,7 @@ def test_cache_hit_vanish_recovers(tmp_path, monkeypatch):
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path))
 
     import builtins
-    import triton_msl.backend.compiler as compiler_mod
+    import triton_msl.backend._cache_contract as cache_contract_mod
     from triton_msl.backend.compiler import MetalBackend, MetalOptions
 
     options = MetalOptions()
@@ -103,12 +103,12 @@ def test_cache_hit_vanish_recovers(tmp_path, monkeypatch):
             raise FileNotFoundError(f"simulated concurrent delete of {path}")
         return real_open(path, *args, **kwargs)
 
-    # compiler.py calls the builtin `open` with no module-level alias.  Injecting
+    # The validated cache-hit read now lives in _cache_contract.py. Injecting
     # `open` into the module's namespace shadows the builtin for code in that
     # module only (module globals are searched before builtins), so other code is
     # unaffected.  monkeypatch.setattr with raising=False adds the name, then
     # removes it on teardown.
-    monkeypatch.setattr(compiler_mod, "open", flaky_open, raising=False)
+    monkeypatch.setattr(cache_contract_mod, "open", flaky_open, raising=False)
 
     # 3) Second call hits the cache → first read raises FNF → must recompile and succeed.
     data2 = MetalBackend.make_metallib(_MINIMAL_MSL, dict(metadata), options)

@@ -72,10 +72,11 @@ def test_optout_matches_torch():
 class _RecordingRuntime:
     """Fake CompileShaderRuntime. Intercepts dispatch and records which MSL was used."""
 
-    def __init__(self, *, fail_dispatch=False):
+    def __init__(self, *, fail_library=False):
         self._unsupported = set()
+        self.compiled_msls = []
         self.dispatched_msls = []  # ordered list of MSL strings passed to dispatch
-        self._fail_dispatch = fail_dispatch
+        self._fail_library = fail_library
 
     def available(self):
         return True
@@ -87,12 +88,13 @@ class _RecordingRuntime:
         self._unsupported.add(msl)
 
     def get_library(self, msl):
+        self.compiled_msls.append(msl)
+        if self._fail_library:
+            raise RuntimeError("injected pre-invocation compile failure")
         return msl  # use the MSL source itself as the lib token
 
     def dispatch(self, lib, name, args, *, threads, group_size):
         self.dispatched_msls.append(lib)
-        if self._fail_dispatch:
-            raise RuntimeError("injected dispatch failure")
 
 
 def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None, monkeypatch=None):
@@ -186,7 +188,7 @@ def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
     assert sel_msl != fast_msl, "(2,4) must produce a different MSL from (4,4)"
 
     descriptor = (fast_msl, 3, 4, 5, 32, 128, "fp32", "fp32")
-    rt = _RecordingRuntime(fail_dispatch=False)
+    rt = _RecordingRuntime(fail_library=False)
 
     _run_fast_matmul_block(
         rt,
@@ -221,10 +223,10 @@ def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
 
 
 def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
-    """After a non-(4,4) sel_msl dispatch fails and is marked unsupported, a
-    second call to the fast-matmul block must NOT attempt dispatch again with
+    """After a non-(4,4) sel_msl compilation fails and is marked unsupported, a
+    second call to the fast-matmul block must NOT attempt compilation again with
     that same sel_msl variant.  Without the fix the is_unsupported gate checks
-    only fast_msl (still clean) so dispatch is retried on every call.
+    only fast_msl (still clean) so compilation is retried on every call.
 
     This test RED-s against the current _run_fast_matmul_block before the
     is_unsupported(sel_msl) guard is added.
@@ -236,9 +238,9 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
     assert sel_msl != fast_msl
 
     descriptor = (fast_msl, 3, 4, 5, 32, 128, "fp32", "fp32")
-    rt = _RecordingRuntime(fail_dispatch=True)
+    rt = _RecordingRuntime(fail_library=True)
 
-    # First call: dispatch is attempted, fails, sel_msl marked unsupported
+    # First call: compilation is attempted, fails, sel_msl marked unsupported
     _run_fast_matmul_block(
         rt,
         descriptor,
@@ -248,11 +250,11 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
         best_rrrc_override=(2, 4),
         monkeypatch=monkeypatch,
     )
-    assert rt.dispatched_msls, "first call must attempt dispatch"
+    assert rt.compiled_msls, "first call must attempt compilation"
     assert sel_msl in rt._unsupported, "first call must mark sel_msl unsupported"
-    first_call_dispatch_count = len(rt.dispatched_msls)
+    first_call_compilation_count = len(rt.compiled_msls)
 
-    # Second call: sel_msl is already unsupported — dispatch must NOT be attempted again
+    # Second call: sel_msl is already unsupported — compilation must NOT be attempted again
     _run_fast_matmul_block(
         rt,
         descriptor,
@@ -262,10 +264,10 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
         best_rrrc_override=(2, 4),
         monkeypatch=monkeypatch,
     )
-    assert len(rt.dispatched_msls) == first_call_dispatch_count, (
-        "Second call must NOT re-attempt dispatch of already-unsupported sel_msl. "
-        f"Expected {first_call_dispatch_count} total dispatch calls, "
-        f"got {len(rt.dispatched_msls)}.  The is_unsupported(sel_msl) guard is missing."
+    assert len(rt.compiled_msls) == first_call_compilation_count, (
+        "Second call must NOT re-attempt compilation of already-unsupported sel_msl. "
+        f"Expected {first_call_compilation_count} total compilation calls, "
+        f"got {len(rt.compiled_msls)}.  The is_unsupported(sel_msl) guard is missing."
     )
 
 
@@ -289,7 +291,7 @@ def test_dispatch_fast_matmul_importable_from_autotuning(monkeypatch):
 
 
 def test_mark_unsupported_targets_sel_msl_not_fast_msl(monkeypatch):
-    """When the selected non-(4,4) variant fails at dispatch, the except block
+    """When the selected non-(4,4) variant fails before invocation, the except block
     must call rt.mark_unsupported(sel_msl), NOT rt.mark_unsupported(fast_msl).
 
     Bug (driver.py line 667 pre-fix): 'rt.mark_unsupported(fast_msl)' is called
@@ -305,7 +307,7 @@ def test_mark_unsupported_targets_sel_msl_not_fast_msl(monkeypatch):
     assert sel_msl != fast_msl
 
     descriptor = (fast_msl, 3, 4, 5, 32, 128, "fp32", "fp32")
-    rt = _RecordingRuntime(fail_dispatch=True)  # dispatch raises -> except block fires
+    rt = _RecordingRuntime(fail_library=True)  # library build raises before invocation
 
     _run_fast_matmul_block(
         rt,
@@ -318,7 +320,8 @@ def test_mark_unsupported_targets_sel_msl_not_fast_msl(monkeypatch):
     )
 
     # The dispatch call is attempted (confirm the block actually reached dispatch)
-    assert rt.dispatched_msls, "dispatch must have been attempted before the failure"
+    assert rt.compiled_msls == [sel_msl], "the selected library build must be attempted"
+    assert not rt.dispatched_msls, "this is a proved pre-invocation miss"
 
     # CRITICAL: fast_msl (the (4,4) default / future fallback) must NOT be blacklisted.
     # If the bug is present, fast_msl IS in _unsupported and this assertion fails.

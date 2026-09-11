@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from test_fa_bwd_routing import _build_lowerer
+from triton_msl.backend.device_detect import _parse_chip
 from triton_msl.errors import MetalNonRecoverableError
 
 
@@ -166,6 +167,18 @@ def test_explicit_language_does_not_override_device_capability(monkeypatch):
         chip_family="M1", metal_version="3.1"))
     with pytest.raises(MetalNonRecoverableError, match="Metal"):
         _lowerer(version="3.2").lower()
+
+
+def test_detected_chip_family_normalization_reaches_ordered_atomic_gate(monkeypatch):
+    # Pin the producer/consumer coupling: device detection must keep the chip
+    # variant separate because the ordered-atomic gate accepts the normalized
+    # family token, not a display name such as "M4 Max".
+    family, variant = _parse_chip("Apple M4 Max")
+    assert (family, variant) == ("M4", "Max")
+    monkeypatch.setattr("triton_msl.backend.device_detect.get_device_info", lambda: SimpleNamespace(
+        chip_family=family, metal_version="3.2", metal_std_flag="-std=metal3.2"))
+    msl = _lowerer(version="3.2").lower()
+    assert msl.count("atomic_thread_fence(") == 2
 
 
 def test_relaxed_old_target_needs_no_fence():

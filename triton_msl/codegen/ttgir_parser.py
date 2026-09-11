@@ -894,8 +894,13 @@ class TTGIRParser:
         kb.declare_threadgroup_array("shared", dtype=primary_dtype, size=n_simd_groups)
 
         # Identity value for the reduction
-        identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}[reduce_op]
+        identity = {"sum": "-0.0f", "max": "-INFINITY", "min": "INFINITY"}[reduce_op]
         combine = {"sum": "+", "max": "max", "min": "min"}[reduce_op]
+
+        def initial_value(extent):
+            # Preserve the legacy callable's empty-sum convention, while an
+            # inserted identity for a nonempty sum must preserve signed zero.
+            return f"({extent} == 0 ? 0.0f : {identity})" if reduce_op == "sum" else identity
 
         # Check if there's a pre-reduce computation (e.g., exp, mul before sum)
         pre_reduce_op = self._find_pre_reduce_op(reduce_input_ssa)
@@ -907,7 +912,7 @@ class TTGIRParser:
             # Row-wise reduction: each program handles one row
             # pid indexes rows, reduce across n_cols columns
             kb._var("row", "pid", ty="uint")
-            kb._var("acc", identity, ty="float")
+            kb._var("acc", initial_value(n_cols_arg), ty="float")
             kb.raw_line(f"for (uint c = lid; c < {n_cols_arg}; c += {kb.block_size}u) {{")
             kb.indent()
             kb._var("idx", f"row * {n_cols_arg} + c", ty="uint")
@@ -924,7 +929,7 @@ class TTGIRParser:
             # Column-wise reduction: each program handles one column
             # pid indexes columns, reduce across n_rows rows
             kb._var("col", "pid", ty="uint")
-            kb._var("acc", identity, ty="float")
+            kb._var("acc", initial_value(n_rows_arg), ty="float")
             kb.raw_line(f"for (uint r = lid; r < {n_rows_arg}; r += {kb.block_size}u) {{")
             kb.indent()
             kb._var("idx", f"r * {n_cols_arg} + col", ty="uint")
@@ -939,7 +944,7 @@ class TTGIRParser:
 
         else:
             # Standard 1D reduction: each program reduces a contiguous block
-            kb._var("acc", identity, ty="float")
+            kb._var("acc", initial_value(n_arg), ty="float")
             kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
             kb.indent()
             kb._var("idx", f"pid * {n_arg} + i", ty="uint")

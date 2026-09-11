@@ -61,6 +61,7 @@ class CalledFunc:
     args: List[FuncArg]  # Function arguments
     ops: List[SSAValue]  # Body ops in topological order
     return_types: List[str]  # Return types (e.g., ["f32"] or ["f32", "f32"])
+    result_meta: Dict[int, ResultMeta] = field(default_factory=dict)
 
 
 @dataclass
@@ -1174,6 +1175,10 @@ class MLIRWalker:
                     args=args,
                     ops=ops,
                     return_types=return_types,
+                    result_meta={
+                        vid: meta for vid, meta in self._result_meta.items()
+                        if meta.function_name == func_name
+                    },
                 )
             )
 
@@ -1281,7 +1286,11 @@ class MLIRWalker:
         """Extract relevant attributes for an operation."""
         attrs = {}
 
-        if name == "tt.make_range":
+        if name == "tt.assert":
+            # This is a semantic StringAttr, never a substring parsed from a
+            # printed location, comment, or kernel name.
+            attrs["message"] = op.get_str_attr("message")
+        elif name == "tt.make_range":
             start = op.get_int_attr("start")
             end = op.get_int_attr("end")
             if start is not None:

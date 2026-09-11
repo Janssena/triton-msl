@@ -184,22 +184,40 @@ def test_ragged_lengths_stay_finite(lens):
 
 
 def _emitted_msl(dtype):
-    """Compile the kernel for ``dtype`` and return its emitted MSL."""
-    import glob
-    import os
+    """Exercise the lowering boundary, never a cached executable or temp file.
 
-    from triton_msl.backend.compiler import _get_cache_dir
+    The old newest-file search depended on the linker's disposable .metal input;
+    an outer JIT hit could also leave no file in this test's private cache. Build
+    this source's TTGIR afresh and inspect the actual generic lowerer's output.
+    Numeric allocation/overhang tests above remain independent GPU checks.
+    """
+    from triton._C.libtriton import ir
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton_msl.backend.compiler import MetalBackend
+    from triton_msl.codegen.generic_lowerer import GenericLowerer
+    from triton_msl.codegen.mlir_walker import walk_ttgir
 
-    _run(dtype, (48, 32), prime=False)
-    newest, newest_mtime = "", -1.0
-    for f in glob.glob(os.path.join(_get_cache_dir(), "**", "*"), recursive=True):
-        if os.path.isfile(f) and f.endswith((".metal", ".msl")):
-            t = open(f).read()
-            # fp16 and fp32 emit separate cache entries; take the most recent match so
-            # this returns the one just compiled rather than the other dtype's.
-            if "_varlen_overhang" in t and os.path.getmtime(f) > newest_mtime:
-                newest, newest_mtime = t, os.path.getmtime(f)
-    return newest
+    element = {torch.float16: "fp16", torch.float32: "fp32"}[dtype]
+    signature = {name: "*" + element for name in ("Q", "K", "V", "Out")}
+    signature.update({name: "*i32" for name in ("cu_q", "cu_k")})
+    signature.update({name: "i32" for name in (
+        "sqt", "sqh", "sqd", "skt", "skh", "skd", "svt", "svh", "svd",
+        "sot", "soh", "sod", "H", "GROUP", "max_seqlen",
+    )})
+    source = ASTSource(_varlen_overhang, signature=signature,
+                       constexprs={"SCALE": 1 / math.sqrt(64), "BM": 32, "BN": 32, "D": 64})
+    target = GPUTarget("metal", "apple-m4", 32)
+    backend = MetalBackend(target)
+    options = backend.parse_options({"num_warps": 4})
+    context = ir.context()
+    ir.load_dialects(context)
+    module = source.make_ir(target, options, backend.get_codegen_implementation(options),
+                            backend.get_module_map(), context)
+    metadata = {}
+    module = backend.make_ttir(module, metadata, options)
+    module = backend.make_ttgir(module, metadata, options)
+    return GenericLowerer(walk_ttgir(module, options), options).lower()
 
 
 @requires_mps
@@ -216,7 +234,7 @@ def test_emitted_msl_guards_every_staged_fill(dtype):
     import re
 
     src = _emitted_msl(dtype)
-    assert src, f"could not find the emitted MSL for _varlen_overhang ({dtype})"
+    assert src, f"lowering emitted no MSL for _varlen_overhang ({dtype})"
 
     fills = re.findall(r"^\s*(smem_\w+)\[_sa\] = (.+);$", src, re.M)
     assert fills, "expected cooperative staged fills in the emitted MSL"

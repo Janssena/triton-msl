@@ -20,6 +20,8 @@ failure here. A loud refusal is a PASS (the backend chose not to mis-compute).
 A non-refusal crash is a FAIL (cryptic failure is not the contract).
 """
 
+from tests.cache_helpers import fresh_compiler_caches
+
 import math
 import pytest
 import torch
@@ -37,12 +39,7 @@ _DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 
 def _clear():
-    import os
-    import shutil
-
-    # Clear ONLY the triton-msl codegen cache. Deleting the shared, content-addressed
-    # ~/.triton/cache per-test races sibling tests' in-flight pipelines (2026-06-22 re-audit).
-    shutil.rmtree(os.path.expanduser("~/.cache/triton_msl"), ignore_errors=True)
+    fresh_compiler_caches(globals())
 
 
 def _invariant(run, reference, dtype, *, must=None):

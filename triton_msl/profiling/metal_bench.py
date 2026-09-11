@@ -1,71 +1,138 @@
 """Metal-specific benchmarking using GPU timestamps.
 
-Uses MTLCommandBuffer.GPUStartTime/GPUEndTime for nanosecond-precision
-GPU timing. Falls back to wall-clock time if GPU timestamps are unavailable.
+Defaults to synchronized wall time. Explicit GPU timing or labeled automatic
+selection can use completed-command GPUStartTime/GPUEndTime.
 """
 
+import math
+import operator
 import time
 
 
-def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, **kwargs):
-    """Benchmark a function with GPU-precise timing.
+def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, synchronize=None,
+                   clock="wall", return_metadata=False, **kwargs):
+    """Benchmark one completed workload per sample, with an explicit clock.
 
     Compatible with Triton's benchmarker interface (registered via
     MetalDriver.get_benchmarker()).
 
-    Uses MTLCommandBuffer.GPUStartTime/GPUEndTime when the function
-    returns a command buffer, otherwise falls back to wall-clock timing.
+    Executes fn exactly once per warmup/sample, completing its work before
+    reading timestamps. The default scalar/list result ALWAYS measures wall time.
+    Automatic selection requires metadata and uses GPU time only if EVERY sample
+    has valid timestamps, otherwise the whole wall-time series. Explicit GPU
+    timing raises on unavailable timestamps; it never silently switches clocks.
+    Never relaunches a callback to obtain a fallback sample.
 
     Args:
         fn: Callable to benchmark. Should dispatch Metal work.
-            If it returns a MTLCommandBuffer, GPU timestamps are used.
+            A returned waitable command buffer must cover completion of ALL its
+            work, or synchronize must be provided to complete the remainder.
+            GPU/auto timing has a STRONGER caller contract: the returned buffer's
+            GPU interval must contain the entire workload. Returning just one of
+            several dispatched buffers undercounts and violates that contract;
+            use wall timing plus a completion callback for multi-buffer work.
+            The helper cannot discover undisclosed queues or buffers.
         quantiles: List of quantiles to return (e.g. [0.5, 0.2, 0.8]).
             If None, returns the median time.
         warmup: Number of warmup iterations.
         rep: Number of timed iterations.
+        synchronize: Optional completion callback for functions that do not
+            return a waitable command buffer. An explicitly supplied callback is
+            ALSO called after a returned buffer completes, so it can wait for
+            other queues/buffers. Defaults to MPS synchronization
+            when MPS is available, otherwise a no-op. Use a matching callback
+            for another asynchronous runtime. Run on an otherwise idle queue;
+            warmup=0 does not discard work queued before this invocation.
+        clock: "wall" (default), "gpu" (strict), or "auto" (requires metadata).
+        return_metadata: Return a dictionary containing value, clock, unit,
+            boundary, requested clock, sample counts and any fallback reason.
+            Measurement records must retain this dictionary, not strip its label.
 
     Returns:
-        If quantiles is None: median time in milliseconds.
-        Otherwise: list of times in ms corresponding to each quantile.
+        By default, a median or quantile list in milliseconds, preserving Triton's
+        benchmarker interface with a fixed wall clock. With return_metadata=True,
+        the same scalar/list is under "value" alongside the measurement boundary.
     """
-    # Warmup
+    warmup, rep = operator.index(warmup), operator.index(rep)
+    if warmup < 0 or rep <= 0:
+        raise ValueError("warmup must be nonnegative and rep must be positive")
+    if clock not in ("wall", "gpu", "auto"):
+        raise ValueError("clock must be wall, gpu or auto")
+    if clock == "auto" and not return_metadata:
+        raise ValueError("automatic clock selection requires return_metadata=True")
+    if quantiles is not None:
+        quantiles = list(quantiles)
+        if not quantiles or any(not math.isfinite(q) or not 0 <= q <= 1 for q in quantiles):
+            raise ValueError("quantiles must be a nonempty sequence in [0, 1]")
+    explicit_sync = synchronize is not None
+    if not explicit_sync:
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        synchronize = torch.mps.synchronize if torch is not None and torch.backends.mps.is_available() else lambda: None
+    if not callable(synchronize):
+        raise TypeError("synchronize must be callable")
+
+    def complete(result):
+        wait = getattr(result, "waitUntilCompleted", None)
+        if callable(wait):
+            wait()
+            error = getattr(result, "error", None)
+            failure = error() if callable(error) else None
+            if failure is not None:
+                raise RuntimeError(f"Metal benchmark command failed: {failure}")
+        if explicit_sync or not callable(wait):
+            synchronize()
+
     for _ in range(warmup):
-        fn()
+        complete(fn())
 
-    times = []
+    wall_times, gpu_times = [], []
     for _ in range(rep):
+        start = time.perf_counter()
         result = fn()
-        # If fn returns a command buffer, use GPU timestamps
-        if result is not None and hasattr(result, "GPUStartTime"):
-            gpu_start = result.GPUStartTime()
-            gpu_end = result.GPUEndTime()
-            if gpu_end > gpu_start:
-                times.append((gpu_end - gpu_start) * 1000.0)
-                continue
-        # Fallback: wall-clock timing (re-run since we already called fn)
-        if not times or (result is None or not hasattr(result, "GPUStartTime")):
-            # For wall-clock mode, we need to re-measure properly
-            start = time.perf_counter()
-            fn()
-            end = time.perf_counter()
-            times.append((end - start) * 1000.0)
+        complete(result)
+        wall_times.append((time.perf_counter() - start) * 1000.0)
+        if clock == "wall":
+            continue
+        gpu_start = getattr(result, "GPUStartTime", None)
+        gpu_end = getattr(result, "GPUEndTime", None)
+        if callable(gpu_start) and callable(gpu_end):
+            a, b = gpu_start(), gpu_end()
+            if math.isfinite(a) and math.isfinite(b) and 0 <= a < b:
+                gpu_times.append((b - a) * 1000.0)
 
-    times.sort()
+    gpu_valid = len(gpu_times) == rep
+    if clock == "gpu" and not gpu_valid:
+        raise ValueError("GPU clock requested but some timestamps are missing or invalid")
+    used_clock = "gpu" if clock != "wall" and gpu_valid else "wall"
+    times = sorted(gpu_times if used_clock == "gpu" else wall_times)
     if quantiles is None:
-        return times[len(times) // 2]
-
-    result = []
-    for q in quantiles:
-        idx = int(q * (len(times) - 1))
-        result.append(times[idx])
-    return result
+        value = times[len(times) // 2]
+    else:
+        value = [times[int(q * (len(times) - 1))] for q in quantiles]
+    if not return_metadata:
+        return value
+    return {
+        "value": value,
+        "clock": used_clock,
+        "requested_clock": clock,
+        "unit": "ms",
+        "boundary": ("entire-workload command buffer GPU start/end" if used_clock == "gpu"
+                     else "callback invocation through completion, including host overhead"),
+        "warmup": warmup,
+        "samples": rep,
+        "valid_gpu_timestamp_samples": len(gpu_times) if clock != "wall" else None,
+        "fallback_reason": ("missing_or_invalid_gpu_timestamps"
+                            if clock == "auto" and not gpu_valid else None),
+    }
 
 
 class MetalBenchmark:
     """GPU-timed benchmark runner using Metal command buffer timestamps.
 
-    Unlike metal_do_bench (which measures wall-clock time including CPU
-    overhead), this class measures pure GPU execution time using
+    This class directly owns its command buffers and measures GPU time using
     MTLCommandBuffer.GPUStartTime/GPUEndTime.
     """
 

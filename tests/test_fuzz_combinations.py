@@ -17,9 +17,9 @@ torch is the reference. Each runner returns (out, ref, canary_or_None, tol, desc
 or raises MetalNonRecoverableError (a clean refusal == pass).
 """
 
-import os
+from tests.cache_helpers import fresh_compiler_caches
+
 import random
-import shutil
 
 import pytest
 import torch
@@ -37,9 +37,7 @@ _SENT = 2048.0  # exactly representable in fp32/fp16/bf16, far from any randn va
 
 
 def _clear():
-    # Clear ONLY the triton-msl codegen cache (force re-codegen). Never delete the
-    # shared content-addressed ~/.triton/cache (it races sibling pipelines).
-    shutil.rmtree(os.path.expanduser("~/.cache/triton_msl"), ignore_errors=True)
+    fresh_compiler_caches(globals())
 
 
 # --------------------------------------------------------------------------- #

@@ -1,3 +1,6 @@
+# _bwd_kv_v_offsets_swapped is adapted from TriFast's _bwd_kv.
+# Copyright (c) 2025 Liam Atkinson; MIT License (third_party/trifast/LICENSE).
+# Source revision and local adaptations: docs/TRIFAST_PROVENANCE.md.
 """Regression: biased-FA backward must preserve ordered head/instance offsets."""
 
 import math

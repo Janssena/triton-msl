@@ -49,10 +49,11 @@ def _fallback_mode() -> str:
     """Return the fallback mode from TRITON_MSL_FALLBACK env var.
 
     Controls behavior when MSL codegen or Metal compilation fails:
-      "warn"   - emit a warning, then re-raise so Triton/torch.compile falls back (default)
+      "warn"   - emit a warning, then re-raise to the caller (default)
       "silent" - re-raise without a warning
       "error"  - re-raise with the original exception (no fallback hint in message)
 
+    This setting does not implement CPU fallback; that is the caller's policy.
     Caches the result to avoid repeated os.environ lookups.
     """
     global _cached_fallback_mode

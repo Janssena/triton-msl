@@ -1,5 +1,151 @@
 # Changelog
 
+## 0.3.0rc4 - 2026-09-11 (unpublished candidate)
+
+Supersedes the unpublished rc1–rc3 snapshots. The frozen 493 code passed 4,609 project tests
+(12 skips; four performance sentinels scheduled separately) and the 9,342-node upstream gate
+(5,780 passed / 3,562 skipped; exact baseline status identity). Its installed wheel passed
+84 acceptance tests and 27 after relocation; both portable validation scripts passed locally,
+not on an independent M1. This documentation-only update still needs artifact rebind/rebuild;
+no earlier archive hash or approval identifies a rebuilt wheel automatically.
+
+- Complete attempted-submission tracking across nested dispatch helpers, preventing fallback
+  replay after an uncertain or failed invocation. This supersedes the earlier hook-only repair.
+- Implement supported retained device assertions with a launch-local error flag, uniform stop
+  before guarded accesses, and host-visible failure before returning results. Unsupported forms
+  still refuse; assertion-bearing launches synchronize to inspect the flag.
+- Record measured latency increases versus earlier candidate 439: **+15.1%** for the
+  standalone retained-assertion workload and **+11.9%** for GPT-2 small. Both are open performance
+  alerts; the other nine tested workloads were within ±1.2%. These local paired comparisons
+  do not qualify historical throughput/speedup claims. GPT-2 has checks on **2 of 43** backend
+  launches; assertion waits and one changed execution width have not been cost-separated.
+- Recover distinct broadcast index expressions, including comparison/select-derived coordinates;
+  retain recursive rejection of unsupported assertions in callees.
+- Recover canonical grouped and N-fastest flat-grid matmul coordinates without replacing the
+  source grid or silently computing unlaunched tiles.
+- Bind runtime float scalars with their declared ABI. Recover issue #11's fp32 32×32 K-loop
+  matmul with runtime alpha/beta and column bias by replaying the source epilogue.
+- Recover PR #7's widened-P/V decode spelling at 8-/16-row tiles, keeping query and key bounds
+  distinct, including folded Q=1; preserve Q's fp16 scale-rounding point. Add source replay for
+  bias-without-LSE at 32×32 tiles, independent lengths, causal masking and fp16/fp32 inputs.
+  These are bounded source contracts, not arbitrary attention spellings or tile combinations.
+- Make the optional value-head dimension mean symmetric attention consistently when absent.
+- Strengthen exceptional-value tests, distinguishing exact classification from Welford's
+  order-robust admissible bounds; no universal error or exceptional-value guarantee is claimed.
+
+Thanks to Hocine Benkelaya / NeuroBrix for PRs #5–#7 and issues #8–#11, their reproducers and
+design observations. The implementation here is independently developed against the current
+compiler; reporter-derived regression kernels are identified in their test files. No contributor
+PR has been merged by this work. Earlier rc entries below are historical development snapshots,
+not evidence that their original repair drafts were complete.
+
+## 0.3.0rc3 - 2026-09-10
+
+Supersedes rc2 (never published). Independent review of rc2 found the dispatch fix and its
+coverage incomplete; this round closes them:
+
+- **Submission-boundary contract made complete and phase-aware.** A failure at/after a kernel is
+  submitted now fails loud across *every* fast-dispatch helper — elementwise, FlashAttention, MLA,
+  fast-matmul (incl. split-K's two dispatches), and the quantized helpers (incl. the per-group
+  fast→scalar fallback, which previously re-dispatched after a caught post-submit failure). A
+  genuine *pre-submission* eligibility miss still falls through to the host path; non-dispatchable
+  args (e.g. `triton.reinterpret` wrappers) are excluded before dispatch rather than via an
+  ambiguous dispatch exception.
+- **Regressions now cover the real driver path** (`[32]→[64]` atomic via a post-submit hook failure)
+  plus a per-helper phase matrix.
+- **Welford / variance exceptional-value tests strengthened** to source-derived per-output
+  classification (both mean and m2), a double-precision clean oracle, finite-sibling exactness, the
+  −Inf case, and checker self-validation.
+
+## 0.3.0rc2 - 2026-09-10
+
+Supersedes 0.3.0rc1 (never published). Two correctness additions found during rc1 validation:
+
+- **Dispatch fallback no longer double-applies.** A fast-path failure *after* a kernel was
+  enqueued (e.g. from the launch-exit hook) was silently re-run on the host path, double-applying
+  atomics and in-place updates. It now fails loud instead; pre-enqueue misses still fall through to
+  the correct host path. Pinned by `tests/test_dispatch_post_submit_no_double_apply.py`.
+- **Exceptional-value coverage for variance / Welford.** NaN / +-Inf inputs to layernorm stay
+  row-local (finite rows bit-identical) and single-pass Welford propagates non-finite inputs rather
+  than returning a plausible-but-wrong finite statistic. Pinned by
+  `tests/test_welford_nonfinite_inputs.py`.
+
+## 0.3.0rc1 - 2026-09-10
+
+**Release candidate, for validation only.** This is a pre-release: pip's default resolution
+excludes it unless you pass `--pre` or pin the version explicitly. It exists so the reporter of GitHub issue #4 and other
+Apple Silicon users can exercise the correctness work before the stable release. Read
+[docs/RELEASE_CANDIDATE_LIMITATIONS.md](docs/RELEASE_CANDIDATE_LIMITATIONS.md) first — it
+states plainly what has and has not been validated on this candidate.
+
+A correctness release. 0.2.0 was about capability and speed; this one is about being wrong
+less often, and refusing loudly where the compiler cannot prove it is right. 86 commits in
+`182c182..1ff716ae` plus a reviewed overlay, the majority of them fixes.
+
+### Reported by users
+
+- **GitHub issue #4 (trifast / AlphaFold triangle attention on M1)** — eight verified defects,
+  three of them silent wrongs. Seven are fixed, four of which moved from *refuse* to *works*:
+  reduction-extent argument naming, loop-carried pointers, the MEPT 2-D accumulator, the
+  constant QK-result score scale, multi-output copy-back, loop-carry layout propagation, and
+  the over-31-buffer-argument case. The eighth, shared key/value attention, was censused on
+  GPU across eight pointer spellings, both dtypes and three head dimensions, plus the exact
+  parameter-count signature the reporter described, against an independent double-precision
+  oracle. No wrong answer appeared; where the value role cannot be proved, the compiler
+  refuses. We do not have the reporter's original kernel, so their exact source is not claimed
+  covered.
+- The trifast kernels used as regression fixtures are attributed in
+  [docs/TRIFAST_PROVENANCE.md](docs/TRIFAST_PROVENANCE.md), with the upstream MIT notice
+  preserved at `third_party/trifast/LICENSE` and named in `project.license-files`.
+
+### Correctness
+
+- **Upstream conformance: 5,780 passed / 0 failed / 3,562 skipped** across all 9,342 nodes
+  (2026-09-10), every status identical to the recorded baseline. At 0.2.0 (2026-08-18) the same
+  suite's totals were 5,559 passed / 3,783 skipped. (Totals as recorded on those dates; no
+  node-by-node historical comparison between the two is attached.)
+- **Rank-3 and higher `tt.dot` recovery** closed the last conformance family: the upstream
+  ratchet went 151 remaining failures to 0 via batch-separable lowering.
+- **Host round-trip marshalling** is now storage-faithful for aliases, before-base offsets and
+  past-view strides — a P0 that could silently miscompute on any 2-D-grid kernel launched
+  through the host path.
+- Numerous silent wrongs closed across the dot, reduce, scan, atomic and FlashAttention
+  paths, each replaced by either a proven-correct lowering or an explicit refusal. Reductions
+  now preserve the sign of zero: a sum whose source produces `-0.0` no longer returns `+0.0`.
+- Per-result metadata replaced printed-type inspection throughout the lowerer, so lowering
+  decisions rest on ownership-proven facts rather than on text that may describe an alias.
+
+### Validation
+
+- Correctness and performance now run as **separate jobs**. `pytest tests/` selects
+  correctness only; the four hardware throughput floors run under
+  `python scripts/run_project_tests.py`. The floors themselves are unchanged. See
+  [docs/VALIDATION_LANES.md](docs/VALIDATION_LANES.md).
+- Project suite: **4,488 passed / 0 failed / 12 skipped**.
+
+### Known limits
+
+Performance numbers in this repository are **not qualified on this candidate**, the optional
+C++ route remains **unaudited and off by default**, and the absolute throughput floors target
+the development M4 Max rather than any M-series Mac. See the limitations document.
+
+
+## Unreleased
+
+### Compiler failure handling
+
+- Nonzero Metal compiler and linker exits now surface immediately on both binary
+  paths, including internal errors and failures without source-location diagnostics.
+  They are no longer silently retried as presumed transient failures. Bounded
+  recovery for explicitly observed missing-artifact races remains in place.
+
+### Build requirements
+
+- Source builds require `setuptools>=77.0.3` for PEP 639 license-file metadata.
+  Both the project license and the TriFast notice are included in distributions.
+  Build environments using an older setuptools must upgrade; the build must not
+  proceed while silently omitting the notices.
+
 ## 0.2.0 - 2026-08-18
 
 Major update. FlashAttention now **beats PyTorch SDPA** and is competitive with Apple's

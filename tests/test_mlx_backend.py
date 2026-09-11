@@ -21,6 +21,27 @@ import triton_msl.mlx as tmlx
 class TestMSLExtractor:
     """Unit tests for MSL body extraction."""
 
+    @pytest.mark.parametrize("thread_decl,body,unresolved", [
+        ("uint3 pid3 [[threadgroup_position_in_grid]]", "uint pid_m = pid3.x; o[pid_m] = x[pid_m];", "pid3"),
+        ("uint3 _lid3 [[thread_position_in_threadgroup]]", "uint lid = _lid3.x; o[lid] = x[lid];", "_lid3"),
+        ("uint lane [[thread_position_in_grid]]", "o[lane] = x[lane];", "lane"),
+        ("uint3 pid3 [[threadgroup_position_in_grid]], uint3 lid3 [[thread_position_in_threadgroup]]",
+         "uint pid = pid3.x; uint lid = lid3.x; o[pid * 32 + lid] = x[pid * 32 + lid]; // pid3 in comment\n", None),
+    ])
+    def test_discarded_thread_parameter_must_be_reconstructed(self, thread_decl, body, unresolved):
+        """Explicit output metadata must not admit an unbound signature name."""
+        from triton_msl.errors import MetalNonRecoverableError
+
+        source = "kernel void k(device float* x [[buffer(0)]], device float* o [[buffer(1)]], " + thread_decl + ") { " + body + " }"
+        if unresolved is not None:
+            with pytest.raises(MetalNonRecoverableError, match="discard live thread parameters " + unresolved):
+                extract_msl_for_mlx(source, [1])
+        else:
+            ext = extract_msl_for_mlx(source, [1])
+            assert ext.input_names == ["x"] and ext.output_names == ["o"]
+            assert "uint pid = __pid_x;" in ext.body
+            assert "uint lid = __lid_x;" in ext.body
+
     def test_extract_elementwise(self):
         """1D elementwise kernel: ptr args + scalar + thread vars."""
         msl = """

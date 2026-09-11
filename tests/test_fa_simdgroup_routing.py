@@ -29,3 +29,17 @@ def test_ineligible_noncontiguous():
     from triton_msl.codegen.generic_lowerer import _simd_fa_eligible
 
     assert _simd_fa_eligible(_info(contiguous=False)) is False
+
+
+def test_optional_value_width_has_one_meaning():
+    # Contributor PR #7 identified the inconsistent absent-key interpretation.
+    from triton_msl.codegen.generic_lowerer import _simd_fa_eligible, _v_head_dim_of
+
+    implicit = _info()
+    for value in (None, 128):
+        explicit = dict(implicit, v_head_dim=value)
+        assert _v_head_dim_of(explicit) == _v_head_dim_of(implicit) == 128
+        assert _simd_fa_eligible(explicit) == _simd_fa_eligible(implicit)
+    assert _v_head_dim_of(dict(implicit, head_dim=192, v_head_dim=128)) == 128
+    with pytest.raises(KeyError):
+        _v_head_dim_of({})

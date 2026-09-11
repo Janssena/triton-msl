@@ -85,10 +85,13 @@ def test_fail_open_on_missing_kernel_name():
     assert dispatch_flash_attention(rt, DESC, None, KARGS, 32, 8, 1) is False
 
 
-def test_dispatch_error_marks_unsupported_and_fails_open():
+def test_dispatch_error_fails_loud_without_blacklisting():
+    from triton_msl.errors import PostSubmitError
+
     rt = _FakeRT(raise_on_dispatch=True)
-    assert dispatch_flash_attention(rt, DESC, "fa_kernel", KARGS, 32, 8, 1) is False
-    assert DESC[1] in rt.unsupported  # marked so we don't retry a broken shader
+    with pytest.raises(PostSubmitError):
+        dispatch_flash_attention(rt, DESC, "fa_kernel", KARGS, 32, 8, 1)
+    assert not rt.unsupported  # no inference about submission from the error
 
 
 def test_skips_already_unsupported_msl():

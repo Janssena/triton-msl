@@ -3,7 +3,9 @@ aligned dims; every miss (misaligned, fp16-output, non-MPS) falls back to the
 generic metallib AND stays correct. Observes the dispatched kernel name via a
 spy on CompileShaderRuntime.dispatch. Serial GPU."""
 
-import os, pytest
+from tests.cache_helpers import fresh_compiler_caches, patch_live_singleton_method
+
+import pytest
 
 try:
     import torch, triton, triton.language as tl
@@ -52,15 +54,17 @@ def mm(
 def _spy(monkeypatch):
     from triton_msl.backend.driver import _get_compile_shader_runtime
 
-    rt = _get_compile_shader_runtime()
     seen = []
-    orig = rt.dispatch
+    def observe(_runtime, original):
+        def spy(lib, kernel_name, args, **kw):
+            seen.append(kernel_name)
+            return original(lib, kernel_name, args, **kw)
 
-    def spy(lib, kernel_name, args, **kw):
-        seen.append(kernel_name)
-        return orig(lib, kernel_name, args, **kw)
+        return spy
 
-    monkeypatch.setattr(rt, "dispatch", spy)
+    patch_live_singleton_method(
+        monkeypatch, _get_compile_shader_runtime, "dispatch", observe
+    )
     return seen
 
 
@@ -92,7 +96,7 @@ def _launch(M, N, K, dtype=torch.float32):
 
 @requires
 def test_aligned_fires_fast(monkeypatch):
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
     seen = _spy(monkeypatch)
@@ -104,7 +108,7 @@ def test_aligned_fires_fast(monkeypatch):
 @requires
 @pytest.mark.parametrize("M,N,K", [(258, 256, 256), (256, 258, 256), (256, 256, 252)])
 def test_misaligned_falls_back(monkeypatch, M, N, K):
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
     seen = _spy(monkeypatch)
@@ -121,7 +125,7 @@ def test_flag_off_skips_cached_descriptor(monkeypatch):
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
 
     # Phase 1: flag ON — compile + cache the descriptor; fast path may fire.
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     seen1 = _spy(monkeypatch)
     _launch(256, 256, 256)
@@ -132,15 +136,17 @@ def test_flag_off_skips_cached_descriptor(monkeypatch):
     # Reset the spy list by patching a fresh one (reuse the same rt object).
     from triton_msl.backend.driver import _get_compile_shader_runtime
 
-    rt = _get_compile_shader_runtime()
     seen2 = []
-    orig2 = rt.dispatch
+    def observe2(_runtime, original):
+        def spy2(lib, kernel_name, args, **kw):
+            seen2.append(kernel_name)
+            return original(lib, kernel_name, args, **kw)
 
-    def spy2(lib, kernel_name, args, **kw):
-        seen2.append(kernel_name)
-        return orig2(lib, kernel_name, args, **kw)
+        return spy2
 
-    monkeypatch.setattr(rt, "dispatch", spy2)
+    patch_live_singleton_method(
+        monkeypatch, _get_compile_shader_runtime, "dispatch", observe2
+    )
 
     A, B, C = _launch(256, 256, 256)
     torch.mps.synchronize()
@@ -199,7 +205,7 @@ def _launch_f16(M, N, K):
 
 @requires
 def test_fp16out_aligned_fires_fast(monkeypatch):
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
     seen = _spy(monkeypatch)
@@ -211,7 +217,7 @@ def test_fp16out_aligned_fires_fast(monkeypatch):
 @requires
 @pytest.mark.parametrize("M,N,K", [(258, 256, 256), (256, 258, 256), (256, 256, 252)])
 def test_fp16out_misaligned_falls_back(monkeypatch, M, N, K):
-    os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
+    fresh_compiler_caches(globals())
     monkeypatch.setenv("TRITON_MSL_FAST_MATMUL", "1")
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
     seen = _spy(monkeypatch)

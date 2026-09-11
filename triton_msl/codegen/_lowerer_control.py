@@ -19,7 +19,7 @@ op dispatch table, not just a subset.
 
 import re
 
-from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
+from triton_msl.codegen.mlir_walker import SSAValue
 from triton_msl.codegen.msl_emitter import _msl_compute_type
 from triton_msl.codegen.msl_types import triton_type_to_msl
 
@@ -28,6 +28,110 @@ from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 class _ControlFlowMixin:
     """``scf.*`` and atomic op lowering for ``GenericLowerer``."""
+
+    def _loop_pointer_parts(self, value_id):
+        """Resolve an address, never `_lookup` a loaded pointer expression.
+
+        Bare kernel pointer arguments do not enter env_is_ptr until an addptr
+        or splat; they are nevertheless valid scalar loop init/yield values.
+        """
+        info = self.env_is_ptr.get(value_id)
+        if info is not None:
+            return info
+        for arg in self.graph.args:
+            if arg.id == value_id and arg.is_ptr:
+                return self._lookup(value_id), "0"
+        return None
+
+    def _prove_atomic_native_contract(self, ssa: SSAValue):
+        """Bind one atomic result to every operand's native representation.
+
+        Atomic emission assumes that the pointer, value/compare operands and
+        mask all describe the same logical lanes.  A result-zero ``type_str``
+        can neither prove that agreement nor identify a damaged per-result
+        record.  Use immutable ResultMeta records only; operation signedness
+        remains in ``rmw_op`` because MLIR integer result bits are signless.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+
+        op_name = ssa.op
+        result_ids = list(ssa.result_ids or [ssa.id])
+        if len(result_ids) != 1 or result_ids[0] != ssa.id or len(ssa.operand_ids or []) != 3:
+            raise MetalNonRecoverableError(
+                "atomic native contract requires exactly one result and three operands",
+                op_name=op_name,
+            )
+
+        result = self._native_value_facts(ssa.id, op_name=op_name)
+        pointer, second, third = [
+            self._native_value_facts(value_id, op_name=op_name)
+            for value_id in ssa.operand_ids
+        ]
+
+        shape = result.shape
+        tensor_contract = (
+            result.is_tensor
+            and shape is not None
+            and len(shape) > 0
+            and all(isinstance(dim, int) and dim > 0 for dim in shape)
+            and result.layout is not None
+        )
+        scalar_contract = not result.is_tensor and shape == () and result.layout is None
+        if not (tensor_contract or scalar_contract):
+            raise MetalNonRecoverableError(
+                "atomic native result does not prove a positive tensor shape or scalar",
+                op_name=op_name,
+            )
+
+        def same_lanes(facts):
+            return (
+                facts.is_tensor == result.is_tensor
+                and facts.shape == shape
+                and facts.layout == result.layout
+            )
+
+        result_sig = (result.kind, result.elem, result.width, result.signed)
+        pointee = pointer.pointee
+        if (
+            pointer.kind != "pointer"
+            or pointer.address_space != 1
+            or pointee is None
+            or pointee.unknown_reason is not None
+            or pointee.is_tensor
+            or not same_lanes(pointer)
+            or (pointee.kind, pointee.elem, pointee.width, pointee.signed) != result_sig
+        ):
+            raise MetalNonRecoverableError(
+                "atomic native pointer/result representation is contradictory",
+                op_name=op_name,
+            )
+
+        if ssa.op == "tt.atomic_cas":
+            data_operands = (second, third)
+        elif ssa.op == "tt.atomic_rmw":
+            data_operands = (second,)
+            if (
+                not same_lanes(third)
+                or (third.kind, third.elem, third.width) != ("integer", "i1", 1)
+            ):
+                raise MetalNonRecoverableError(
+                    "atomic native mask representation is contradictory",
+                    op_name=op_name,
+                )
+        else:
+            raise MetalNonRecoverableError(
+                f"unsupported atomic native contract for {ssa.op!r}", op_name=op_name
+            )
+
+        for facts in data_operands:
+            if not same_lanes(facts) or (
+                facts.kind, facts.elem, facts.width, facts.signed
+            ) != result_sig:
+                raise MetalNonRecoverableError(
+                    "atomic native value/result representation is contradictory",
+                    op_name=op_name,
+                )
+        return result
 
     def _lower_scf_for(self, ssa: SSAValue):
         """scf.for -> MSL for loop with iter_args.
@@ -84,50 +188,47 @@ class _ControlFlowMixin:
         # loop). Maps index -> (n_elems, msl_type).
         mept_array_iter_indices = set()
         mept_array_iter_n = {}
-        # Pointer offset-carry iter-args (loop-carried pointer, GitHub issue #4.2): carry the
-        # OFFSET (uint), not a value -- base is loop-invariant. index -> base MSL expr.
+        # Scalar pointer carries preserve the ACTUAL typed address. Splitting
+        # it into base + `uint` offset loses negative signed offsets; keeping a
+        # guessed integer offset produced an in-bounds source load as OOB/zero.
+        # A loop may also yield another allocation, so a frozen base is unsafe.
         ptr_offset_iter_indices = set()
         ptr_offset_iter_base = {}
         # MEPT (tile > threadgroup) loop-carried pointer: carry a per-thread offset ARRAY
-        # ``uint off[n]``. index -> (base expr, n).
+        # ``long off[n]``. Pointer differences are signed; uint would turn a
+        # valid negative in-allocation update into an enormous OOB index.
+        # index -> (base expr, n).
         ptr_offset_arr_iter_indices = set()
         ptr_offset_arr_iter = {}
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
-            # Loop-carried POINTER (e.g. ``ptrs += BLOCK * stride`` advanced across the
-            # scf.for) is not supported by the register-array lowering: the carried pointer
-            # is mis-lowered as a per-thread scalar VALUE (declared ``float`` and then
-            # subscripted), which is silently wrong at some tile sizes and a Metal compile
-            # error at others (GitHub issue #4.2). The matmul / FlashAttention templates use
-            # this idiom too but rebuild addresses internally and never reach the generic
-            # scf.for lowering. Refuse rather than emit silently-wrong output.
-            _ptr = self.env_is_ptr.get(init_id)
+            _ptr = self._loop_pointer_parts(init_id)
             if _ptr is not None:
-                # Scalar (1 element/thread) loop-carried pointer: carry the OFFSET. Declare
-                # ``uint off = <offset>`` and map the block-arg back to a pointer
-                # (base, off) so tt.load reads ``base[off]`` and ``p += X`` becomes
-                # ``off += X`` at the yield (base stays loop-invariant). Issue #4.2.
                 _base, _off = _ptr
-                _off_var = self._next_var("off")
-                self.kb.raw_line(f"    uint {_off_var} = (uint)({_off});")
-                iter_vars.append(_off_var)
-                iter_dtypes.append("i32")
+                _address = _base if not _off or _off == "0" else f"({_base} + {_off})"
+                _ptr_var = self._next_var("ptr")
+                self.kb.raw_line(f"    auto {_ptr_var} = {_address};")
+                iter_vars.append(_ptr_var)
+                iter_dtypes.append(self._trace_ptr_dtype(init_id))
                 ptr_offset_iter_indices.add(i)
-                ptr_offset_iter_base[i] = _base
+                ptr_offset_iter_base[i] = _ptr_var
                 continue
             _parr = getattr(self, "env_ptr_array", {}).get(init_id)
             if _parr is not None:
                 # MEPT (tile > threadgroup) loop-carried pointer: the offset is a per-thread
-                # ARRAY. Carry ``uint off[n]`` (seeded from the init's offset array); map the
+                # ARRAY. Carry signed ``long off[n]`` (seeded from the init's offset array); map the
                 # block-arg to (base, off, n) so tt.load reads ``base[off[e]]`` and ``p += X``
                 # updates ``off[e]`` at the yield. Array analog of the scalar case (#4.2).
                 _base, _off_arr, _n = _parr
-                _off_var = self._var_array("off", [f"{_off_arr}[{e}]" for e in range(_n)], "uint")
+                _base_var = self._next_var("ptr_base")
+                self.kb.raw_line(f"    auto {_base_var} = {_base};")
+                _off_var = self._var_array(
+                    "off", [f"long({_off_arr}[{e}])" for e in range(_n)], "long")
                 iter_vars.append(_off_var)
-                iter_dtypes.append("i32")
+                iter_dtypes.append(self._trace_ptr_dtype(init_id))
                 ptr_offset_arr_iter_indices.add(i)
-                ptr_offset_arr_iter[i] = (_base, _n)
+                ptr_offset_arr_iter[i] = (_base_var, _n)
                 continue
             init_val = self._lookup(init_id)
             # Prefer result type, fall back to init value type
@@ -361,10 +462,9 @@ class _ControlFlowMixin:
                         n_arr, mt = mept_array_iter_n[i]
                         self.env_array[ba_id] = (var, n_arr, mt)
                         self.env_n_elems[ba_id] = n_arr
-                    # Pointer offset-carry iter-arg: block-arg is a pointer (base, off_var);
-                    # tt.load/addptr in the body consume env_is_ptr, the yield updates off_var.
+                    # The scalar block arg is the carried typed address itself.
                     if i in ptr_offset_iter_indices:
-                        self.env_is_ptr[ba_id] = (ptr_offset_iter_base[i], var)
+                        self.env_is_ptr[ba_id] = (var, "0")
                     if i in ptr_offset_arr_iter_indices:
                         _b, _n = ptr_offset_arr_iter[i]
                         self.env_ptr_array[ba_id] = (_b, var, _n)
@@ -460,6 +560,37 @@ class _ControlFlowMixin:
             if ssa.region_ops:
                 for body_op in ssa.region_ops:
                     if body_op.op == "scf.yield":
+                        # SSA yields are simultaneous. Snapshot every pointer's
+                        # full next state BEFORE updating any carried variable;
+                        # p,q = q,p must not read an already-updated p or offset.
+                        pointer_next = {}
+                        for i, yield_id in enumerate(body_op.operand_ids):
+                            if i in ptr_offset_iter_indices:
+                                info = self._loop_pointer_parts(yield_id)
+                                if info is None:
+                                    from triton_msl.errors import MetalNonRecoverableError
+                                    raise MetalNonRecoverableError(
+                                        "loop-carried pointer yield has no address representation",
+                                        op_name="scf.for")
+                                base, off = info
+                                address = base if not off or off == "0" else f"({base} + {off})"
+                                next_ptr = self._next_var("next_ptr")
+                                self.kb.raw_line(f"        auto {next_ptr} = {address};")
+                                pointer_next[i] = next_ptr
+                            elif i in ptr_offset_arr_iter_indices:
+                                info = self.env_ptr_array.get(yield_id)
+                                width = ptr_offset_arr_iter[i][1]
+                                if info is None or info[2] != width:
+                                    from triton_msl.errors import MetalNonRecoverableError
+                                    raise MetalNonRecoverableError(
+                                        "loop-carried pointer-array yield representation/width mismatch",
+                                        op_name="scf.for")
+                                base, offsets, _ = info
+                                next_base = self._next_var("next_base")
+                                self.kb.raw_line(f"        auto {next_base} = {base};")
+                                next_offsets = self._var_array(
+                                    "next_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                                pointer_next[i] = (next_base, next_offsets)
                         # Update iter_arg variables from yield operands
                         for i, yield_id in enumerate(body_op.operand_ids):
                             if i < len(iter_vars):
@@ -484,33 +615,15 @@ class _ControlFlowMixin:
                                         self.kb.raw_line(f"    }}")
                                         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                                     continue
-                                # Pointer offset-carry iter-arg: assign off_var from the
-                                # yielded (advanced) pointer's offset; base is loop-invariant.
                                 if i in ptr_offset_iter_indices:
-                                    _ny = self.env_is_ptr.get(yield_id)
-                                    if _ny is None:
-                                        from triton_msl.errors import MetalNonRecoverableError
-
-                                        raise MetalNonRecoverableError(
-                                            "loop-carried pointer yield is not a pointer; "
-                                            "refusing rather than mis-lower (issue #4.2).",
-                                            op_name="scf.for",
-                                        )
-                                    self.kb.raw_line(f"        {iter_vars[i]} = (uint)({_ny[1]});")
+                                    self.kb.raw_line(f"        {iter_vars[i]} = {pointer_next[i]};")
                                     continue
                                 # Pointer offset-ARRAY iter-arg (MEPT): copy the advanced
                                 # pointer's per-thread offset array element-wise into off[e].
                                 if i in ptr_offset_arr_iter_indices:
-                                    _nya = self.env_ptr_array.get(yield_id)
-                                    if _nya is None:
-                                        from triton_msl.errors import MetalNonRecoverableError
-
-                                        raise MetalNonRecoverableError(
-                                            "loop-carried pointer-array yield is not a pointer; "
-                                            "refusing rather than mis-lower (issue #4.2).",
-                                            op_name="scf.for",
-                                        )
-                                    _, _noff, _nn = _nya
+                                    _nb, _noff = pointer_next[i]
+                                    _base, _nn = ptr_offset_arr_iter[i]
+                                    self.kb.raw_line(f"        {_base} = {_nb};")
                                     for _e in range(_nn):
                                         self.kb.raw_line(f"        {iter_vars[i]}[{_e}] = {_noff}[{_e}];")
                                     continue
@@ -563,10 +676,11 @@ class _ControlFlowMixin:
                     # Pointer offset-carry iter-arg: expose the result as a pointer
                     # (base, off_var) so a post-loop tt.load/addptr on the final pointer works.
                     if i in ptr_offset_iter_indices:
-                        self.env_is_ptr[rid] = (ptr_offset_iter_base[i], var)
+                        self.env_is_ptr[rid] = (var, "0")
                     if i in ptr_offset_arr_iter_indices:
                         _b, _n = ptr_offset_arr_iter[i]
                         self.env_ptr_array[rid] = (_b, var, _n)
+                        self.env_n_elems[rid] = _n
                     # MEPT register-array iter-arg: expose the result as an
                     # env_array so the post-loop store reads ``v[e]``.
                     if i in mept_array_iter_indices:
@@ -593,6 +707,16 @@ class _ControlFlowMixin:
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
             if init_ids and init_ids[0] in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
+            if 0 in smem_iter_indices:
+                # Single-result loops use ssa.id rather than result_ids. They
+                # carry the same persistent storage as the multi-result branch.
+                self._shared_mem_descs[ssa.id] = (iter_vars[0], self.env_shapes[ssa.id], "fp32")
+            if 0 in ptr_offset_iter_indices:
+                self.env_is_ptr[ssa.id] = (iter_vars[0], "0")
+            if 0 in ptr_offset_arr_iter_indices:
+                _b, _n = ptr_offset_arr_iter[0]
+                self.env_ptr_array[ssa.id] = (_b, iter_vars[0], _n)
+                self.env_n_elems[ssa.id] = _n
             # MEPT register-array iter-arg: a single-result scf.for reports
             # ``result_ids`` as None (mlir_walker collapses len==1), so the
             # result maps to ``ssa.id`` here, not the multi-result loop above.
@@ -628,6 +752,25 @@ class _ControlFlowMixin:
 
         cond = self._lookup(ssa.operand_ids[0])
         result_ids = ssa.result_ids or ([ssa.id] if ssa.id is not None else [])
+        pointer_results = {}
+        for i, rid in enumerate(result_ids):
+            meta = self.graph.result_meta.get(rid)
+            if meta is not None and meta.type.kind == "pointer":
+                pointee = meta.type.pointee
+                if (meta.schema_version != 1 or meta.value_id != rid
+                        or meta.kind != "result" or meta.producer_id != ssa.id
+                        or meta.result_index != i or meta.type.address_space != 1 or pointee is None
+                        or pointee.unknown_reason or pointee.elem is None):
+                    from triton_msl.errors import MetalNonRecoverableError
+                    raise MetalNonRecoverableError(
+                        "scf.if pointer result lacks complete native per-result metadata",
+                        op_name="scf.if")
+                pointer_results[i] = _mlir_to_triton_dtype(pointee.elem)
+        if "!tt.ptr" in (ssa.type_str or "") and not pointer_results:
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "scf.if pointer result lacks native per-result identity; refusing address guessing",
+                op_name="scf.if")
 
         # Check both then and else for yield with operands
         all_body_ops = list(ssa.region_ops or []) + list(ssa.else_ops or [])
@@ -641,6 +784,10 @@ class _ControlFlowMixin:
             for body_op in all_body_ops:
                 if body_op.op == "scf.yield" and body_op.operand_ids:
                     for yid in body_op.operand_ids:
+                        i = len(yield_types)
+                        if i in pointer_results:
+                            yield_types.append(pointer_results[i])
+                            continue
                         # scf.if declares a SCALAR result var below; a yielded MEPT
                         # register array (n>1, block > num_threads) then fails the MSL
                         # compile with 'assigning from incompatible type float[n]' — a
@@ -683,7 +830,9 @@ class _ControlFlowMixin:
                 var_name = f"ifr_{abs(rid)}_{i}"
                 result_vars.append((rid, var_name))
                 yt = yield_types[i] if i < len(yield_types) else "fp32"
-                if yt.startswith("fp") or yt.startswith("bf") or yt.startswith("f"):
+                if i in pointer_results:
+                    msl_type = f"volatile device {triton_type_to_msl(yt)}*"
+                elif yt.startswith("fp") or yt.startswith("bf") or yt.startswith("f"):
                     msl_type = "float"
                 elif yt == "i64":
                     msl_type = "long"
@@ -695,6 +844,23 @@ class _ControlFlowMixin:
                     msl_type = "int"
                 self.kb.raw_line(f"    {msl_type} {var_name};")
 
+        def _assign_result(index, yield_id):
+            _, var_name = result_vars[index]
+            if index not in pointer_results:
+                self.kb.raw_line(f"        {var_name} = {self._lookup(yield_id)};")
+                return
+            info = self._loop_pointer_parts(yield_id)
+            if info is None:
+                from triton_msl.errors import MetalNonRecoverableError
+                why = ("a per-thread pointer array" if yield_id in self.env_ptr_array
+                       else "no address representation")
+                raise MetalNonRecoverableError(
+                    f"scf.if pointer branch has {why}; refusing rather than load/cast it",
+                    op_name="scf.if")
+            base, offset = info
+            expr = base if not offset or offset == "0" else f"({base} + {offset})"
+            self.kb.raw_line(f"        {var_name} = {expr};")
+
         self.kb.raw_line(f"    if ({cond}) {{")
 
         # Lower "then" body
@@ -703,9 +869,7 @@ class _ControlFlowMixin:
                 if body_op.op == "scf.yield":
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(result_vars):
-                            yield_val = self._lookup(yield_id)
-                            rid, var_name = result_vars[i]
-                            self.kb.raw_line(f"        {var_name} = {yield_val};")
+                            _assign_result(i, yield_id)
                 else:
                     self._lower_op(body_op)
 
@@ -716,9 +880,7 @@ class _ControlFlowMixin:
                 if body_op.op == "scf.yield":
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(result_vars):
-                            yield_val = self._lookup(yield_id)
-                            rid, var_name = result_vars[i]
-                            self.kb.raw_line(f"        {var_name} = {yield_val};")
+                            _assign_result(i, yield_id)
                 else:
                     self._lower_op(body_op)
 
@@ -730,6 +892,8 @@ class _ControlFlowMixin:
             # Propagate type from yield operands
             yt = yield_types[i] if i < len(yield_types) else "fp32"
             self.env_types[rid] = yt
+            if i in pointer_results:
+                self.env_is_ptr[rid] = (var_name, "0")
 
     def _lower_scf_while(self, ssa: SSAValue):
         """scf.while → MSL while(true) { condition-check; body; } loop.
@@ -751,7 +915,30 @@ class _ControlFlowMixin:
         # Declare iter_arg variables from init values
         iter_vars = []
         iter_dtypes = []
+        ptr_iter = {}
+        ptr_array_iter = {}
         for i, init_id in enumerate(init_ids):
+            ptr = self._loop_pointer_parts(init_id)
+            if ptr is not None:
+                base, offset = ptr
+                address = base if not offset or offset == "0" else f"({base} + {offset})"
+                ptr_var = self._next_var("wh_ptr")
+                self.kb.raw_line(f"    auto {ptr_var} = {address};")
+                iter_vars.append(ptr_var)
+                iter_dtypes.append(self._trace_ptr_dtype(init_id))
+                ptr_iter[i] = ptr_var
+                continue
+            ptr_array = self.env_ptr_array.get(init_id)
+            if ptr_array is not None:
+                base, offsets, width = ptr_array
+                base_var = self._next_var("wh_base")
+                self.kb.raw_line(f"    auto {base_var} = {base};")
+                off_var = self._var_array(
+                    "wh_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                iter_vars.append(off_var)
+                iter_dtypes.append(self._trace_ptr_dtype(init_id))
+                ptr_array_iter[i] = (base_var, width)
+                continue
             var_name = self._next_var("wh")
             init_val = self._lookup(init_id)
             init_type = self.env_types.get(init_id, "i32")
@@ -775,6 +962,12 @@ class _ControlFlowMixin:
             if i < len(before_block_args):
                 self.env[before_block_args[i]] = var
                 self.env_types[before_block_args[i]] = iter_dtypes[i]
+                if i in ptr_iter:
+                    self.env_is_ptr[before_block_args[i]] = (var, "0")
+                elif i in ptr_array_iter:
+                    base, width = ptr_array_iter[i]
+                    self.env_ptr_array[before_block_args[i]] = (base, var, width)
+                    self.env_n_elems[before_block_args[i]] = width
 
         # Lower "before" region (condition evaluation)
         for body_op in ssa.region_ops or []:
@@ -787,10 +980,17 @@ class _ControlFlowMixin:
                 after_block_args = ssa.attrs.get("else_block_arg_ids", [])
                 for j, fwd_id in enumerate(body_op.operand_ids[1:]):
                     if j < len(after_block_args):
+                        after_id = after_block_args[j]
                         fwd_val = self._lookup(fwd_id)
-                        self.env[after_block_args[j]] = fwd_val
+                        self.env[after_id] = fwd_val
                         fwd_type = self.env_types.get(fwd_id, "i32")
-                        self.env_types[after_block_args[j]] = fwd_type
+                        self.env_types[after_id] = fwd_type
+                        fwd_ptr = self._loop_pointer_parts(fwd_id)
+                        if fwd_ptr is not None:
+                            self.env_is_ptr[after_id] = fwd_ptr
+                        elif fwd_id in self.env_ptr_array:
+                            self.env_ptr_array[after_id] = self.env_ptr_array[fwd_id]
+                            self.env_n_elems[after_id] = self.env_ptr_array[fwd_id][2]
             else:
                 self._lower_op(body_op)
 
@@ -801,13 +1001,57 @@ class _ControlFlowMixin:
             if i < len(after_block_args) and after_block_args[i] not in self.env:
                 self.env[after_block_args[i]] = var
                 self.env_types[after_block_args[i]] = iter_dtypes[i]
+                if i in ptr_iter:
+                    self.env_is_ptr[after_block_args[i]] = (var, "0")
+                elif i in ptr_array_iter:
+                    base, width = ptr_array_iter[i]
+                    self.env_ptr_array[after_block_args[i]] = (base, var, width)
+                    self.env_n_elems[after_block_args[i]] = width
 
         # Lower "after" region (loop body)
         for body_op in ssa.else_ops or []:
             if body_op.op == "scf.yield":
+                pointer_next = {}
+                for j, yield_id in enumerate(body_op.operand_ids):
+                    if j in ptr_iter:
+                        info = self._loop_pointer_parts(yield_id)
+                        if info is None:
+                            from triton_msl.errors import MetalNonRecoverableError
+                            raise MetalNonRecoverableError(
+                                "scf.while pointer yield has no address representation",
+                                op_name="scf.while")
+                        base, offset = info
+                        address = base if not offset or offset == "0" else f"({base} + {offset})"
+                        next_ptr = self._next_var("wh_next_ptr")
+                        self.kb.raw_line(f"        auto {next_ptr} = {address};")
+                        pointer_next[j] = next_ptr
+                    elif j in ptr_array_iter:
+                        info = self.env_ptr_array.get(yield_id)
+                        width = ptr_array_iter[j][1]
+                        if info is None or info[2] != width:
+                            from triton_msl.errors import MetalNonRecoverableError
+                            raise MetalNonRecoverableError(
+                                "scf.while pointer-array yield representation/width mismatch",
+                                op_name="scf.while")
+                        base, offsets, _ = info
+                        next_base = self._next_var("wh_next_base")
+                        self.kb.raw_line(f"        auto {next_base} = {base};")
+                        next_offsets = self._var_array(
+                            "wh_next_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                        pointer_next[j] = (next_base, next_offsets)
                 # Update iter_arg variables from yield operands
                 for j, yield_id in enumerate(body_op.operand_ids):
                     if j < len(iter_vars):
+                        if j in ptr_iter:
+                            self.kb.raw_line(f"        {iter_vars[j]} = {pointer_next[j]};")
+                            continue
+                        if j in ptr_array_iter:
+                            next_base, next_offsets = pointer_next[j]
+                            base, width = ptr_array_iter[j]
+                            self.kb.raw_line(f"        {base} = {next_base};")
+                            for e in range(width):
+                                self.kb.raw_line(f"        {iter_vars[j]}[{e}] = {next_offsets}[{e}];")
+                            continue
                         yield_val = self._lookup(yield_id)
                         self.kb.raw_line(f"        {iter_vars[j]} = {yield_val};")
             else:
@@ -821,9 +1065,21 @@ class _ControlFlowMixin:
                 if i < len(result_ids):
                     self.env[result_ids[i]] = var
                     self.env_types[result_ids[i]] = iter_dtypes[i] if i < len(iter_dtypes) else "i32"
+                    if i in ptr_iter:
+                        self.env_is_ptr[result_ids[i]] = (var, "0")
+                    elif i in ptr_array_iter:
+                        base, width = ptr_array_iter[i]
+                        self.env_ptr_array[result_ids[i]] = (base, var, width)
+                        self.env_n_elems[result_ids[i]] = width
         elif n_iter_args == 1 and iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "i32"
+            if 0 in ptr_iter:
+                self.env_is_ptr[ssa.id] = (iter_vars[0], "0")
+            elif 0 in ptr_array_iter:
+                base, width = ptr_array_iter[0]
+                self.env_ptr_array[ssa.id] = (base, iter_vars[0], width)
+                self.env_n_elems[ssa.id] = width
         elif iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "i32"
@@ -930,6 +1186,7 @@ class _ControlFlowMixin:
         if len(ssa.operand_ids) < 2:
             return
 
+        native_result = self._prove_atomic_native_contract(ssa)
         fence_before, fence_after = self._atomic_ordering_fences(ssa)
 
         ptr_id = ssa.operand_ids[0]
@@ -947,44 +1204,53 @@ class _ControlFlowMixin:
             base_ptr = self._lookup(ptr_id)
             offsets = "0"
 
-        # Determine value type (int vs float)
-        val_dtype = self.env_types.get(val_id, "fp32")
-        is_float = val_dtype.startswith("fp") or val_dtype.startswith("bf") or val_dtype.startswith("f")
-
-        # Determine the storage element type from the pointer arg
-        store_dtype = self._trace_ptr_dtype(ptr_id)
-        is_float_ptr = store_dtype.startswith("fp") or store_dtype.startswith("bf")
-
         # Metal has NO 64-bit device atomic. The integer path below casts to
         # device atomic_int* and the value to (int), silently truncating a 64-bit
         # pointer + value to the low 32 bits (re-audit #10: int64 atomic_add wrote 0).
         # Refuse loudly rather than mis-compute.
-        if val_dtype in ("i64", "u64", "ui64") or store_dtype in ("i64", "u64", "ui64"):
+        if native_result.width != 32 and not (
+            native_result.kind == "float" and native_result.width == 16
+        ):
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
-                "64-bit atomic (i64/u64) is not supported: Metal has no 64-bit device "
-                "atomic, and emitting a 32-bit atomic would silently truncate the value. "
-                "Refusing.",
+                f"{native_result.width}-bit atomic is not supported: Metal has no matching "
+                "device atomic and emitting a 32-bit operation would silently change the value. Refusing.",
                 op_name="tt.atomic_rmw",
             )
 
-        # Use float detection: if either the value or the pointer is float
-        is_float = is_float or is_float_ptr
+        is_float = native_result.kind == "float"
 
         # 16-bit float atomics: no native Metal 16-bit atomic, but a
         # neighbor-preserving 32-bit word-CAS is correct (Phase 3 feature 1).
-        is_16bit_float = val_dtype in ("fp16", "bf16", "f16") or store_dtype in ("fp16", "bf16", "f16")
+        is_16bit_float = is_float and native_result.width == 16
         half_type = None
         if is_16bit_float:
-            _bf = val_dtype == "bf16" or store_dtype == "bf16"
-            half_type = "bfloat" if _bf else "half"
+            half_type = "bfloat" if native_result.elem == "bf16" else "half"
             if rmw_op not in ("add", "fadd", "max", "min", "exch"):
                 from triton_msl.errors import MetalNonRecoverableError
 
                 raise MetalNonRecoverableError(
                     f"atomic_rmw '{rmw_op}' on 16-bit float not supported (only add/max/min/exch via word-CAS)."
                 )
+        elif is_float and (native_result.elem != "f32" or rmw_op not in ("add", "fadd", "exch")):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"atomic_rmw '{rmw_op}' has no proved 32-bit floating-point lowering",
+                op_name="tt.atomic_rmw",
+            )
+        elif not is_float and (
+            native_result.kind != "integer"
+            or native_result.elem != "i32"
+            or native_result.width != 32
+        ):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "atomic_rmw native result is not a supported signless i32 representation",
+                op_name="tt.atomic_rmw",
+            )
 
         # Check for mask
         mask_var = None
@@ -1040,8 +1306,8 @@ class _ControlFlowMixin:
         # Scalar atomics (non-tensor): only thread 0 per threadgroup executes.
         # In Triton, a scalar atomic (ptr is !tt.ptr, not tensor<Nx!tt.ptr>)
         # is per-program, not per-thread. Guard with lid == 0.
-        is_scalar = not ssa.is_tensor
-        atom_shape = _extract_shape(ssa.type_str) if ssa.is_tensor else ()
+        is_scalar = not native_result.is_tensor
+        atom_shape = native_result.shape
         atomic_result_shared = None
         if is_scalar or atom_shape == (1,):
             # The scalar result is logically available to every thread after a later
@@ -1065,7 +1331,7 @@ class _ControlFlowMixin:
         # missed twin of the 2-D case) — apply it whenever the atomic tensor is 1-D
         # and under-fills the threadgroup. Re-audit 2026-06-27.
         atomic_1d_guard = None
-        if ssa.is_tensor:
+        if not is_scalar:
             if len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
                 atomic_1d_guard = atom_shape[0]
 
@@ -1263,6 +1529,7 @@ class _ControlFlowMixin:
         if len(ssa.operand_ids) < 3:
             return
 
+        native_result = self._prove_atomic_native_contract(ssa)
         fence_before, fence_after = self._atomic_ordering_fences(ssa)
 
         ptr_id = ssa.operand_ids[0]
@@ -1280,29 +1547,37 @@ class _ControlFlowMixin:
             base_ptr = self._lookup(ptr_id)
             offsets = "0"
 
-        # Determine value type
-        val_dtype = self.env_types.get(val_id, "i32")
-        is_float = val_dtype.startswith("fp") or val_dtype.startswith("bf") or val_dtype.startswith("f")
-
-        # Also check pointer type
-        store_dtype = self._trace_ptr_dtype(ptr_id)
-        is_float_ptr = store_dtype.startswith("fp") or store_dtype.startswith("bf")
-        is_float = is_float or is_float_ptr
-
         # Metal has no 64-bit device atomic — refuse rather than truncate to 32 bits
         # (re-audit #10), mirroring _lower_atomic_rmw.
-        if val_dtype in ("i64", "u64", "ui64") or store_dtype in ("i64", "u64", "ui64"):
+        if native_result.width != 32:
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
-                "64-bit atomic CAS (i64/u64) is not supported: Metal has no 64-bit "
-                "device atomic, and a 32-bit CAS would silently truncate. Refusing.",
+                f"{native_result.width}-bit atomic CAS is not supported: Metal has no matching "
+                "device atomic and a 32-bit CAS would silently change the value. Refusing.",
+                op_name="tt.atomic_cas",
+            )
+
+        is_float = native_result.kind == "float"
+        if is_float:
+            if native_result.elem != "f32":
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "atomic_cas native result is not a supported f32 representation",
+                    op_name="tt.atomic_cas",
+                )
+        elif native_result.kind != "integer" or native_result.elem != "i32":
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "atomic_cas native result is not a supported signless i32 representation",
                 op_name="tt.atomic_cas",
             )
 
         # Scalar CAS: only thread 0 per threadgroup should execute.
-        is_scalar = not ssa.is_tensor
-        atom_shape = _extract_shape(ssa.type_str) if ssa.is_tensor else ()
+        is_scalar = not native_result.is_tensor
+        atom_shape = native_result.shape
 
         n = self._var_counter
         self._var_counter += 1
@@ -1334,7 +1609,7 @@ class _ControlFlowMixin:
         # execute only on its logical lanes. Otherwise tensor<1> races every lane
         # on one address and tensor<N> writes OOB for lid >= N.
         atomic_1d_guard = None
-        if ssa.is_tensor and len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
+        if not is_scalar and len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
             atomic_1d_guard = atom_shape[0]
 
         # n>1 under-cover guard (mirrors _lower_store): a BLOCK-wide atomic the

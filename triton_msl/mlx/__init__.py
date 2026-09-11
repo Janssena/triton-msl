@@ -43,7 +43,7 @@ _compile_cache = {}
 # does NOT — a route-only template ABI (packed scalar buffer, template-ordered arguments), a
 # two-kernel split, a runtime-dispatch matmul descriptor, host-side address-bounds checks. Binding
 # the Triton arguments positionally against such a kernel is silently wrong, so the route refuses.
-_UNSUPPORTED_DESCRIPTORS = ("flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds")
+_UNSUPPORTED_DESCRIPTORS = ("flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds", "device_assert")
 
 
 def mlx_available():

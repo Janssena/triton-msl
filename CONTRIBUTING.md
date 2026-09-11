@@ -30,8 +30,14 @@ pip install mlx
 ## Running Tests
 
 ```bash
-# All local/project tests (current count is reported in README.md)
-pytest tests/ -v
+# Both required local jobs, serialized in separate processes; use a NEW evidence path.
+python scripts/run_project_tests.py --output /absolute/new/validation-evidence
+
+# Correctness-only development pass: does NOT satisfy the performance obligation.
+pytest tests/ --project-lane=correctness -v
+
+# Dedicated performance-floor job (not amid randomized correctness).
+pytest tests/ --project-lane=performance -p no:randomly -v
 
 # Specific test suites
 pytest tests/test_torch_compile.py -v      # torch.compile (32 tests)
@@ -50,9 +56,15 @@ python scripts/run_upstream_tests.py --test-file test_core.py --timeout 1800  # 
 
 > **Hosted CI runs lint only.** GitHub's hosted macOS runners can't build Triton in time
 > (Triton ships no macOS wheels; a from-source build exceeds the runner's time limit), so
-> GPU/Metal correctness is validated **locally** — run `pytest tests/` on Apple Silicon
-> (with a source-built Triton) before pushing; the suite is currently 1,968 / 0. For
-> automated GPU coverage, register a self-hosted macOS runner (see `.github/workflows/ci.yml`).
+> GPU/Metal validation is **local**. Before pushing, run both jobs using
+> `python scripts/run_project_tests.py --output /absolute/new/validation-evidence`
+> on Apple Silicon with a source-built Triton, and retain the separate results.
+> Bare `pytest tests/` selects correctness only. A passing floor job is still
+> **unqualified**: release claims require controlled, hardware-qualified measurements.
+> The inherited absolute floors target the campaign's M4 Max, not every M-series Mac;
+> do not weaken them or count a skip as a pass on another device. See
+> [Validation lanes](docs/VALIDATION_LANES.md) for scope and qualification requirements.
+> Automated GPU runner deployment is separate; hosted lint is not GPU validation.
 
 ## Running Benchmarks
 
@@ -89,6 +101,6 @@ Key directories:
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes
-3. Run `pytest tests/ -v` to ensure all tests pass
+3. Run both required local jobs with `python scripts/run_project_tests.py --output /absolute/new/validation-evidence`; report correctness and performance separately. A correctness-only pass does not clear performance or release qualification (see [Validation lanes](docs/VALIDATION_LANES.md)).
 4. Run `ruff check` to ensure code style compliance
 5. Open a PR with a clear description of the change

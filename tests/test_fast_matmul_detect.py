@@ -32,6 +32,8 @@ because under randomized test order the shared-cache version failed 4/5 (found
 """
 
 import os, glob, json, shutil, pytest
+import hashlib
+from pathlib import Path
 
 try:
     import torch, triton, triton.language as tl
@@ -211,11 +213,26 @@ def _mm_bf16_out(
 
 def _descriptors():
     out = []
+    products = 0
     for p in glob.glob(os.path.join(_cache_dir(), "*.meta.json")):
         with open(p) as f:
-            m = json.load(f)
+            record = json.load(f)
+        # Source-product metadata is inside a versioned envelope. Binary records
+        # share the directory but do not contain lowering descriptors. Assert
+        # that a source record actually existed even for the negative control;
+        # an empty/misread cache must not masquerade as "no descriptor".
+        if record.get("kind") == "metallib-product":
+            continue
+        assert record["kind"] == "msl-source-product"
+        assert record["schema"] == 3
+        source = Path(p.removesuffix(".meta.json") + ".msl").read_bytes()
+        assert hashlib.sha256(source).hexdigest() == record["source_sha256"]
+        m = record["metadata"]
+        assert isinstance(m, dict)
+        products += 1
         if m.get("fast_matmul"):
             out.append(m["fast_matmul"])
+    assert products, "expected a freshly emitted source-product cache record"
     return out
 
 
