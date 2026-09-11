@@ -24,6 +24,7 @@ _EXTERNAL_SEARCH = ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PA
                     "DYLD_VERSIONED_FRAMEWORK_PATH")
 _lock = threading.RLock()
 _snapshot = None
+_environment_inputs = None
 
 
 def _tree_manifest(root, *, ignore_bytecode=False, exclude_root_names=(), allow_empty=False):
@@ -142,12 +143,21 @@ def _resolve_toolchain():
 
 def toolchain_identity():
     """Fail closed on incomplete identity or live selector changes, never 'unknown'."""
-    global _snapshot
+    global _snapshot, _environment_inputs
     from triton_msl.errors import MetalNonRecoverableError
+    from ._environment_snapshot import environment_snapshot, is_snapshot
 
-    selection = tuple(os.environ.get(key) for key in _SELECTION)
-    external = sorted({key for key in _EXTERNAL_SEARCH if os.environ.get(key)}
-                      | {key for key in os.environ if key.startswith("DYLD_") and os.environ.get(key)})
+    environment = environment_snapshot()
+    cached = _environment_inputs
+    if (cached is not None and cached[0] is environment
+            and cached[1:3] == (_SELECTION, _EXTERNAL_SEARCH)):
+        selection, external = cached[3:]
+    else:
+        selection = tuple(environment.get(key) for key in _SELECTION)
+        external = sorted({key for key in _EXTERNAL_SEARCH if environment.get(key)}
+                          | {key for key in environment if key.startswith("DYLD_") and environment.get(key)})
+        if is_snapshot(environment):
+            _environment_inputs = environment, _SELECTION, _EXTERNAL_SEARCH, selection, external
     if external:
         raise MetalNonRecoverableError(
             "untracked compiler search/injection environment: " + ", ".join(external)

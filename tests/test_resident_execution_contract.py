@@ -85,6 +85,10 @@ def test_restored_handle_cannot_recertify_old_dependency_bytes(dependency, monke
 
 
 def test_current_handle_reaches_existing_launch_boundary(monkeypatch):
+    # Production constructs the backend (and its lazy module map) before a
+    # producer captures identity. A launcher stamped before that initialization
+    # is genuinely stale and must not be accepted just to reach this sentinel.
+    backend = compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32))
     launcher = _launcher(_stamp())
     class ReachedRuntime(Exception):
         pass
@@ -93,7 +97,7 @@ def test_current_handle_reaches_existing_launch_boundary(monkeypatch):
         raise ReachedRuntime
     monkeypatch.setattr(driver, "_get_utils", runtime)
     with pytest.raises(ReachedRuntime):
-        packed = compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32)).pack_metadata(_metadata(_stamp()))
+        packed = backend.pack_metadata(_metadata(_stamp()))
         launcher(1, 1, 1, None, None, packed, None, lambda _: events.append("enter"), None)
     assert events == ["enter"]
 

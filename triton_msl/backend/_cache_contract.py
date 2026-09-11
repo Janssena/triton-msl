@@ -17,6 +17,7 @@ import weakref
 
 SOURCE_SCHEMA = 3
 _jit_guard_lock = threading.RLock()
+_policy_snapshot = None
 
 
 def _digest(value):
@@ -56,15 +57,23 @@ def effective_policy():
     FORCE_PYTHON and USE_CPP are retained separately: the family predicate reads
     USE_CPP itself, so collapsing them to one boolean would lose that dependency.
     """
+    from ._environment_snapshot import environment_snapshot, is_snapshot
+    global _policy_snapshot
+    environment = environment_snapshot()
+    cached = _policy_snapshot
+    if cached is not None and cached[0] is environment:
+        return cached[1].copy()
     result = {}
     for name in ("MEPT", "QUANT_MATMUL", "FAST_MATMUL", "COMPILE_SHADER", "FA_FAST"):
-        result[name] = os.environ.get("TRITON_MSL_" + name, "1") != "0"
+        result[name] = environment.get("TRITON_MSL_" + name, "1") != "0"
     for name in ("INFER_LAYOUT", "LEGACY", "USE_CPP", "FORCE_PYTHON"):
-        result[name] = os.environ.get("TRITON_MSL_" + name) == "1"
-    result["FA_HALF_ACCUM"] = os.environ.get("TRITON_MSL_FA_HALF_ACCUM", "0") in ("1", "true", "True")
+        result[name] = environment.get("TRITON_MSL_" + name) == "1"
+    result["FA_HALF_ACCUM"] = environment.get("TRITON_MSL_FA_HALF_ACCUM", "0") in ("1", "true", "True")
     # Preserve exact skip spelling until the caller's split/strip contract is
     # centralized; this can over-invalidate but cannot merge distinct policies.
-    result["CPP_SKIP"] = os.environ.get("TRITON_MSL_CPP_SKIP", "")
+    result["CPP_SKIP"] = environment.get("TRITON_MSL_CPP_SKIP", "")
+    if is_snapshot(environment):
+        _policy_snapshot = environment, result.copy()
     return result
 
 
