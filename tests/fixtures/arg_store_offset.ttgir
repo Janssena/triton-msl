@@ -1,0 +1,42 @@
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "metal:apple-m4", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @argmax_g(%X: !tt.ptr<f32> {tt.divisibility = 16 : i32} , %O: !tt.ptr<i32> {tt.divisibility = 16 : i32} ) attributes {noinline = false} {
+    %c64_i32 = arith.constant 64 : i32 
+    %x = arith.constant 1024 : i32 
+    %x_0 = arith.constant dense<16> : tensor<64x1xi32, #blocked> 
+    %pid = tt.get_program_id x : i32 
+    %r = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1> 
+    %x_1 = arith.muli %pid, %x : i32 
+    %x_2 = tt.addptr %X, %x_1 : !tt.ptr<f32>, i32 
+    %x_3 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> 
+    %x_4 = tt.expand_dims %x_3 {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64x1xi32, #blocked> 
+    %x_5 = arith.muli %x_4, %x_0 : tensor<64x1xi32, #blocked> 
+    %x_6 = tt.splat %x_2 : !tt.ptr<f32> -> tensor<64x1x!tt.ptr<f32>, #blocked> 
+    %x_7 = tt.addptr %x_6, %x_5 : tensor<64x1x!tt.ptr<f32>, #blocked>, tensor<64x1xi32, #blocked> 
+    %x_8 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> 
+    %x_9 = tt.expand_dims %x_8 {axis = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x16xi32, #blocked> 
+    %x_10 = tt.broadcast %x_7 : tensor<64x1x!tt.ptr<f32>, #blocked> -> tensor<64x16x!tt.ptr<f32>, #blocked> 
+    %x_11 = tt.broadcast %x_9 : tensor<1x16xi32, #blocked> -> tensor<64x16xi32, #blocked> 
+    %x_12 = tt.addptr %x_10, %x_11 : tensor<64x16x!tt.ptr<f32>, #blocked>, tensor<64x16xi32, #blocked> 
+    %x_13 = tt.load %x_12 : tensor<64x16x!tt.ptr<f32>, #blocked> 
+    %0 = arith.muli %pid, %c64_i32 : i32 
+    %1 = tt.addptr %O, %0 : !tt.ptr<i32>, i32 
+    %2 = tt.splat %1 : !tt.ptr<i32> -> tensor<64x!tt.ptr<i32>, #blocked1> 
+    %3 = tt.addptr %2, %r : tensor<64x!tt.ptr<i32>, #blocked1>, tensor<64xi32, #blocked1> 
+    %4:2 = "tt.reduce"(%x_13, %x_11) <{axis = 1 : i32}> ({
+    ^bb0(%arg2: f32 , %arg3: i32 , %arg4: f32 , %arg5: i32 ):
+      %tie = arith.cmpf oeq, %arg2, %arg4 : f32 
+      %tie_14 = arith.cmpi slt, %arg3, %arg5 : i32 
+      %tie_15 = arith.andi %tie, %tie_14 : i1 
+      %gt = arith.cmpf ogt, %arg2, %arg4 : f32 
+      %gt_16 = arith.ori %gt, %tie_15 : i1 
+      %v_ret = arith.select %gt_16, %arg2, %arg4 : f32 
+      %i_ret = arith.select %gt_16, %arg3, %arg5 : i32 
+      tt.reduce.return %v_ret, %i_ret : f32, i32 
+    }) : (tensor<64x16xf32, #blocked>, tensor<64x16xi32, #blocked>) -> (tensor<64xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>) 
+    %5 = ttg.convert_layout %4#1 : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64xi32, #blocked1> 
+    tt.store %3, %5 : tensor<64x!tt.ptr<i32>, #blocked1> 
+    tt.return 
+  } 
+} 

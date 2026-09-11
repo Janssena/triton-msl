@@ -6,8 +6,9 @@ Supersedes the unpublished rc1–rc3 snapshots. The frozen 493 code passed 4,609
 (12 skips; four performance sentinels scheduled separately) and the 9,342-node upstream gate
 (5,780 passed / 3,562 skipped; exact baseline status identity). Its installed wheel passed
 84 acceptance tests and 27 after relocation; both portable validation scripts passed locally,
-not on an independent M1. This documentation-only update still needs artifact rebind/rebuild;
-no earlier archive hash or approval identifies a rebuilt wheel automatically.
+not on an independent M1. Later 523/527/529 source changes still need final integrated gates,
+performance/cross-vendor validation and rebuilt-artifact acceptance; earlier archive hashes
+and approvals do not identify a rebuilt wheel.
 
 - Complete attempted-submission tracking across nested dispatch helpers, preventing fallback
   replay after an uncertain or failed invocation. This supersedes the earlier hook-only repair.
@@ -32,6 +33,53 @@ no earlier archive hash or approval identifies a rebuilt wheel automatically.
 - Make the optional value-head dimension mean symmetric attention consistently when absent.
 - Strengthen exceptional-value tests, distinguishing exact classification from Welford's
   order-robust admissible bounds; no universal error or exceptional-value guarantee is claimed.
+
+- **Fix a silently-wrong generic two-dimensional reduction present since 0.2.0.** The threadgroup
+  scratch allocator previously merged arrays by textual first/last use and could place a reduction's result on
+  its own input array; reducers in later SIMD groups then overwrote rows that reducers in the first
+  SIMD group were still reading. On one M4 Max this produced wrong rows in roughly 2% of launches for
+  row-softmax and row-sum tiles with more than 32 rows (for example 128×8 and 64×16), on the 0.2.0
+  source and on the earlier rc4 candidate alike. Results are now held in registers and written after
+  a barrier on both reduction axes, with emission pins for both. Attention kernels with 32-row tiles
+  (one SIMD group of reducers) were not observed to fail; larger generic axis-1 reductions
+  could be exposed when emitted with this alias pattern. The earlier rc4 artifact is superseded for this reason.
+- Refuse MLX direct extraction when the returned shader still references original thread-parameter
+  names that the generated preamble does not supply (issue #2's direct-extractor escape). Quoted text
+  and comments are excluded from the check; the diagnostic names the discarded parameters.
+- Replay K-loop matmul epilogues for f16/bf16/f32 storage and rectangular 16/32/64 tiles with f32 dot
+  accumulation and f32 epilogue arithmetic (nine recovered dyadic-exact GPU cases plus the fp32 32×32 control).
+  Activations, clamps, fused multiply-adds and non-tile-boundary output masks still refuse.
+- Recover six biased-attention combinations with 8/16/32 query rows, 32 keys, D32/64,
+  fp16/bf16 storage and f32 or explicit f16 probabilities. A separate full-row replay also
+  computes the tested fp16/D64 32×64 noncausal and 64×32 causal score tiles with independent
+  query/key lengths. It preserves typed f32 negative-infinity sentinels and completes all
+  program input reads before output stores, including the tested overlapping Bias/Out
+  allocation. D128, explicit bf16 dot operands and arbitrary score-result scaling remain
+  outside the demonstrated envelope. The wide route performs 130 score evaluations per key
+  block; its performance remains unqualified.
+- Repair threadgroup scratch reuse at the allocator: aliases now require proved synchronization
+  between lifetimes, including control-flow and loop-backedge checks. This closes packet 516's
+  reduce→scan and join→split races and the structural arg-reduction/atomic handoff concerns.
+  The reduce→scan defect is public since 0.2.0; join→split was introduced in the unpublished
+  lineage (commit 6ab6db7, already an ancestor of local main). B/F/G were structural concerns,
+  not witnessed numeric failures. On the retained bounded corpus, the repair has zero audit
+  flags across 1,230 unique emitted kernels and no newly over-budget allocation; a focused
+  D/E GPU replay went from 60/60 wrong parent launches to 0/80 wrong repaired/control launches.
+  These finite observations do not prove all possible kernels race-free.
+- Fix public argmin/argmax axis1 output-address corruption: blocked one-dimensional stores now
+  preserve program/runtime offsets and remap the pointer and mask to the result's row.
+  Runtime strides, selects, masks and negative offsets have exact index/sentinel checks.
+  Nonuniform/unparsed tensor constants and unproved data-dependent address leaves now refuse
+  at this store boundary; true/false splat masks remain supported. This is distinct from the
+  allocator's unwitnessed arg-reduction scratch race.
+- Reject unknown/nonuniform constant literals at generic constant lowering instead of silently
+  treating them as zero or uniformly true. A valid alternating boolean mask was confirmed to
+  compile as an all-true mask even on a direct one-dimensional store, outside the arg-reduction
+  repair. Numeric scalar/splat literals, true/false masks and typed special-float words remain
+  supported; general nonuniform tensor constants are not newly implemented.
+- Refuse, with a typed capacity error that autotuning may prune, source-replay kernels whose
+  threadgroup allocations exceed 32 KiB after scratch reuse (previously a pipeline-creation failure at
+  load time); exactly 32 KiB remains admitted. The check covers the bounded replay families only.
 
 Thanks to Hocine Benkelaya / NeuroBrix for PRs #5–#7 and issues #8–#11, their reproducers and
 design observations. The implementation here is independently developed against the current

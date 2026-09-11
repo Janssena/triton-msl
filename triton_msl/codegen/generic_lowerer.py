@@ -5019,6 +5019,78 @@ class GenericLowerer(
                 if 0 < wrap_total < span:
                     store_wrap_guard = wrap_total
 
+        def remap_blocked_address(inner):
+            # The result is broadcast at row=lid/inner, whereas the pointer
+            # and mask may have been computed from a separate direct 1-D range.
+            # Replay THEIR SSA cones at that row, preserving every scalar base,
+            # stride, integer conversion and predicate. Reusing the old offset
+            # keeps the wrong coordinate; replacing it drops the pointer DAG.
+            import copy
+
+            replay = copy.copy(self)
+            # Emission shares the builder, but store-local names/layout facts
+            # must not replace values used by later source operations.
+            for key, value in vars(self).items():
+                if isinstance(value, (dict, set)):
+                    setattr(replay, key, value.copy())
+            by_id = self._layout_op_index()
+            done = set()
+
+            def visit(vid):
+                if vid in done:
+                    return
+                done.add(vid)
+                op = by_id.get(vid)
+                shape = self._native_shape(vid, op_name="tt.store address")
+                if not shape:
+                    return  # Scalar args and program/loop offsets.
+                if op is not None and op.op == "arith.constant":
+                    # Only a parsed scalar/splat is coordinate-invariant. A
+                    # dense tensor mask cannot be treated as coordinate-
+                    # invariant merely because its operation is a constant.
+                    if isinstance(op.attrs.get("value"), (bool, int, float)):
+                        return
+                    raise MetalNonRecoverableError(
+                        "blocked 1-D store address/mask contains a nonuniform "
+                        "or unparsed tensor constant", op_name="tt.store"
+                    )
+                if op is not None and op.op == "tt.make_range":
+                    start = int(op.attrs.get("start", 0))
+                    row = f"({self._lid_expr} / {inner}u)"
+                    replay.env[vid] = f"({row} + {start}u)" if start else row
+                    return
+                wrappers = ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout")
+                if op is not None and (op.op in wrappers or op.op == "tt.addptr" or op.op.startswith("arith.")):
+                    for operand in op.operand_ids:
+                        visit(operand)
+                    if op.op in ("ttg.convert_layout", "tt.broadcast", "tt.expand_dims"):
+                        replay._emit_passthrough(op)
+                    else:
+                        replay._lower_op_dispatch(op)
+                    return
+                # An already blocked/uniform value has the requested row.
+                # Do not replay loads, reductions or effects at a different time.
+                if self._value_1d_layout_of(vid) in ("blocked", "any"):
+                    return
+                raise MetalNonRecoverableError(
+                    "blocked 1-D store address/mask depends on a tensor whose "
+                    "row coordinate cannot be reconstructed without replaying "
+                    "a load or effect",
+                    op_name="tt.store",
+                )
+
+            try:
+                visit(ptr_id)
+                if native_mask_id is not None:
+                    visit(native_mask_id)
+                ptr = replay.env_is_ptr.get(ptr_id)
+                if ptr is None:
+                    raise MetalNonRecoverableError("blocked 1-D store lacks its traced pointer", op_name="tt.store")
+                mask = replay._lookup(native_mask_id) if native_mask_id is not None else None
+                return ptr[0], ptr[1], mask
+            finally:
+                self._var_counter = replay._var_counter
+
         clauses = []
         if store_1d_guard is not None:
             lid = self._lid_expr
@@ -5040,7 +5112,7 @@ class GenericLowerer(
                 shape = self._effective_2d_shape
                 if shape and len(shape) >= 2 and shape[1] > 0:
                     N = shape[1]
-                    offsets = f"({lid} / {N}u)"
+                    base_ptr, offsets, mask_var = remap_blocked_address(N)
                     clauses.append(f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u")
                 else:
                     clauses.append(f"{lid} < {store_1d_guard}u")
@@ -5059,7 +5131,7 @@ class GenericLowerer(
                 shape = self._effective_2d_shape
                 if shape and len(shape) >= 2 and store_1d_guard == shape[0] and shape[1] > 0:
                     N = shape[1]
-                    offsets = f"({lid} / {N}u)"
+                    base_ptr, offsets, mask_var = remap_blocked_address(N)
                     clauses.append(f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u")
                 else:
                     clauses.append(f"{lid} < {store_1d_guard}u")
@@ -5172,18 +5244,20 @@ class GenericLowerer(
         import math
         import struct as _struct
 
-        # Constants are splat-like: every thread holds the same value.
-        self._is_splat.add(ssa.id)
-
         value = ssa.attrs.get("value")
+        # Only a decoded scalar/splat literal is uniform. Non-splat DenseAttr
+        # text is not a scalar truth value (e.g. [true,false] is nonempty but
+        # must not become an all-true store mask). Missing values aren't zero.
+        if isinstance(value, str) and ssa.elem_type == "i1" and value in ("true", "false", "-1", "0", "1"):
+            value = value not in ("false", "0")
+        if not isinstance(value, (bool, int, float)):
+            raise MetalNonRecoverableError(
+                "nonuniform or unparsed tensor constant (or unknown scalar literal) "
+                "cannot be lowered as a uniform scalar; a decoded numeric scalar/splat is required",
+                op_name="arith.constant",
+            )
+        self._is_splat.add(ssa.id)
         var_name = self._next_var("c")
-
-        if value is None:
-            # Unknown constant — use 0
-            self.env[ssa.id] = "0"
-            self.env_types[ssa.id] = "i32"
-            self.env_shapes[ssa.id] = ()
-            return
 
         # Check if this is a hex integer that should be interpreted as float
         is_float_type = ssa.elem_type in ("f32", "f16", "bf16", "f64")

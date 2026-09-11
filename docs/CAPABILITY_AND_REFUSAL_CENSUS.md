@@ -42,6 +42,10 @@ Current development recoveries (focused GPU and lowering-boundary evidence, fina
 | Issue11 runtime alpha/beta, K-loop and column bias | fp32 32×32×32 tiles; partial output grids | `test_loop_matmul_epilogue.py`, `test_template_scalar_abi.py` |
 | PR7 independent query/key lengths, folded Q1 | fp16/fp32; 32-row generic and 8-/16-row tiled source spelling; widened P/V dot | `test_q1_decode_boundary.py` |
 | PR7 bias without LSE | 32×32 tiles, D32/64, fp16/fp32, independent lengths, causal/noncausal, strided bias | `test_biased_decode_replay.py` |
+| Issue11 low-precision / rectangular K-loop epilogues | f16/bf16/f32 storage; 16/32/64 tiles; f32 accumulation and epilogue arithmetic; ≤ 32 KiB threadgroup after reuse | `test_epilogue_capability.py` |
+| PR7 biased attention precision / query tiles | 8/16/32-row query × 32-key tiles; D32/64; fp16/bf16 storage; f32 or explicit f16 probabilities; top-left causal; independent lengths incl. folded Q=1 | `test_attention_capability.py` |
+| PR7 wide biased attention | tested fp16/D64 32×64 noncausal NQ=19/NK=97 and 64×32 causal NQ=65/NK=97; typed f32 -Inf; disjoint/overlapping Bias/Out; zero replay shared bytes | `test_attention_capability.py` (515/523) |
+| Argmin/argmax output offsets | axis1 8×128/64×16, 3 programs; runtime offset/stride/select/mask; negative offset views; exact sentinels | `test_arg_store_offsets.py`, p527/final-focused |
 
 ---
 
@@ -66,6 +70,11 @@ tree until the combined gates complete.
 | **#9 broadcast index collision — bare / arith / gather** | silent-wrong (2nd broadcast copied 1st's stride) | computes | packet 464 | **this sibling** (`test_broadcast_index_collision.py`) |
 | **#9 residual — comparison `(range>0).to(int32)` / select `where(range==0,7,3)`** | silent-wrong (on candidate AND baseline) | computes | packet 468 (this pass) | **this sibling** (`test_broadcast_index_collision.py`) |
 | PR6 grouped matmul (canonical cdiv mapping) | refuse | computes (full/short-final/column-tail/partial/overflow) | packet 459 | integrated 475: `test_grouped_matmul_mapping.py` |
+| **generic 2-D reduction result aliased onto its input (public since 0.2.0)** | silent-wrong (wrong rows in ~2% of launches; tiles with > 32 reducers) | register result → barrier → guarded write, both axes | packets 512 (GPU witnesses on rc4 emission and the `v0.2.0` archive), 517 (independent confirmation) | 511 `_lowerer_reduce.py` hunk; two-axis emission pins `test_reduce_alias_barrier.py` (sibling `daybreak-reduce-pin-517`) |
+| Issue11 epilogues: f16/bf16 storage, rectangular 16/32/64 tiles | refuse (nine of ten cases) | computes, dyadic-exact vs fp64 | packets 509, 510 | `test_epilogue_capability.py` (509) |
+| PR7 biased attention: 8/16-row query tiles, bf16 storage, explicit f16 probabilities, D64 causal | refuse (all six rows on 509) | computes (≤ 3e-5 vs fp64 oracle; independent attack rows ≤ 9.1e-7 with f32 output) | packets 511, 512 | `test_attention_capability.py` (511) |
+| Generic scratch reuse B/D/E/F/G | unsafe textual-lifetime aliases; D/E witnessed wrong, B/F/G structural | synchronization-separated aliases including loop backedges; D/E parent 60/60 wrong versus repair 0/80 wrong; 1,230 emissions, 0 audit flags | 529; focused 456 passes, combined gate still owed | `test_shared_pool_epochs.py` |
+| Public argmin/argmax axis1 scalar/program output offsets (C) | deterministic wrong addresses | pointer/mask SSA remapped at result row; final 51 focused passes plus 16 exact adversarial GPU rows | 527 | `test_arg_store_offsets.py` |
 
 Historical 461 was capability evidence, not a measured transition. Subsequent 485/493 recover
 the previously refusing Q1/small-tile sources and biased-no-LSE source. Candidate pins copied to
@@ -78,6 +87,11 @@ establish arbitrary combinations of bias, tile sizes, score casts or attention r
 |---|---|---|---|---|
 | **#8 retained `tl.device_assert` (source or framework, including Inductor defaults)** | silently elided at direct generic lowering; blanket refusal in 475 broke 11 framework workloads | candidate 477 executes supported generic checks using a uniform threadgroup stop and launch-local host error; unsupported forms and callee regions still refuse | 466/472 refusal, 475 regression, 477 repair pending combined gates and independent review | `test_retained_device_assert_refuses.py`, `refusal_catalog.retained_device_assert`; see [assertion contract](DEVICE_ASSERTIONS.md) |
 | dispatch post-submit boundary (completed library call then a later raise) | fail-open → swallowed, fallback re-ran work | `PostSubmitError`, fail-loud, no double-apply | packet 457 | integrated 475; reviewed in 458 |
+| MLX direct extraction (`extract_msl_for_mlx`) of a shader that still names original thread parameters | admitted an invalid shader with undefined `pid3`/`_lid3` | refuses before lazy shader construction, naming the parameters | packets 505, 506 | `test_mlx_backend.py` (505) |
+| source-replay kernels over the 32 KiB threadgroup budget (e.g. 64×64×64 epilogue = 49,152 B) | lowered, then a plain pipeline-creation `RuntimeError` at load | typed `MetalResourceError` → `OutOfResources` at lowering; 32,768 B admitted | packets 510, 513, 514, 517 | `test_epilogue_capability.py` (513) |
+| Blocked 1-D store with a nonuniform/unparsed constant mask or offset | mixed bool mask could emit as uniformly true; offset may emit invalid MSL | precise store-local refusal; true/false splats compute the original predicate | 527, legalIR emission counterexample and boundary pins | `test_arg_store_offsets.py` |
+| Blocked 1-D store depending on an unproved loaded/effect-derived tensor address | wrong row could be used without remapping | refuse when no blocked/uniform leaf proof exists; do not re-execute effects | 527 | `test_arg_store_offsets.py` |
+| Generic constant lowering, including direct 1-D stores | mixed dense boolean mask compiled as `if (1)`; unknown scalar could default to zero | decoded numeric scalar/splat required; no truthiness or zero fallback for unparsed constants | 531; direct native-IR public compile witness, CPU boundary controls | `test_constant_admission.py` |
 
 (The broader silent-wrong→refuse lineage — uint64 max/min, reduce-combine classifier, dot/reduce
 stride families, bf16 FA dtype gate, 3-D reduce pre-op — is committed and catalogued as its own
@@ -88,12 +102,18 @@ regression suites; it is summarised here, not re-enumerated.)
 | family | representative reason | documented workaround |
 |---|---|---|
 | small-query decode beyond the source contract above | unsupported probability narrowing, dimensions or value graph | no blanket workaround claimed |
-| bias-without-LSE beyond 32×32 tiles / D32 or D64 | not covered by the replay admission proof | use only a source spelling whose complete semantics are supported; changing tile size alone is not universal equivalence |
+| bias-without-LSE outside the generic and 515/523 wide replay proofs | tested tiles/dtypes listed above; arbitrary combinations remain unqualified | changing tile size is not universal semantic equivalence |
 | runtime scale/bias on a `tt.dot` result | cannot prove finite constant multiply on the score path | scale Q pre-dot; bias as the dot accumulator |
 | two reductions of one loaded tile | second would reduce over the first's accumulator | load the tile separately per reduction |
 | narrow-dtype backward delta (`rowsum(O·dO)` in fp16) | order-dependent | `tl.sum((o*do).to(tl.float32), 1)` |
 | rank-≥3 `tt.trans` non-identity permutation; `nd` `cat`/`join`; `join`→`dot`; top-level `cf.br` | no proven safe lowering | see `refusal_catalog.py` messages |
 | C++ / MLX boundary | C++ route defect; MLX extraction gap | leave `TRITON_MSL_USE_CPP` off (default) |
+| **explicit bf16 dot operands** (`p.to(bf16)` or bf16 V/K fed straight into `tl.dot`) | biased replay admits f32 or explicit f16 probabilities only; bf16 dot arithmetic is unproven | keep bf16 storage, compute probabilities in f32 (`p.to(tl.float32)`) |
+| **biased attention outside the proved generic and full-row replay envelopes**, including D128 and explicit bf16 dot arithmetic | 32×64 and 64×32 fp16/D64 cases are now computed by 515/523; arbitrary combinations are untested or separately refused, not certified by those rows | retain the original source's precision/mask semantics; no universal spelling substitution |
+| **score scaling after QK** in the biased replay — constant (`score * c` after `tl.dot(q, kᵀ, bias)`) or runtime | value graph outside the replay proof; a constant post-dot scale is not folded into Q because that changes rounding | scale Q before the dot in the source; bias as the dot accumulator |
+| **epilogue operations beyond add/mul/extend/truncate with ≤ 1 column bias** (activation, clamp, fma, exp, row bias) and non-tile-boundary output masks | outside `_loop_epilogue.eligible`'s closed op set / structural-mask proof | keep the epilogue to scale + column bias; mask stores on tile boundaries |
+| **source-replay tiles over 32 KiB of threadgroup memory** (64×64×64 epilogue) | typed capacity refusal after scratch reuse | 64×64×32, 64×32×64, 32×64×64 sit exactly at the limit and compute |
+| **single-key launches (nk = 1) of the biased attention spelling** | Triton specialises the length-1 argument; the folded graph leaves the replay admission and refuses loudly | key counts 32 and 65 were verified; no claim for every other key count; nk = 1 is a loud refusal, not a wrong answer |
 
 ### 2d. Historical refusal site inventory (not re-counted for rc4)
 
