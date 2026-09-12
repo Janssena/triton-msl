@@ -442,7 +442,7 @@ _COMPILE_SHADER_SAFE_SCALAR_SIGS = frozenset(
 )
 
 
-def _compile_shader_scalars_ok(launcher, kargs) -> bool:
+def _compile_shader_scalars_ok(launcher, kargs, *, checked=None) -> bool:
     """True iff every NON-tensor arg in ``kargs`` has a declared scalar
     signature type that compile_shader binds correctly (see the SAFE set).
 
@@ -475,6 +475,16 @@ def _compile_shader_scalars_ok(launcher, kargs) -> bool:
             # to an explicitly fp32 IRSource would bind integer bits, not 1.0f.
             if sig == "fp32" and type(a) is not float:
                 return False
+            # The binder already packed this invocation's live scalar. Reuse
+            # that proof only for the same exact immutable value, declaration
+            # and source position, as observed HERE after hooks/runtime calls.
+            # Changed declarations, positions or custom values still repack.
+            if (checked is not None and type(sig) is str
+                    and (type(a) is int or type(a) is bool or type(a) is float)
+                    and j < len(checked[0]) and checked[0][j] is a
+                    and checked[1][j] is sig and checked[2][j] == oi
+                    and type(checked[3][j]) is bytes):
+                continue
             from triton_msl.backend._launch_signature import scalar_bytes
 
             scalar_bytes(a, sig)  # prove representability, never truncate by guess
@@ -536,9 +546,10 @@ class MetalLauncher:
         self._packed_contract = validate_launch_metadata(metadata)
         install_jit_policy_guard(getattr(src, "fn", None), self._execution_contract)
         self.constants = src.constants if hasattr(src, "constants") else {}
-        from triton_msl.backend._launch_signature import ordered_source_signature
+        from triton_msl.backend._launch_signature import ordered_source_signature, make_binding_plan
 
         self.arg_names, self.signature = ordered_source_signature(src)
+        self._binding_plan = make_binding_plan(self.arg_names, self.signature)
         # Identify constexpr arg indices — these are compiled into the kernel
         # and must NOT be packed as Metal buffers at launch time.
         self.constexpr_indices = set()
@@ -598,9 +609,14 @@ class MetalLauncher:
         from triton_msl.backend._launch_contract import validate_packed_launch
 
         kernel_metadata = validate_packed_launch(kernel_metadata, getattr(self, "_packed_contract", None))
-        from triton_msl.backend._launch_signature import bind_arguments
+        from triton_msl.backend._launch_signature import bind_arguments, bind_arguments_with_plan
 
-        flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments(args, self.arg_names, self.signature)
+        binding_plan = getattr(self, "_binding_plan", None)
+        if binding_plan is None:
+            flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments(args, self.arg_names, self.signature)
+        else:
+            flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments_with_plan(
+                args, self.arg_names, self.signature, binding_plan)
         if kernel_metadata[4] is not None and any(i >= len(flat_args) for i in kernel_metadata[4]):
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -734,7 +750,8 @@ class MetalLauncher:
                     ):
                         # Every NON-tensor scalar arg must have a compile_shader-safe
                         # declared type (fp16/bf16 scalars mis-bind to 0.0). (Fix 4.)
-                        scalars_ok = _compile_shader_scalars_ok(self, kargs)
+                        scalars_ok = _compile_shader_scalars_ok(
+                            self, kargs, checked=(flat_args, flat_sigs, flat_origin, scalar_payloads))
                         # 1-D-grid only: anything needing a 2-D grid (or gridY/gridZ > 1)
                         # falls back to the existing path (correct, just slower).
                         if all_mps and scalars_ok and not needs_2d_grid and gridY == 1 and gridZ == 1:

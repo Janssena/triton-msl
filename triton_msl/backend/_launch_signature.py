@@ -4,6 +4,8 @@ This is not yet the full dynamic argument/pipeline certificate. Pointer storage,
 tuple-copyback mapping and pre-hook validation are separate consumers to audit.
 """
 import struct
+from collections import namedtuple
+from types import MappingProxyType
 
 from triton_msl.errors import MetalNonRecoverableError
 
@@ -69,7 +71,7 @@ def scalar_bytes(value, declared_type):
     _refuse(f"unsupported or missing scalar declaration {ty!r}; no width is inferred from the Python value")
 
 
-def bind_arguments(args, names, signature):
+def bind_arguments(args, names, signature, *, _plan=None):
     """Exact tuple shape and constexpr-free TTGIR positions, before hooks.
 
     Return source-ordered leaves and prepacked scalar payloads. Tensor storage
@@ -79,6 +81,7 @@ def bind_arguments(args, names, signature):
     if len(args) != len(names):
         _refuse(f"expected {len(names)} runtime parameter positions, got {len(args)}")
     leaves, types, origins, payloads = [], [], [], []
+    packers = _plan.packers if type(_plan) is _BindingPlan else None
     def bind(value, ty, origin):
         if isinstance(ty, tuple):
             if not isinstance(value, tuple) or len(value) != len(ty):
@@ -95,7 +98,20 @@ def bind_arguments(args, names, signature):
                 _refuse("pointer parameter requires a tensor/pointer wrapper or None")
             payload = None
         else:
-            payload = scalar_bytes(value, ty)
+            packing = packers.get(ty) if packers is not None and type(ty) is str else None
+            value_type = type(value)
+            if packing is not None and (value_type is int or value_type is bool
+                                        or (packing[0] and value_type is float)):
+                if ty in ("i1", "u1") and value not in (0, 1):
+                    _refuse(f"{ty} requires a representable integer value")
+                try:
+                    payload = packing[1](value)
+                except (struct.error, OverflowError, ValueError) as exc:
+                    _refuse(f"value cannot be represented as {ty}: {exc}")
+            else:
+                # Per-node fallback preserves callback ordering; never restart
+                # the already-observed prefix of this invocation.
+                payload = scalar_bytes(value, ty)
         leaves.append(value)
         types.append(ty)
         origins.append(origin)
@@ -103,3 +119,31 @@ def bind_arguments(args, names, signature):
     for index, (value, name) in enumerate(zip(args, names)):
         bind(value, signature[name], index)
     return leaves, types, origins, payloads
+
+
+_BindingPlan = namedtuple("_BindingPlan", "packers")
+
+
+def make_binding_plan(names, signature):
+    """Cache canonical scalar packers, never live declaration traversal.
+
+    A pointer getter or custom scalar can change a later public declaration.
+    bind_arguments must retain its original sequential reads across callbacks.
+    This private immutable map contains only type-specific struct packers;
+    current names, positions, tuple shapes and values are still read per call.
+    """
+    if type(names) is not list or type(signature) is not dict:
+        return None
+    packers = {}
+    for ty in signature.values():
+        if type(ty) is not str:
+            continue
+        if ty in _INTEGER:
+            packers[ty] = (False, struct.Struct("<" + _INTEGER[ty]).pack)
+        elif ty in ("fp16", "fp32"):
+            packers[ty] = (True, struct.Struct("<" + ("e" if ty == "fp16" else "f")).pack)
+    return _BindingPlan(MappingProxyType(packers)) if packers else None
+
+
+def bind_arguments_with_plan(args, names, signature, plan):
+    return bind_arguments(args, names, signature, _plan=plan)
