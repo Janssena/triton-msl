@@ -95,6 +95,17 @@ The result is immutable only on the recognized path.
         return env
     with _lock:
         raw = env._data.copy()
+        cached = _cached
+        # The cached private copy contains ONLY exact bytes. Matching every
+        # key/value by identity therefore proves their types and contents too,
+        # without calling user equality or decoding. Keep strong references and
+        # check length: zip/map alone would accept a truncated mapping. Changed
+        # identities/order take the existing exact-type/content path below.
+        if (cached is not None and cached[0] is env
+                and len(cached[1]) == len(raw)
+                and all(map(is_, raw, cached[1]))
+                and all(map(is_, raw.values(), cached[1].values()))):
+            return cached[2]
         # environb accepts bytes subclasses whose decode/equality can depend on
         # mutable state. Equal byte payloads alone do not prove those objects
         # immutable, so check exact types BEFORE the cached equality fast path.

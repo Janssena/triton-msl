@@ -21,6 +21,12 @@ def test_snapshot_tracks_same_size_edits_new_keys_and_is_unaliased(monkeypatch):
         assert environment.environment_snapshot() is first
         with pytest.raises(TypeError):
             first["TRITON_MSL_SNAPSHOT_WITNESS"] = "broken"
+        # Equal payloads with different identities and insertion order still
+        # mean the same snapshot; neither may accidentally bypass a later edit.
+        key = b"TRITON_MSL_SNAPSHOT_WITNESS"
+        raw_value = os.environ._data.pop(key)
+        os.environ._data[key] = bytes(bytearray(raw_value))
+        assert environment.environment_snapshot() is first
     else:
         assert first is os.environ
     monkeypatch.setenv("TRITON_MSL_SNAPSHOT_WITNESS", "b")
@@ -115,6 +121,17 @@ def test_policy_copy_and_same_mapping_changes_cannot_stale(monkeypatch):
         state[0] = "1"
         assert os.environ.get("TRITON_MSL_FA_FAST") == "1"
         assert cache.effective_policy()["FA_FAST"] is True
+        # A byte-equal foreign KEY also must not inherit an owned bytes proof.
+        # Replace through the encoded dict: dict assignment to an equal key
+        # would otherwise retain the original key object.
+        raw_key = b"TRITON_MSL_FA_FAST"
+        os.environ._data.pop(raw_key)
+        os.environ._data[EncodedValue(raw_key)] = b"0"
+        try:
+            assert environment.environment_snapshot() is os.environ
+        finally:
+            os.environ._data.pop(raw_key)
+            os.environ._data[raw_key] = b"0"
 
 
 def test_preimport_overrides_are_not_certified_as_standard(monkeypatch):
