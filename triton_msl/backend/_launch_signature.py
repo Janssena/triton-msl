@@ -117,7 +117,40 @@ def bind_arguments(args, names, signature, *, _plan=None):
         origins.append(origin)
         payloads.append(payload)
     for index, (value, name) in enumerate(zip(args, names)):
-        bind(value, signature[name], index)
+        # Keep each declaration read at its original position, after all prior
+        # callbacks. Exact string leaves can run inline; tuple/custom declarations
+        # retain the original recursive path without replaying an observed prefix.
+        ty = signature[name]
+        if type(ty) is not str:
+            bind(value, ty, index)
+            continue
+        if ty == "constexpr":
+            continue
+        if isinstance(value, tuple):
+            _refuse("tuple value in a scalar/pointer parameter")
+        if ty.startswith("*"):
+            if value is not None and not callable(getattr(value, "data_ptr", None)):
+                _refuse("pointer parameter requires a tensor/pointer wrapper or None")
+            payload = None
+        else:
+            packing = packers.get(ty) if packers is not None and type(ty) is str else None
+            value_type = type(value)
+            if packing is not None and (value_type is int or value_type is bool
+                                        or (packing[0] and value_type is float)):
+                if ty in ("i1", "u1") and value not in (0, 1):
+                    _refuse(f"{ty} requires a representable integer value")
+                try:
+                    payload = packing[1](value)
+                except (struct.error, OverflowError, ValueError) as exc:
+                    _refuse(f"value cannot be represented as {ty}: {exc}")
+            else:
+                # Per-node fallback preserves callback ordering; never restart
+                # the already-observed prefix of this invocation.
+                payload = scalar_bytes(value, ty)
+        leaves.append(value)
+        types.append(ty)
+        origins.append(index)
+        payloads.append(payload)
     return leaves, types, origins, payloads
 
 
