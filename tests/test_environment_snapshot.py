@@ -202,3 +202,27 @@ def test_decode_uses_private_copy_even_when_live_values_change_and_return(monkey
     assert events == ["changed-after-copy", "restored-after-decode"]
     assert os.environ["TRITON_MSL_FA_FAST"] == snapshot["TRITON_MSL_FA_FAST"] == "0"
     assert cache.effective_policy()["FA_FAST"] is False
+
+
+def test_rebound_identity_predicate_cannot_hide_changed_environment(monkeypatch):
+    import operator
+
+    for mode in ("live", "preimport"):
+        with monkeypatch.context() as patch:
+            patch.setenv("TRITON_MSL_FA_FAST", "0")
+            if mode == "preimport":
+                patch.setattr(operator, "is_", lambda *args: True)
+                spec = importlib.util.spec_from_file_location("snapshot_identity_preimport", environment.__file__)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            else:
+                module = environment
+            first = module.environment_snapshot()
+            assert first["TRITON_MSL_FA_FAST"] == "0"
+            if mode == "live":
+                patch.setattr(module, "is_", lambda *args: True)
+            patch.setenv("TRITON_MSL_FA_FAST", "1")
+            second = module.environment_snapshot()
+            assert second["TRITON_MSL_FA_FAST"] == "1", mode
+            if module.is_snapshot(second):
+                assert second is not first, mode

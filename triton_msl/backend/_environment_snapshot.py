@@ -6,13 +6,14 @@ invalidate it too. Nonstandard environment mappings retain their live behavior.
 No watcher, private dict version counter, or mutation hook is installed.
 """
 import os
+import _operator
 import sys
 import threading
 from collections.abc import Mapping
 from importlib.machinery import FrozenImporter
 from itertools import repeat
 from operator import is_
-from types import CodeType, MappingProxyType, MethodType
+from types import BuiltinFunctionType, CodeType, MappingProxyType, MethodType
 
 
 def _frozen_codes(module="os"):
@@ -72,6 +73,12 @@ _standard = (
 )
 _lock = threading.RLock()
 _cached = None
+# Do not bless an arbitrary pre-import override as an identity predicate.
+# Builtin name/self identify the interpreter's _operator.is_; Python wrappers
+# and later rebinding retain the original type/content fallback.
+_builtin_identity = (is_ if type(is_) is BuiltinFunctionType
+                     and is_.__self__ is _operator and is_.__name__ == "is_"
+                     else None)
 
 
 def environment_snapshot():
@@ -101,7 +108,8 @@ The result is immutable only on the recognized path.
         # without calling user equality or decoding. Keep strong references and
         # check length: zip/map alone would accept a truncated mapping. Changed
         # identities/order take the existing exact-type/content path below.
-        if (cached is not None and cached[0] is env
+        if (_builtin_identity is not None and is_ is _builtin_identity
+                and cached is not None and cached[0] is env
                 and len(cached[1]) == len(raw)
                 and all(map(is_, raw, cached[1]))
                 and all(map(is_, raw.values(), cached[1].values()))):
