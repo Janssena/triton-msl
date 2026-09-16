@@ -1950,23 +1950,26 @@ def make_flash_attention_kernel_simdgroup(
     # (Dv == head_dim), byte-identical to before. Registers scale with Dv, so
     # MLA (Dqk=192, Dv=128) has the SAME footprint as hd128 despite the 192-wide QK.
     Dv = v_head_dim if v_head_dim is not None else D
-    if not (BM == 32 and BN == 64 and D % 8 == 0 and Dv % 8 == 0):
-        raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, head_dim%8==0, v_head_dim%8==0")
+    if not (BM == 32 and BN == 64 and D > 0 and Dv > 0 and D % 8 == 0 and Dv % 8 == 0):
+        raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, positive head_dim/v_head_dim divisible by 8")
     n_groups = NT // 32
     # TPG = output col-tiles (8-wide) each simdgroup owns. When Dv/8 < n_groups (a
     # SMALL head_dim, e.g. Dv=32 -> 4 tiles < 8 groups), the plain floor gives 0
-    # (a zero-length o[4][TPG] -> compile error). Clamp to >=1 and, when there are
+    # (a zero-length o[4][TPG] -> compile error). Round up and, when there are
     # then MORE (group,tile) slots than real col-tiles, gate the V-load / PV-MMA /
     # store on `ct*8 < Dv` so the surplus groups idle. For Dv a multiple of 64
     # (64/128/192) TPG*n_groups*8 == Dv exactly -> no guard, byte-identical to before.
-    TPG = max(1, (Dv // 8) // n_groups)
+    # Round up also for partial later rounds (e.g. Dv=96 needs two rounds).
+    TPG = (Dv + n_groups * 8 - 1) // (n_groups * 8)
     need_ct_guard = TPG * n_groups * 8 > Dv
     # ct-guard fragments (value-level, NOT wrapping any barrier -> no divergent-barrier
     # UB). Empty when not needed -> byte-identical for Dv multiple of 64. In the biased
-    # path Dv==D so the `< D` bound is the v_head_dim bound.
-    _ct_off = "(ct*8u < D ? ct*8u : 0u)" if need_ct_guard else "ct*8u"   # full V-load clamp
-    _ct_tail_g = " && (ct*8u + cc < D)" if need_ct_guard else ""          # tail V-staging value
-    _ct_store_g = " && (dc2 < D)" if need_ct_guard else ""                # final store value
+    # path Dv==D so retain its existing text; asymmetric callers need the V
+    # width, not the QK contraction width, at all three memory boundaries.
+    _v_bound = "D" if Dv == D else f"{Dv}u"
+    _ct_off = f"(ct*8u < {_v_bound} ? ct*8u : 0u)" if need_ct_guard else "ct*8u"   # full V-load clamp
+    _ct_tail_g = f" && (ct*8u + cc < {_v_bound})" if need_ct_guard else ""          # tail V-staging value
+    _ct_store_g = f" && (dc2 < {_v_bound})" if need_ct_guard else ""                # final store value
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(D))
     if out_dtype in ("fp16", "f16"):
         elem, store_cast = "half", lambda e: f"half({e})"
@@ -2169,6 +2172,30 @@ def make_flash_attention_kernel_simdgroup(
                 simdgroup_load(o[rb][t], on_scratch + sgitg*64u, 8u);
                 simdgroup_barrier(mem_flags::mem_threadgroup);
             }}"""
+
+    # Batched scratch is valid only when P lives separately in tgP and the
+    # score tile has float storage. Other variants retain the original path.
+    # The unconditional threadgroup barrier immediately before ALPHA_RESCALE
+    # completes every score reader. Each SIMD group then owns 256 disjoint
+    # float slots; 8 groups * 4 fragments * 64 slots == BM * BN == 2048.
+    # The end-of-key-block threadgroup barrier protects the next score store.
+    if elem == "half" and not half_accumulate:
+        _alpha_rescale = """// Batch four row fragments in the now-dead float score tile.
+            for (uint rb=0u;rb<4u;rb++) {
+                simdgroup_store(o[rb][t], tg_S + sgitg*256u + rb*64u, 8u);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint rb=0u;rb<4u;rb++) {
+                for (uint e=lid%32u;e<64u;e+=32u) {
+                    float a=tg_alpha[rb*8u+e/8u];
+                    tg_S[sgitg*256u+rb*64u+e] = float(tg_S[sgitg*256u+rb*64u+e] * float(isfinite(a) ? a : 0.0f));
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint rb=0u;rb<4u;rb++) {
+                simdgroup_load(o[rb][t], tg_S + sgitg*256u + rb*64u, 8u);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);"""
 
     # An explicit dense-source proof may retain zero-K scores beyond N_CTX.
     # Keep this opt-in: biased/MLA/standalone contracts must not inherit it.
@@ -8341,11 +8368,10 @@ kernel void kda_prefill(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for(uint idx=lid; idx<D*D; idx+=NT){ uint l=idx/D, j=idx%D; float d=0.0f;
       for(uint i=0u;i<C;i++) d += KT[i*D+l]*W[i*D+j];
-      float Bl=B[(C-1u)*D+l]; S[l*D+j]=Bl*(S[l*D+j]+d); }
+      float Bl=B[(C-1u)*D+l]; S[l*D+j]=Bl*(S[l*D+j]+d);
+      if(!isfinite(S[l*D+j])) atomic_store_explicit(&replay,1u,memory_order_relaxed); }
     // The diagnostic reads Out through different lanes than the MMA store.
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-    for(uint idx=lid;idx<D*D;idx+=NT)
-      if(!isfinite(S[idx])) atomic_store_explicit(&replay,1u,memory_order_relaxed);
     for(uint idx=lid;idx<C*D;idx+=NT)
       if(!isfinite(W[idx]) || !isfinite(float(Out[hb+base*D+idx])))
         atomic_store_explicit(&replay,1u,memory_order_relaxed);
@@ -8424,11 +8450,11 @@ kernel void kda_decode(
   uint head=tg.x; uint hd=head*D; uint hS=head*D*D;
   threadgroup float u[64];
   for(uint j=lid; j<D; j+=NT){ float acc=0.0f; for(uint l=0u;l<D;l++) acc += k[hd+l]*a[hd+l]*S[hS+l*D+j]; u[j]=acc; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
   float bt=beta[head];
   for(uint idx=lid; idx<D*D; idx+=NT){ uint l=idx/D, j=idx%D;
     S[hS+idx] = a[hd+l]*S[hS+idx] + bt*k[hd+l]*(v[hd+j]-u[j]); }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
   for(uint j=lid; j<D; j+=NT){ float acc=0.0f; for(uint l=0u;l<D;l++) acc += q[hd+l]*S[hS+l*D+j]; Out[hd+j]=acc; }
 }
 """

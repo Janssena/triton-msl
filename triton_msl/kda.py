@@ -18,6 +18,33 @@ _LIBS = {}  # fp16 bool -> compiled prefill library
 _DEC_LIB = None
 
 
+def _require_tensor_abi(name, tensor, *, shape, dtype, device):
+    """Refuse a fixed-ABI mismatch before compiling or allocating Metal resources."""
+    if tuple(tensor.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+
+
+def _require_mps(name, tensor):
+    if tensor.device.type != "mps":
+        raise ValueError(f"{name} must be on an mps device, got {tensor.device}")
+
+
+def _state_layout_injective(state):
+    """Prove positive-stride indices occupy distinct storage locations."""
+    dimensions = sorted((stride, size) for size, stride in zip(state.shape, state.stride())
+                        if size > 1)
+    span = 1
+    for stride, size in dimensions:
+        if stride < span:
+            return False
+        span += (size - 1) * stride
+    return True
+
+
 def _kernel(fp16=False):
     """Lazily build + cache the compiled KDA prefill library (one per dtype)."""
     global _RT
@@ -56,8 +83,14 @@ def kda_attention(q, k, v, a, beta):
     if q.dtype not in (torch.float32, torch.float16):
         raise ValueError(f"kda_attention supports float32/float16, got {q.dtype}")
     ZH, T, D = q.shape
+    if ZH <= 0 or T <= 0:
+        raise ValueError(f"kda_attention requires positive ZH and T, got ZH={ZH}, T={T}")
     if T % 8 != 0:
         raise ValueError(f"kda_attention requires T % 8 == 0 (chunk size 8), got T={T}")
+    _require_mps("q", q)
+    for name, tensor in (("k", k), ("v", v), ("a", a)):
+        _require_tensor_abi(name, tensor, shape=(ZH, T, D), dtype=q.dtype, device=q.device)
+    _require_tensor_abi("beta", beta, shape=(ZH, T), dtype=q.dtype, device=q.device)
 
     rt, lib = _kernel(fp16=q.dtype == torch.float16)
     out = torch.empty(ZH, T, D, device=q.device, dtype=q.dtype)
@@ -103,9 +136,27 @@ def kda_decode_step(q, k, v, a, beta, S):
 
     if q.dim() != 2 or q.shape[1] != 64:
         raise ValueError(f"kda_decode_step expects q of shape [ZH, 64], got {tuple(q.shape)}")
+    if q.dtype != torch.float32:
+        raise ValueError(f"kda_decode_step supports float32, got {q.dtype}")
     ZH, D = q.shape
+    if ZH <= 0:
+        raise ValueError(f"kda_decode_step requires positive ZH, got ZH={ZH}")
+    _require_mps("q", q)
+    for name, tensor in (("k", k), ("v", v), ("a", a)):
+        _require_tensor_abi(name, tensor, shape=(ZH, D), dtype=q.dtype, device=q.device)
+    _require_tensor_abi("beta", beta, shape=(ZH,), dtype=q.dtype, device=q.device)
+    _require_tensor_abi("S", S, shape=(ZH, D, D), dtype=q.dtype, device=q.device)
+    if not _state_layout_injective(S):
+        raise ValueError("S state layout cannot be proven non-overlapping")
+    readonly = (q, k, v, a, beta)
+    prepared = [tensor.clone(memory_format=torch.contiguous_format)
+                if torch._C._overlaps(S, tensor) else tensor.contiguous()
+                for tensor in readonly]
     rt, lib = _decode_kernel()
     out = torch.empty(ZH, D, device=q.device, dtype=torch.float32)
-    args = [q.contiguous(), k.contiguous(), v.contiguous(), a.contiguous(), beta.contiguous(), S, out]
+    state = S if S.is_contiguous() else S.contiguous()
+    args = [*prepared, state, out]
     rt.dispatch(lib, "kda_decode", args, threads=(ZH * 256, 1, 1), group_size=(256, 1, 1))
+    if state is not S:
+        S.copy_(state)
     return out

@@ -88,8 +88,13 @@ class MetalBufferPool:
         )
         if metal_buf is None:
             # Fallback: allocate via Metal API (loses zero-copy benefit)
+            # from_buffer exports the mapping; release that view before closing
+            # it, otherwise cleanup raises BufferError and bypasses fallback.
+            del buf_from_mem
             aligned_mem.close()
             metal_buf = self._device.newBufferWithLength_options_(size_class, Metal.MTLResourceStorageModeShared)
+            if metal_buf is None:
+                raise MemoryError(f"Metal buffer allocation failed for {size_class} bytes")
             return metal_buf, None, size_class
 
         return metal_buf, aligned_mem, size_class
@@ -119,6 +124,8 @@ class MetalBufferPool:
         import Metal
 
         buf = self._device.newBufferWithLength_options_(max(nbytes, 4), Metal.MTLResourceStorageModeShared)
+        if buf is None:
+            raise MemoryError(f"Metal scalar buffer allocation failed for {max(nbytes, 4)} bytes")
         return buf
 
     def release_scalar(self, buf, nbytes):

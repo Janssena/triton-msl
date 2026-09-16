@@ -14,7 +14,7 @@ kernel — it ships as a direct op rather than a detector/route.
 ```python
 from triton_msl.kda import kda_attention, kda_decode_step
 
-# Prefill (chunked, MMA-optimized ~7-12x over a naive kernel):
+# Prefill (chunked MMA; historical ~7-12x vs naive is unqualified on this candidate):
 out = kda_attention(q, k, v, a, beta)          # q,k,v,a: [ZH,T,64]; beta: [ZH,T]; mps
 
 # Decode (one autoregressive step, state updated in place):
@@ -44,9 +44,10 @@ o.backward(dO)                              # dQ/dK/dV computed on Metal
 ```
 
 - head dim `== 64`, `N % 16 == 0`, full and causal.
-- The forward computes `O` (torch SDPA, which routes to the backend's simdgroup FA) and the
-  log-sum-exp the backward needs via a dedicated Metal flash kernel (`make_fa_logsumexp_kernel`,
-  tiled/online), so it never materializes the N×N score matrix.
+- The forward computes `O` through PyTorch SDPA; that eager call is not rerouted to
+  triton-msl merely by importing this package. A separate dedicated Metal flash kernel
+  (`make_fa_logsumexp_kernel`, tiled/online) computes the log-sum-exp needed by backward
+  without materializing its N×N score matrix. PyTorch owns SDPA's implementation selection.
 
 
 ## Biased / triangle attention (trifast's shape) — forward and backward templates

@@ -40,7 +40,7 @@ def test_aliased_reduce_waits_for_all_reads_before_result_write(kernel, axis, ex
     # Every reducer first commits to a register. No pooled result slot may be
     # overwritten until all simdgroups have completed their input-array reads.
     pattern = rf"""
-        for\s*\(uint\s+{loop_var}\s*=\s*0;[^{{]+\{{.*?
+        for\s*\(uint\s+{loop_var}\s*=\s*0u?;[^{{]+\{{.*?
         reduced_\d+\s*=\s*acc;\s*
         \}}\s*
         threadgroup_barrier\(mem_flags::mem_threadgroup\);\s*

@@ -308,6 +308,7 @@ class GenericLowerer(
         # metadata. Routes the 2-D-grid FA kernel through compile_shader (its
         # 2-D grid blocks the generic 1-D fast-path). None for every other kernel.
         self._flash_attention = None
+        self._tail_access_bounds = None
         self.options = options
         self.env = {}  # ssa_id -> MSL variable name
         self.env_types = {}  # ssa_id -> triton dtype string
@@ -1188,7 +1189,18 @@ class GenericLowerer(
                 # {64,128}): _fa_maxdim is the LARGER qk dim, so MLA (qk=192) lands here
                 # too. maxdim>128 was previously an unconditional refuse, so detection
                 # here can only ADD capability or refuse identically -- no regression.
-                info = self._detect_flash_attention()
+                # This prescan is intentionally broader than proven attention
+                # (e.g. a ReLU MLP followed by softmax also has two dots, exp,
+                # and max). Keep the established role-specific diagnostic when
+                # the conventional FA stride ABI is present; otherwise use a
+                # neutral subject. This changes wording only, never admission.
+                _fa_arg_names = {str(a.name).lower() for a in self.graph.args}
+                _named_fa_abi = {
+                    "stride_qm", "stride_qk", "stride_kn", "stride_kk",
+                }.issubset(_fa_arg_names)
+                info = self._detect_flash_attention(
+                    unresolved_subject=None if _named_fa_abi else "multi-dot softmax-shaped kernel",
+                )
                 if (
                     info is not None
                     and info["block_m"] == 32
@@ -5191,6 +5203,14 @@ class GenericLowerer(
 
     def _is_mask(self, ssa_id: int) -> bool:
         """Check if an SSA value is a boolean mask."""
+        # Entry arguments have no defining operation. Searching only graph.ops
+        # silently discarded a runtime scalar i1 load mask (False read memory
+        # instead of returning `other`). Bind their role to native owned facts,
+        # not the argument name, replay cache, or a printed signature.
+        if any(arg.id == ssa_id for arg in self.graph.args):
+            facts = self._native_value_facts(ssa_id, op_name="mask")
+            return (not facts.is_tensor and facts.shape == () and
+                    facts.kind == "integer" and facts.elem == "i1" and facts.width == 1)
         if ssa_id in self.env_is_mask:
             return True
 
@@ -7515,7 +7535,7 @@ class GenericLowerer(
         self._prescan_stores()
         return msl
 
-    def _detect_flash_attention(self, *, sequence_index=None):
+    def _detect_flash_attention(self, *, sequence_index=None, unresolved_subject=None):
         """Recognize a FlashAttention forward kernel and extract its params.
 
         Returns ``None`` when the kernel is NOT an FA pattern (fewer than two
@@ -7572,6 +7592,11 @@ class GenericLowerer(
         # Past this point the kernel IS an FA pattern: any unresolved field is
         # a hard refusal, never a guess.
         def _refuse(field):
+            if unresolved_subject is not None:
+                raise MetalNonRecoverableError(
+                    f"{unresolved_subject}: required pointer/stride roles could not be "
+                    "resolved; refusing rather than guess"
+                )
             raise MetalNonRecoverableError(
                 f"FlashAttention recognized but {field} could not be resolved; refusing rather than guess"
             )
@@ -14277,8 +14302,11 @@ class GenericLowerer(
             "arith.index_castui",
             "arith.extsi",
             "arith.extui",
-            "arith.trunci",
         )
+
+        # A truncation is not an affine row/column term. Dropping it here
+        # recreates the template's wrong address in the generic staging path.
+        # Keep it unproved until this representation can replay its wrap point.
 
         def _const_str(tid):
             """MSL string for a compile-time / block-constant coefficient
@@ -15195,6 +15223,9 @@ class GenericLowerer(
         if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = (shared_name, shape, shared_dtype)
+        if not hasattr(self, "_shared_mem_orientations"):
+            self._shared_mem_orientations = {}
+        self._shared_mem_orientations[ssa.id] = False
         # Also mark the source operand as having its data in shared memory.
         # This allows downstream reduces on the source to skip redundant copies.
         if ssa.operand_ids:
@@ -15227,6 +15258,39 @@ class GenericLowerer(
         if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = shared_info
+        if not hasattr(self, "_shared_mem_orientations"):
+            self._shared_mem_orientations = {}
+        orientations = self._shared_mem_orientations
+        if src_id not in orientations:
+            # A local_alloc creates the root descriptor view. Its physical fill
+            # and logical shape have the same orientation; only a proved
+            # memdesc_trans may toggle that fact. The K-chunk allocator owns its
+            # descriptor through a specialized lowering path, so it can reach
+            # here without the ordinary local_alloc helper having installed the
+            # otherwise-identical identity fact.
+            source = None
+            pending = list(self.graph.ops)
+            visited = set()
+            while pending:
+                candidate = pending.pop()
+                if candidate.id in visited:
+                    continue
+                visited.add(candidate.id)
+                if candidate.id == src_id:
+                    source = candidate
+                    break
+                pending.extend(candidate.region_ops or [])
+                pending.extend(candidate.else_ops or [])
+            if source is not None and source.op == "ttg.local_alloc":
+                orientations[src_id] = False
+            else:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "ttg.local_load has shared descriptor data without proved orientation",
+                    op_name="ttg.local_load",
+                )
+        orientations[ssa.id] = orientations[src_id]
 
     def _lower_memdesc_trans(self, ssa: SSAValue):
         """ttg.memdesc_trans -> transpose shared memory descriptor.
@@ -15241,6 +15305,46 @@ class GenericLowerer(
             return
 
         src_id = ssa.operand_ids[0]
+        order = ssa.attrs.get("order")
+        shape = self.env_shapes.get(src_id)
+        if shape is None or not isinstance(order, (list, tuple)) or sorted(order) != list(range(len(shape))):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "ttg.memdesc_trans requires a proven operation-owned permutation; refusing to guess",
+                op_name="ttg.memdesc_trans",
+            )
+        orientations = getattr(self, "_shared_mem_orientations", {})
+        if src_id not in orientations:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "ttg.memdesc_trans source has no proved descriptor orientation",
+                op_name="ttg.memdesc_trans",
+            )
+
+        if list(order) == list(range(len(shape))):
+            # An identity descriptor view preserves every alias, shape and
+            # transposed-state fact of its source exactly.
+            self._emit_passthrough(ssa)
+            if hasattr(self, "_shared_mem_descs") and src_id in self._shared_mem_descs:
+                self._shared_mem_descs[ssa.id] = self._shared_mem_descs[src_id]
+            orientations[ssa.id] = orientations[src_id]
+            return
+
+        inner_swap = list(range(len(shape)))
+        if len(shape) < 2:
+            inner_swap = []
+        else:
+            inner_swap[-2:] = [len(shape) - 1, len(shape) - 2]
+        if list(order) != inner_swap:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "ttg.memdesc_trans supports only identity or the proven inner-dimension swap; "
+                f"permutation {list(order)!r} is not reproduced",
+                op_name="ttg.memdesc_trans",
+            )
 
         # Propagate env, env_types, env_shapes from source
         self._emit_passthrough(ssa)
@@ -15251,17 +15355,10 @@ class GenericLowerer(
         shared_info = self._shared_mem_descs.get(src_id)
         if shared_info:
             shared_name, shape, shared_dtype = shared_info
-            # Swap dimensions to reflect transposed access
-            if len(shape) >= 2:
-                trans_shape = (shape[1], shape[0]) + shape[2:]
-            else:
-                trans_shape = shape
+            trans_shape = tuple(shape[i] for i in order)
             self._shared_mem_descs[ssa.id] = (shared_name, trans_shape, shared_dtype)
             self.env_shapes[ssa.id] = trans_shape
-            # Mark this shared array as transposed for dot indexing
-            if not hasattr(self, "_shared_mem_transposed"):
-                self._shared_mem_transposed = set()
-            self._shared_mem_transposed.add(shared_name)
+            orientations[ssa.id] = not orientations[src_id]
 
     # -- Matrix multiply (tt.dot) --
 
@@ -15370,9 +15467,25 @@ class GenericLowerer(
         # Check if operands were transposed via memdesc_trans.
         # Transposed arrays need swapped indexing: B_trans[k, col] reads
         # physical B_orig[col, k] = smem[col * K_orig + k].
-        transposed = getattr(self, "_shared_mem_transposed", set())
-        a_trans = a_smem in transposed
-        b_trans = b_smem in transposed
+        orientations = getattr(self, "_shared_mem_orientations", {})
+
+        def descriptor_orientation(value_id):
+            if value_id in orientations:
+                return orientations[value_id]
+            op = next((candidate for candidate in self.graph.ops if candidate.id == value_id), None)
+            if op is not None and op.op == "ttg.local_load" and op.operand_ids:
+                source_id = op.operand_ids[0]
+                if source_id in orientations:
+                    return orientations[source_id]
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "generic dot shared operand has no proved descriptor orientation",
+                op_name="tt.dot",
+            )
+
+        a_trans = descriptor_orientation(a_id)
+        b_trans = descriptor_orientation(b_id)
 
         # For transposed operands, the physical storage dimensions differ from
         # the logical ones. K is the inner/contraction dimension.

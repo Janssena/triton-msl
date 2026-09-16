@@ -955,11 +955,10 @@ class _ReduceScanMixin:
         #     whose cmp compares exactly those block args. Sign + direction come from the
         #     cmp predicate AND the select operand mapping (where(a>b,b,a) is a MIN).
         if nm == "arith.select" and len(top.operand_ids or []) >= 3:
-            return self._classify_cmp_select(ops, top, a, b)
+            return self._classify_cmp_select(ssa, ops, top, a, b)
         return None
 
-    @staticmethod
-    def _classify_cmp_select(ops, sel, a, b):
+    def _classify_cmp_select(self, ssa, ops, sel, a, b):
         """(kind, signed) for a cmp+select max/min, or None. The select must pick between the
         two block args, and its condition must be a cmp of exactly those block args — OR an
         ``ori(cmp, isnan)`` mask (inductor's NaN-propagating triton_helpers.maximum/minimum),
@@ -971,7 +970,7 @@ class _ReduceScanMixin:
         by_id = {o.id: o for o in ops}
         cond_op = by_id.get(cond)
         cmp = None
-        nan_prop = False
+        isnan_value = None
         if cond_op is not None and cond_op.op in ("arith.cmpf", "arith.cmpi"):
             cmp = cond_op
         elif cond_op is not None and cond_op.op == "arith.ori" and len(cond_op.operand_ids or []) == 2:
@@ -1002,7 +1001,7 @@ class _ReduceScanMixin:
             )
             if cmp is None or isnan is None:
                 return None
-            nan_prop = True
+            isnan_value = isnan.operand_ids[0]
         if cmp is None or len(cmp.operand_ids or []) < 2:
             return None
         lhs, rhs = cmp.operand_ids[0], cmp.operand_ids[1]
@@ -1018,8 +1017,22 @@ class _ReduceScanMixin:
             kind = "min" if is_gt else "max" if is_lt else None
         else:
             kind = None
-        if kind and nan_prop:
-            kind = "nan" + kind  # nanmax / nanmin
+        if kind and cmp.op == "arith.cmpf":
+            # A float cmp/select recurrence is ordered even when it computes a
+            # finite max/min or explicitly propagates NaN: ties and unordered
+            # comparisons select an exact operand.  Symmetric fmax/fmin or an
+            # any-NaN side channel loses that operand choice and therefore
+            # changes signed-zero and NaN/payload semantics. Carry the exact
+            # predicate/selection mapping to the ordered reducer. Direct
+            # arith.maximumf/minimumf was classified separately above.
+            if pred not in ("ogt", "oge", "olt", "ole") or lhs != a or rhs != b:
+                return None
+            _shape = self._native_shape(ssa.operand_ids[0], op_name="tt.reduce")
+            if _shape is None or len(_shape) not in (1, 2):
+                return None
+            true_side = "a" if t == a else "b"
+            nan_side = "none" if isnan_value is None else ("a" if isnan_value == a else "b")
+            kind = f"ordered_{pred}_{true_side}_{nan_side}"
         return (kind, signed) if kind else None
 
     def _get_reduce_combine_info(self, ssa):
@@ -1031,8 +1044,10 @@ class _ReduceScanMixin:
         to sum) — the prime directive.
         """
         _res = self.classify_reduce_combine(ssa)
-        # The multipass path supports the canonical kinds (sum/max/min/and/or/xor — the
-        # same set the single-pass path does); a custom / NaN-propagating combine refuses.
+        # The multipass path supports the canonical kinds plus the structurally proved
+        # ordered float cmp/select family.  Ordered operands are staged and folded in
+        # logical source order by _lower_multipass_reduction; they must never use an
+        # invented identity here.
         if _res is None:
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -1054,6 +1069,22 @@ class _ReduceScanMixin:
             "nanmin": "INFINITY",
         }
         return combine_op, identities.get(combine_op, "0.0f")
+
+    @staticmethod
+    def _ordered_multipass_shape_is_full(shape, axis, total):
+        """True only when one ordered result covers the complete staged tile."""
+        shape = tuple(shape or ())
+        if axis is None:
+            axis = 0 if len(shape) == 1 else None
+        if isinstance(axis, int) and axis < 0:
+            axis += len(shape)
+        if not isinstance(axis, int) or not 0 <= axis < len(shape):
+            return False
+        nonreduce_extent = 1
+        for dim, extent in enumerate(shape):
+            if dim != axis:
+                nonreduce_extent *= extent
+        return shape[axis] == total and nonreduce_extent == 1
 
     def _reduce_identity_combine(self, combine_op, msl_type):
         """Return (identity, combine_expr) for an `acc`/`val` sequential reduce.
@@ -1118,6 +1149,52 @@ class _ReduceScanMixin:
             combine_expr = "acc + val"
         return identity, combine_expr
 
+    def _multipass_scalar_load_ids(self):
+        """Prove entry-scalar loads that can live outside the element loops.
+
+        A non-tensor load was previously treated as per-element unconditionally.
+        Its scalar consumer was hoisted, however, and read a name whose defining
+        loop had closed. Only move ordinary loads through a read-only prefix;
+        stores, atomics, assertions, calls, control flow and volatile reads end
+        the proof. Pointer/mask/other dependencies must themselves be scalar and
+        available outside the loops. This is not general load speculation.
+        """
+        available = {
+            arg.id for arg in self.graph.args
+            if self._native_shape(arg.id, op_name="tt.load") == ()
+        }
+        pure_tt = {
+            "tt.make_range", "tt.get_program_id", "tt.get_num_programs",
+            "tt.splat", "tt.broadcast", "tt.expand_dims", "tt.reshape",
+            "tt.trans", "tt.addptr", "ttg.convert_layout",
+        }
+
+        def pure(op):
+            if op.op == "tt.load":
+                return op.attrs.get("isVolatile") is False
+            if op.op == "tt.reduce":
+                return all(child.op == "tt.reduce.return" or pure(child)
+                           for child in op.region_ops or [])
+            if op.region_ops or op.else_ops:
+                return False
+            return op.op.startswith(("arith.", "math.")) or op.op in pure_tt
+
+        loads = set()
+        for op in self.graph.ops:
+            if not pure(op):
+                break
+            ids = self._native_result_ids_for_op(op)
+            if (len(ids) != 1 or
+                    self._native_shape(ids[0], op_name=op.op) != () or
+                    not all(dep in available for dep in op.operand_ids)):
+                continue
+            if op.op == "tt.load":
+                loads.add(op.id)
+                available.add(ids[0])
+            elif self._is_scalar_op(op):
+                available.add(ids[0])
+        return loads
+
     def _lower_multipass_reduction(self, block_size):
         """Emit multi-pass reduction: per-element loops separated by reductions.
 
@@ -1135,6 +1212,10 @@ class _ReduceScanMixin:
         """
         total = self._total_elements
         phases = self._split_ops_by_reductions()
+        scalar_load_ids = self._multipass_scalar_load_ids()
+
+        def is_scalar_op(op):
+            return op.id in scalar_load_ids or self._is_scalar_op(op)
 
         # Collect all reduce result SSA IDs (scalars available across phases)
         reduce_result_ids = set()
@@ -1174,8 +1255,8 @@ class _ReduceScanMixin:
             )
 
             # Separate scalar ops (hoist before loop) from tensor ops (inside loop)
-            scalar_ops = [op for op in phase_ops if self._is_scalar_op(op)]
-            tensor_ops = [op for op in phase_ops if not self._is_scalar_op(op)]
+            scalar_ops = [op for op in phase_ops if is_scalar_op(op)]
+            tensor_ops = [op for op in phase_ops if not is_scalar_op(op)]
 
             # A SCALAR (per-program) atomic / store consuming a reduce RESULT must
             # execute EXACTLY ONCE — NOT once per wrap-loop iteration. Emitting it
@@ -1254,8 +1335,8 @@ class _ReduceScanMixin:
             )
 
             # Also hoist scalar deps from replay_ops before the loop
-            replay_scalar = [op for op in replay_ops if self._is_scalar_op(op)]
-            replay_tensor = [op for op in replay_ops if not self._is_scalar_op(op)]
+            replay_scalar = [op for op in replay_ops if is_scalar_op(op)]
+            replay_tensor = [op for op in replay_ops if not is_scalar_op(op)]
             for ssa in replay_scalar:
                 if ssa.id not in lowered_scalar_ids:
                     self._lower_op(ssa)
@@ -1281,6 +1362,41 @@ class _ReduceScanMixin:
                 # mismatch the ulong accumulator and silently mis-reduce above 2^63).
                 is_u64_reduce = reduce_input_dtype in ("u64", "ui64") or (is_i64_reduce and _unsigned)
                 acc_msl_type, _ = self._reduce_acc_msl_type(reduce_input_dtype, _unsigned)
+                ordered_multipass = combine_op.startswith("ordered_")
+                ordered_stage = None
+                if ordered_multipass:
+                    # The ordered comparator is operand-selecting and has no padding
+                    # identity.  A full adjacent tree over the logical source sequence
+                    # preserves operand order, NaN payload choice and signed-zero ties.
+                    # Restrict this bounded recovery to a complete power-of-two tile;
+                    # non-power-of-two tails need a separate value+validity design.
+                    _full_logical_reduce = self._ordered_multipass_shape_is_full(
+                        next_reduce_native.get("shape"),
+                        next_reduce_native.get("axis"),
+                        total,
+                    )
+                    if (
+                        acc_msl_type != "float"
+                        or total < block_size
+                        or total <= 0
+                        or total & (total - 1)
+                        or not _full_logical_reduce
+                    ):
+                        from triton_msl.errors import MetalNonRecoverableError
+
+                        raise MetalNonRecoverableError(
+                            "ordered float cmp/select on the multipass reduction path "
+                            "requires a complete power-of-two full logical reduction "
+                            "with at least one value per thread and only singleton "
+                            "non-reduction dimensions; refusing rather than flattening "
+                            "an axis reduction, padding, or reassociating a tail.",
+                            op_name="tt.reduce",
+                        )
+                    ordered_stage = f"shared_ordered_multipass_{self._shared_counter}"
+                    self._shared_counter += 1
+                    self.kb.declare_threadgroup_array(
+                        ordered_stage, dtype="fp32", size=total
+                    )
                 # bitwise (and/or/xor) identities are width-independent: and = all-ones,
                 # or/xor = 0; product identity = 1.
                 _bitwise_ident = {"and": "(~0)", "or": "0", "xor": "0", "prod": "1"}
@@ -1300,8 +1416,10 @@ class _ReduceScanMixin:
                         identity = {"sum": "0", "max": "INT_MIN", "min": "INT_MAX", **_bitwise_ident}.get(
                             combine_op, "0"
                         )
-                # else float: identity preserved from above
-                self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {identity};")
+                # else float: identity preserved from above. Ordered reductions do
+                # not declare an identity accumulator: every source element is staged.
+                if not ordered_multipass:
+                    self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {identity};")
 
             # Open the per-element loop
             self._needs_wrapping = True
@@ -1343,7 +1461,11 @@ class _ReduceScanMixin:
                 input_var = self._lookup(reduce_input_id)
                 # Cast input to accumulator type to avoid Metal ambiguity
                 cast_input = f"({acc_msl_type}){input_var}"
-                if combine_op == "sum":
+                if ordered_multipass:
+                    self.kb.raw_line(
+                        f"        {ordered_stage}[_loop_e] = {cast_input};"
+                    )
+                elif combine_op == "sum":
                     self.kb.raw_line(f"        {acc_var} += {cast_input};")
                 elif combine_op == "prod":
                     self.kb.raw_line(f"        {acc_var} *= {cast_input};")
@@ -1369,6 +1491,38 @@ class _ReduceScanMixin:
             # Close the loop
             self.kb.raw_line(f"    }}")
             self._needs_wrapping = False
+
+            if next_reduce and ordered_multipass:
+                # Each round combines adjacent, equal-sized contiguous source
+                # subranges. All writes in a round are disjoint; the barrier publishes
+                # them before the next round. This is the same leaf order as the
+                # single-pass ordered tree, without strided per-thread partials.
+                self.kb.barrier("threadgroup")
+                _span = 1
+                while _span < total:
+                    _pairs = total // (2 * _span)
+                    self.kb.raw_line(
+                        f"    for (uint _ord_mp = lid; _ord_mp < {_pairs}u; "
+                        f"_ord_mp += {block_size}u) {{"
+                    )
+                    self.kb.raw_line(
+                        f"        uint _ord_left = _ord_mp * {2 * _span}u;"
+                    )
+                    self.kb.raw_line(
+                        f"        {ordered_stage}[_ord_left] = "
+                        + self.kb.ordered_combine_expr(
+                            combine_op,
+                            f"{ordered_stage}[_ord_left]",
+                            f"{ordered_stage}[_ord_left + {_span}u]",
+                        )
+                        + ";"
+                    )
+                    self.kb.raw_line("    }")
+                    self.kb.barrier("threadgroup")
+                    _span *= 2
+                self.kb.raw_line(
+                    f"    {acc_msl_type} {acc_var} = {ordered_stage}[0];"
+                )
 
             # Emit any scalar terminal write (atomic/store of a reduce result)
             # ONCE, AFTER the per-element loop — never inside it (B3 over-count fix).
@@ -1413,6 +1567,11 @@ class _ReduceScanMixin:
                         op_name="tt.reduce",
                     )
                 self.env[reduce_input_id] = acc_var
+                if ordered_multipass:
+                    self.env_shapes[reduce_input_id] = None
+                    if not hasattr(self, "_ordered_multipass_inputs"):
+                        self._ordered_multipass_inputs = set()
+                    self._ordered_multipass_inputs.add(reduce_input_id)
                 _acc_dtype = {"long": "i64", "ulong": "u64", "int": "i32", "float": "fp32"}.get(acc_msl_type)
                 if _acc_dtype is not None:
                     self.env_types[reduce_input_id] = _acc_dtype
@@ -1565,6 +1724,7 @@ class _ReduceScanMixin:
                 "custom combine is refused rather than silently mis-computed."
             )
         combine_op, _signed = _res
+        ordered_cmp = combine_op.startswith("ordered_")
         has_unsigned_minmax = combine_op in ("max", "min") and not _signed
 
         # The input and result representation/shape are native per-value facts.
@@ -1580,6 +1740,41 @@ class _ReduceScanMixin:
 
         # Check if this is a 2D axis-specific reduction
         input_shape = native["shape"]
+
+        # Ordered float cmp/select has no symmetric intrinsic or generally safe
+        # padding identity. Exact one-value-per-lane 1-D and fully staged rank-2
+        # axis reductions are handled here. A separately proved top-level
+        # multipass full reduction arrives already folded in logical source order;
+        # array-fold, nested, tail-padded, or other N-D forms still refuse.
+        if ordered_cmp:
+            _ordered_multipass = ssa.operand_ids[0] in getattr(
+                self, "_ordered_multipass_inputs", set()
+            )
+            _rn = input_shape[0] if input_shape and len(input_shape) == 1 else None
+            _rank2 = bool(input_shape and len(input_shape) == 2 and self._is_2d)
+            _total2 = input_shape[0] * input_shape[1] if _rank2 else None
+            _exact_1d = (
+                _rn == self.kb.block_size
+                and (self.kb.block_size == 16 or (self.kb.block_size >= 32 and self.kb.block_size % 32 == 0))
+            )
+            _staged_2d = _rank2 and _total2 <= self.kb.block_size
+            if (
+                self.env_array.get(ssa.operand_ids[0]) is not None
+                or self._control_flow_depth > 0
+                or not (_exact_1d or _staged_2d or _ordered_multipass)
+            ):
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "ordered float cmp/select reduction is supported only for an exact "
+                    "16-or-more-value 1-D tile or a fully staged rank-2 axis tile, with no "
+                    "tail padding, nesting, unproved multipass, or register-array fold; this shape "
+                    "is refused rather than changing "
+                    "NaN, payload, or signed-zero operand-selection semantics.",
+                    op_name="tt.reduce",
+                )
+            if _ordered_multipass:
+                input_shape = None
 
         # Phase 4e: MEPT array operand. Fold this thread's register array to
         # a scalar partial with the combine op, then run the existing 1-D
@@ -2508,10 +2703,17 @@ class _ReduceScanMixin:
             self._shared_counter += 1
             self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
 
+        ordered_cmp = combine_op.startswith("ordered_")
+
         # Identity + combine expression. Must branch on the actual MSL type:
         # long/ulong need 64-bit identities and the integer max/min overload,
         # not the 32-bit INT_MIN/INT_MAX or the float fmax/fmin.
-        identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
+        if ordered_cmp:
+            # Zero initializes only lanes outside the logical result. Every
+            # real result seeds from its first in-bounds axis element below.
+            identity, combine_expr = f"({msl_type})0", None
+        else:
+            identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
 
         result_var = self._next_var("reduced")
 
@@ -2546,10 +2748,17 @@ class _ReduceScanMixin:
             self.kb.declare_threadgroup_array(result_shared, dtype=shared_dtype, size=M)
             self.kb.raw_line(f"    {msl_type} {result_var} = {identity};")
             self.kb.raw_line(f"    if (lid < {M}u) {{")
-            self.kb.raw_line(f"        {msl_type} acc = {identity};")
-            self.kb.raw_line(f"        for (uint j = 0; j < {N}u; j++) {{")
+            _seed = f"{shared_name}[lid * {N}u]" if ordered_cmp else identity
+            _start = 1 if ordered_cmp else 0
+            self.kb.raw_line(f"        {msl_type} acc = {_seed};")
+            self.kb.raw_line(f"        for (uint j = {_start}u; j < {N}u; j++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[lid * {N}u + j];")
-            self.kb.raw_line(f"            acc = {combine_expr};")
+            if ordered_cmp:
+                self.kb.raw_line(
+                    f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};"
+                )
+            else:
+                self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
             self.kb.raw_line(f"        {result_var} = acc;")
             self.kb.raw_line(f"    }}")
@@ -2572,10 +2781,17 @@ class _ReduceScanMixin:
             self.kb.declare_threadgroup_array(result_shared, dtype=shared_dtype, size=N)
             self.kb.raw_line(f"    {msl_type} {result_var} = {identity};")
             self.kb.raw_line(f"    if (lid < {N}u) {{")
-            self.kb.raw_line(f"        {msl_type} acc = {identity};")
-            self.kb.raw_line(f"        for (uint i = 0; i < {M}u; i++) {{")
+            _seed = f"{shared_name}[lid]" if ordered_cmp else identity
+            _start = 1 if ordered_cmp else 0
+            self.kb.raw_line(f"        {msl_type} acc = {_seed};")
+            self.kb.raw_line(f"        for (uint i = {_start}u; i < {M}u; i++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[i * {N}u + lid];")
-            self.kb.raw_line(f"            acc = {combine_expr};")
+            if ordered_cmp:
+                self.kb.raw_line(
+                    f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};"
+                )
+            else:
+                self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
             self.kb.raw_line(f"        {result_var} = acc;")
             self.kb.raw_line(f"    }}")

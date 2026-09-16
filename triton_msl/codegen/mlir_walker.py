@@ -19,6 +19,40 @@ from typing import Any, Dict, List, Optional, Tuple
 from .result_metadata import ResultMeta, layout_aliases, parse_type_facts
 
 
+def _mlir_symbol_identity(token: str) -> str:
+    """Return the semantic symbol name from a bare or quoted MLIR token.
+
+    Quoted symbols use MLIR string escapes (not Python escapes). Native
+    ``sym_name`` attributes expose this decoded identity, so text-assisted call
+    and function indexes must use the same identity for ownership checks.
+    """
+    if len(token) < 2 or token[0] != '"' or token[-1] != '"':
+        return token
+    body = token[1:-1]
+    out = bytearray()
+    i = 0
+    simple = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+    while i < len(body):
+        if body[i] != "\\":
+            out.extend(body[i].encode("utf-8"))
+            i += 1
+            continue
+        if i + 2 < len(body) and all(c in "0123456789abcdefABCDEF" for c in body[i + 1 : i + 3]):
+            out.append(int(body[i + 1 : i + 3], 16))
+            i += 3
+            continue
+        if i + 1 < len(body) and body[i + 1] in simple:
+            out.extend(simple[body[i + 1]].encode("utf-8"))
+            i += 2
+            continue
+        # Unknown escape is not a symbol identity we can prove.
+        return ""
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -130,6 +164,18 @@ def _is_ptr_type(type_str: str) -> bool:
     return "!tt.ptr" in type_str
 
 
+def _native_argument_fields(facts):
+    """Use the native value's parsed facts for ABI-facing type fields."""
+    from triton_msl.errors import MetalNonRecoverableError
+
+    element = facts.pointee if facts.kind == "pointer" else facts
+    if element is None or element.elem is None or element.kind not in ("integer", "float", "index"):
+        raise MetalNonRecoverableError(
+            f"walker: unsupported native function type {facts.raw!r}; refusing to default its type"
+        )
+    return facts.raw, element.elem, facts.kind == "pointer", facts.is_tensor
+
+
 def _extract_shape(type_str: str) -> tuple:
     """Extract tensor shape from an MLIR type string.
 
@@ -201,23 +247,46 @@ class _ModuleTextIndex:
         self.predicates = self._parse_predicates()
         self.atomic_ops = self._parse_atomic_ops()
         self.call_targets = self._parse_call_targets()
+        self.trans_orders = self._parse_trans_orders()
+        self.memdesc_trans_orders = self._parse_permutation_ops("ttg.memdesc_trans")
         self.func_defs = self._parse_func_defs()
         self.cond_br_ops = self._parse_cond_br_ops()
         self.extern_elementwise_ops = self._parse_extern_elementwise_ops()
 
+    def _op_lines(self, opcode: str) -> List[str]:
+        """Return canonical operation lines, never text in locations/comments.
+
+        MLIR's printer places the operation mnemonic at the start of an op line,
+        after an optional SSA result assignment.  Anchoring there prevents quoted
+        locations such as ``loc("%fake = arith.cmpi ugt, ...")`` from entering a
+        walk-order semantic channel.
+        """
+        prefix = re.compile(
+            rf"^\s*(?:%[\w.$-]+(?::\d+)?\s*=\s*)?{re.escape(opcode)}\b"
+        )
+        return [line for line in self.text.splitlines() if prefix.match(line)]
+
     def _parse_func_name(self) -> str:
-        m = re.search(r"(?:tt\.func|func\.func)\s+(?:public\s+)?@(\w+)", self.text)
-        return m.group(1) if m else "kernel"
+        m = re.search(r'(?:tt\.func|func\.func)\s+(?:public\s+)?@("(?:[^"\\]|\\.)*"|[^\s(]+)', self.text)
+        return _mlir_symbol_identity(m.group(1)) if m else "kernel"
 
     def _parse_arg_names(self, func_name: str = None) -> List[str]:
         # The function signature contains loc(...) with nested parens,
         # so we can't use a simple [^)]* regex. Instead, find the
         # function keyword and then balanced-paren match the args.
-        if func_name:
-            pattern = rf"(?:tt\.func|func\.func)\s+(?:public\s+|private\s+)?@{re.escape(func_name)}\s*\("
-        else:
-            pattern = r"(?:tt\.func|func\.func)\s+(?:public\s+)?@\w+\s*\("
-        m = re.search(pattern, self.text)
+        pattern = re.compile(
+            r'(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?'
+            r'@("(?:[^"\\]|\\.)*"|[^\s(]+)\s*\('
+        )
+        m = None
+        for candidate in pattern.finditer(self.text):
+            visibility = candidate.group(1) or "public"
+            identity = _mlir_symbol_identity(candidate.group(2))
+            if (func_name is not None and identity == func_name) or (
+                func_name is None and visibility == "public"
+            ):
+                m = candidate
+                break
         if not m:
             return []
         start = m.end()  # Position right after the opening '('
@@ -241,13 +310,78 @@ class _ModuleTextIndex:
             tt.call @callee_name(...) : ...   (void return)
         """
         result = {}
-        # With result(s):
-        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.call\s+@([^\s(]+)", self.text):
-            result[m.group(1)] = m.group(2)
-        # Void calls (no result):
-        for m in re.finditer(r"^\s*tt\.call\s+@([^\s(]+)", self.text, re.MULTILINE):
-            # Use function name as key for void calls
-            result[f"_void_call_{m.group(1)}"] = m.group(1)
+        target_re = re.compile(r'tt\.call\s+@(?:"((?:[^"\\]|\\.)*)"|([^\s(]+))\s*\(')
+        for line in self._op_lines("tt.call"):
+            m = target_re.search(line)
+            if m is None:
+                continue
+            token = f'"{m.group(1)}"' if m.group(1) is not None else m.group(2)
+            target = _mlir_symbol_identity(token)
+            owner = re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=", line)
+            result[owner.group(1) if owner else f"_void_call_{target}"] = target
+        return result
+
+    def _parse_trans_orders(self) -> List[Dict[str, Any]]:
+        return self._parse_permutation_ops("tt.trans")
+
+    def _parse_permutation_ops(self, opcode: str) -> List[Dict[str, Any]]:
+        """Index actual printed transpose operations with their function scope.
+
+        The native binding cannot print one operation and exposes no dense-array
+        getter. Restrict recovery to anchored operation lines from the native
+        module printer; quoted locations/comments cannot create a record.
+        """
+        result = []
+        current_function = None
+        function_depth = 0
+
+        def brace_delta(line):
+            clean, quoted, escaped = [], False, False
+            for char in line:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\" and quoted:
+                    escaped = True
+                    continue
+                if char == '"':
+                    quoted = not quoted
+                    continue
+                if not quoted:
+                    clean.append(char)
+            text = "".join(clean).split("//", 1)[0]
+            return text.count("{") - text.count("}")
+
+        for line in self.text.splitlines():
+            if current_function is None:
+                func = re.match(r"^\s*(?:tt\.func|func\.func)\s+(?:(?:public|private)\s+)?@(\S+)\s*\(", line)
+                if func is None:
+                    continue
+                current_function = func.group(1)
+                function_depth = brace_delta(line)
+            else:
+                function_depth += brace_delta(line)
+
+            match = re.match(
+                rf"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*{re.escape(opcode)}\b[^\n]*?"
+                r"order\s*=\s*array<i32:\s*([^>]+)>[^\n]*?\s->\s(.+?)(?:\s+loc\(|\s*$)",
+                line,
+            )
+            if match is not None:
+                try:
+                    order = tuple(int(part.strip()) for part in match.group(2).split(","))
+                except ValueError:
+                    order = ()
+                result.append(
+                    {
+                        "function": current_function,
+                        "result": match.group(1),
+                        "order": order,
+                        "result_type": match.group(3).strip(),
+                    }
+                )
+            if function_depth <= 0:
+                current_function = None
         return result
 
     def _parse_func_defs(self) -> Dict[str, Dict]:
@@ -261,9 +395,12 @@ class _ModuleTextIndex:
         }
         """
         result = {}
-        for m in re.finditer(r"(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?@(\S+)\s*\(", self.text):
+        for m in re.finditer(
+            r'(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?@("(?:[^"\\]|\\.)*"|[^\s(]+)\s*\(',
+            self.text,
+        ):
             visibility = m.group(1) or "public"   # MLIR default visibility is public
-            func_name = m.group(2)
+            func_name = _mlir_symbol_identity(m.group(2))
 
             # Parse args (balanced paren matching)
             start = m.end()
@@ -321,9 +458,10 @@ class _ModuleTextIndex:
         # or: %name = arith.constant dense<VALUE> : tensor<...>
         # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         # constants with negative values often get printed as e.g. `%c-123_i32`.
-        for m in re.finditer(
-            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", self.text, re.MULTILINE
-        ):
+        for line in self._op_lines("arith.constant"):
+            m = re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", line)
+            if m is None:
+                continue
             ssa_name = m.group(1)
             rest = m.group(2).strip()
 
@@ -357,9 +495,10 @@ class _ModuleTextIndex:
         result = []
         # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         # constants with negative values often get printed as e.g. `%c-123_i32`.
-        for m in re.finditer(
-            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", self.text, re.MULTILINE
-        ):
+        for line in self._op_lines("arith.constant"):
+            m = re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", line)
+            if m is None:
+                continue
             rest = m.group(2).strip()
 
             dm = re.match(r"dense<([^>]+)>", rest)
@@ -377,15 +516,20 @@ class _ModuleTextIndex:
                 else:
                     result.append(_try_parse_number(val_str))
             else:
-                result.append(0)
+                # Preserve parse failure for the walker's loud channel check;
+                # zero is a valid constant and must never be invented here.
+                result.append(None)
 
         return result
 
     def _parse_predicates(self) -> Dict[str, str]:
         """Parse comparison predicate names: SSA name -> predicate."""
         result = {}
-        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", self.text):
-            result[m.group(1)] = m.group(2)
+        for opcode in ("arith.cmpi", "arith.cmpf"):
+            for line in self._op_lines(opcode):
+                m = re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", line)
+                if m is not None:
+                    result[m.group(1)] = m.group(2)
         return result
 
     def _parse_atomic_ops(self) -> Dict[str, Dict[str, str]]:
@@ -424,7 +568,10 @@ class _ModuleTextIndex:
         suitable for walk-order matching.
         """
         results = []
-        for m in re.finditer(r"tt\.extern_elementwise\b[^{]*\{([^}]*)\}", self.text):
+        for line in self._op_lines("tt.extern_elementwise"):
+            m = re.search(r"tt\.extern_elementwise\b[^{]*\{([^}]*)\}", line)
+            if m is None:
+                continue
             attrs_text = m.group(1)
             info = {}
             # Extract symbol = "..."
@@ -449,8 +596,11 @@ class _ModuleTextIndex:
         Used to split cf.cond_br operand_ids into condition, true args, false args.
         """
         results = []
-        pattern = r"cf\.cond_br\s+%[^\s,]+\s*,\s*\^\w+(\([^)]*\))?\s*,\s*\^\w+(\([^)]*\))?"
-        for m in re.finditer(pattern, self.text):
+        pattern = re.compile(r"cf\.cond_br\s+%[^\s,]+\s*,\s*\^\w+(\([^)]*\))?\s*,\s*\^\w+(\([^)]*\))?")
+        for line in self._op_lines("cf.cond_br"):
+            m = pattern.search(line)
+            if m is None:
+                continue
             true_args_str = m.group(1) or ""
             false_args_str = m.group(2) or ""
             n_true = true_args_str.count("%")
@@ -516,6 +666,16 @@ class MLIRWalker:
         self._predicates_in_order = self._get_predicates_in_order()
         self._predicate_walk_index = 0
 
+        # Installed bindings expose scalar but not array attributes. Bind
+        # each textual transpose to the native op at the same checked walk
+        # position; consumers must never search by rank across the module.
+        self._trans_orders_in_order = self._text_index.trans_orders
+        self._trans_walk_index = 0
+        self._trans_binding_errors = []
+        self._memdesc_trans_orders_in_order = self._text_index.memdesc_trans_orders
+        self._memdesc_trans_walk_index = 0
+        self._memdesc_trans_binding_errors = []
+
         # Call target matching: map walk order -> callee name
         self._call_targets_in_order = self._get_call_targets_in_order()
         self._call_walk_index = 0
@@ -525,6 +685,7 @@ class MLIRWalker:
 
         # tt.extern_elementwise matching: symbol/libname by text order
         self._extern_elementwise_walk_index = 0
+        self._channel_binding_errors = []
 
     def _get_constant_ssa_names_in_order(self) -> List[str]:
         r"""Get arith.constant SSA names in text order.
@@ -532,11 +693,19 @@ class MLIRWalker:
         SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         constants with negative values often get printed as `%c-123_i32`.
         """
-        return [m.group(1) for m in re.finditer(r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant", self._mod_text)]
+        return [
+            m.group(1)
+            for line in self._text_index._op_lines("arith.constant")
+            if (m := re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant", line))
+        ]
 
     def _get_predicate_ssa_names_in_order(self) -> List[str]:
         """Get arith.cmp* SSA names in text order."""
-        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]", self._mod_text)]
+        return [
+            m.group(1)
+            for line in self._mod_text.splitlines()
+            if (m := re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.cmp[if]\b", line))
+        ]
 
     def _get_predicates_in_order(self) -> List[str]:
         """Get arith.cmp* PREDICATES in text order, parallel to the SSA-name
@@ -545,7 +714,11 @@ class MLIRWalker:
         and after), so a name->predicate dict collides and the later region
         overwrites the earlier one — corrupting the loop condition. Same anchored
         regex as the name list so the two stay index-aligned."""
-        return [m.group(2) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", self._mod_text)]
+        return [
+            m.group(2)
+            for line in self._mod_text.splitlines()
+            if (m := re.match(r"^\s*%([\w.$-]+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", line))
+        ]
 
     def _get_call_targets_in_order(self) -> List[str]:
         """Get tt.call callee names in text order.
@@ -555,8 +728,12 @@ class MLIRWalker:
             %x = tt.call @callee(...) -> non-void
         """
         targets = []
-        for m in re.finditer(r"tt\.call\s+@(\S+)\(", self._mod_text):
-            targets.append(m.group(1))
+        target_re = re.compile(r'tt\.call\s+@(?:"((?:[^"\\]|\\.)*)"|([^\s(]+))\s*\(')
+        for line in self._text_index._op_lines("tt.call"):
+            m = target_re.search(line)
+            if m is not None:
+                token = f'"{m.group(1)}"' if m.group(1) is not None else m.group(2)
+                targets.append(_mlir_symbol_identity(token))
         return targets
 
     def _next_var(self) -> str:
@@ -775,7 +952,7 @@ class MLIRWalker:
         # function visited is the public entry" (a private function before the public one in the
         # module text swapped the two bodies). Post-order visits sibling functions in text order;
         # each function op is cross-checked by name and visibility against the text table.
-        func_order = [(n.strip('"'), info) for n, info in self._text_index.func_defs.items()]
+        func_order = list(self._text_index.func_defs.items())
         func_k = [0]
         refusal = [None]  # set inside the walk, raised after it (see the tt.func handler)
         func_body_blocks = [set()]  # function-body block ids seen for the function being collected
@@ -1091,6 +1268,50 @@ class MLIRWalker:
 
         self.module.walk(walk_fn)
 
+        if self._trans_walk_index != len(self._trans_orders_in_order):
+            refusal[0] = (
+                "walker: native/text tt.trans counts disagree; refusing to guess a permutation "
+                f"({self._trans_walk_index} native, {len(self._trans_orders_in_order)} textual)"
+            )
+        elif self._trans_binding_errors:
+            refusal[0] = self._trans_binding_errors[0]
+        elif self._memdesc_trans_walk_index != len(self._memdesc_trans_orders_in_order):
+            refusal[0] = (
+                "walker: native/text ttg.memdesc_trans counts disagree; refusing to guess a permutation "
+                f"({self._memdesc_trans_walk_index} native, "
+                f"{len(self._memdesc_trans_orders_in_order)} textual)"
+            )
+        elif self._memdesc_trans_binding_errors:
+            refusal[0] = self._memdesc_trans_binding_errors[0]
+        elif self._constant_walk_index != len(self._text_index.constants_by_position):
+            refusal[0] = (
+                "walker: native/text arith.constant counts disagree; refusing positional metadata "
+                f"({self._constant_walk_index} native, {len(self._text_index.constants_by_position)} textual)"
+            )
+        elif self._predicate_walk_index != len(self._predicates_in_order):
+            refusal[0] = (
+                "walker: native/text comparison counts disagree; refusing predicate metadata "
+                f"({self._predicate_walk_index} native, {len(self._predicates_in_order)} textual)"
+            )
+        elif self._call_walk_index != len(self._call_targets_in_order):
+            refusal[0] = (
+                "walker: native/text tt.call counts disagree; refusing callee metadata "
+                f"({self._call_walk_index} native, {len(self._call_targets_in_order)} textual)"
+            )
+        elif self._cond_br_walk_index != len(self._text_index.cond_br_ops):
+            refusal[0] = (
+                "walker: native/text cf.cond_br counts disagree; refusing branch metadata "
+                f"({self._cond_br_walk_index} native, {len(self._text_index.cond_br_ops)} textual)"
+            )
+        elif self._extern_elementwise_walk_index != len(self._text_index.extern_elementwise_ops):
+            refusal[0] = (
+                "walker: native/text tt.extern_elementwise counts disagree; refusing symbol metadata "
+                f"({self._extern_elementwise_walk_index} native, "
+                f"{len(self._text_index.extern_elementwise_ops)} textual)"
+            )
+        elif self._channel_binding_errors:
+            refusal[0] = self._channel_binding_errors[0]
+
         if refusal[0] is not None:
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -1101,9 +1322,9 @@ class MLIRWalker:
     def _build_called_funcs(self, callee_funcs_raw, nested_ops, block_args_map):
         """Build CalledFunc objects from raw callee function data.
 
-        Uses the text-parsed function definitions to get function names,
-        argument info, and return types. Matches callee ops to their function
-        definitions by order (walk order matches text order).
+        Text supplies names only. Argument and returned-value types come from
+        the per-native-value records collected in the same walk, never a
+        comma-split function signature or a default f32 type.
         """
         if not callee_funcs_raw:
             return []
@@ -1112,34 +1333,46 @@ class MLIRWalker:
         func_defs = self._text_index.func_defs
         private_funcs = [(name, info) for name, info in func_defs.items() if not info["is_public"]]
 
+        from triton_msl.errors import MetalNonRecoverableError
+
+        if len(callee_funcs_raw) != len(private_funcs):
+            raise MetalNonRecoverableError("walker: callee body/name counts disagree; refusing to guess a function signature")
+
+        def native_type(value_id, function_name, *, argument=False):
+            meta = self._result_meta.get(value_id)
+            if meta is None or meta.function_name != function_name or (argument and meta.kind != "callee_arg"):
+                raise MetalNonRecoverableError(
+                    f"walker: missing native type for {'argument' if argument else 'return value'} "
+                    f"of callee {function_name!r}; refusing to default its type"
+                )
+            return _native_argument_fields(meta.type)
+
         called_funcs = []
         for i, raw in enumerate(callee_funcs_raw):
-            if i >= len(private_funcs):
-                break
-
             func_name, func_info = private_funcs[i]
             ops = raw["ops"]
-            callee_block_ids = raw["block_ids"]
 
             # Build function arguments from block_args_map
             # The callee's entry block is the first block in callee_block_ids
             args = []
             arg_names = func_info.get("arg_names", [])
-            arg_types = func_info.get("arg_types", [])
 
             # The callee's arguments are the block arguments of its FUNCTION-BODY block
             # (packet 166). `callee_block_ids` is an unordered set and a loop's condition /
             # body blocks carry block arguments too (the loop-carried values), so scanning for
             # "a block with arguments" bound a callee's signature to its loop on some walks.
             entry_bid = raw.get("entry_block_id")
+            actual_ids = block_args_map.get(entry_bid, [])
+            if len(actual_ids) != len(arg_names):
+                raise MetalNonRecoverableError(
+                    f"walker: argument name/native-value counts disagree for callee {func_name!r}"
+                )
             for bid in ([entry_bid] if entry_bid is not None else []):
                 if bid in block_args_map and block_args_map[bid]:
                     arg_ids = block_args_map[bid]
                     for j, arg_id in enumerate(arg_ids):
-                        a_name = arg_names[j] if j < len(arg_names) else f"arg{j}"
-                        a_type = arg_types[j] if j < len(arg_types) else "f32"
-                        elem_type = _extract_elem_type(a_type)
-                        is_ptr = _is_ptr_type(a_type)
+                        a_name = arg_names[j]
+                        a_type, elem_type, is_ptr, is_tensor = native_type(arg_id, func_name, argument=True)
                         fa = FuncArg(
                             id=arg_id,
                             name=a_name,
@@ -1158,7 +1391,7 @@ class MLIRWalker:
                             attrs={"index": j, "is_ptr": is_ptr},
                             type_str=a_type,
                             elem_type=elem_type,
-                            is_tensor=_is_tensor_type(a_type),
+                            is_tensor=is_tensor,
                         )
                     break
 
@@ -1167,7 +1400,12 @@ class MLIRWalker:
             callee_nested_ops = raw.get("nested", {})
             self._attach_nested_ops(ops, callee_nested_ops, block_args_map)
 
-            return_types = func_info.get("return_types", [])
+            returns = [op for op in ops if op.op in ("tt.return", "func.return")]
+            if len(returns) != 1 or not ops or returns[0] is not ops[-1]:
+                raise MetalNonRecoverableError(
+                    f"walker: callee {func_name!r} needs one terminal return to establish its native result types"
+                )
+            return_types = [native_type(vid, func_name)[0] for vid in returns[0].operand_ids]
 
             called_funcs.append(
                 CalledFunc(
@@ -1195,9 +1433,7 @@ class MLIRWalker:
         for i in range(n_args):
             arg = entry_block.get_argument(i)
             arg_id = arg.id()
-            type_str = str(arg.get_type())
-            elem_type = _extract_elem_type(type_str)
-            is_ptr = _is_ptr_type(type_str)
+            type_str, elem_type, is_ptr, is_tensor = _native_argument_fields(self._type_facts(arg))
             name = arg_names[i] if i < len(arg_names) else f"arg{i}"
             # Triton frontend flattens tuple args into dot-indexed names
             # (e.g. `Ptrs.0`). Dots are not valid in C identifiers, so
@@ -1224,7 +1460,7 @@ class MLIRWalker:
                 attrs={"index": i, "is_ptr": is_ptr},
                 type_str=type_str,
                 elem_type=elem_type,
-                is_tensor=_is_tensor_type(type_str),
+                is_tensor=is_tensor,
             )
 
     def _make_ssa_value(self, op, name: str) -> SSAValue:
@@ -1286,6 +1522,12 @@ class MLIRWalker:
         """Extract relevant attributes for an operation."""
         attrs = {}
 
+        if name == "tt.load":
+            # Native BoolAttr, needed to prove that a scalar read may be moved
+            # out of a multipass element loop. Never infer it from printed IR.
+            volatile = op.get_bool_attr("isVolatile")
+            attrs["isVolatile"] = False if volatile is None else bool(volatile)
+
         if name == "tt.assert":
             # This is a semantic StringAttr, never a substring parsed from a
             # printed location, comment, or kernel name.
@@ -1331,7 +1573,13 @@ class MLIRWalker:
                 # multiple noinline functions).
                 idx = self._constant_walk_index
                 if idx < len(self._text_index.constants_by_position):
-                    attrs["value"] = self._text_index.constants_by_position[idx]
+                    parsed = self._text_index.constants_by_position[idx]
+                    if parsed is None:
+                        self._channel_binding_errors.append(
+                            "walker: anchored arith.constant text could not be parsed; refusing to invent zero"
+                        )
+                    else:
+                        attrs["value"] = parsed
                 elif idx < len(self._constant_names_in_order):
                     ssa_name = self._constant_names_in_order[idx]
                     if ssa_name in self._text_index.constants:
@@ -1342,12 +1590,28 @@ class MLIRWalker:
             pred = op.get_int_attr("predicate")
             if pred is not None:
                 attrs["predicate"] = pred
-            # Look up predicate name POSITIONALLY by walk order (not by SSA
-            # name — region-local names collide across scf.while/scf.if regions
-            # and a name-keyed lookup returns the wrong region's predicate).
+            # Prefer the operation-owned native enum. Text is only an independently
+            # anchored cross-check because pybind exposes the integer but not its
+            # spelling; locations/comments can never create a candidate record.
             idx = self._predicate_walk_index
-            if idx < len(self._predicates_in_order):
-                attrs["predicate_name"] = self._predicates_in_order[idx]
+            integer_names = {
+                0: "eq", 1: "ne", 2: "slt", 3: "sle", 4: "sgt",
+                5: "sge", 6: "ult", 7: "ule", 8: "ugt", 9: "uge",
+            }
+            float_names = {
+                0: "false", 1: "oeq", 2: "ogt", 3: "oge", 4: "olt",
+                5: "ole", 6: "one", 7: "ord", 8: "ueq", 9: "ugt",
+                10: "uge", 11: "ult", 12: "ule", 13: "une", 14: "uno", 15: "true",
+            }
+            native_name = (integer_names if name == "arith.cmpi" else float_names).get(pred)
+            textual_name = self._predicates_in_order[idx] if idx < len(self._predicates_in_order) else None
+            if native_name is None or textual_name != native_name:
+                self._channel_binding_errors.append(
+                    "walker: operation-owned comparison predicate disagrees with anchored text "
+                    f"({native_name!r} native, {textual_name!r} textual); refusing"
+                )
+            else:
+                attrs["predicate_name"] = native_name
             self._predicate_walk_index += 1
 
         elif name == "cf.cond_br":
@@ -1366,10 +1630,71 @@ class MLIRWalker:
                 attrs["axis"] = 0
 
         elif name == "tt.trans":
-            # Extract permutation order from the op
-            # The order attribute is an array<i32: 1, 0> for 2D transpose
-            # Try to extract via text parsing since bindings may not expose array attrs
-            attrs["order"] = None  # Will be populated from text if available
+            idx = self._trans_walk_index
+            record = self._trans_orders_in_order[idx] if idx < len(self._trans_orders_in_order) else None
+            self._trans_walk_index += 1
+            result = op.get_result(0) if op.get_num_results() == 1 else None
+            facts = self._type_facts(result) if result is not None else None
+            text_facts = (
+                parse_type_facts(record["result_type"], self._type_aliases)
+                if record is not None
+                else None
+            )
+            shape = facts.shape if facts is not None else None
+            rank = len(shape) if shape is not None else None
+            meta = self._result_meta.get(result.id()) if result is not None else None
+            same_owner = record is not None and meta is not None and record["function"] == meta.function_name
+            same_type = (
+                facts is not None
+                and text_facts is not None
+                and text_facts.unknown_reason is None
+                and facts.unknown_reason is None
+                and (text_facts.kind, text_facts.elem, text_facts.shape, text_facts.is_tensor)
+                == (facts.kind, facts.elem, facts.shape, facts.is_tensor)
+            )
+            if record is not None and (not same_owner or not same_type):
+                self._trans_binding_errors.append(
+                    "walker: textual/native tt.trans ownership cross-check failed for "
+                    f"%{record['result']} in {record['function']!r}; refusing its permutation"
+                )
+            order = record["order"] if record is not None and same_owner and same_type else ()
+            attrs["order"] = (
+                list(order)
+                if rank is not None and len(order) == rank and sorted(order) == list(range(rank))
+                else None
+            )
+
+        elif name == "ttg.memdesc_trans":
+            idx = self._memdesc_trans_walk_index
+            records = self._memdesc_trans_orders_in_order
+            record = records[idx] if idx < len(records) else None
+            self._memdesc_trans_walk_index += 1
+            result = op.get_result(0) if op.get_num_results() == 1 else None
+            facts = self._type_facts(result) if result is not None else None
+            meta = self._result_meta.get(result.id()) if result is not None else None
+            same_owner = record is not None and meta is not None and record["function"] == meta.function_name
+
+            def memdesc_value_signature(raw):
+                match = re.match(r"^!ttg\.memdesc<((?:\d+x)+)([a-z]\w*)\s*,", raw.strip())
+                if match is None:
+                    return None
+                return tuple(int(x) for x in match.group(1).split("x") if x), match.group(2)
+
+            text_signature = memdesc_value_signature(record["result_type"]) if record is not None else None
+            native_signature = memdesc_value_signature(facts.raw) if facts is not None else None
+            same_type = text_signature is not None and text_signature == native_signature
+            if record is not None and (not same_owner or not same_type):
+                self._memdesc_trans_binding_errors.append(
+                    "walker: textual/native ttg.memdesc_trans ownership cross-check failed for "
+                    f"%{record['result']} in {record['function']!r}; refusing its permutation"
+                )
+            order = record["order"] if record is not None and same_owner and same_type else ()
+            rank = len(native_signature[0]) if native_signature is not None else None
+            attrs["order"] = (
+                list(order)
+                if rank is not None and len(order) == rank and sorted(order) == list(range(rank))
+                else None
+            )
 
         elif name == "tt.reduce":
             axis = op.get_int_attr("axis")
@@ -1427,16 +1752,25 @@ class MLIRWalker:
             self._call_walk_index += 1
 
         elif name == "tt.extern_elementwise":
-            # Look up symbol/libname from pre-parsed module text by walk order
+            # String/bool attrs are operation-owned when pybind exposes them.
+            # Anchored text remains a checked fallback for older bindings.
             idx = self._extern_elementwise_walk_index
+            native_symbol = op.get_str_attr("symbol")
+            native_libname = op.get_str_attr("libname")
+            native_pure = op.get_bool_attr("pure")
             if idx < len(self._text_index.extern_elementwise_ops):
                 info = self._text_index.extern_elementwise_ops[idx]
-                if "symbol" in info:
-                    attrs["symbol"] = info["symbol"]
-                if "libname" in info:
-                    attrs["libname"] = info["libname"]
-                if "pure" in info:
-                    attrs["pure"] = info["pure"]
+                for key, native in (
+                    ("symbol", native_symbol), ("libname", native_libname), ("pure", native_pure)
+                ):
+                    textual = info.get(key)
+                    if native is not None and textual is not None and native != textual:
+                        self._channel_binding_errors.append(
+                            f"walker: operation-owned tt.extern_elementwise {key} disagrees with anchored text"
+                        )
+                    value = native if native is not None else textual
+                    if value is not None:
+                        attrs[key] = value
             self._extern_elementwise_walk_index += 1
 
         return attrs

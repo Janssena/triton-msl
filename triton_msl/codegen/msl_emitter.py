@@ -340,6 +340,32 @@ class KernelBuilder:
 
     # -- Reduction operations --
 
+    @staticmethod
+    def ordered_combine_expr(op, left, right):
+        """Render one exact ordered cmp/select combine."""
+        try:
+            _, pred, true_side, nan_side = op.split("_", 3)
+            cmp = {"ogt": ">", "oge": ">=", "olt": "<", "ole": "<="}[pred]
+        except (ValueError, KeyError) as exc:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(f"unknown ordered reduction combine '{op}'") from exc
+        if true_side not in ("a", "b"):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(f"unknown ordered reduction true side '{true_side}'")
+        cond = f"({left} {cmp} {right})"
+        if nan_side == "a":
+            cond = f"({cond} || ({left} != {left}))"
+        elif nan_side == "b":
+            cond = f"({cond} || ({right} != {right}))"
+        elif nan_side != "none":
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(f"unknown ordered reduction NaN side '{nan_side}'")
+        tval, fval = (left, right) if true_side == "a" else (right, left)
+        return f"({cond} ? {tval} : {fval})"
+
     def threadgroup_reduce(self, op, val_var, shared_var, out_var, reduce_ty="float"):
         """Emit a full threadgroup reduction: SIMD reduce → shared mem → final SIMD reduce.
 
@@ -373,6 +399,71 @@ class KernelBuilder:
             )
         self._needs_simd_qualifiers = True
         from triton_msl.codegen.msl_builtins import SIMD_REDUCTIONS
+
+        _ordered = op.startswith("ordered_")
+
+        if _ordered:
+            if reduce_ty not in ("float", "half", "bfloat") or (
+                self.block_size != 16 and (self.block_size < 32 or self.block_size % 32)
+            ):
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "ordered cmp/select reduction requires a complete float SIMD-group tile"
+                )
+            # All lanes execute the same five shuffle calls. Build adjacent
+            # contiguous ranges ([0,1], [2,3], then [0,3], ...) rather than the
+            # ordinary shuffle-down interleaving (0,16,8,24,...). The operator
+            # is associative but can be non-commutative: reassociation is legal,
+            # changing leaf order is not.
+            lane_val = f"(({reduce_ty}){val_var})"
+            self._var(f"ordered_{out_var}", lane_val, ty=reduce_ty)
+            _last_active_lane = min(self.block_size, 32) - 1
+            for _offset in (1, 2, 4, 8, 16):
+                if _offset >= min(self.block_size, 32):
+                    continue
+                _right = f"ordered_right_{out_var}_{_offset}"
+                # Clamp indices unused by this round so every lane executes a
+                # defined, convergent shuffle before the leader-only update.
+                self._var(
+                    _right,
+                    f"simd_shuffle(ordered_{out_var}, "
+                    f"min((uint)tiisg + {_offset}u, {_last_active_lane}u))",
+                    ty=reduce_ty,
+                )
+                self.begin_if(f"(((uint)tiisg & {(2 * _offset) - 1}u) == 0u)")
+                self._emit(
+                    f"ordered_{out_var} = "
+                    + self.ordered_combine_expr(op, f"ordered_{out_var}", _right)
+                    + ";"
+                )
+                self.end_block()
+            n_simd_groups = (self.block_size + 31) // 32
+            self.barrier("threadgroup")
+            self.begin_if("tiisg == 0")
+            self._emit(f"{shared_var}[sgitg] = ordered_{out_var};")
+            self.end_block()
+            self.barrier("threadgroup")
+            # Do not let non-leader threads read slot zero while lid 0 may be
+            # writing the final group fold.  Their temporary value is dead;
+            # all threads consume the published slot only after the barrier.
+            self._var(out_var, f"({reduce_ty})0", ty=reduce_ty)
+            self.begin_if("lid == 0")
+            self._emit(f"{out_var} = {shared_var}[0];")
+            self._emit(f"for (uint _ord_group = 1u; _ord_group < {n_simd_groups}u; ++_ord_group) {{")
+            self._indent += 1
+            self._emit(
+                f"{out_var} = "
+                + self.ordered_combine_expr(op, out_var, f"{shared_var}[_ord_group]")
+                + ";"
+            )
+            self._indent -= 1
+            self._emit("}")
+            self._emit(f"{shared_var}[0] = {out_var};")
+            self.end_block()
+            self.barrier("threadgroup")
+            self._emit(f"{out_var} = {shared_var}[0];")
+            return out_var
 
         intrinsic = SIMD_REDUCTIONS[op]
         # Reduce IN the element type. Integer reductions were emitted in float
@@ -681,6 +772,9 @@ def emit_msl(mod, metadata, options):
         from triton_msl.codegen.generic_lowerer import lower_ir_graph
 
         graph = walk_ttgir(mod, options)
+        if retained_asserts:
+            from triton_msl.codegen._constant_assertions import discharge_scalar_true
+            graph = discharge_scalar_true(graph, mod)
         metadata["name"] = _sanitize_msl_name(graph.func_name)
 
         from triton_msl.codegen.generic_lowerer import GenericLowerer
@@ -710,7 +804,15 @@ def emit_msl(mod, metadata, options):
             metadata["flash_attention"] = getattr(lowerer, "_flash_attention", None)
             # Batched-dot host-roundtrip address-bounds descriptor; None for
             # other kernels. Runtime strides must stay inside each view mirror.
-            metadata["batched_dot_bounds"] = getattr(lowerer, "_batched_dot_bounds", None)
+            # Mutually exclusive address-plan union, sealed by the packed
+            # launch contract. Rank-3 batched dot and the K-loop templates do
+            # not share a lowering route.
+            _batched_bounds = getattr(lowerer, "_batched_dot_bounds", None)
+            _tail_bounds = getattr(lowerer, "_tail_access_bounds", None)
+            if _batched_bounds is not None and _tail_bounds is not None:
+                raise MetalNonRecoverableError(
+                    "lowering produced conflicting launch address contracts", op_name="tt.dot")
+            metadata["batched_dot_bounds"] = _batched_bounds or _tail_bounds
             plan = lowerer._assert_plan
             metadata['device_assert'] = ({'schema': 1, 'messages': plan['messages'],
                                           'buffer_index': len(graph.args)} if plan is not None else None)

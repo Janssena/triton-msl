@@ -189,7 +189,8 @@ def test_scalar_signature_templates_execute_without_changing_matmul(monkeypatch,
         # compiled.function identifies the staged entry, not this execution.
         from triton_msl.backend.driver import _MM_DIRECT_PIPELINES
 
-        expected_pipeline = _MM_DIRECT_PIPELINES[id(handle.function)]
+        primary_pipeline, expected_pipeline = _MM_DIRECT_PIPELINES[id(handle.function)]
+        assert primary_pipeline is handle.function
     else:
         expected_pipeline = handle.function
     assert len(calls) == 1 and calls[0][0] is expected_pipeline

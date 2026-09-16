@@ -7,13 +7,14 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0 (Node 24)
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0 (Node 24)
         with:
-          python-version: '3.12'
+          python-version: '3.14'
+          architecture: arm64
 
       - name: Verify tag matches package version
         run: |
@@ -22,11 +23,16 @@ jobs:
           test "$TAG" = "$VER" || { echo "::error::tag $TAG does not match pyproject version $VER"; exit 1; }
           echo "tag $TAG matches package version $VER"
 
+      - name: Check malformed artifact rejection and build isolation
+        run: python -I tests/test_release_artifacts.py -v
+
       - name: Install build tools
         run: pip install build twine
 
-      - name: Build sdist and wheel
-        run: python -m build
+      - name: Build and verify the native, pure and source bundle
+        # Native requests are explicit and fail on the wrong interpreter/platform.
+        # Each wheel builds from a separate fresh extraction of the sole sdist.
+        run: python scripts/release_artifacts.py build --source . --dist dist
 
       - name: Check package
         run: twine check dist/*
@@ -39,8 +45,18 @@ jobs:
 
   test-install:
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: native
+            python: '3.14'
+          - mode: pure
+            python: '3.12'
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0 (Node 24)
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1 (Node 24)
         with:
           name: dist
@@ -48,13 +64,20 @@ jobs:
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0 (Node 24)
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
+          architecture: arm64
 
-      - name: Install from wheel
-        run: pip install dist/*.whl
-
-      - name: Verify import
-        run: python -c "import triton_msl; print('triton_msl imported successfully')"
+      - name: Verify bundle and install the selected wheel outside checkout
+        env:
+          ARTIFACT_MODE: ${{ matrix.mode }}
+        run: |
+          WHEEL=$(python scripts/release_artifacts.py select --source . --dist dist --mode "$ARTIFACT_MODE")
+          SMOKE="$GITHUB_WORKSPACE/scripts/release_artifacts.py"
+          NEUTRAL=$(mktemp -d "$RUNNER_TEMP/triton-install.XXXXXX")
+          python -m venv "$NEUTRAL/venv"
+          cd "$NEUTRAL"
+          "$NEUTRAL/venv/bin/python" -I -m pip install "$WHEEL"
+          "$NEUTRAL/venv/bin/python" -I "$SMOKE" smoke --wheel "$WHEEL" --mode "$ARTIFACT_MODE"
 
   publish-testpypi:
     needs: test-install

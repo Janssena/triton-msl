@@ -33,6 +33,10 @@ assert-carrying kernels use the generic path. The experimental C++ compiler uses
 the checked MSL path for these kernels, and the MLX adapter refuses the descriptor
 because it does not implement the status-buffer/result-return contract.
 
+Native scalar-true checks may be discharged when the source graph proves the
+predicate true without loading device data. This does not discharge indirect-index
+checks or turn unsupported assertion forms into silently ignored operations.
+
 The descriptor is bound into version 2 of the packed launch contract. Old or
 altered records must recompile; neither messages nor the hidden buffer binding
 may be changed on a cached launcher. Kernels without retained assertions allocate
@@ -42,4 +46,11 @@ measured +15.1% latency for a standalone asserted kernel and +11.9% for GPT-2 sm
 The latter executes checks on 2 of 43 backend launches. These measured increases remain
 open performance alerts; they are not universal bounds or qualified published claims.
 The baseline omitted retained checks, and those checks must not be elided to improve timing.
-See [RC limitations](RELEASE_CANDIDATE_LIMITATIONS.md) for the measurement scope.
+See [RC limitations](RELEASE_CANDIDATE_LIMITATIONS.md) for the separate current
+main-relative matrix and its 13 open alerts; the older 439 comparison is not that matrix.
+
+If the host transfer/synchronization itself reports a separate native runtime error,
+it can raise before the launch-local flag is inspected. The attempted-submission
+boundary still prevents replay, but simultaneous native and assertion failures are
+not guaranteed to retain assertion-message attribution. Do not infer the source of
+that native error from its text or describe this diagnostics limit as repaired.

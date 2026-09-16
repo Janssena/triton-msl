@@ -150,8 +150,9 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         False — pre-invocation miss; caller may use the generic path.
         Errors after attempted invocation propagate, including post-launch hooks.
     """
-    # Unpack descriptor defensively (6/8/9-element; older descriptors lack dtype
-    # / stride-check fields).
+    # Unpack descriptor defensively. New descriptors append the source K-loop
+    # tail contract; older descriptors lack it and retain their historical
+    # behavior (their cache products are source-hash bound).
     _submission = submission_state if submission_state is not None else SubmissionState()
     try:
         fast_msl = descriptor[0]
@@ -161,6 +162,8 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         msl_out = descriptor[7] if len(descriptor) > 7 else None
         stride_checks = descriptor[8] if len(descriptor) > 8 else ()
         grid_spec = descriptor[9] if len(descriptor) > 9 else None
+        k_tail_mode = descriptor[10] if len(descriptor) > 10 else None
+        source_block_k = descriptor[11] if len(descriptor) > 11 else None
     except (TypeError, ValueError, IndexError):
         return False  # malformed descriptor -> skip
 
@@ -173,6 +176,20 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         M = int(kargs[m_idx])
         N = int(kargs[n_idx])
         K = int(kargs[k_idx])
+
+        # The replacement shader reduces only through logical K. An unmasked
+        # Triton K-loop executes a complete final BLOCK_K iteration, so a
+        # nondivisible runtime K must stay on the generic padded replay. This is
+        # checked before tuning, compilation, allocation, or submission.
+        if k_tail_mode == "full_blocks":
+            try:
+                source_block_k = int(source_block_k)
+            except (TypeError, ValueError):
+                return False
+            if source_block_k <= 0 or K % source_block_k:
+                return False
+        elif k_tail_mode not in (None, "masked_zero"):
+            return False
 
         # LAUNCH CONTRACT (packet 105 B) — first, so it also gates split-K and the tuned
         # tile selection below (both are replacement launches).

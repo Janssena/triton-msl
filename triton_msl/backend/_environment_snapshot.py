@@ -6,6 +6,9 @@ invalidate it too. Nonstandard environment mappings retain their live behavior.
 No watcher, private dict version counter, or mutation hook is installed.
 """
 import os
+import builtins
+import dis
+import _collections_abc
 import _operator
 import sys
 import threading
@@ -13,7 +16,20 @@ from collections.abc import Mapping
 from importlib.machinery import FrozenImporter
 from itertools import repeat
 from operator import is_
-from types import BuiltinFunctionType, CodeType, MappingProxyType, MethodType
+from types import BuiltinFunctionType, CodeType, FunctionType, MappingProxyType, MethodType
+from triton_msl.backend._cache_contract import _validation_native
+
+_native_all = (all if type(all) is BuiltinFunctionType and all.__self__ is builtins
+               and all.__name__ == "all" else None)
+_native_map = _validation_native.map_type if _validation_native is not None else None
+_native_builtins = __builtins__
+
+
+def _dependency_checks(fn, iterator):
+    # The nonstandard all() fallback receives lazy observations, not an eagerly
+    # evaluated list. A custom consumer may stop or raise before any lookup.
+    for name, expected in iterator:
+        yield fn.__globals__.get(name, fn.__builtins__.get(name)) is expected
 
 
 def _frozen_codes(module="os"):
@@ -48,6 +64,40 @@ _codes = _frozen_codes()
 _encoding = sys.getfilesystemencoding()
 
 
+def _implementation(fn, code, namespace, *, getter=False):
+    """Admit frozen code only with its ordinary globals and call signature.
+
+    Equal code can be borrowed by a function with different globals/builtins.
+    Resolve only the frozen code's global loads; attribute names are not globals.
+    Unsupported global dependencies decline this optional optimization.
+    """
+    if (type(fn) is not FunctionType or code is None or fn.__code__ != code
+            or fn.__globals__ is not namespace or fn.__builtins__ is not vars(builtins)
+            or fn.__kwdefaults__ is not None):
+        return None
+    defaults = fn.__defaults__
+    if (getter and not (type(defaults) is tuple and len(defaults) == 1 and defaults[0] is None)
+            or not getter and defaults is not None):
+        return None
+    known = {"KeyError": KeyError, "list": list, "dict": dict, "isinstance": isinstance,
+             "str": str, "TypeError": TypeError, "type": type}
+    names = {op.argval for op in dis.get_instructions(code) if op.opname == "LOAD_GLOBAL"}
+    if not names <= known.keys():
+        return None
+    dependencies = tuple((name, known[name]) for name in sorted(names))
+    guard = fn, fn.__code__, defaults, dependencies
+    return guard if _implementation_unchanged(guard) else None
+
+
+def _implementation_unchanged(guard):
+    if _validation_native is not None and _native_all is not None:
+        return _validation_native.implementation_unchanged(globals(), guard)
+    fn, code, defaults, dependencies = guard
+    return (fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is None
+            and all(fn.__globals__.get(name, fn.__builtins__.get(name)) is expected
+                    for name, expected in dependencies))
+
+
 def _standard_encoding(fn):
     closure = getattr(fn, "__closure__", None)
     return (closure is not None and len(closure) == 1
@@ -71,6 +121,16 @@ _standard = (
             and getattr(fn.__code__, "co_qualname", "").startswith("_create_environ_mapping.<locals>.")
             for fn in _codecs)
 )
+_implementations = (
+    _implementation(_get, _frozen_codes("_collections_abc").get("Mapping.get"),
+                    vars(_collections_abc), getter=True),
+    *(_implementation(fn, _codes.get(name), vars(os)) for fn, name in (
+        (_getitem, "_Environ.__getitem__"), (_iter, "_Environ.__iter__"),
+        (_copy, "_Environ.copy"))),
+    *(_implementation(fn, _codes.get(getattr(getattr(fn, "__code__", None), "co_qualname", None)),
+                      vars(os)) for fn in _codecs[:2]),
+) if _standard else ()
+_standard = _standard and all(guard is not None for guard in _implementations)
 _lock = threading.RLock()
 _cached = None
 # Do not bless an arbitrary pre-import override as an identity predicate.
@@ -92,6 +152,7 @@ The result is immutable only on the recognized path.
     env = os.environ
     getter, copier = getattr(env, "get", None), getattr(env, "copy", None)
     if (not _standard or type(env) is not _type or _type is not getattr(os, "_Environ", None)
+            or not all(_implementation_unchanged(guard) for guard in _implementations)
             or _type.__getitem__ is not _getitem or _type.__iter__ is not _iter
             or type(getter) is not MethodType or getter.__func__ is not _get or getter.__self__ is not env
             or type(copier) is not MethodType or copier.__func__ is not _copy or copier.__self__ is not env
@@ -111,8 +172,10 @@ The result is immutable only on the recognized path.
         if (_builtin_identity is not None and is_ is _builtin_identity
                 and cached is not None and cached[0] is env
                 and len(cached[1]) == len(raw)
-                and all(map(is_, raw, cached[1]))
-                and all(map(is_, raw.values(), cached[1].values()))):
+                and (_validation_native.same_items(raw, cached[1])
+                     if _validation_native is not None and all is _native_all and map is _native_map
+                     else (all(map(is_, raw, cached[1]))
+                           and all(map(is_, raw.values(), cached[1].values()))))):
             return cached[2]
         # environb accepts bytes subclasses whose decode/equality can depend on
         # mutable state. Equal byte payloads alone do not prove those objects

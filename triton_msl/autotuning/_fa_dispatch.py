@@ -31,6 +31,52 @@ group_size=(tg, 1, 1) -- exactly the (validated) native-grid launch.
 from triton_msl.autotuning._submission import SubmissionState
 
 
+# The specialization below skips only builtin scalar-resolution operations.
+# Foreign converters and replacement builtin bindings keep the original path.
+_MLA_TYPE = (0).__class__.__class__
+_MLA_INT = (0).__class__
+_MLA_BOOL = True.__class__
+_MLA_LIST = [].__class__
+_MLA_TUPLE = ().__class__
+_MLA_STR = "".__class__
+_MLA_ISINSTANCE, _MLA_HASATTR, _MLA_LEN = isinstance, hasattr, len
+_MLA_RESOLVER_BUILTINS = True
+for _mla_fn, _mla_name in ((_MLA_ISINSTANCE, "isinstance"), (_MLA_HASATTR, "hasattr"), (_MLA_LEN, "len")):
+    _MLA_RESOLVER_BUILTINS = (_MLA_RESOLVER_BUILTINS and _MLA_TYPE(_mla_fn) is [].append.__class__
+                            and _mla_fn.__module__ == "builtins" and _mla_fn.__name__ == _mla_name)
+del _mla_fn, _mla_name
+
+
+def _mla_builtin_strides(kargs, refs):
+    """Resolve three builtin source strides and folded c1, without caching values.
+
+    Every role reads the current argument list anew. Eligibility performs no
+    user conversions or attribute reads; a miss leaves those to the original
+    resolver, in its original order.
+    """
+    if not (_MLA_RESOLVER_BUILTINS and int is _MLA_INT and bool is _MLA_BOOL and tuple is _MLA_TUPLE
+            and isinstance is _MLA_ISINSTANCE and hasattr is _MLA_HASATTR and len is _MLA_LEN):
+        return None
+    args_type, refs_type = _MLA_TYPE(kargs), _MLA_TYPE(refs)
+    if args_type is not _MLA_LIST and args_type is not _MLA_TUPLE:
+        return None
+    if refs_type is not _MLA_LIST and refs_type is not _MLA_TUPLE:
+        return None
+    if len(refs) != 4:
+        return None
+    a, b, c, d = refs
+    if (_MLA_TYPE(a) is not _MLA_INT or _MLA_TYPE(b) is not _MLA_INT or _MLA_TYPE(c) is not _MLA_INT
+            or _MLA_TYPE(d) is not _MLA_STR or d != "c1"):
+        return None
+    size = len(kargs)
+    if not (0 <= a < size and 0 <= b < size and 0 <= c < size):
+        return None
+    sa, sb, sc = kargs[a], kargs[b], kargs[c]
+    if _MLA_TYPE(sa) is _MLA_INT and _MLA_TYPE(sb) is _MLA_INT and _MLA_TYPE(sc) is _MLA_INT:
+        return sa, sb, sc, 1
+    return None
+
+
 def _launch_grid_ok(grid, expected):
     """Packet 105 B: a replacement template computes the FULL output from its descriptor;
     it may stand in for the compiled kernel only when the caller launched EXACTLY the
@@ -107,7 +153,10 @@ def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, la
                 return False
             if t.dtype != want:
                 return False
-            st = tuple(_res(r) for r in srefs[role])
+            refs = srefs[role]
+            st = _mla_builtin_strides(kargs, refs)
+            if st is None:
+                st = tuple(_res(r) for r in refs)
             if len(st) != 4 or any(s is None or s < 0 for s in st):
                 return False
             shape = (Z, H, N, last)

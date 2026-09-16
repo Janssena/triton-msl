@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 # PEP 541 confusability check, so this ships as `triton-msl` — a distinct stem
 # (MSL = Metal Shading Language, which this backend emits). Import name: triton_msl.
 name = "triton-msl"
-version = "0.3.0rc4"
+version = "0.3.0"
 description = "Metal (Apple Silicon) backend for Triton"
 readme = "README.md"
 # PEP 639 SPDX expression (Metadata-Version 2.4). Do NOT also add a
@@ -71,6 +71,13 @@ metal = "triton_msl.backend"
 
 [tool.setuptools.packages.find]
 include = ["triton_msl*"]
+
+# A local experiment binary must never leak into a pure-Python wheel as data.
+# Declared Extension products are installed by build_ext, not package-data copy.
+[tool.setuptools.exclude-package-data]
+"triton_msl.backend" = ["_validation_native*.so", "_validation_native*.dylib",
+                        "_packed_native*.so", "_packed_native*.dylib",
+                        "_binder_native*.so", "_binder_native*.dylib"]
 
 [tool.pytest.ini_options]
 markers = [

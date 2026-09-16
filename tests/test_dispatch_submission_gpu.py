@@ -21,17 +21,17 @@ def _accumulate(X, O, B: tl.constexpr):
 @pytest.mark.parametrize("failure", ["hook", "runtime_return", "compile_miss"])
 def test_real_driver_does_not_repeat_submitted_atomic(monkeypatch, failure):
     from triton.knobs import runtime
+    from triton_msl.backend import driver
     from triton_msl.backend.driver import _get_compile_shader_runtime
 
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
+    # The intentional compile miss enters this runtime's negative cache. Give
+    # each injection its own real runtime so that miss cannot send a later case
+    # down the host path. Monkeypatch restores the caller's original singleton.
+    rt = CompileShaderRuntime()
+    monkeypatch.setattr(driver, "_COMPILE_SHADER_RUNTIME", rt)
     x = torch.ones(256, device="mps")
     out = torch.zeros(8, device="mps")
-    # Compile and establish the source's one-application value before injection.
-    _accumulate[(1,)](x, out, B=256)
-    torch.mps.synchronize()
-    assert torch.equal(out.cpu(), torch.full((8,), 32.0))
-    out.zero_()
-    rt = _get_compile_shader_runtime()
     calls = []
     original_dispatch = rt.dispatch
 
@@ -42,6 +42,14 @@ def test_real_driver_does_not_repeat_submitted_atomic(monkeypatch, failure):
     monkeypatch.setattr(rt, "dispatch", observed)
     assert _get_compile_shader_runtime() is rt
     assert _get_compile_shader_runtime().dispatch is observed
+    # Establish both the numeric control and the actual path before injecting a
+    # failure. A correct host fallback is not evidence for this shader boundary.
+    _accumulate[(1,)](x, out, B=256)
+    torch.mps.synchronize()
+    assert torch.equal(out.cpu(), torch.full((8,), 32.0))
+    assert calls == ["invoked"], "warmup did not exercise the actual shader dispatch"
+    calls.clear()
+    out.zero_()
     hook_calls = []
 
     def hook(metadata):

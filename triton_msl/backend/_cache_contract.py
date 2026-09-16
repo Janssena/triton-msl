@@ -15,6 +15,35 @@ import threading
 import weakref
 
 
+def _select_validation_native(import_module, find_spec, modules):
+    """Only proved extension absence permits Python fallback; errors stay loud."""
+    name = "triton_msl.backend._validation_native"
+    if name not in modules and find_spec(name) is None:
+        return None
+    native = import_module(name)
+    for entry in ("implementation_unchanged", "same_items", "identity_probes", "type_version", "mro_absent", "dict_keys_exact_str", "dict_keys_exact_bytes", "bytes_dict_items_are", "function_code_is", "function_state", "function_state_is", "identity_fast_path_disabled"):
+        if not callable(getattr(native, entry, None)):
+            raise ImportError(f"validation extension has no callable {entry} entry point")
+    return native
+
+
+# Before framework/provider inventory, not a lazy import halfway through policy
+# observation. Both persistent and resident identities bind the actual image.
+from importlib import import_module as _import_module
+from importlib.util import find_spec as _find_spec
+import sys as _sys
+_validation_native = _select_validation_native(_import_module, _find_spec, _sys.modules)
+# Optional packed copying must be selected before the first implementation or
+# framework/provider stamp. Broken installed helpers propagate; absence alone
+# retains the original Python copier. No launch can introduce a late native image.
+from triton_msl.backend import _launch_contract as _packed_launch_contract
+# Binding can also select a native image. Complete that selection before any
+# provider stamp, including pointer-only launches whose binding plan stays Python.
+# Do not catch broken-helper imports or refresh a previously captured stamp.
+from triton_msl.backend import _launch_signature as _launch_binding_contract
+
+
+
 SOURCE_SCHEMA = 3
 _jit_guard_lock = threading.RLock()
 _policy_snapshot = None
@@ -29,11 +58,11 @@ def _digest(value):
 def _package_content(root):
     """Stable logical filenames plus bytes of runtime source/native inputs.
 
-    Native build SOURCES are not runtime inputs; a rebuilt extension's bytes are.
+    Bind shipped C sources and actual native image bytes; neither substitutes for the other.
     Symlink targets are read for their bytes, but absolute paths never enter the
     result. Missing/unreadable files propagate instead of hashing as 'unknown'.
     """
-    suffixes = {".py", ".so", ".dylib", ".a", ".bc", ".metal", ".metallib"}
+    suffixes = {".py", ".c", ".so", ".dylib", ".a", ".bc", ".metal", ".metallib"}
     files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix in suffixes)
     if not files or not (root / "__init__.py").is_file():
         raise RuntimeError("cannot fingerprint an incomplete triton_msl package")
@@ -247,13 +276,26 @@ def execution_contract():
     modules or run custom finders. Never cache across those live checks.
     """
     global _execution_snapshot
+    saved = _identity_fast_path.check()
+    if saved is not None:
+        return saved
+    # Only a MISS can release obsolete certificate ownership. Finalizers may
+    # re-enter or change policy: drain before selecting ANY complete-evaluator
+    # input, never in the hot probe loop or after building its replacement stamp.
+    # Older helper images keep their existing bounded-cache behavior; the pure
+    # Python fallback owns no native program cache.
+    if _validation_native is not None:
+        collect = getattr(_validation_native, "probe_cache_collect", None)
+        if collect is not None:
+            collect()
     if source_contract is not _standard_source_contract:
         return _encode_execution(source_contract(), toolchain_identity())
-
     from triton_msl import CODEGEN_VERSION
     schema = SOURCE_SCHEMA
     implementation = implementation_identity()
     frameworks = framework_identity()
+    # Capture framework inputs at their original phase, before later callbacks.
+    _identity_fast_path.build(frameworks)
 
     # Select providers at their ORIGINAL observation points. A framework
     # callback can replace policy; policy can replace the toolchain provider.
@@ -292,6 +334,9 @@ def execution_contract():
         if (cached is not None and cached[0] is environment and cached[1] is schema
                 and cached[2] is implementation and cached[3] is frameworks
                 and cached[4] is CODEGEN_VERSION and cached[5] is compiler):
+            _identity_fast_path.finalize(cached[6], (schema, implementation, frameworks,
+                policy_provider, capture, policy_helper, environment,
+                compiler_provider, compiler, CODEGEN_VERSION))
             return cached[6]
     source = {"schema": schema, "implementation": implementation, "frameworks": frameworks,
               "policy": policy, "label": CODEGEN_VERSION}
@@ -300,6 +345,9 @@ def execution_contract():
             and type(frameworks) is str and type(CODEGEN_VERSION) is str
             and type(compiler) is str):
         _execution_snapshot = environment, schema, implementation, frameworks, CODEGEN_VERSION, compiler, stamp
+        _identity_fast_path.finalize(stamp, (schema, implementation, frameworks,
+            policy_provider, capture, policy_helper, environment,
+            compiler_provider, compiler, CODEGEN_VERSION))
     return stamp
 
 
@@ -419,3 +467,7 @@ def publish_binary_record(path, source, key, data):
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+# Bound last: the fast path observes the providers defined above by identity.
+from . import _identity_fast_path  # noqa: E402

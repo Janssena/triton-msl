@@ -825,7 +825,8 @@ def test_lowering_boundary_kloop_roles_through_iter_args():
     scalar = [i for i, ln in enumerate(lines) if "_sum +=" in ln]
     if scalar:
         read = lines[scalar[0]] + lines[scalar[0] + 1]  # the product spans two lines
-        assert "Ap[m" in read and "Bp[k" in read, f"A must be read from Ap and B from Bp, got {read!r}"
+        assert "Ap[" in read and "Bp[" in read, f"A must be read from Ap and B from Bp, got {read!r}"
+        assert "(uint)m * (uint)(sam)" in read and "(uint)k * (uint)(sbk)" in read
     else:
         a_stage = [ln for ln in lines if "tg_A[i] =" in ln]
         b_stage = [ln for ln in lines if "tg_B[i] =" in ln]
@@ -918,7 +919,7 @@ def test_lowering_boundary_1d_grid_mapping_emitted():
     sig = {"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32", "sam": "i32", "sak": "i32", "sbk": "i32", "sbn": "i32", "scm": "i32", "scn": "i32"}
     lw = _direct_lowerer_for(_tut_1d_079, sig, {"BM": 32, "BN": 32, "BK": 32})
     msl = lw.lower()
-    assert "pid3.x % _npm" in msl and "pid3.x / _npm" in msl and "(_M + 32u - 1u) / 32u" in msl, "1-D grid split not replayed"
+    assert "pid3.x % _npm" in msl and "pid3.x / _npm" in msl and "((uint)_M + 32u - 1u) / 32u" in msl, "1-D grid split not replayed"
     assert "pid3.y" not in msl, "the 2-D mapping leaked into a 1-D-grid kernel"
 
 

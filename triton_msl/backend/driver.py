@@ -33,8 +33,10 @@ def ty_to_cpp(ty):
 
 # Two-kernel-split matmul (#159): when a metallib carries both a staged matmul
 # kernel and its pure-direct (no-threadgroup) variant, load_binary resolves both
-# and records the direct pipeline here, keyed by id() of the primary (staged)
-# pipeline. The launcher looks it up to dispatch the direct kernel for
+# and records (primary, direct) here, keyed by id() of the primary (staged)
+# pipeline. Retaining and checking the primary prevents an address-reused
+# pipeline from selecting an unrelated direct variant after cache eviction.
+# The launcher looks it up to dispatch the direct kernel for
 # fully-aligned matmuls (max occupancy / MLX parity).
 _MM_DIRECT_PIPELINES = {}
 
@@ -155,6 +157,112 @@ def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
         return "the batched-dot runtime address bounds could not be proven"
 
 
+def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloads=None):
+    """Return a refusal reason for an unmasked rounded-K access plan, else None."""
+    try:
+        if not (type(descriptor) in (tuple, list) and len(descriptor) == 6
+                and descriptor[0] == "matmul_full_k_storage_v1"):
+            return "the K-tail allocation descriptor is missing or malformed; mask the K tail"
+        block_k, tensor_indices, extent_refs, stride_refs, arithmetic = descriptor[1:]
+        if (type(block_k) is not int or block_k <= 0
+                or type(tensor_indices) not in (tuple, list) or len(tensor_indices) != 3
+                or type(extent_refs) not in (tuple, list) or len(extent_refs) != 3
+                or type(stride_refs) not in (tuple, list) or len(stride_refs) != 6
+                or type(arithmetic) not in (tuple, list) or len(arithmetic) != 3):
+            return "the K-tail allocation descriptor is malformed; mask the K tail"
+        limits = {
+            "i32": (-(1 << 31), (1 << 31) - 1), "u32": (0, (1 << 32) - 1),
+            "i64": (-(1 << 63), (1 << 63) - 1), "u64": (0, (1 << 64) - 1),
+        }
+
+        def _value(ref):
+            if type(ref) not in (tuple, list) or len(ref) != 3 or ref[2] not in limits:
+                raise ValueError("malformed scalar reference")
+            if ref[0] == "arg":
+                index = int(ref[1])
+                if signatures is not None and scalar_payloads is not None:
+                    from triton_msl.backend._launch_signature import scalar_bytes
+                    if signatures[index] != ref[2] or scalar_bytes(kargs[index], signatures[index]) != scalar_payloads[index]:
+                        raise ValueError("runtime scalar changed after its captured launch payload")
+                value = int(kargs[index])
+            else:
+                value = int(ref[1]) if ref[0] == "literal" else None
+            if value is None or not limits[ref[2]][0] <= value <= limits[ref[2]][1]:
+                raise ValueError("runtime scalar is outside its declared source width")
+            return value
+
+        # K alone decides whether this launch has a tail obligation. Do not
+        # re-observe unrelated scalar providers for ordinary aligned launches.
+        k = _value(extent_refs[2])
+        if k <= 0 or k % block_k == 0:
+            return None
+        m, n = (_value(ref) for ref in extent_refs[:2])
+        rounded_k = ((k + block_k - 1) // block_k) * block_k
+        if rounded_k > (1 << 63) - 1:
+            return "rounded K exceeds the signed source address range; mask the K tail"
+        strides = tuple(_value(ref) for ref in stride_refs)
+        roles = (
+            ("A", tensor_indices[0], (max(m, 0), rounded_k), strides[0:2], arithmetic[0]),
+            ("B", tensor_indices[1], (rounded_k, max(n, 0)), strides[2:4], arithmetic[1]),
+            ("C", tensor_indices[2], (max(m, 0), max(n, 0)), strides[4:6], arithmetic[2]),
+        )
+        signed_min, signed_max = -(1 << 63), (1 << 63) - 1
+        for role, tensor_index, extents, role_strides, arith in roles:
+            if 0 in extents:
+                continue
+            if (type(arith) not in (tuple, list) or len(arith) != 3
+                    or arith[0] not in ("i32", "i64") or arith[1] not in ("i32", "i64")
+                    or type(arith[2]) is not bool):
+                return f"{role} source address widths are malformed; mask the K tail"
+            term_ranges = []
+            for extent, stride, width in zip(extents, role_strides, arith[:2]):
+                delta = (extent - 1) * stride
+                width_min, width_max = limits[width]
+                lo, hi = min(0, delta), max(0, delta)
+                if lo < width_min or hi > width_max:
+                    return f"{role} source {width} address term can wrap; mask the K tail"
+                term_ranges.append((lo, hi))
+            if arith[2]:
+                fused_min = sum(item[0] for item in term_ranges)
+                fused_max = sum(item[1] for item in term_ranges)
+                width_min, width_max = limits[arith[0]]
+                if fused_min < width_min or fused_max > width_max:
+                    return f"{role} fused source address can wrap; mask the K tail"
+            tensor = kargs[int(tensor_index)]
+            layout = tensor if hasattr(tensor, "untyped_storage") else getattr(tensor, "base", None)
+            if layout is None or any(not hasattr(layout, name) for name in
+                                     ("element_size", "storage_offset", "untyped_storage", "data_ptr")):
+                return f"{role} backing storage cannot be inspected; mask the K tail"
+            lower = upper = 0
+            for extent, stride in zip(extents, role_strides):
+                delta = (extent - 1) * stride
+                if not signed_min <= delta <= signed_max:
+                    return f"{role} source address arithmetic can overflow signed 64-bit; mask the K tail"
+                lower += min(0, delta)
+                upper += max(0, delta)
+                if not signed_min <= lower <= signed_max or not signed_min <= upper <= signed_max:
+                    return f"{role} source address sum can overflow signed 64-bit; mask the K tail"
+            if not hasattr(tensor, "element_size"):
+                return f"{role} dispatched pointer element width cannot be inspected; mask the K tail"
+            elem_size = int(tensor.element_size())
+            if elem_size != int(layout.element_size()):
+                return f"{role} wrapper/base element widths disagree; mask the K tail"
+            storage = layout.untyped_storage()
+            storage_nbytes = int(storage.nbytes())
+            base_byte = int(layout.storage_offset()) * elem_size
+            if (elem_size <= 0 or storage_nbytes <= 0 or base_byte < 0
+                    or int(tensor.data_ptr()) != int(storage.data_ptr()) + base_byte):
+                return f"{role} tensor/storage identity cannot be proven; mask the K tail"
+            lower_byte = base_byte + lower * elem_size
+            upper_byte = base_byte + (upper + 1) * elem_size
+            if lower_byte < 0 or upper_byte > storage_nbytes:
+                return (f"{role} full-block K tail reaches outside its {storage_nbytes}-byte backing allocation; "
+                        "pad the backing allocation or mask the K tail")
+        return None
+    except Exception:
+        return "the K-tail runtime allocation bounds could not be proven; mask the K tail"
+
+
 class MetalUtils:
     """Manages Metal device, command queue, and kernel dispatch.
 
@@ -272,7 +380,7 @@ class MetalUtils:
             if direct_fn is not None:
                 direct_ps, derr = self.device.newComputePipelineStateWithFunction_error_(direct_fn, None)
                 if derr is None and direct_ps is not None:
-                    _MM_DIRECT_PIPELINES[id(pipeline_state)] = direct_ps
+                    _MM_DIRECT_PIPELINES[id(pipeline_state)] = (pipeline_state, direct_ps)
         except Exception:
             pass
 
@@ -475,6 +583,11 @@ def _compile_shader_scalars_ok(launcher, kargs, *, checked=None) -> bool:
             # to an explicitly fp32 IRSource would bind integer bits, not 1.0f.
             if sig == "fp32" and type(a) is not float:
                 return False
+            # The raw bridge casts Python integers to signed int64, even for
+            # a u64 declaration. Keep the full unsigned range on the host path.
+            # This must precede reuse of the binder's declared-width proof.
+            if sig != "fp32" and (type(a) not in (int, bool) or not -(1 << 63) <= a < (1 << 63)):
+                return False
             # The binder already packed this invocation's live scalar. Reuse
             # that proof only for the same exact immutable value, declaration
             # and source position, as observed HERE after hooks/runtime calls.
@@ -631,6 +744,46 @@ class MetalLauncher:
             # but 2 were given`` (test_launch::test_metadata).
             launch_enter_hook(launch_metadata)
 
+        # Run after the enter hook and before runtime acquisition or either
+        # dispatch route, using the immutable checked descriptor snapshot.
+        address_bounds = kernel_metadata[10]
+        tail_access_bounds = batched_dot_bounds = None
+        if address_bounds is not None:
+            if not isinstance(address_bounds, (tuple, list)) or not address_bounds:
+                from triton_msl.errors import MetalNonRecoverableError
+                raise MetalNonRecoverableError(
+                    "Refusing launch: packed address-bounds contract is malformed",
+                    op_name="tt.dot",
+                )
+            if address_bounds[0] == "matmul_full_k_storage_v1":
+                tail_access_bounds = address_bounds
+            elif address_bounds[0] == "batched_dot_host_bounds_v1":
+                batched_dot_bounds = address_bounds
+            else:
+                from triton_msl.errors import MetalNonRecoverableError
+                raise MetalNonRecoverableError(
+                    "Refusing launch: packed address-bounds contract has an unknown discriminator",
+                    op_name="tt.dot",
+                )
+        if tail_access_bounds is not None:
+            _tail_reason = _matmul_tail_bounds_reason(
+                tail_access_bounds, flat_args, flat_sigs, scalar_payloads)
+            if _tail_reason is not None:
+                from triton_msl.errors import MetalNonRecoverableError
+                raise MetalNonRecoverableError(
+                    "Refusing unmasked partial-K matmul launch: " + _tail_reason,
+                    op_name="tt.dot",
+                )
+        if batched_dot_bounds is not None:
+            _bounds_reason = _batched_dot_host_bounds_reason(
+                batched_dot_bounds, flat_args, (gridX, gridY, gridZ))
+            if _bounds_reason is not None:
+                from triton_msl.errors import MetalNonRecoverableError
+                raise MetalNonRecoverableError(
+                    "Refusing batched dot on the host-roundtrip launch path: " + _bounds_reason,
+                    op_name="tt.dot",
+                )
+
         utils = _get_utils()
 
         # Unpack kernel metadata: (num_warps, num_ctas, shared, block_size, output_indices, needs_2d_grid)
@@ -657,7 +810,6 @@ class MetalLauncher:
         fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
         quant_matmul = kernel_metadata[8] if (kernel_metadata and len(kernel_metadata) > 8) else None
         flash_attention = kernel_metadata[9] if (kernel_metadata and len(kernel_metadata) > 9) else None
-        batched_dot_bounds = kernel_metadata[10] if (kernel_metadata and len(kernel_metadata) > 10) else None
         # FAIL-CLOSED for quantized: the compiled kernel IS the fast dequant kernel,
         # which the host-roundtrip path below cannot dispatch correctly. So a quantized
         # launch must be handled by dispatch_quant_matmul (compile_shader) or REFUSED —
@@ -752,15 +904,26 @@ class MetalLauncher:
                         # declared type (fp16/bf16 scalars mis-bind to 0.0). (Fix 4.)
                         scalars_ok = _compile_shader_scalars_ok(
                             self, kargs, checked=(flat_args, flat_sigs, flat_origin, scalar_payloads))
-                        # 1-D-grid only: anything needing a 2-D grid (or gridY/gridZ > 1)
-                        # falls back to the existing path (correct, just slower).
-                        if all_mps and scalars_ok and not needs_2d_grid and gridY == 1 and gridZ == 1:
+                        _generic_geometry = None
+                        if all_mps and scalars_ok and needs_2d_grid:
+                            from ._generic_launch import generic_2d_geometry
+                            # The direct positional list must be identical to
+                            # the binder's constexpr-free leaves. Aggregates
+                            # and argument-buffer packing keep the host route.
+                            if len(kargs) == len(flat_args) and all(a is b for a, b in zip(kargs, flat_args)):
+                                _generic_geometry = generic_2d_geometry(
+                                    self, kargs, flat_sigs, kernel_metadata, (gridX, gridY, gridZ))
+                        if all_mps and scalars_ok and (
+                            (not needs_2d_grid and gridY == 1 and gridZ == 1) or _generic_geometry is not None
+                        ):
                             # The stashed MSL's OWN threadgroup size — NOT the
                             # metadata block_size, which the C++ LLVM path may have
                             # clobbered with a value meant for its host metallib
                             # (mis-launches MEPT MSL kernels here -> wrong results).
                             tg = min(self._msl_block_size or block_size, 1024)
                             threads, group_size = gridX * tg, tg
+                            if _generic_geometry is not None:
+                                threads, group_size = _generic_geometry
                             lib = _rt.get_library(self._msl)
                             # >31 args -> the MSL packs scalars into one buffer; pack the
                             # dispatch args to match (issue #4.7).
@@ -797,21 +960,6 @@ class MetalLauncher:
         # inside the complete backing allocation the storage-faithful marshaller
         # will mirror below.  Offsets outside the logical view are valid; offsets
         # outside the allocation still refuse before any unsafe dispatch.
-        if batched_dot_bounds is not None:
-            _batched_kargs = [a for i, a in enumerate(args) if i not in self.constexpr_indices]
-            _bounds_reason = _batched_dot_host_bounds_reason(
-                batched_dot_bounds,
-                _batched_kargs,
-                (gridX, gridY, gridZ),
-            )
-            if _bounds_reason is not None:
-                from triton_msl.errors import MetalNonRecoverableError
-
-                raise MetalNonRecoverableError(
-                    "Refusing batched dot on the host-roundtrip launch path: " + _bounds_reason,
-                    op_name="tt.dot",
-                )
-
         # Quantized matmul is compile_shader-only: if it wasn't dispatched above
         # (non-MPS, compile_shader unavailable, opt-out, or a shape the edge-free
         # fast kernel can't tile), REFUSE. The compiled self._msl is the fast dequant
@@ -953,8 +1101,9 @@ class MetalLauncher:
                         f"float64 tensor argument {arg_idx} must cover one complete contiguous storage; "
                         "Metal's fp32 conversion path cannot preserve a partial or strided fp64 backing span"
                     )
-                f64_key = (storage_ptr, storage_nbytes)
-                if f64_key in float64_storage_owners:
+                f64_key = ("mps" if hasattr(layout, "device") and str(layout.device).startswith("mps")
+                           else "host", storage_ptr, storage_nbytes)
+                if f64_key in float64_storage_owners or f64_key in storage_groups:
                     _storage_refusal(
                         "aliased float64 arguments cannot preserve storage identity through separate fp32 conversions"
                     )
@@ -992,6 +1141,10 @@ class MetalLauncher:
             except Exception as error:
                 _storage_refusal(f"tensor argument {arg_idx}'s backing storage cannot be inspected ({error})")
             key = ("mps" if is_mps else "host", storage_ptr, storage_nbytes)
+            if key in float64_storage_owners:
+                _storage_refusal(
+                    "aliased float64 arguments cannot preserve storage identity through separate fp32 conversions"
+                )
             group = storage_groups.setdefault(
                 key,
                 {
@@ -1266,14 +1419,8 @@ class MetalLauncher:
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
-        threads_per_tg = min(block_size, 1024)  # Metal max threads_per_threadgroup
-        if needs_2d_grid:
-            # Kernel uses program_id(1) or program_id(2) — preserve grid dimensions
-            grid = (gridX, gridY, gridZ)
-        else:
-            # Kernel uses only program_id(0) — flatten to 1D for scalar pid
-            grid = (gridX * gridY * gridZ, 1, 1)
-        threadgroup_size = (threads_per_tg, 1, 1)
+        from ._generic_launch import host_launch_geometry
+        grid, threadgroup_size = host_launch_geometry((gridX, gridY, gridZ), block_size, needs_2d_grid)
 
         # Two-kernel split (#159): for a fully-aligned float matmul, dispatch the
         # pure-direct (no-threadgroup) kernel instead of the staged one — same
@@ -1283,8 +1430,9 @@ class MetalLauncher:
         dispatch_fn = function
         mm_two = kernel_metadata[6] if (kernel_metadata and len(kernel_metadata) > 6) else None
         if mm_two is not None:
-            direct_ps = _MM_DIRECT_PIPELINES.get(id(function))
-            if direct_ps is not None:
+            direct_entry = _MM_DIRECT_PIPELINES.get(id(function))
+            if direct_entry is not None and direct_entry[0] is function:
+                direct_ps = direct_entry[1]
                 try:
                     _M = int(flat_args[mm_two["m_idx"]])
                     _N = int(flat_args[mm_two["n_idx"]])

@@ -82,46 +82,50 @@ def bind_arguments(args, names, signature, *, _plan=None):
         _refuse(f"expected {len(names)} runtime parameter positions, got {len(args)}")
     leaves, types, origins, payloads = [], [], [], []
     packers = _plan.packers if type(_plan) is _BindingPlan else None
-    def bind(value, ty, origin):
-        if isinstance(ty, tuple):
-            if not isinstance(value, tuple) or len(value) != len(ty):
-                _refuse("tuple argument structure does not match its declaration")
-            for child, child_ty in zip(value, ty):
-                bind(child, child_ty, origin)
-            return
-        if ty == "constexpr":
-            return
-        if isinstance(value, tuple):
-            _refuse("tuple value in a scalar/pointer parameter")
-        if ty.startswith("*"):
-            if value is not None and not callable(getattr(value, "data_ptr", None)):
-                _refuse("pointer parameter requires a tensor/pointer wrapper or None")
-            payload = None
-        else:
-            packing = packers.get(ty) if packers is not None and type(ty) is str else None
-            value_type = type(value)
-            if packing is not None and (value_type is int or value_type is bool
-                                        or (packing[0] and value_type is float)):
-                if ty in ("i1", "u1") and value not in (0, 1):
-                    _refuse(f"{ty} requires a representable integer value")
-                try:
-                    payload = packing[1](value)
-                except (struct.error, OverflowError, ValueError) as exc:
-                    _refuse(f"value cannot be represented as {ty}: {exc}")
-            else:
-                # Per-node fallback preserves callback ordering; never restart
-                # the already-observed prefix of this invocation.
-                payload = scalar_bytes(value, ty)
-        leaves.append(value)
-        types.append(ty)
-        origins.append(origin)
-        payloads.append(payload)
+    # Flat declarations use the inline path. Build the recursive helper only
+    # when a live declaration first needs it, without inspecting later names.
+    bind = None
     for index, (value, name) in enumerate(zip(args, names)):
         # Keep each declaration read at its original position, after all prior
         # callbacks. Exact string leaves can run inline; tuple/custom declarations
         # retain the original recursive path without replaying an observed prefix.
         ty = signature[name]
         if type(ty) is not str:
+            if bind is None:
+                def bind(value, ty, origin):
+                    if isinstance(ty, tuple):
+                        if not isinstance(value, tuple) or len(value) != len(ty):
+                            _refuse("tuple argument structure does not match its declaration")
+                        for child, child_ty in zip(value, ty):
+                            bind(child, child_ty, origin)
+                        return
+                    if ty == "constexpr":
+                        return
+                    if isinstance(value, tuple):
+                        _refuse("tuple value in a scalar/pointer parameter")
+                    if ty.startswith("*"):
+                        if value is not None and not callable(getattr(value, "data_ptr", None)):
+                            _refuse("pointer parameter requires a tensor/pointer wrapper or None")
+                        payload = None
+                    else:
+                        packing = packers.get(ty) if packers is not None and type(ty) is str else None
+                        value_type = type(value)
+                        if packing is not None and (value_type is int or value_type is bool
+                                                    or (packing[0] and value_type is float)):
+                            if ty in ("i1", "u1") and value not in (0, 1):
+                                _refuse(f"{ty} requires a representable integer value")
+                            try:
+                                payload = packing[1](value)
+                            except (struct.error, OverflowError, ValueError) as exc:
+                                _refuse(f"value cannot be represented as {ty}: {exc}")
+                        else:
+                            # Per-node fallback preserves callback ordering; never restart
+                            # the already-observed prefix of this invocation.
+                            payload = scalar_bytes(value, ty)
+                    leaves.append(value)
+                    types.append(ty)
+                    origins.append(origin)
+                    payloads.append(payload)
             bind(value, ty, index)
             continue
         if ty == "constexpr":
@@ -154,7 +158,7 @@ def bind_arguments(args, names, signature, *, _plan=None):
     return leaves, types, origins, payloads
 
 
-_BindingPlan = namedtuple("_BindingPlan", "packers")
+_BindingPlan = namedtuple("_BindingPlan", "packers native", defaults=(None,))
 
 
 def make_binding_plan(names, signature):
@@ -175,8 +179,33 @@ def make_binding_plan(names, signature):
             packers[ty] = (False, struct.Struct("<" + _INTEGER[ty]).pack)
         elif ty in ("fp16", "fp32"):
             packers[ty] = (True, struct.Struct("<" + ("e" if ty == "fp16" else "f")).pack)
-    return _BindingPlan(MappingProxyType(packers)) if packers else None
+    if not packers:
+        return None
+    if _binder_native is not None:
+        parts = _binder_native.make_parts(packers)
+        if parts is not None:
+            return _BindingPlan(*parts)
+    return _BindingPlan(MappingProxyType(packers))
 
 
 def bind_arguments_with_plan(args, names, signature, plan):
     return bind_arguments(args, names, signature, _plan=plan)
+
+
+def _select_binder_native():
+    # Genuine absence alone selects Python; broken native imports remain errors.
+    from importlib import import_module
+    from importlib.util import find_spec
+    import sys
+    name = __package__ + "._binder_native"
+    if name not in sys.modules and find_spec(name) is None:
+        return None
+    native = import_module(name)
+    if not native.configure(bind_arguments, _BindingPlan, bind_arguments_with_plan):
+        return None
+    return native
+
+
+_binder_native = _select_binder_native()
+if _binder_native is not None:
+    bind_arguments_with_plan = _binder_native.bind_with_plan

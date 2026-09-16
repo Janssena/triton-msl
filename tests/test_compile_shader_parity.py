@@ -1,8 +1,8 @@
 """Parity: kernels run identically (to tolerance) with the compile_shader
 fast-path ON (TRITON_MSL_COMPILE_SHADER=1) vs OFF (=0). Every kernel must
 match torch AND match itself across both flag values. The fast-path must NEVER
-change a result; the 2-D-grid kernel MUST fall back under flag=1 yet stay
-correct. Serial GPU."""
+change a result; eligible generic 2-D grids preserve their tuple geometry.
+Serial GPU."""
 
 import os, pytest
 
@@ -130,7 +130,7 @@ def test_atomic_add_parity(flag, monkeypatch):
     torch.testing.assert_close(OUT, ref, rtol=1e-4, atol=1e-3)
 
 
-# ---- 2-D-grid kernel: uses tl.program_id(1) -> MUST fall back under flag=1 --
+# ---- 2-D-grid kernel: program_id(1) must retain its native grid axis --------
 @triton.jit
 def _add2d(A, B, OUT, M, N, BLOCK: tl.constexpr):
     rm = tl.program_id(1)

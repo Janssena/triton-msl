@@ -200,3 +200,31 @@ def pack_launch_metadata(metadata):
     # Version 2 appends the assertion descriptor; nested JSON arrays remain lists,
     # as they already are after Triton's persistent metadata restoration.
     return tuple(json.loads(expected))
+
+
+# The optional host-only helper performs the same checked copy, not codegen or
+# device execution. A genuinely absent extension retains the original Python
+# implementation. Broken imports/initializers are not classified as absence.
+def _select_checked_copy(import_module, find_spec, modules):
+    name = __package__ + "._packed_native"
+    # The loader's exception name is not evidence that it never ran. An
+    # installed module can raise ModuleNotFoundError naming itself. Establish
+    # absence before invoking any loader, then propagate every import failure.
+    # Preserve sys.modules selection, including its explicit None/block sentinel.
+    if name not in modules and find_spec(name) is None:
+        return None
+    native = import_module(name)
+    if not callable(getattr(native, "copy", None)):
+        raise ImportError("packed-copy extension has no callable copy entry point")
+    return native
+
+
+from importlib import import_module as _import_module
+from importlib.util import find_spec as _find_spec
+import sys as _sys
+_checked_packed_copy_python = _checked_packed_copy
+_packed_native = _select_checked_copy(_import_module, _find_spec, _sys.modules)
+PACKED_COPY_IMPLEMENTATION = "python" if _packed_native is None else "native"
+if _packed_native is not None:
+    def _checked_packed_copy(value, plan):
+        return _packed_native.copy(value, plan, globals())

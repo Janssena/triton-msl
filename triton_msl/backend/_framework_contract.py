@@ -23,6 +23,12 @@ _owned_selection = None
 _native_guard = None
 _lock = threading.RLock()
 _RUNTIME_SELECTION_ENV = ("PYTORCH_MPS_FAST_MATH", "PYTORCH_MPS_PREFER_METAL", "PYTORCH_ENABLE_MPS_FALLBACK")
+_REQUIRED_NAMES = ("triton",) + (("objc", "Metal", "Foundation", "CoreFoundation", "AppKit", "MetalPerformanceShaders")
+                                 if sys.platform == "darwin" else ())
+# Editable finders may resolve an optional native CHILD from a different
+# installation even when the top-level package came from this worktree.
+# Bind its actual selected spec/bytes; never infer it from __init__.__file__.
+_SELECTION_NAMES = (*_REQUIRED_NAMES, "torch", "numpy", "mlx", "triton_msl", "triton_msl._triton_msl_cpp")
 
 
 def _python_roots():
@@ -173,12 +179,17 @@ class _LoadedNativeGuard:
         self._generation_reader = create_generation_reader()
         self._generation_checked = None
 
-    def verify(self):
+    def verify(self, *, allow_scan=True):
         from ._native_dependencies import _system
         reader = getattr(self, "_generation_reader", None)
         generation = reader() if reader is not None else None
         if generation is not None and generation == getattr(self, "_generation_checked", None):
             return
+        if not allow_scan:
+            # A speculative contract hit may check the live generation, but may
+            # not invoke the scan's callbacks and then replay them on fallback.
+            # The complete evaluator owns scans and inventory reconstruction.
+            raise _NativeSelectionChanged("native generation requires complete evaluation")
         count = self.count()
         # A dlclose followed by dlopen may leave the image count unchanged.
         # Recheck names, not merely the count; unchanged names avoid filesystem
@@ -212,13 +223,7 @@ class _LoadedNativeGuard:
 
 def _discover_selection():
     global _discovery_snapshot, _owned_selection
-    required = ("triton",)
-    if sys.platform == "darwin":
-        required += ("objc", "Metal", "Foundation", "CoreFoundation", "AppKit", "MetalPerformanceShaders")
-    # Editable finders may resolve an optional native CHILD from a different
-    # installation even when the top-level package came from this worktree.
-    # Bind its actual selected spec/bytes; never infer it from __init__.__file__.
-    names = (*required, "torch", "numpy", "mlx", "triton_msl", "triton_msl._triton_msl_cpp")
+    required, names = _REQUIRED_NAMES, _SELECTION_NAMES
     # Resolve filesystem locations only when the Python import selection can
     # have changed. Loaded modules' current spec values are inspected, not just
     # their version labels. Code/installation mutation still requires restart.

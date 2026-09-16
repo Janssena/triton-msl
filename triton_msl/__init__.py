@@ -1,10 +1,9 @@
 """triton-msl: Metal (Apple Silicon) backend for OpenAI Triton."""
 
-# Bump on ANY emitter/lowerer change: persistent caches at ~/.cache/triton_msl
-# are keyed by TTGIR + options only; without this, codegen fixes silently
-# replay stale compiled kernels after upgrade (Phase 0, audit debt #1).
-# RELEASE CHECKLIST: this MUST be bumped before every PyPI release so an
-# in-place upgrade can never hit a warm cache entry from a pre-fix codegen.
+# An explicit version marker supplements the content-bound cache identity.
+# Source/native implementation bytes, framework/toolchain selection and relevant
+# policy also enter the keys; correctness no longer relies on manually bumping
+# this constant after every codegen edit. Installed-code changes require restart.
 CODEGEN_VERSION = "2026.06.24.1"
 
 # Distribution version, discoverable as ``triton_msl.__version__`` (falls back

@@ -3,6 +3,7 @@ import os
 import importlib.util
 import sys
 from types import FunctionType, MappingProxyType, MethodType
+from collections.abc import Mapping
 
 import pytest
 
@@ -10,6 +11,128 @@ from triton_msl.backend import _cache_contract as cache
 from triton_msl.backend import _environment_snapshot as environment
 from triton_msl.backend import _toolchain_contract as toolchain
 from triton_msl.errors import MetalNonRecoverableError
+
+
+def _isolated_snapshot(monkeypatch, foreign=None):
+    """Clone functions so code-mutation witnesses never alter installed code."""
+    def clone(fn, namespace=None):
+        return FunctionType(fn.__code__, fn.__globals__ if namespace is None else namespace,
+                            fn.__name__, fn.__defaults__, fn.__closure__)
+
+    functions = {"get": clone(Mapping.get), "getitem": clone(os._Environ.__getitem__),
+                 "iter": clone(os._Environ.__iter__), "copy": clone(os._Environ.copy),
+                 "encode": clone(os.environ.encodekey), "decode": clone(os.environ.decodekey)}
+    if foreign is not None:
+        name, overrides = foreign
+        fn = functions[name]
+        functions[name] = clone(fn, dict(fn.__globals__, **overrides))
+    monkeypatch.setattr(Mapping, "get", functions["get"])
+    for name, attribute in (("getitem", "__getitem__"), ("iter", "__iter__"), ("copy", "copy")):
+        monkeypatch.setattr(os._Environ, attribute, functions[name])
+    private = os._Environ({b"TRITON_MSL_FA_HALF_ACCUM": b"0", b"ALT": b"1"},
+                          functions["encode"], functions["decode"],
+                          functions["encode"], functions["decode"])
+    monkeypatch.setattr(os, "environ", private)
+    spec = importlib.util.spec_from_file_location("isolated_environment_recognition", environment.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, private, functions
+
+
+def _changed_codec(encoding, *, encode=False):
+    if encode:
+        def changed(value):
+            return ("ALT" if value == "TRITON_MSL_FA_HALF_ACCUM" else value).encode(encoding)
+    else:
+        def changed(value):
+            return "1" if value == b"0" else value.decode(encoding)
+    return changed
+
+
+@pytest.mark.parametrize("name", ("get", "getitem", "iter", "copy", "encode", "decode"))
+def test_same_function_code_change_after_admission_stays_live(monkeypatch, name):
+    with monkeypatch.context() as patch:
+        module, private, functions = _isolated_snapshot(patch)
+        before = module.environment_snapshot()
+        assert module.is_snapshot(before)
+        assert before["TRITON_MSL_FA_HALF_ACCUM"] == "0"
+        assert module.environment_snapshot() is before  # Positive unchanged reuse.
+        fn = functions[name]
+        raw = dict(private._data)
+        def changed_iter(self):
+            yield "ALT"
+        replacements = {"get": lambda self, key, default=None: "1",
+                        "getitem": lambda self, key: "1",
+                        "iter": changed_iter,
+                        "copy": lambda self: {"changed": "1"}}
+        changed = (_changed_codec(fn.__closure__[0].cell_contents, encode=name == "encode")
+                   if name in ("encode", "decode") else replacements[name])
+        original_code = fn.__code__
+        fn.__code__ = changed.__code__
+        after = module.environment_snapshot()
+        assert after is private
+        assert not module.is_snapshot(after)
+        assert private._data == raw
+        if name == "iter":
+            assert tuple(after) == ("ALT",)
+        elif name == "copy":
+            assert after.copy() == {"changed": "1"}
+        else:
+            assert after.get("TRITON_MSL_FA_HALF_ACCUM") == "1"
+        fn.__code__ = original_code
+        assert module.environment_snapshot() is before
+
+
+def test_same_getter_defaults_change_after_admission_stays_live(monkeypatch):
+    with monkeypatch.context() as patch:
+        module, private, functions = _isolated_snapshot(patch)
+        before = module.environment_snapshot()
+        assert module.is_snapshot(before)
+        assert before.get("absent") is None
+        functions["get"].__defaults__ = ("changed-default",)
+        after = module.environment_snapshot()
+        assert after is private
+        assert after.get("absent") == "changed-default"
+
+
+@pytest.mark.parametrize("name,overrides", (
+    ("get", {"KeyError": ValueError}),
+    ("getitem", {"KeyError": ValueError}),
+    ("iter", {"list": lambda value: [b"ALT"]}),
+    ("copy", {"dict": lambda value: {"changed": "1"}}),
+    ("encode", {"str": bytes}),
+))
+def test_equal_frozen_code_with_foreign_globals_is_not_admitted(monkeypatch, name, overrides):
+    with monkeypatch.context() as patch:
+        module, private, _ = _isolated_snapshot(patch, (name, overrides))
+        after = module.environment_snapshot()
+        assert after is private
+        assert not module.is_snapshot(after)
+        if name == "get":
+            with pytest.raises(KeyError):
+                after.get("absent")
+        elif name == "getitem":
+            with pytest.raises(KeyError) as caught:
+                after["absent"]
+            assert caught.value.args == (b"absent",)
+        elif name == "iter":
+            assert tuple(after) == ("ALT",)
+        elif name == "copy":
+            assert after.copy() == {"changed": "1"}
+        else:
+            with pytest.raises(TypeError):
+                after.get("TRITON_MSL_FA_HALF_ACCUM")
+
+
+def test_live_standard_global_dependency_change_stays_live(monkeypatch):
+    with monkeypatch.context() as patch:
+        module, private, functions = _isolated_snapshot(patch)
+        before = module.environment_snapshot()
+        assert module.is_snapshot(before)
+        patch.setitem(functions["iter"].__globals__, "list", lambda value: [b"ALT"])
+        after = module.environment_snapshot()
+        assert after is private
+        assert tuple(after) == ("ALT",)
 
 
 def test_snapshot_tracks_same_size_edits_new_keys_and_is_unaliased(monkeypatch):

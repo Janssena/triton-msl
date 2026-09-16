@@ -13,3 +13,20 @@ prune .github
 # Retain the notice while excluding repository-only tests and third-party code.
 # PEP 639 also carries it into the wheel's dist-info/licenses directory.
 include third_party/trifast/LICENSE
+# Retain the optional accelerator SOURCE even when creating an sdist on Python
+# or a platform that deliberately builds the pure-Python fallback wheel.
+include triton_msl/backend/_validation_native.c
+exclude triton_msl/backend/_validation_native*.so
+exclude triton_msl/backend/_validation_native*.dylib
+# The packed helper is independently optional under the same ABI/platform gate.
+include triton_msl/backend/_packed_native.c
+exclude triton_msl/backend/_packed_native*.so
+exclude triton_msl/backend/_packed_native*.dylib
+# The binder has a narrower CPython gate; retain its source even in pure sdists.
+include triton_msl/backend/_binder_native.c
+exclude triton_msl/backend/_binder_native*.so
+exclude triton_msl/backend/_binder_native*.dylib
+# Source distribution only: retain everything needed to attempt the explicitly
+# optional C++ build. This does not build, enable, or qualify that route.
+# Enumerated suffixes avoid copying local build products into the archive.
+recursive-include triton_msl/csrc *.cpp *.h CMakeLists.txt

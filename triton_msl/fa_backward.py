@@ -1,14 +1,14 @@
 """FlashAttention with a Metal backward pass — enables TRAINING.
 
-The backend's forward FlashAttention is inference-only (torch SDPA routes to the simdgroup
-kernel, but no gradient). This exposes ``flash_attention`` as a ``torch.autograd.Function``:
-the forward computes the output (and the logsumexp the backward needs), and the backward
-dispatches the tiled, MMA-optimized Metal dK/dV and dQ kernels (FA-2 backward). So an
-attention call inside a training loop gets its gradients from Metal.
+This exposes ``flash_attention`` as a ``torch.autograd.Function``. The forward obtains
+the output from PyTorch's eager scaled-dot-product attention and computes the logsumexp
+with a separate Metal kernel. The backward dispatches this package's tiled Metal dK/dV
+and dQ kernels (FA-2 backward). Calling eager torch SDPA does not by itself route that
+operation through this package's Triton-to-Metal backend.
 
-Head dim is fixed at 64, ``N % 16 == 0`` (the backward tile). The forward computes O (torch
-SDPA, which routes to the backend's simdgroup FA) and the logsumexp on Metal via a dedicated
-flash kernel (``make_fa_logsumexp_kernel``), so it never materializes the N*N score matrix.
+Head dim is fixed at 64, ``N % 16 == 0`` (the backward tile). The dedicated Metal
+``make_fa_logsumexp_kernel`` does not materialize the N*N score matrix. That statement
+describes the logsumexp kernel, not the implementation PyTorch selects for the output.
 See ``make_fa_backward_dkv_kernel`` / ``make_fa_backward_dq_kernel`` for the backward kernels
 and ``tests/test_fa_backward.py`` for the autograd cross-check.
 """
@@ -102,17 +102,41 @@ def flash_attention(q, k, v, scale=None, causal=False):
     """FlashAttention whose backward runs on Metal (trainable).
 
     Args:
-        q, k, v: ``[..., N, 64]`` float32/float16/bfloat16 on ``mps``; leading dims fold to ZH.
+        q, k, v: Identically shaped, nonempty ``[..., N, 64]`` strided tensors,
+            with the same float32/float16/bfloat16 dtype and MPS device.
+            Leading dims fold to ZH; noncontiguous views are supported.
+            This fixed self-attention API does not broadcast peers or accept
+            different query/key sequence lengths.
             Half inputs compute in fp32 internally and cast back (grads match the input dtype).
         scale: softmax scale (default ``1/sqrt(64)``).
         causal: causal masking.
 
     Returns an output of the same shape; ``.backward()`` produces dQ/dK/dV via Metal.
     """
+    # Establish the fixed backward ABI before a Q-driven cast or reshape can
+    # erase a peer mismatch. Eager SDPA's broader broadcasting/cross-attention
+    # capabilities do not establish the layout consumed by these Metal kernels.
+    for name, value in (("q", q), ("k", k), ("v", v)):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"flash_attention requires {name} to be a torch.Tensor")
+        if value.ndim < 2:
+            raise ValueError(f"flash_attention requires {name} to have rank >= 2")
+    if k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("flash_attention requires identical q, k and v shapes; peer broadcasting is unsupported")
+    if any(size == 0 for size in q.shape):
+        raise ValueError("flash_attention requires nonempty q, k and v shapes")
     if q.shape[-1] != 64:
         raise ValueError(f"flash_attention (Metal backward) supports head_dim=64, got {q.shape[-1]}")
     if q.shape[-2] % 16 != 0:
         raise ValueError(f"N must be divisible by 16, got {q.shape[-2]}")
+    if q.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError("flash_attention supports only float32, float16 or bfloat16 dtype")
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("flash_attention requires identical q, k and v dtypes")
+    if q.device.type != "mps" or k.device != q.device or v.device != q.device:
+        raise ValueError("flash_attention requires q, k and v on the same MPS device")
+    if any(value.layout != torch.strided for value in (q, k, v)):
+        raise ValueError("flash_attention requires strided tensor layouts")
     if scale is None:
         scale = q.shape[-1] ** -0.5
     in_dtype = q.dtype

@@ -73,6 +73,14 @@ PROBED_CASES = [
 CASES = PROBED_CASES[:6]
 OPEN_CASES = PROBED_CASES[6:]
 
+# Adjacent complete/tail key blocks and a second query program on both wide
+# forms. Same source, oracle, numerical tolerance and canary checks below.
+WIDE_REUSE_CASES = [
+    (dtype, bm, bn, d, bm + 1, keys, narrow, causal)
+    for dtype, bm, bn, d, _nq, _nk, narrow, causal in OPEN_CASES
+    for keys in (bn - 1, bn, bn + 1)
+]
+
 
 def compile_case(case, fn=_attention):
     dtype, bm, bn, d, nq, nk, narrow, causal = case
@@ -138,6 +146,42 @@ def test_wider_score_tiles_use_zero_scratch_row_replay(case):
     assert "Out[" not in msl[:barrier]
 
 
+@pytest.mark.parametrize("case", OPEN_CASES)
+def test_wide_score_reuse_is_outside_output_column_loop(case):
+    """Pin the work reduction and its ordering at the real lowering boundary."""
+    import re
+
+    obj = compile_case(case)
+    msl = obj.lower()
+    _, bm, bn, d, *_ = case
+    assert obj._actual_dispatch_threads == bm
+    assert obj._replay_shared_bytes == 0
+    assert not obj.kb._threadgroup_arrays
+    assert f"float _p553_block_values[{bn}];" in msl
+    # One emitted dot loop, nested only in the key/block loops. The previous
+    # emitter had four sites, two of them inside the output-column loop.
+    assert len(re.findall(r"for \(uint _p515_kd_", msl)) == 1
+    assert msl.count("float _p515_score_d0 = Bias[") == 1
+    block = msl.index("for (int _p515_start_d")
+    score = msl.index("float _p515_score_d0")
+    maximum = msl.index("float _p515_newmax_d")
+    probability = msl.index("float _p553_p = exp(")
+    denom = msl.index("_p515_denom = _p515_denom * _p515_alpha_d + _p515_p_sum_d;")
+    output_loop = msl.index(f"for (uint _p515_od = 0u; _p515_od < {d}u; ++_p515_od)", denom)
+    rescale = msl.index("_p515_acc *= _p515_alpha_d;")
+    valid_key = msl.index("if (_p515_key_a1 < NK)", rescale)
+    accumulate = msl.index("_p515_acc += _p553_block_values[_p515_j_a1]", valid_key)
+    normalize = msl.index("_p523_output[_p515_od] = _p515_acc / _p515_denom;")
+    barrier = msl.index("threadgroup_barrier(mem_flags::mem_device);")
+    assert block < score < maximum < probability < denom < output_loop < rescale < valid_key < accumulate < normalize < barrier
+    assert "Bias[" not in msl[output_loop:]
+    assert "Q[" not in msl[output_loop:]
+    assert "K[" not in msl[output_loop:]
+    assert "return;" not in msl
+    assert "Out[" not in msl[:barrier]
+    assert re.search(r"}\s*threadgroup_barrier\(mem_flags::mem_device\);\s*if \(_p523_active\)", msl)
+
+
 def test_finite_f32_tail_sentinel_has_distinct_analytic_semantics():
     # In the second BN64 block, 33 valid keys score zero while 31 padded
     # positions score 64512. The valid probabilities underflow and padded V
@@ -165,7 +209,9 @@ def test_finite_f32_tail_sentinel_does_not_match_negative_infinity(case):
     "case,poison",
     [(case, False) for case in PROBED_CASES]
     + [(CASES[2], True), (CASES[4], True)]
-    + [(case, True) for case in OPEN_CASES],
+    + [(case, True) for case in OPEN_CASES]
+    + [(case, False) for case in WIDE_REUSE_CASES]
+    + [(case, poison) for case in OPEN_CASES for poison in ("masked_row", "nan_bias", "inf_bias")],
 )
 def test_attention_runtime(case, poison, monkeypatch):
     assert torch.backends.mps.is_available()
@@ -181,12 +227,18 @@ def test_attention_runtime(case, poison, monkeypatch):
     k = torch.randn((nk, d), generator=g).to(dt)
     v = torch.randn((nk, d), generator=g).to(dt)
     bias = torch.randn((nq, nk), generator=g) * 0.2
-    if poison:
+    if poison is True:
         q.zero_()
         k.zero_()
         bias.zero_()
         v.fill_(1)
         v[0, 7] = float("inf")
+    elif poison == "masked_row":
+        bias[3, :] = -float("inf")
+    elif poison == "nan_bias":
+        bias[3, 0] = float("nan")
+    elif poison == "inf_bias":
+        bias[3, 0] = float("inf")
     out = torch.full((triton.cdiv(nq, bm) * bm + 1, d), -8192.0, device="mps")
     calls = []
 
@@ -215,7 +267,7 @@ def test_attention_runtime(case, poison, monkeypatch):
     torch.mps.synchronize()
     assert calls == [h.function]
     actual = out.cpu()
-    if poison:
+    if poison is True:
         # Every valid query attends key zero with positive probability. Only
         # column seven can be infinite; all other columns average exact ones.
         expected = torch.ones((nq, d))
@@ -231,7 +283,10 @@ def test_attention_runtime(case, poison, monkeypatch):
     assert torch.equal(torch.isnan(actual[:nq]), torch.isnan(expected))
     assert torch.equal(torch.isposinf(actual[:nq]), torch.isposinf(expected))
     assert torch.equal(torch.isneginf(actual[:nq]), torch.isneginf(expected))
-    torch.testing.assert_close(actual[:nq], expected, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(
+        actual[:nq], expected, atol=3e-5, rtol=3e-5,
+        equal_nan=poison in ("masked_row", "nan_bias", "inf_bias"),
+    )
     assert torch.equal(actual[nq:], torch.full_like(actual[nq:], -8192.0))
 
 

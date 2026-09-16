@@ -141,7 +141,65 @@ class _TemplateMixin:
             return ("simdgroup", descriptors)
         return ("scalar", descriptors)
 
-    def _k_extent_line(self, info, BLOCK_K, has_K):
+    def _tail_ref(self, value):
+        """Immutable runtime/literal reference used by the launch bounds plan."""
+        for index, arg in enumerate(self.graph.args):
+            if arg.name == value:
+                width = self._declared_int_elem_type(arg.name)
+                if width not in ("i32", "i64", "u32", "u64"):
+                    return None
+                return ("arg", index, width)
+        try:
+            return ("literal", int(value), "i64")
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _record_full_block_tail_bounds(self, info, block_m, block_n, block_k, source, has_m, has_n):
+        """Bind an unmasked K-tail template to its runtime allocation proof."""
+        roles = self._dot_template_ptr_roles()
+        strides = self._inferred_stride_descriptors()
+        widths = self._dot_offset_arith_widths()
+        if roles is None or len(roles) != 3 or strides is None or any(value is None for value in strides):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "unmasked K-loop full-block replay has no complete A/B/C address proof; mask the K tail",
+                op_name="tt.dot",
+            )
+        if widths is None or any(role not in widths for role in ("A", "B", "C")):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "unmasked K-loop source address widths are unresolved; mask the K tail", op_name="tt.dot")
+        indices = {arg.id: index for index, arg in enumerate(self.graph.args)}
+        try:
+            tensor_indices = tuple(indices[arg.id] for arg in roles)
+        except (KeyError, AttributeError):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "unmasked K-loop pointer ownership is unresolved; mask the K tail", op_name="tt.dot")
+        m_ext, n_ext = self._matmul_output_extent_args()
+        m_ref = self._tail_ref(m_ext if m_ext is not None else ("M" if has_m else block_m))
+        n_ref = self._tail_ref(n_ext if n_ext is not None else ("N" if has_n else block_n))
+        k_ref = self._tail_ref(source)
+        stride_refs = tuple(self._tail_ref(value) for value in strides)
+        if m_ref is None or n_ref is None or k_ref is None or any(ref is None for ref in stride_refs):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "unmasked K-loop affine bounds cannot be represented by the launch ABI; mask the K tail",
+                op_name="tt.dot",
+            )
+        descriptor = (
+            "matmul_full_k_storage_v1", int(block_k), tensor_indices,
+            (m_ref, n_ref, k_ref), stride_refs,
+            tuple(tuple(widths[role]) for role in ("A", "B", "C")),
+        )
+        previous = getattr(self, "_tail_access_bounds", None)
+        if previous is not None and previous != descriptor:
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "matmul template produced inconsistent K-tail launch contracts; mask the K tail", op_name="tt.dot")
+        self._tail_access_bounds = descriptor
+
+    def _k_extent_line(self, info, BLOCK_K, has_K, BLOCK_M=None, BLOCK_N=None):
         """MSL statement setting ``_K`` (the matmul reduction extent), resolved
         STRUCTURALLY from the scf.for upper bound (``k_extent_arg``, works for any arg
         name); the name-based ``has_K`` is kept only as a no-regression fallback. Refuses
@@ -152,14 +210,65 @@ class _TemplateMixin:
         k_extent_arg = info.get("k_extent_arg")
         scf_iters = info.get("scf_iters")
         has_k_loop = bool(info.get("has_k_loop"))
+        if has_k_loop:
+            mode = info.get("k_tail_mode")
+            source = k_extent_arg if k_extent_arg is not None else ("K" if has_K else info.get("k_extent_const"))
+            source_expr = str(source) if str(source).isidentifier() else f"({source})"
+            if source is not None and mode == "masked_zero":
+                return f"    long _K = (long){source_expr};  // both operands prove a zero-masked K tail"
+            if source is not None and mode == "full_blocks":
+                # Padding a dynamic i64 extent with ``BLOCK_K - 1`` in signed MSL
+                # could overflow before the fragment-path range guard runs.  The
+                # canonical Triton K-loop induction bound is i32, for which the
+                # widening addition below is exact.  Decline wider dynamic bounds
+                # rather than manufacture a wrapped reduction extent.
+                source_width = info.get("k_extent_width")
+                if k_extent_arg is None and has_K:
+                    source_width = self._declared_int_elem_type("K")
+                if k_extent_arg is not None or has_K:
+                    if source_width != "i32":
+                        from triton_msl.errors import MetalNonRecoverableError
+
+                        raise MetalNonRecoverableError(
+                            "unmasked K-loop full-block replay requires an i32 source "
+                            "reduction extent; a wider dynamic bound cannot be rounded "
+                            "without a signed-overflow proof",
+                            op_name="tt.dot",
+                        )
+                elif int(source) > (2**63 - 1) - (BLOCK_K - 1):
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    raise MetalNonRecoverableError(
+                        "unmasked K-loop full-block replay extent exceeds the signed "
+                        "MSL reduction-index range",
+                        op_name="tt.dot",
+                    )
+                scalar_names = {a.name for a in self.graph.args if not a.is_ptr}
+                self._record_full_block_tail_bounds(
+                    info, BLOCK_M, BLOCK_N, BLOCK_K, source,
+                    "M" in scalar_names, "N" in scalar_names,
+                )
+                return (
+                    f"    long _K = (long){source_expr};\n"
+                    f"    long _K_source = _K;\n"
+                    f"    _K = _K_source > 0L ? ((_K_source + {BLOCK_K - 1}L) / {BLOCK_K}L) * {BLOCK_K}L : 0L;"
+                    "  // unmasked source executes complete BLOCK_K iterations"
+                )
+            if mode not in ("masked_zero", "full_blocks"):
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "K-loop matmul reduction-tail semantics were not proven from both operand loads",
+                    op_name="tt.dot",
+                )
         if k_extent_arg is not None:
-            return f"    uint _K = (uint){k_extent_arg};"
+            return f"    long _K = (long){k_extent_arg};"
         if has_K:  # legacy fallback: arg literally named K (structural trace missed it)
-            return "    uint _K = (uint)K;"
+            return "    long _K = (long)K;"
         if has_k_loop and scf_iters is not None and scf_iters >= 1:
-            return f"    uint _K = {BLOCK_K * scf_iters}u;  // BLOCK_K * scf.for iters"
+            return f"    long _K = {BLOCK_K * scf_iters};  // BLOCK_K * scf.for iters"
         if not has_k_loop:
-            return f"    uint _K = {BLOCK_K}u;  // single, non-looped dot tile"
+            return f"    long _K = {BLOCK_K};  // single, non-looped dot tile"
         from triton_msl.errors import MetalNonRecoverableError
 
         raise MetalNonRecoverableError(
@@ -210,7 +319,7 @@ class _TemplateMixin:
             block_n = pid_map[1]
             return [
                 "    // N-fastest source tile mapping; preserve signed i32 add/div/rem",
-                f"    int _npn = as_type<int>(_N + {block_n - 1}u) / {block_n};",
+                f"    int _npn = as_type<int>((uint)_N + {block_n - 1}u) / {block_n};",
                 "    uint pid_m = as_type<uint>(as_type<int>(pid3.x) / _npn);",
                 "    uint pid_n = as_type<uint>(as_type<int>(pid3.x) % _npn);",
             ]
@@ -220,8 +329,8 @@ class _TemplateMixin:
                 "    // grouped source tile mapping; retain the short final group",
                 # arith.addi/muli/subi wrap at i32, while divsi/remsi/minsi
                 # interpret those bits as signed. Do not turn the latter unsigned.
-                f"    int _npm = as_type<int>(_M + {block_m - 1}u) / {block_m};",
-                f"    int _npn = as_type<int>(_N + {block_n - 1}u) / {block_n};",
+                f"    int _npm = as_type<int>((uint)_M + {block_m - 1}u) / {block_m};",
+                f"    int _npn = as_type<int>((uint)_N + {block_n - 1}u) / {block_n};",
                 f"    int _span = as_type<int>(as_type<uint>(_npn) * {group}u);",
                 f"    int _first_m = as_type<int>(as_type<uint>(as_type<int>(pid3.x) / _span) * {group}u);",
                 f"    int _group_m = min(as_type<int>(as_type<uint>(_npm) - as_type<uint>(_first_m)), {group});",
@@ -231,7 +340,7 @@ class _TemplateMixin:
             ]
         if pid_map == "1d":
             return [
-                f"    uint _npm = (_M + {block_m}u - 1u) / {block_m}u;  // cdiv(M, BLOCK_M), as in the IR",
+                f"    uint _npm = ((uint)_M + {block_m}u - 1u) / {block_m}u;  // cdiv(M, BLOCK_M), as in the IR",
                 "    uint pid_m = pid3.x % _npm;",
                 "    uint pid_n = pid3.x / _npm;",
             ]
@@ -360,6 +469,437 @@ class _TemplateMixin:
             )
         return _roles[0], _roles[1], _roles[2]
 
+    # ------------------------------------------------------------------
+    # Address-arithmetic WIDTH/SIGNEDNESS (packet 825, W2 F-7)
+    #
+    # A Triton offset expression is evaluated in the SOURCE's integer type and
+    # only then sign-extended by ``tt.addptr``. The templates used to render
+    # every runtime stride as ``(uint)s`` and index with ``uint`` variables,
+    # which (a) TRUNCATED an i64 stride to 32 bits, (b) evaluated the sum as
+    # unsigned, and (c) zero-extended a negative offset into the pointer
+    # (``A[(uint)(-6)]`` -> ``A + 4294967290``). The driver binds every argument
+    # at its view's byte offset inside a full-storage mirror, so a negative
+    # offset relative to the bound base is reachable, not hypothetical.
+    #
+    # The repair reproduces the source's arithmetic instead of swapping casts:
+    #   * i32 offset term -> 32-bit WRAPPING product in ``uint`` (well defined,
+    #     no signed-overflow UB), bit-cast back with ``as_type<int>`` and then
+    #     widened to ``long`` for the pointer add (= the addptr sign-extend).
+    #   * i64 offset term -> computed in ``long`` with the i32 index promoted
+    #     (= the ``arith.extsi`` Triton inserts).
+    #   * terms that share ONE ``tt.addptr`` link are summed at the link's own
+    #     width before that extend; terms on SEPARATE links are extended
+    #     independently (Triton emits one addptr per source ``+``).
+    # Anything whose width or signedness is not provable refuses.
+    # ------------------------------------------------------------------
+
+    _ADDR_LAYOUT_OPS = (
+        "tt.broadcast",
+        "ttg.convert_layout",
+        "tt.reshape",
+        "arith.sitofp",
+        "arith.extsi",
+        "arith.trunci",
+    )
+
+    def _addr_op_index(self):
+        """``{ssa_id: op}`` over the whole function, regions included."""
+        op_by_id = {}
+
+        def _collect(ops):
+            for s in ops:
+                op_by_id[s.id] = s
+                if s.region_ops:
+                    _collect(s.region_ops)
+                if s.else_ops:
+                    _collect(s.else_ops)
+
+        _collect(self.graph.ops)
+        return op_by_id
+
+    def _dot_offset_arith_widths(self):
+        """Prove the offset-arithmetic width of each matmul operand's address, PER AXIS.
+
+        Walks the ``tt.addptr`` chain ``infer_dot_strides`` already traced for each
+        A/B/C role. Each link's offset operand carries the element type Triton
+        evaluated that link's offset in — and the type ``tt.addptr`` sign-extends
+        from. Each link is attributed to an axis by the ``tt.expand_dims`` axes
+        reachable inside its offset subgraph (axis 1 = row, axis 0 = col), which is
+        exactly how ``_classify`` separates the terms; the INDEX ssa ids cannot be
+        used because a kernel that reuses one ``tl.arange`` for both axes CSEs them
+        to a single ``tt.make_range``.
+
+        Returns ``{"A": (row_width, col_width, fused), ...}`` where each width is
+        ``"i32"`` or ``"i64"`` and ``fused`` says both terms share ONE addptr link
+        (so their sum wraps at that width before the single extend). Returns
+        ``None`` when anything is unprovable — the caller then refuses.
+        """
+        traced = self.infer_dot_strides(with_index=True)
+        if not (isinstance(traced, tuple) and len(traced) == 3):
+            return None
+        _strides, _index_ids, addptr_ids = traced
+        if not isinstance(addptr_ids, dict):
+            return None
+        op_by_id = self._addr_op_index()
+        _EXT = ("arith.extsi", "arith.extui", "arith.trunci")
+        _SHAPE = ("tt.broadcast", "ttg.convert_layout", "tt.reshape")
+
+        def _skip(o):
+            seen = 0
+            while o is not None and seen < 16 and o.op in self._ADDR_LAYOUT_OPS:
+                if not o.operand_ids:
+                    return o
+                o = op_by_id.get(o.operand_ids[0])
+                seen += 1
+            return o
+
+        def _peel(o):
+            """Drop shape-only wrappers (NOT the width-carrying ext/trunc ops)."""
+            seen = 0
+            while o is not None and seen < 16 and o.op in _SHAPE:
+                if not o.operand_ids:
+                    return o
+                o = op_by_id.get(o.operand_ids[0])
+                seen += 1
+            return o
+
+        def _link_width(off):
+            """Width one link's offset was COMPUTED in, or None.
+
+            MLIR integers are signless, so a ``u32`` argument is indistinguishable
+            from ``i32`` in the signature — the signedness shows up only in the
+            extension opcode. ``arith.extsi`` is transparent (the arithmetic
+            happened at the narrower width and is sign-extended exactly as the
+            pointer add would); ``arith.extui`` means the source type was UNSIGNED
+            and ``arith.trunci`` that a wider expression was narrowed — neither is
+            reproduced by the signed model, so both refuse.
+            """
+            seen = 0
+            while off is not None and seen < 16:
+                seen += 1
+                if off.op in _SHAPE or off.op == "tt.expand_dims":
+                    off = op_by_id.get(off.operand_ids[0]) if off.operand_ids else None
+                    continue
+                if off.op == "arith.extsi":
+                    off = op_by_id.get(off.operand_ids[0]) if off.operand_ids else None
+                    continue
+                if off.op in ("arith.extui", "arith.trunci"):
+                    return None
+                w = (off.elem_type or "").strip()
+                return w if w in ("i32", "i64") else None
+            return None
+
+        def _axes(root_id):
+            """expand_dims axes reachable in this offset subgraph (bounded DFS)."""
+            found = set()
+            seen = set()
+            stack = [root_id]
+            budget = 256
+            while stack and budget > 0:
+                budget -= 1
+                cur = stack.pop()
+                if cur is None or cur in seen:
+                    continue
+                seen.add(cur)
+                o = op_by_id.get(cur)
+                if o is None:
+                    continue
+                if o.op == "tt.expand_dims":
+                    a = o.attrs.get("axis")
+                    if a in (0, 1):
+                        found.add(a)
+                stack.extend(o.operand_ids or [])
+            return found if budget > 0 else None
+
+        def _fused_is_uniform(off):
+            """A fused link is uniform only if neither addend is itself extended.
+
+            ``A + (rm*sam_i32 + rk*sak_i64)`` promotes the i32 product with an
+            ``extsi`` INSIDE an i64 ``addi``: that product still wraps at 32 bits,
+            which a single-width fused model would not reproduce.
+            """
+            top = _peel(off)
+            if top is None or top.op not in ("arith.addi", "arith.add"):
+                return True
+            for oid in top.operand_ids or []:
+                a = _peel(op_by_id.get(oid))
+                if a is not None and a.op in _EXT:
+                    return False
+            return True
+
+        out = {}
+        for role in ("A", "B", "C"):
+            cur = op_by_id.get(addptr_ids.get(role))
+            links = []  # (width, axes)
+            seen_ids = set()
+            depth = 0
+            while (
+                cur is not None
+                and cur.op == "tt.addptr"
+                and len(cur.operand_ids) >= 2
+                and cur.id not in seen_ids
+                and depth < 16
+            ):
+                seen_ids.add(cur.id)
+                depth += 1
+                off = op_by_id.get(cur.operand_ids[1])
+                w = _link_width(off)
+                ax = _axes(cur.operand_ids[1])
+                if w is None or not ax:
+                    return None
+                if len(ax) == 2 and not _fused_is_uniform(off):
+                    return None
+                links.append((w, ax))
+                base = _skip(op_by_id.get(cur.operand_ids[0]))
+                # A scalar base advance is applied before the splat; cross it so the
+                # link count matches what infer_dot_strides flattened (it refuses any
+                # such residual, so crossing here can only AGREE with it).
+                if base is not None and base.op == "tt.splat" and base.operand_ids:
+                    inner = op_by_id.get(base.operand_ids[0])
+                    if inner is not None and inner.op == "tt.addptr":
+                        base = inner
+                cur = base
+            if len(links) == 1:
+                w, ax = links[0]
+                # One link. Both axes inside it -> their sum wraps at w before the
+                # single extend. One axis -> that link carries the whole offset at w.
+                out[role] = (w, w, len(ax) == 2)
+            elif len(links) == 2 and all(len(a) == 1 for _, a in links):
+                by_axis = {}
+                for w, ax in links:
+                    a = next(iter(ax))
+                    if a in by_axis:
+                        return None  # two links on the same axis: not attributable
+                    by_axis[a] = w
+                if set(by_axis) != {0, 1}:
+                    return None
+                out[role] = (by_axis[1], by_axis[0], False)
+            else:
+                return None
+        return out
+
+    def _declared_int_elem_type(self, name):
+        """Declared Triton element type of scalar argument ``name`` (or None)."""
+        for a in self.graph.args:
+            if a.name == name and not a.is_ptr:
+                return (a.elem_type or "").strip()
+        return None
+
+    def _checked_signed_stride(self, desc, scalar_names, what):
+        """A stride descriptor rendered as a plain MSL operand, or refuse.
+
+        The function signature Triton hands the walker is SIGNLESS (``tl.uint32``
+        and ``tl.int32`` both arrive as ``i32``), so unsignedness is NOT decidable
+        here — it is decided in ``_dot_offset_arith_widths`` from the extension
+        opcode (``arith.extui`` refuses). This guard covers what the declared type
+        genuinely proves: that the descriptor names an INTEGER scalar at all, so a
+        float argument can never be spliced into an address.
+        """
+        if desc not in scalar_names:
+            return str(desc)  # compile-time integer literal
+        elem = self._declared_int_elem_type(desc)
+        if elem is None or not (elem.startswith("i") or elem.startswith("u")):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"{what}: stride argument '{desc}' has declared type "
+                f"{elem!r}, which is not an integer, so it cannot be the traced "
+                "address coefficient the template is about to emit. Refusing "
+                "(correct-or-refuse).",
+                op_name="tt.dot",
+            )
+        return str(desc)
+
+    def _width_faithful_addr(self, terms, row_width, col_width, fused, *, what, scalar_names):
+        """Build the MSL index expression for one operand address.
+
+        ``terms`` is ``[(row_index_expr, row_stride), (col_index_expr, col_stride)]``.
+        ``row_width`` / ``col_width`` are the proven widths of the two offset terms and
+        ``fused`` says they shared ONE ``tt.addptr`` link. The result is a ``long``
+        expression suitable for ``ptr[<expr>]``.
+
+        EVERY arithmetic step is performed in an UNSIGNED type and reinterpreted with
+        ``as_type`` (packet 834): signed overflow is UB in MSL/C++ and would let the
+        compiler assume it cannot happen, while Triton's ``arith.muli``/``arith.addi``
+        are two's-complement WRAPPING at their width. Unsigned arithmetic is defined
+        modulo 2**w and has exactly the same bit pattern, so the bit-cast back is the
+        wrap.
+
+        * i32 term  -> ``(uint)idx * (uint)(stride)`` then ``as_type<int>`` (the
+          32-bit wrap) then widened to 64 bits (the ``tt.addptr`` sign-extend).
+        * i64 term  -> ``(ulong)idx * (ulong)(stride)``, the index zero-extended
+          (it is a non-negative tile index, so that equals the source's
+          ``arith.extsi``) and the product wrapping mod 2**64 as ``arith.muli`` does.
+        * terms in ONE link are summed AT THAT WIDTH before the single extend; terms
+          in separate links are extended separately and added at 64 bits.
+
+        Two forms are used so the common all-i32 address stays readable:
+
+        * all-i32 separate links: ``(long)as_type<int>(t0) + (long)as_type<int>(t1)``.
+          Each addend is in ``[-2**31, 2**31)``, so their sum is in ``[-2**32, 2**32)``
+          and CANNOT overflow ``long`` — the signed ``+`` is defined, and it equals the
+          mod-2**64 pointer add because the exact value is representable.
+        * anything involving i64: the whole offset is accumulated in ``ulong``
+          (defined mod 2**64, the pointer-arithmetic modulus) with each i32 link
+          sign-extended first (``(ulong)as_type<int>(...)`` is a modular conversion),
+          and one ``as_type<long>`` produces the signed offset.
+        """
+
+        def _u_term(idx, desc, width):
+            s = self._checked_signed_stride(desc, scalar_names, what)
+            # A compound index ("mstrip + r") must be parenthesised before the cast,
+            # or ``(uint)mstrip + r`` would cast only the first addend.
+            i = idx if str(idx).isidentifier() else f"({idx})"
+            if width == "i64":
+                return f"(ulong){i} * (ulong)({s})"
+            return f"(uint){i} * (uint)({s})"
+
+        widths = (row_width, row_width) if fused else (row_width, col_width)
+        any64 = "i64" in widths
+
+        if fused:
+            inner = " + ".join(_u_term(i, d, row_width) for i, d in terms)
+            if row_width == "i64":
+                # One i64 addptr: the sum wraps mod 2**64 exactly as the pointer add.
+                return f"as_type<long>({inner})"
+            return f"(long)as_type<int>({inner})"
+
+        parts = []
+        for (idx, desc), width in zip(terms, widths):
+            t = _u_term(idx, desc, width)
+            if width == "i64":
+                parts.append(t if any64 else f"as_type<long>({t})")
+            elif any64:
+                # Sign-extend the 32-bit link, then keep accumulating modulo 2**64.
+                parts.append(f"(ulong)as_type<int>({t})")
+            else:
+                parts.append(f"(long)as_type<int>({t})")
+        joined = " + ".join(parts)
+        return f"as_type<long>({joined})" if any64 else joined
+
+    # ------------------------------------------------------------------
+    # Simdgroup leading-dimension ABI proof + width-faithful scalar fallback
+    # (packet 834, task 1)
+    #
+    # ``simdgroup_load`` / ``simdgroup_store`` take ``ulong elements_per_row``: a
+    # NEGATIVE leading dimension is not expressible, and a 64-bit one does not fit
+    # the 32-bit index arithmetic the fragment path uses. The K-loop template used
+    # that ABI unconditionally, so a negative or oversized runtime row stride read
+    # and wrote the wrong memory. The repair keeps the fast path for layouts the ABI
+    # provably represents and takes a scalar, width-faithful route otherwise.
+    #
+    # The decision is UNIFORM: it reads only kernel scalars (the runtime extents and
+    # the leading dimensions), never ``pid``/``tiitg``/``sgitg``, so every thread in
+    # every threadgroup computes the same verdict and the early ``return`` on the
+    # fallback branch can never split a threadgroup across a barrier.
+    # ------------------------------------------------------------------
+
+    _I32_MAX_L = "0x7fffffffL"
+    _I32_LIMIT_L = "0x80000000L"
+    _I32_MAX_UL = "0x7fffffffUL"
+
+    def _simd_layout_guard_lines(self, a_ld, b_ld, c_ld, indent="    "):
+        """Emit ``bool _simd_ok = <uniform proof>;``.
+
+        SUFFICIENT CONDITIONS for the simdgroup leading-dimension path. With row
+        extents from the traced output bounds, ``a_ld``/``b_ld``/``c_ld`` the traced
+        ROW strides and unit column strides (this template only claims
+        contiguous-inner operands), the largest element the SIMD path touches is
+        ``(_M-1)*a_ld + (_K-1)`` for A, ``(_K-1)*b_ld + (_N-1)`` for B and
+        ``(_M-1)*c_ld + (_N-1)`` for C. The path is entered only when ALL of:
+
+          1. ``_M > 0 && _N > 0 && _K > 0``        (non-empty, non-negative extents)
+          2. each extent ``<= 2**31-1``            (an i32 index cannot name more)
+          3. each leading dim, read as ``ulong``, ``<= 2**31-1``. For an i32 stride
+             argument rendered ``(uint)s`` this is exactly ``s >= 0``; for a 64-bit
+             one rendered ``(ulong)s`` it rejects negatives AND anything the
+             fragment path's 32-bit stepping could not carry.
+          4. each operand's MAXIMAL offset above is ``< 2**31``.
+
+        (4) is the condition a bare sign test cannot give: a POSITIVE stride still
+        lets ``index * stride`` cross the signed boundary, after which the source's
+        i32 arithmetic wraps NEGATIVE while ``simdgroup_load`` would keep walking
+        forward. With (1)-(3) holding, every product below is at most
+        ``(2**31-1)**2 < 2**63``, so the 64-bit check itself cannot overflow, and
+        the ``&&`` chain short-circuits before any product is formed from a leading
+        dimension that failed (3).
+
+        Under 1-4 every address the SIMD path forms lies in ``[0, 2**31)``, so the
+        template's ``uint`` index arithmetic is bit-identical to the source's i32
+        arithmetic AND to the exact mathematical value — no wrap, no sign question.
+        """
+        i32 = self._I32_MAX_L
+        lim = self._I32_LIMIT_L
+        u32 = self._I32_MAX_UL
+        return [
+            f"{indent}// Uniform simdgroup leading-dimension proof (packet 834): reads only",
+            f"{indent}// kernel scalars, so every thread agrees and the fallback return below",
+            f"{indent}// can never split a threadgroup across a barrier.",
+            f"{indent}ulong _lda = (ulong)({a_ld});",
+            f"{indent}ulong _ldb = (ulong)({b_ld});",
+            f"{indent}ulong _ldc = (ulong)({c_ld});",
+            f"{indent}bool _simd_ok =",
+            f"{indent}       _M > 0L && _N > 0L && _K > 0L",
+            f"{indent}    && _M <= {i32} && _N <= {i32} && _K <= {i32}",
+            f"{indent}    && _lda <= {u32} && _ldb <= {u32} && _ldc <= {u32}",
+            f"{indent}    && (_M - 1L) * (long)_lda + (_K - 1L) < {lim}",
+            f"{indent}    && (_K - 1L) * (long)_ldb + (_N - 1L) < {lim}",
+            f"{indent}    && (_M - 1L) * (long)_ldc + (_N - 1L) < {lim};",
+        ]
+
+    def _scalar_tile_fallback_lines(
+        self, *, widths, descriptors, a_name, b_name, c_name, out_type,
+        block_m, block_n, threads, scalar_names, indent="        ",
+    ):
+        """Width-faithful scalar matmul over THIS threadgroup's output tile.
+
+        Used when ``_simd_ok`` is false. Reproduces what the simdgroup path would
+        have computed for the same tile:
+
+        * the same tile bounds and the same signed ``_M``/``_N`` masks, so partial
+          edge tiles write exactly the in-range elements;
+        * the full reduction ``k in [0, _K)`` with no 8-multiple assumption, so a K
+          tail is covered (the SIMD path needs ``_K % 8 == 0`` and stages the tail);
+        * fp32 accumulation, the accumulator width ``tl.dot`` specifies and the same
+          the ``simdgroup_float8x8`` accumulators use;
+        * the same terminal cast to the output element type.
+
+        It does NOT reproduce the MMA path's summation ORDER (``tl.dot`` fixes no
+        order; both are fp32 sums of the identical products, and the branch is a
+        deterministic function of the kernel scalars, so one launch gets one answer).
+        It allocates no threadgroup memory, so it can be used inside the
+        occupancy-tuned ``__mmdirect`` twin without changing that kernel's
+        threadgroup footprint.
+        """
+        a_row, a_col, b_row, b_col, c_row, c_col = descriptors
+        a_addr = self._width_faithful_addr(
+            [("m", a_row), ("k", a_col)], *widths["A"],
+            what="K-loop matmul scalar fallback operand A", scalar_names=scalar_names,
+        )
+        b_addr = self._width_faithful_addr(
+            [("k", b_row), ("n", b_col)], *widths["B"],
+            what="K-loop matmul scalar fallback operand B", scalar_names=scalar_names,
+        )
+        c_addr = self._width_faithful_addr(
+            [("m", c_row), ("n", c_col)], *widths["C"],
+            what="K-loop matmul scalar fallback output C", scalar_names=scalar_names,
+        )
+        i = indent
+        return [
+            f"{i}// Layout the simdgroup leading-dimension ABI cannot represent: same tile,",
+            f"{i}// same masks, same K tail, same fp32 accumulator, width-faithful addresses.",
+            f"{i}for (uint _fe = tiitg; _fe < {block_m * block_n}u; _fe += {threads}u) {{",
+            f"{i}    uint m = row_base + _fe / {block_n}u;",
+            f"{i}    uint n = col_base + _fe % {block_n}u;",
+            f"{i}    if ((long)m >= _M || (long)n >= _N) continue;",
+            f"{i}    float _facc = 0.0f;",
+            f"{i}    for (long k = 0L; k < _K; k++) {{",
+            f"{i}        _facc += (float){a_name}[{a_addr}] * (float){b_name}[{b_addr}];",
+            f"{i}    }}",
+            f"{i}    {c_name}[{c_addr}] = ({out_type})_facc;",
+            f"{i}}}",
+        ]
+
     def _lower_strided_scalar_matmul(self, info, descriptors):
         """Fully stride-aware scalar matmul for a NON-contiguous-inner operand.
 
@@ -389,16 +929,21 @@ class _TemplateMixin:
         all_scalar_args = [a for a in self.graph.args if not a.is_ptr]
         scalar_names = {a.name for a in all_scalar_args}
 
-        def _sx(desc):
-            # Stride descriptor -> MSL expression. A runtime arg name must be a
-            # declared scalar (unpacked from its buffer below); a literal int
-            # string passes through. (Descriptors only ever hold an arg NAME or
-            # an integer literal — never None here; the gate refused None.)
-            return desc if desc not in scalar_names else f"(uint){desc}"
+        # Offset arithmetic is rendered at the SOURCE's integer width (packet 825,
+        # W2 F-7): the old ``(uint){desc}`` truncated i64 strides, evaluated the sum
+        # as unsigned and zero-extended negative offsets into the pointer.
+        _widths = self._dot_offset_arith_widths()
+        if _widths is None:
+            from triton_msl.errors import MetalNonRecoverableError
 
-        a_rs, a_cs = _sx(a_row), _sx(a_col)
-        b_rs, b_cs = _sx(b_row), _sx(b_col)
-        c_rs, c_cs = _sx(c_row), _sx(c_col)
+            raise MetalNonRecoverableError(
+                "strided matmul: the integer width of the operand address arithmetic "
+                "could not be proven from the traced tt.addptr chain (unreadable, or "
+                "the chain mixes i32 and i64 offsets). Emitting the address would have "
+                "to guess whether each term wraps at 32 bits, so refusing "
+                "(correct-or-refuse).",
+                op_name="tt.dot",
+            )
 
         has_k_loop = bool(info.get("has_k_loop"))
         if has_k_loop:
@@ -458,9 +1003,14 @@ class _TemplateMixin:
         # Output extents resolved structurally from the store mask (issue #4.5): any arg
         # name works, so a square N x N matmul clips both axes correctly instead of _M=BLOCK_M.
         m_ext, n_ext = self._matmul_output_extent_args()
-        lines.append(f"    uint _M = {f'(uint){m_ext}' if m_ext else ('(uint)M' if has_M else f'{BLOCK_M}u')};")
-        lines.append(f"    uint _N = {f'(uint){n_ext}' if n_ext else ('(uint)N' if has_N else f'{BLOCK_N}u')};")
-        lines.append(self._k_extent_line(info, BLOCK_K, has_K))
+        # Extents are SIGNED and full width (packet 825): the source compares a signed
+        # i32 index against a signed i32 extent, so a negative extent must mask
+        # everything. ``(uint)`` made ``-1`` admit every row; ``(long)`` sign-extends an
+        # i32 extent, keeps an i64 one whole, and leaves the ``uint`` index promoted for
+        # a signed comparison at every ``< _M`` / ``>= _M`` site below.
+        lines.append(f"    long _M = {f'(long){m_ext}' if m_ext else ('(long)M' if has_M else f'{BLOCK_M}')};")
+        lines.append(f"    long _N = {f'(long){n_ext}' if n_ext else ('(long)N' if has_N else f'{BLOCK_N}')};")
+        lines.append(self._k_extent_line(info, BLOCK_K, has_K, BLOCK_M, BLOCK_N))
         if has_pid:
             lines.extend(self._pid_map_lines(info, BLOCK_M))
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
@@ -475,10 +1025,19 @@ class _TemplateMixin:
         lines.append("        if (m >= _M || n >= _N) continue;")
         lines.append("        float _sum = 0.0f;")
         lines.append("        for (uint k = 0u; k < _K; k++) {")
-        lines.append(f"            _sum += (float){a_name}[m * {a_rs} + k * {a_cs}]")
-        lines.append(f"                  * (float){b_name}[k * {b_rs} + n * {b_cs}];")
+        _a_addr = self._width_faithful_addr(
+            [("m", a_row), ("k", a_col)], *_widths["A"], what="strided matmul operand A", scalar_names=scalar_names
+        )
+        _b_addr = self._width_faithful_addr(
+            [("k", b_row), ("n", b_col)], *_widths["B"], what="strided matmul operand B", scalar_names=scalar_names
+        )
+        _c_addr = self._width_faithful_addr(
+            [("m", c_row), ("n", c_col)], *_widths["C"], what="strided matmul output C", scalar_names=scalar_names
+        )
+        lines.append(f"            _sum += (float){a_name}[{_a_addr}]")
+        lines.append(f"                  * (float){b_name}[{_b_addr}];")
         lines.append("        }")
-        lines.append(f"        {c_name}[m * {c_rs} + n * {c_cs}] = ({c_msl})_sum;")
+        lines.append(f"        {c_name}[{_c_addr}] = ({c_msl})_sum;")
         lines.append("    }")
         lines.append("}")
         return "\n".join(lines)
@@ -890,18 +1449,18 @@ class _TemplateMixin:
 
         m_ext, n_ext = self._matmul_output_extent_args()  # structural extents (issue #4.5)
         if m_ext:
-            lines.append(f"    uint _M = (uint){m_ext};")
+            lines.append(f"    long _M = (long){m_ext};")
         elif has_M:
-            lines.append(f"    uint _M = (uint)M;")
+            lines.append(f"    long _M = (long)M;")
         else:
-            lines.append(f"    uint _M = {BLOCK_M}u;  // no M arg, single tile")
+            lines.append(f"    long _M = {BLOCK_M};  // no M arg, single tile")
         if n_ext:
-            lines.append(f"    uint _N = (uint){n_ext};")
+            lines.append(f"    long _N = (long){n_ext};")
         elif has_N:
-            lines.append(f"    uint _N = (uint)N;")
+            lines.append(f"    long _N = (long)N;")
         else:
-            lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")
-        lines.append(self._k_extent_line(info, BLOCK_K, has_K))
+            lines.append(f"    long _N = {BLOCK_N};  // no N arg, single tile")
+        lines.append(self._k_extent_line(info, BLOCK_K, has_K, BLOCK_M, BLOCK_N))
         lines.extend(self._pid_map_lines(info, BLOCK_M))
 
         # Leading dims for the simdgroup loads/stores = each operand's ROW stride.
@@ -923,7 +1482,12 @@ class _TemplateMixin:
             if row_desc is None:
                 return dim_default
             if row_desc in scalar_names:
-                return f"(uint){row_desc}"  # runtime row stride (sliced/padded rows)
+                # Runtime row stride (sliced/padded rows). Render it at its DECLARED
+                # width (packet 825): ``(uint)`` silently truncated a 64-bit stride to
+                # 32 bits here, so a row stride past 4 Gi elements addressed the wrong
+                # row on every load, store and leading-dim argument.
+                _msl = triton_type_to_msl(self._declared_int_elem_type(row_desc) or "i32")
+                return f"({'ulong' if _msl in ('long', 'ulong') else 'uint'}){row_desc}"
             try:
                 return f"{int(str(row_desc))}u"  # compile-time literal row stride
             except (TypeError, ValueError):
@@ -940,6 +1504,44 @@ class _TemplateMixin:
         lines.append(f"")
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
         lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
+
+        # Packet 834: prove the simdgroup leading-dimension ABI can represent this
+        # launch's layout before using it, and take a width-faithful scalar route
+        # otherwise. The verdict is uniform (kernel scalars only), so the early
+        # return below is taken by a whole threadgroup or by none of it — no
+        # divergent barrier. Both the direct fast path and the staged path live
+        # behind it, so neither needs its own check.
+        _fb_widths = self._dot_offset_arith_widths()
+        if descriptors is None or _fb_widths is None:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "K-loop matmul requires proven operand strides and source integer widths "
+                "for its simdgroup layout guard and scalar fallback; refusing rather than "
+                "emit an unguarded leading-dimension path",
+                op_name="tt.dot",
+            )
+        _emit_layout_guard = True
+        if _emit_layout_guard:
+            lines.append(f"")
+            lines.extend(self._simd_layout_guard_lines(a_ld, b_ld, c_ld))
+            lines.append(f"    if (!_simd_ok) {{")
+            lines.extend(
+                self._scalar_tile_fallback_lines(
+                    widths=_fb_widths,
+                    descriptors=descriptors,
+                    a_name=a_name,
+                    b_name=b_name,
+                    c_name=c_name,
+                    out_type=output_msl_type,
+                    block_m=BLOCK_M,
+                    block_n=BLOCK_N,
+                    threads=128,
+                    scalar_names=scalar_names,
+                )
+            )
+            lines.append(f"        return;")
+            lines.append(f"    }}")
         lines.append(f"")
         lines.append(f"    threadgroup {tg_type} tg_A[{tg_a_size}];")
         lines.append(f"    threadgroup {tg_type} tg_B[{tg_b_size}];")
@@ -1147,7 +1749,8 @@ class _TemplateMixin:
             lines.append(f") {{")
             for arg in all_scalar_args:
                 lines.append(_scalar_unpack(arg))
-            lines.append(f"    uint _M = (uint)M, _N = (uint)N, _K = (uint)K;")
+            lines.append(f"    long _M = (long)M, _N = (long)N;")
+            lines.append(self._k_extent_line(info, BLOCK_K, has_K, BLOCK_M, BLOCK_N))
             # Packet 106: the direct variant replays the SAME proven grid mapping as the
             # staged kernel (the tutorial's 1-D split, and tile 0 on an axis the source
             # kernel does not tile) — it used to hard-code ``pid3.x / pid3.y``, so the
@@ -1155,6 +1758,29 @@ class _TemplateMixin:
             lines.extend(self._pid_map_lines(info, BLOCK_M))
             lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
             lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
+            # Packet 834: the direct twin has no staged path to fall through to, so it
+            # carries the SAME uniform proof and the SAME scalar fallback. The fallback
+            # uses no threadgroup memory, so this kernel keeps the zero-threadgroup
+            # footprint that is its whole reason to exist.
+            if _emit_layout_guard:
+                lines.extend(self._simd_layout_guard_lines(a_ld, b_ld, c_ld))
+                lines.append(f"    if (!_simd_ok) {{")
+                lines.extend(
+                    self._scalar_tile_fallback_lines(
+                        widths=_fb_widths,
+                        descriptors=descriptors,
+                        a_name=a_name,
+                        b_name=b_name,
+                        c_name=c_name,
+                        out_type=output_msl_type,
+                        block_m=BLOCK_M,
+                        block_n=BLOCK_N,
+                        threads=128,
+                        scalar_names=scalar_names,
+                    )
+                )
+                lines.append(f"        return;")
+                lines.append(f"    }}")
             lines.append(f"    {acc_frag} {', '.join(n + '(0)' for n in all_accs)};")
             lines.append(f"    {in_frag} a_frag, {', '.join(b_names)};")
             lines.append(f"    for (uint k = 0u; k < _K; k += 8u) {{")
@@ -1833,7 +2459,17 @@ class _TemplateMixin:
         # -> silently wrong. Shared guard (_refuse_if_pid_tiles_baked_output); M/N
         # are baked constexpr here (a runtime M/N can't reach this template —
         # m_block/n_strips need a concrete M), so has_M/has_N are False.
-        self._refuse_if_pid_tiles_baked_output(False, False, "fused matmul+softmax")
+        # Unlike the whole-output matmul makers, this maker never consumes
+        # mask-derived runtime extents. The shared guard's extent inference
+        # cannot certify a program-id mapping this maker does not emit.
+        if any(op.op in self._PID_OPS for op in self.graph.ops):
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "fused matmul+softmax/epilogue template does not reproduce program-id "
+                "tiling, even when the store mask exposes runtime output bounds.",
+                op_name="tt.dot",
+            )
 
         # 128 threads = 4 SIMD groups × 32 threads.
         self.effective_block_size = 128
@@ -1855,10 +2491,41 @@ class _TemplateMixin:
         col_tiles_per_sg = cols_per_sg // 8  # 8×8 col tiles per SG
         row_tiles = m_block // 8  # 8×8 row tiles per strip
 
-        def _addr(base, row, col, row_stride, col_stride, inner_dim):
-            row_term = f"({row}) * {row_stride}" if row_stride else f"({row}) * {inner_dim}u"
-            col_term = f"({col}) * {col_stride}" if col_stride else f"({col})"
-            return f"{base}[{row_term} + {col_term}]"
+        # Addresses are rendered at the SOURCE's integer width (packet 825, W2 F-7 —
+        # extension). ``f"({row}) * {row_stride}"`` was an UNCAST product: with an i32
+        # stride argument (``constant int&``) a ``uint`` row index made it a 32-bit
+        # UNSIGNED product that is then ZERO-extended at the subscript, so a negative
+        # stride addressed ~4 GiB forward instead of backwards, and a product past
+        # 2**31 lost its sign. (It did not truncate an i64 stride — ``uint * long``
+        # promotes — but that was luck, not a proof.) Same prover as the strided scalar
+        # matmul: per-operand addptr-link width, refuse when unprovable.
+        _widths = self._dot_offset_arith_widths()
+        if _widths is None:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "fused matmul+softmax/epilogue template: the integer width of the operand "
+                "address arithmetic could not be proven from the traced tt.addptr chain "
+                "(unreadable, or the chain mixes i32 and i64 offsets). Emitting the address "
+                "would have to guess whether each term wraps at 32 bits, so refusing "
+                "(correct-or-refuse).",
+                op_name="tt.dot",
+            )
+        _scalar_names = {a.name for a in self.graph.args if not a.is_ptr}
+
+        def _addr(base, row, col, row_stride, col_stride, inner_dim, role):
+            # The detectors feeding this template both go through
+            # _inferred_stride_descriptors, which never yields a None slot; the
+            # ``inner_dim`` / unit fallbacks are kept for defence and carry the same
+            # width as the rest of that operand's address.
+            terms = [(row, row_stride if row_stride else str(inner_dim)),
+                     (col, col_stride if col_stride else "1")]
+            expr = self._width_faithful_addr(
+                terms, *_widths[role],
+                what=f"fused matmul+softmax/epilogue operand {role}",
+                scalar_names=_scalar_names,
+            )
+            return f"{base}[{expr}]"
 
         safe_name = _sanitize_msl_name(self.graph.func_name)
 
@@ -1902,13 +2569,13 @@ class _TemplateMixin:
         # Stage strip\'s A[M_BLOCK, 8] cooperatively.
         lines.append(f"            for (uint i = tiitg; i < {m_block * 8}u; i += 128u) {{")
         lines.append("                uint r = i / 8u, c = i % 8u;")
-        a_load = _addr(a_ptr, "mstrip + r", "kk + c", a_row_s, a_col_s, K)
+        a_load = _addr(a_ptr, "mstrip + r", "kk + c", a_row_s, a_col_s, K, "A")
         lines.append(f"                tg_A[i] = {in_cast}({a_load});")
         lines.append("            }")
         # Stage B[8, N] cooperatively.
         lines.append(f"            for (uint i = tiitg; i < {8 * N}u; i += 128u) {{")
         lines.append(f"                uint r = i / {N}u, c = i % {N}u;")
-        b_load = _addr(b_ptr, "kk + r", "c", b_row_s, b_col_s, N)
+        b_load = _addr(b_ptr, "kk + r", "c", b_row_s, b_col_s, N, "B")
         lines.append(f"                tg_B[i] = {in_cast}({b_load});")
         lines.append("            }")
         lines.append("            threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -1973,7 +2640,7 @@ class _TemplateMixin:
         # Write strip to global.
         lines.append(f"        for (uint i = tiitg; i < {m_block * N}u; i += 128u) {{")
         lines.append(f"            uint row = i / {N}u, col = i % {N}u;")
-        c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N)
+        c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N, "C")
         lines.append(f"            {c_store_addr} = ({c_msl_type})tg_C[i];")
         lines.append("        }")
         lines.append("        threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -2120,10 +2787,42 @@ class _TemplateMixin:
             f"            uint row = i / {N}u, col = i % {N}u;",
         ]
         lines.extend(body)
-        c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N)
+        c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N, "C")
         lines.append(f"            {c_store_addr} = ({c_msl_type})({out});")
         lines.append("        }")
         return lines
+
+    def _row_stride_offset_expr(self, lid_expr, stride_desc, what):
+        """``long`` row-base offset for a row-per-thread template (packet 825).
+
+        Only a COMPILE-TIME literal stride is emitted: ``_detect_row_wise_sort``
+        proves such a stride is a non-negative constant no smaller than the row
+        width, so widening it to ``long`` is exact and also removes the 32-bit
+        overflow the old ``lid * (uint)C`` carried.
+
+        A RUNTIME stride refuses. The old form (``lid * (uint)s``) truncated a
+        64-bit stride and zero-extended a negative one, and this template has no
+        traced ``tt.addptr`` chain to prove the offset's width/signedness from
+        (the way ``_dot_offset_arith_widths`` does for the matmul templates).
+        The runtime branch of the detector is currently unreachable — it requires
+        the stride argument to appear DIRECTLY in an ``arith.muli``, while Triton
+        always ``tt.splat``s a scalar first — so this refusal cannot regress an
+        admitted kernel; it makes the latent hole loud if that detector branch is
+        ever repaired.
+        """
+        names = {a.name for a in self.graph.args if not a.is_ptr}
+        if str(stride_desc) not in names:
+            return f"(long){lid_expr} * (long)({stride_desc})"
+        from triton_msl.errors import MetalNonRecoverableError
+
+        raise MetalNonRecoverableError(
+            f"{what}: the row stride is the runtime argument '{stride_desc}', and this "
+            "template cannot prove the integer width or signedness of the source's row "
+            "offset arithmetic (no traced tt.addptr chain). Emitting it as a 32-bit "
+            "unsigned product would truncate a 64-bit stride and turn a negative one "
+            "into a huge positive offset. Refusing (correct-or-refuse).",
+            op_name="tt.store",
+        )
 
     def _lower_row_wise_sort_template(self, info) -> str:
         """Emit a per-row bitonic sort / top-k kernel.
@@ -2219,7 +2918,8 @@ class _TemplateMixin:
         lines.append(f"    if (lid < {M}u) {{")
         # Load N elements for this row
         lines.append(f"        {compute_type} v[{N}];")
-        lines.append(f"        uint _row_off = lid * (uint){stride_xm};")
+        _row_off_x = self._row_stride_offset_expr("lid", stride_xm, "row-wise sort input")
+        lines.append(f"        long _row_off = {_row_off_x};")
         lines.append(f"        for (uint _i = 0u; _i < {N}u; _i++) {{")
         lines.append(f"            v[_i] = static_cast<{compute_type}>({x_ptr}[_row_off + _i]);")
         lines.append(f"        }}")
@@ -2250,7 +2950,8 @@ class _TemplateMixin:
         # For topk ascending (not descending): smallest K → v[0..K-1] in ascending order.
         # For topk descending: largest K → v[N-K..N-1] → store in reverse order.
         # For sort ascending: v[0..N-1].
-        lines.append(f"        uint _row_off_z = lid * (uint){stride_zm};")
+        _row_off_zx = self._row_stride_offset_expr("lid", stride_zm, "row-wise sort output")
+        lines.append(f"        long _row_off_z = {_row_off_zx};")
         if descending:
             if K < N:
                 # topk largest: take v[N-K..N-1], reverse for descending order
@@ -2318,8 +3019,13 @@ class _TemplateMixin:
             identity = "INFINITY" if msl_type == "float" else "INT_MAX"
             combine_expr = "fmin(acc, val)" if msl_type == "float" else "min(acc, val)"
         else:
-            identity = "0.0f" if msl_type == "float" else "0"
-            combine_expr = "acc + val"
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"3-D reduce template cannot emit combine {combine_op!r}; "
+                "refusing rather than substitute a sum.",
+                op_name="tt.reduce",
+            )
 
         safe_name = _sanitize_msl_name(self.graph.func_name)
 
@@ -4736,4 +5442,20 @@ class _TemplateMixin:
             return None
         _bm, _bn = int(_ash[0]), int(_bsh[1])
         _grid_spec = ("1d", _bm, _bn) if _vp[3] == "1d" else ("2d", _bm, _bn, bool(_vp[4][0]), bool(_vp[4][1]))
-        return (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out, tuple(stride_checks), _grid_spec)
+        # Bind the replacement launch to the source K-loop tail contract.  An
+        # unmasked source executes its final complete BLOCK_K iteration; the
+        # fast shader instead loops to logical K and therefore may replace it
+        # only when K is BLOCK_K-divisible.  A both-zero-masked source does have
+        # logical-K semantics and retains the existing fast-path K%8 gate.
+        _tail_mode = _vp[5] if len(_vp) > 5 else None
+        _block_k = None
+        if _tail_mode is not None:
+            # The dot operand's inner tile is the source loop's BLOCK_K; this
+            # shape was already operation-owned and validated immediately above.
+            _block_k = int(_ash[1])
+            if _tail_mode not in ("masked_zero", "full_blocks") or _block_k <= 0:
+                return None
+        return (
+            fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out,
+            tuple(stride_checks), _grid_spec, _tail_mode, _block_k,
+        )

@@ -44,11 +44,14 @@ def mm(
     b_ptrs = b_ptr + (offk[:, None] * sbk + offn[None, :] * sbn)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
-        acc += tl.dot(tl.load(a_ptrs), tl.load(b_ptrs))
+        # Misaligned cases use exact allocations: source masks must own the tails.
+        a = tl.load(a_ptrs, (offm[:, None] < M) & (offk[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, (offk[:, None] < K - k) & (offn[None, :] < N), other=0.0)
+        acc += tl.dot(a, b)
         a_ptrs += BK * sak
         b_ptrs += BK * sbk
     c_ptrs = c_ptr + (offm[:, None] * scm + offn[None, :] * scn)
-    tl.store(c_ptrs, acc)
+    tl.store(c_ptrs, acc, (offm[:, None] < M) & (offn[None, :] < N))
 
 
 def _spy(monkeypatch):
@@ -170,11 +173,13 @@ def mm_f16(
     b_ptrs = b_ptr + (offk[:, None] * sbk + offn[None, :] * sbn)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
-        acc += tl.dot(tl.load(a_ptrs), tl.load(b_ptrs))
+        a = tl.load(a_ptrs, (offm[:, None] < M) & (offk[None, :] < K - k), other=0.0)
+        b = tl.load(b_ptrs, (offk[:, None] < K - k) & (offn[None, :] < N), other=0.0)
+        acc += tl.dot(a, b)
         a_ptrs += BK * sak
         b_ptrs += BK * sbk
     c_ptrs = c_ptr + (offm[:, None] * scm + offn[None, :] * scn)
-    tl.store(c_ptrs, acc.to(tl.float16))
+    tl.store(c_ptrs, acc.to(tl.float16), (offm[:, None] < M) & (offn[None, :] < N))
 
 
 def _launch_f16(M, N, K):

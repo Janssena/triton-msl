@@ -1,25 +1,88 @@
 # Changelog
 
-## 0.3.0rc4 - 2026-09-11 (unpublished candidate)
+## 0.3.0
 
-Supersedes the unpublished rc1–rc3 snapshots. The frozen 493 code passed 4,609 project tests
-(12 skips; four performance sentinels scheduled separately) and the 9,342-node upstream gate
-(5,780 passed / 3,562 skipped; exact baseline status identity). Its installed wheel passed
-84 acceptance tests and 27 after relocation; both portable validation scripts passed locally,
-not on an independent M1. Later 523/527/529 source changes still need final integrated gates,
-performance/cross-vendor validation and rebuilt-artifact acceptance; earlier archive hashes
-and approvals do not identify a rebuilt wheel.
+Supersedes unpublished rc1–rc4 candidates. Exact871 records 6,079 project passes / 16 skips, exact 9,342-node upstream identity (5,780 passed / 3,562 skipped), installed acceptance 1,468 native / 252 pure with no failures/skips, and four unchanged M4 Max floors. The numerical correctness, installed-acceptance and performance campaigns used the named 0.3.0rc4 artifacts. Final-version 0.3.0 artifacts have been freshly built, reproduced from the sdist and rebound to their tested runtime payloads.
+
+The 814→871 audit repaired codegen admission, native type ownership, transpose orientation, reduction ordering, partial-K extent replay, flip detection/side effects, runtime ABI/state checks and diagnostics; unsupported forms now refuse where a faithful bounded lowering is not proved. Exact scopes are pinned in the capability register. M1 remains best-effort post-merge and the optional C++ route remains deferred/off by default. Performance costs remain open and unaccepted.
+
+- Requalify the attention comparison on the current M4 Max stack (890): 84 native/pure
+  cases pass the declared checks. Native wins all 36 dense medians against current SDPA,
+  but takes 23–44% longer than MLX; historical MLX near-parity is not sustained. At D128,
+  batch 2 / 8 heads / N1024–4096, fp16 full is 1.94–2.18× SDPA and fp32 full
+  1.36–1.41×; pure is separately 1.18–1.50× and 0.94–1.16×. Pure has 34/36 dense
+  median wins and substantial block variation. These are API-call measurements, not a
+  recreation of the August stack or a clearance of main-relative regressions. See the
+  current-comparator and same-stack attribution sections in the release limitations.
+- Add a same-stack main/final follow-up (895): 28 backend cases pass; native final/main
+  paired-block latency ratios are 1.085–1.291 on 12 dense D128 cases and 1.125/1.131
+  on full/causal MLA N2048. Main already trails current MLX on the dense medians;
+  the final backend adds a measurable cost. Two long-context dense comparisons have
+  blocks crossing parity. This isolates a current-stack backend difference, not its
+  individual code-hunk causes or the entire historical August-to-current change.
+
+- Record candidate-bound A40/MI300X source-portability checks (2026-09-15): all 11 required
+  exact-byte predicates pass across Metal/native, Metal/pure and both remote backends.
+  The original default-precision runs remain 14/16 required numerical passes per remote
+  backend: two attention rows miss the unchanged oracle tolerance. Two additive
+  explicit-IEEE attention contexts pass on all three vendors at the same 3e-5 absolute
+  and relative tolerances; largest cross-vendor difference is 1.79e-7. This corrects the
+  validation's precision contract, not production defaults or tolerances. Original failed
+  results remain failed and are not replaced by the companion results. See `PORTABILITY.md`.
+
+- Adopt the explicitly scoped option-A saved-identity path: recognized unchanged-state hits
+  use callback-free reads and omit key/descriptor/metadata observation callbacks and their
+  associated Python audit hooks, including side effects. `TRITON_MSL_IDENTITY_FAST_PATH=0`
+  runs the complete evaluator on every invocation, including after a warm record. Supported
+  between-call policy/provider changes remain checked; neither public-launch validation nor
+  argument/ABI validation or immediate assertion reporting is removed.
+- Cache only the exact-dictionary/exact-string-key predicate with a public CPython dictionary
+  watcher; mutations dirty it, deallocation removes it, and unavailable watcher slots or full
+  tables retain the original scan. Correct multi-instance invalidation and bind the live
+  environment instance dictionary before inspecting its saved children. Native modules must
+  respect watcher-ID ownership; clearing a foreign ID can defeat invalidation without detection
+  on the cached-hit path and is outside the supported contract.
+- Cache immutable probe-schema/key-domain preparation without caching dictionary values.
+  Bound certificates by watcher epoch/context/live size and preserve all value reads. Reclaim
+  obsolete cache-only programs on a miss before evaluator inputs are read; never run cleanup
+  on a hot hit. This fixes ordinary rebuilds exhausting the 16-slot cache. Held/cyclic programs
+  conservatively retain slots and scan if necessary. Component screens save about 0.5–0.6 µs
+  per validation; no workload alert is cleared by those screens.
+- Ship three CPU host helpers in the CPython 3.14 macOS 15+ arm64 wheel: validation, packed
+  copying and binding. The pure wheel contains none. Missing and discoverable-broken helpers
+  retain distinct fallback/error behavior. Validation/packed source builds support 3.13/3.14;
+  the binder is 3.14-only, and no runtime-qualified 3.13 native wheel is included.
 
 - Complete attempted-submission tracking across nested dispatch helpers, preventing fallback
   replay after an uncertain or failed invocation. This supersedes the earlier hook-only repair.
 - Implement supported retained device assertions with a launch-local error flag, uniform stop
   before guarded accesses, and host-visible failure before returning results. Unsupported forms
   still refuse; assertion-bearing launches synchronize to inspect the flag.
-- Record measured latency increases versus earlier candidate 439: **+15.1%** for the
+- Record exact 871 native and pure-Python comparisons against main `182c1820`: all 30 required
+  candidate rows source-correct versus 18 correct / six wrong / six refused on main. Native
+  retains 13 alerts above 10%; pure retains 14; KDA prefill is a separate 1.1016× alert. Separate tables and µs/request accounting are
+  in the limitations document. No ratio is assigned against wrong/refusing main; no residual
+  cost is accepted or declared irreducible. Cross-session ratio changes do not isolate code
+  effects. The varlen comparison includes a changed retained route, not a same-route speedup.
+- Reduce the per-validation key/probe scan overhead (not the seconds-scale fresh-process toolchain/framework content-hash inventory) and certify standard top-level namespace-path
+  no-op recalculation, including real MLX imports. Changed or unsupported namespace state
+  retains the complete evaluator. This is a validator recovery, not full MLX qualification.
+- Batch nonfinite-safe scratch rescaling on the half-input/default-float attention path
+  without reintroducing diagonal multiplication or skipping scalar arithmetic. Other
+  precision paths retain their existing emission. Full-call results remain workload-specific.
+- Disclose the historical, pre-P1 MLA length-context measurements separately from retained
+  exact871 N=32 results. Completion-wait timing is not a GPU timestamp; the historical
+  longer-context observations do not establish a current exact871 larger-N residual.
+- Explicitly qualify the shipped half-accumulate docstring's historical speed/error numbers
+  in README and limitations: unvalidated for this candidate, no universal error bound,
+  and no new opt-in-mode credit from the default-float P1 tests. Runtime text is unchanged.
+- Preserve the separate historical latency experiment versus earlier candidate 439: **+15.1%** for the
   standalone retained-assertion workload and **+11.9%** for GPT-2 small. Both are open performance
-  alerts; the other nine tested workloads were within ±1.2%. These local paired comparisons
+  alerts in that experiment; the other nine tested workloads were within ±1.2%. Those figures
+  are not the current main-relative summary. These local paired comparisons
   do not qualify historical throughput/speedup claims. GPT-2 has checks on **2 of 43** backend
-  launches; assertion waits and one changed execution width have not been cost-separated.
+  launches. Later diagnostics separately identify host-validation and immediate-observation
+  components; the historical whole-call figures are not an additive per-kernel decomposition.
 - Recover distinct broadcast index expressions, including comparison/select-derived coordinates;
   retain recursive rejection of unsupported assertions in callees.
 - Recover canonical grouped and N-fastest flat-grid matmul coordinates without replacing the
@@ -55,8 +118,9 @@ and approvals do not identify a rebuilt wheel.
   query/key lengths. It preserves typed f32 negative-infinity sentinels and completes all
   program input reads before output stores, including the tested overlapping Bias/Out
   allocation. D128, explicit bf16 dot operands and arbitrary score-result scaling remain
-  outside the demonstrated envelope. The wide route performs 130 score evaluations per key
-  block; its performance remains unqualified.
+  outside the demonstrated envelope. The later accepted score-reuse repair evaluates each
+  wide score tile once per key block instead of 130 times, preserving the tested source
+  arithmetic, aliases and exceptional-value behavior. Current performance remains unqualified.
 - Repair threadgroup scratch reuse at the allocator: aliases now require proved synchronization
   between lifetimes, including control-flow and loop-backedge checks. This closes packet 516's
   reduce→scan and join→split races and the structural arg-reduction/atomic handoff concerns.
