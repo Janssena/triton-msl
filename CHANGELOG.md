@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.3.0 - 2026-09-16
 
 Supersedes unpublished rc1–rc4 candidates. Fresh validation on the formatted 0.3.0 candidate at `73ba428` records 6,079 project passes / 16 skips, exact 9,342-node upstream identity (5,780 passed / 3,562 skipped), installed acceptance 1,468 native / 252 pure with no failures/skips, and four unchanged M4 Max floors (packets 906–909). Final-version artifacts are freshly built, reproduced from the sdist and rebound to these tested runtime payloads. The full warm comparisons in packets 879/890/895 and the vendor receipts remain pre-format measurements; they were not rerun on formatted bytes, and no warm alert is cleared.
 
