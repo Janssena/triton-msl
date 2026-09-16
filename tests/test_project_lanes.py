@@ -1,4 +1,5 @@
 """Two mechanism pins: disjoint scheduling and failure/coverage accounting."""
+
 from types import SimpleNamespace
 
 from scripts import run_project_tests as gate
@@ -20,8 +21,9 @@ def test_lane_partition_is_lossless_and_explicit(monkeypatch):
     partitions = {}
     for lane in ("all", "correctness", "performance"):
         deselected = []
-        config = SimpleNamespace(getoption=lambda name: lane,
-                                 hook=SimpleNamespace(pytest_deselected=lambda items: deselected.extend(items)))
+        config = SimpleNamespace(
+            getoption=lambda name: lane, hook=SimpleNamespace(pytest_deselected=lambda items: deselected.extend(items))
+        )
         selected = list(original)
         conftest.pytest_collection_modifyitems(config, selected)
         assert set(selected).isdisjoint(deselected)
@@ -43,8 +45,12 @@ def test_job_receipt_requires_every_floor_to_execute_and_never_qualifies_claims(
     receipt = dict(job="performance", process_rc=0, source_unchanged=True, results=[result])
     assert gate.job_succeeded(receipt, False)
     assert not gate.job_succeeded(receipt, True)  # Timing is not collection evidence.
-    for field, bad in (("classification", "FAILED_OR_INCOMPLETE"), ("source_unchanged", False),
-                       ("phase", "another-job"), ("rc", 1)):
+    for field, bad in (
+        ("classification", "FAILED_OR_INCOMPLETE"),
+        ("source_unchanged", False),
+        ("phase", "another-job"),
+        ("rc", 1),
+    ):
         altered = dict(result, **{field: bad})
         assert not gate.job_succeeded(dict(receipt, results=[altered]), False)
     assert not gate.job_succeeded(dict(receipt, results=[]), False)
@@ -58,7 +64,9 @@ def test_job_receipt_requires_every_floor_to_execute_and_never_qualifies_claims(
     assert observer.result("performance", 1)["classification"] == "FAILED_OR_INCOMPLETE"
     # Setup/call success cannot conceal teardown failure, nor can a later success erase it.
     observer.pytest_runtest_logreport(SimpleNamespace(nodeid=node, when="teardown", failed=True))
-    observer.pytest_runtest_logreport(SimpleNamespace(nodeid=node, when="call", failed=False, skipped=False, outcome="passed"))
+    observer.pytest_runtest_logreport(
+        SimpleNamespace(nodeid=node, when="call", failed=False, skipped=False, outcome="passed")
+    )
     assert observer.result("performance", 0)["classification"] == "FAILED_OR_INCOMPLETE"
     observer.collected.append(node)
     assert not observer.result("performance", 0)["accounting_valid"]

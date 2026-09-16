@@ -7,6 +7,7 @@ The detector must refuse GQA (Q/K/V head-index mismatch) so it lowers on a path 
 the real per-tensor head offset (generic at hd<=64; loud refuse -> CPU fallback at hd128).
 Either way the OUTPUT must match the GQA reference. MHA (shared head offset) still routes.
 """
+
 import math
 import pytest
 import torch
@@ -22,23 +23,60 @@ requires_mps = pytest.mark.skipif(
 
 
 @triton.jit
-def _dense_gqa_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
-                  svz, svh, svn, svk, soz, soh, som, sok,
-                  Z, H, GROUP, N, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
-    hkv = h // GROUP                                  # GQA: fewer kv heads
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.)
+def _dense_gqa_fa(
+    Q,
+    K,
+    V,
+    O,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    GROUP,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    hz = tl.program_id(1)
+    z = hz // H
+    h = hz % H
+    hkv = h // GROUP  # GQA: fewer kv heads
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
     q = q * (1.0 / math.sqrt(D))
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32); acc = tl.zeros([BM, D], tl.float32)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z * skz + hkv * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + hkv * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li * a + tl.sum(p, 1); acc = acc * a[:, None]
-        v = tl.load(V + z * svz + hkv * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p, v); mi = m2
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + hkv * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p, v)
+        mi = m2
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
@@ -48,22 +86,24 @@ def _ref_gqa(q, k, v, H, G, D):
         for h in range(H):
             hk = h // G
             sc = (q[z, h].float() @ k[z, hk].float().transpose(-2, -1)) / math.sqrt(D)
-            o[z, h] = (torch.softmax(sc, -1) @ v[z, hk].float())
+            o[z, h] = torch.softmax(sc, -1) @ v[z, hk].float()
     return o
 
 
 @requires_mps
 @pytest.mark.parametrize("D", [32, 64, 128])
 def test_dense_gqa_not_misrouted(D):
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     Z, H, Hkv, N = 1, 4, 2, 64
     G = H // Hkv
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, Hkv, N, D, device=dev)
-    v = torch.randn(Z, Hkv, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, Hkv, N, D, device=dev)
+    v = torch.randn(Z, Hkv, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
     try:
-        _dense_gqa_fa[(triton.cdiv(N, 32), Z * H)](
-            q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, G, N, 32, 32, D)
+        _dense_gqa_fa[(triton.cdiv(N, 32), Z * H)](q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, G, N, 32, 32, D)
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return  # refused loudly — safe
@@ -73,42 +113,114 @@ def test_dense_gqa_not_misrouted(D):
 
 
 @triton.jit
-def _dense_mha_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
-                  svz, svh, svn, svk, soz, soh, som, sok,
-                  Z, H, N, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.)
+def _dense_mha_fa(
+    Q,
+    K,
+    V,
+    O,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    hz = tl.program_id(1)
+    z = hz // H
+    h = hz % H
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
     q = q * (1.0 / math.sqrt(D))
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32); acc = tl.zeros([BM, D], tl.float32)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li * a + tl.sum(p, 1); acc = acc * a[:, None]
-        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p, v); mi = m2
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p, v)
+        mi = m2
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
 @triton.jit
-def _dense_batch_inner_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
-                          svz, svh, svn, svk, soz, soh, som, sok,
-                          Z, H, N, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); zh = tl.program_id(1); h = zh // Z; z = zh % Z  # BATCH-INNER
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.)
+def _dense_batch_inner_fa(
+    Q,
+    K,
+    V,
+    O,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    zh = tl.program_id(1)
+    h = zh // Z
+    z = zh % Z  # BATCH-INNER
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
     q = q * (1.0 / math.sqrt(D))
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32); acc = tl.zeros([BM, D], tl.float32)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li * a + tl.sum(p, 1); acc = acc * a[:, None]
-        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p, v); mi = m2
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p, v)
+        mi = m2
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
@@ -120,14 +232,18 @@ def test_dense_batch_inner_not_misrouted(D):
     # (silent-wrong, err ~0.97 at hd128). The detector must refuse (off_h is a divsi, not
     # remsi(pid, H)) -> fallback computes correctly. Dense mis-map stays in-bounds (z,h both
     # small) so this can only pass or fail, never hang.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     Z, H, N = 2, 3, 64
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
-    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
     try:
         _dense_batch_inner_fa[(triton.cdiv(N, 32), Z * H)](
-            q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
+            q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D
+        )
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return  # refused loudly — safe
@@ -135,7 +251,7 @@ def test_dense_batch_inner_not_misrouted(D):
     for z in range(Z):
         for h in range(H):
             sc = (q[z, h].float() @ k[z, h].float().transpose(-2, -1)) / math.sqrt(D)
-            ref[z, h] = (torch.softmax(sc, -1) @ v[z, h].float())
+            ref[z, h] = torch.softmax(sc, -1) @ v[z, h].float()
     err = (o - ref).abs().max().item()
     assert err < 1e-2, f"dense batch-inner hd{D} mis-computed (routed head-inner?): err {err:.2e}"
 
@@ -144,17 +260,19 @@ def test_dense_batch_inner_not_misrouted(D):
 @pytest.mark.parametrize("D", [64, 128])
 def test_dense_mha_still_routes_correct(D):
     # MHA (Q/K/V share the head offset) must NOT be over-refused by the GQA guard.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     Z, H, N = 1, 4, 64
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
-    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
-    _dense_mha_fa[(triton.cdiv(N, 32), Z * H)](
-        q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
+    _dense_mha_fa[(triton.cdiv(N, 32), Z * H)](q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
     torch.mps.synchronize()
     ref = torch.zeros_like(o)
     for h in range(H):
         sc = (q[0, h].float() @ k[0, h].float().transpose(-2, -1)) / math.sqrt(D)
-        ref[0, h] = (torch.softmax(sc, -1) @ v[0, h].float())
+        ref[0, h] = torch.softmax(sc, -1) @ v[0, h].float()
     err = (o - ref).abs().max().item()
     assert err < 1e-2, f"MHA hd{D} wrong (guard over-refused/broke routing?): err {err:.2e}"

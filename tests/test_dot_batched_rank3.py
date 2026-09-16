@@ -721,9 +721,7 @@ def test_batched_gpu_replays_nontrivial_runtime_strides_and_broadcast(
         num_warps=4,
     )
     torch.mps.synchronize()
-    assert hits == [
-        ((batch,), ("stride_ab", "stride_am", "1"), ("stride_bb", "stride_bk", "1"))
-    ]
+    assert hits == [((batch,), ("stride_ab", "stride_am", "1"), ("stride_bb", "stride_bk", "1"))]
     torch.testing.assert_close(c, ref_a @ b, rtol=1e-3, atol=1e-3)
     assert torch.all(c_storage[:, :32, 32:] == sentinel)
     assert torch.all(c_storage[:, 32:, :] == sentinel)

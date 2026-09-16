@@ -40,6 +40,7 @@ def cpp_refusal_reason(ttgir_text):
         return "scalar tt.load is unsupported by C++ native lowering; use the MSL path"
     return None
 
+
 FAMILIES = {
     # Historical default-on candidate; actual compilation is opt-in only.
     "elementwise": {
@@ -186,9 +187,7 @@ def enabled_ops():
 # Quoted strings and comments are not semantic type evidence: source locations
 # contain arbitrary paths (including worktrees named ``bf16``), and scanning the
 # raw text made routing depend on the checkout directory.
-UNSAFE_DTYPE_RE = re.compile(
-    r"(?:(?<=x)|(?<![A-Za-z0-9_]))(?:bf16|f16|i1|i8|i16)(?![A-Za-z0-9_])"
-)
+UNSAFE_DTYPE_RE = re.compile(r"(?:(?<=x)|(?<![A-Za-z0-9_]))(?:bf16|f16|i1|i8|i16)(?![A-Za-z0-9_])")
 
 
 def _without_mlir_strings_and_comments(ttgir_text):

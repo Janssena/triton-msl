@@ -64,11 +64,12 @@ def test_mixed_fp32_i32_scan_truncates_neither_slot(N):
     torch.mps.synchronize()
 
     assert torch.allclose(o_val, torch.cumsum(x, 0), atol=1e-4), (
-        f"fp32 slot wrong at N={N} (staged with the int slot's dtype?)")
+        f"fp32 slot wrong at N={N} (staged with the int slot's dtype?)"
+    )
     got = o_cnt.cpu().numpy()
     assert (got == big).all(), (
-        f"int32 slot truncated at N={N}: got {got[0]} want {big} "
-        "(staged with the fp32 slot's dtype loses 2**24+1)")
+        f"int32 slot truncated at N={N}: got {got[0]} want {big} (staged with the fp32 slot's dtype loses 2**24+1)"
+    )
 
 
 @triton.jit

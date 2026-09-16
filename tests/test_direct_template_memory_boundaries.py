@@ -1,4 +1,5 @@
 """CPU checks of emitted memory-order and direct-maker column coverage."""
+
 from collections import Counter
 import re
 
@@ -16,14 +17,30 @@ def test_kda_decode_orders_cross_thread_state_reads_and_writes():
     # State (l=1,j=0) is read by thread 0 but updated by thread 64.
     assert (1 * 64 + 0) % 256 != 0
     for boundary in (source[first_read:write], source[write:last_read]):
-        flags, = re.findall(r"threadgroup_barrier\(([^)]+)\)", boundary)
+        (flags,) = re.findall(r"threadgroup_barrier\(([^)]+)\)", boundary)
         assert "mem_flags::mem_threadgroup" in flags
         assert "mem_flags::mem_device" in flags
 
 
-@pytest.mark.parametrize("qk,v", [(128, 32), (128, 40), (192, 96), (32, 96), (96, 96),
-                                  (192, 72), (128, 120), (192, 136), (128, 248),
-                                  (8, 8), (32, 32), (128, 64), (192, 128), (192, 192)])
+@pytest.mark.parametrize(
+    "qk,v",
+    [
+        (128, 32),
+        (128, 40),
+        (192, 96),
+        (32, 96),
+        (96, 96),
+        (192, 72),
+        (128, 120),
+        (192, 136),
+        (128, 248),
+        (8, 8),
+        (32, 32),
+        (128, 64),
+        (192, 128),
+        (192, 192),
+    ],
+)
 @pytest.mark.parametrize("dtype,half_accumulate", [("fp32", False), ("fp16", False), ("fp16", True)])
 def test_direct_maker_covers_each_value_column_once_without_out_of_bounds(qk, v, dtype, half_accumulate):
     if dtype == "fp32" and qk == 192:
@@ -32,12 +49,14 @@ def test_direct_maker_covers_each_value_column_once_without_out_of_bounds(qk, v,
         with pytest.raises(ValueError, match="threadgroup memory.*32KB"):
             make_flash_attention_kernel_simdgroup(head_dim=qk, v_head_dim=v, out_dtype=dtype)
         return
-    source = make_flash_attention_kernel_simdgroup(head_dim=qk, v_head_dim=v,
-                                                  out_dtype=dtype, half_accumulate=half_accumulate)
+    source = make_flash_attention_kernel_simdgroup(
+        head_dim=qk, v_head_dim=v, out_dtype=dtype, half_accumulate=half_accumulate
+    )
     rounds = int(re.search(r"TPG = (\d+)u", source).group(1))
     store_guard = re.search(r"if \(qr2 < N_CTX && \(dc2 < (D|\d+u)\)\)", source)
-    bound = qk if store_guard and store_guard.group(1) == "D" else (
-        int(store_guard.group(1)[:-1]) if store_guard else None)
+    bound = (
+        qk if store_guard and store_guard.group(1) == "D" else (int(store_guard.group(1)[:-1]) if store_guard else None)
+    )
     written = Counter()
     for group in range(8):
         for tile in range(rounds):
@@ -68,5 +87,6 @@ def test_direct_maker_refuses_nonpositive_or_partial_fragment_width(qk, v):
 
 @pytest.mark.parametrize("width", [8, 16, 32, 40, 64, 128, 192])
 def test_symmetric_explicit_width_keeps_default_emission(width):
-    assert make_flash_attention_kernel_simdgroup(head_dim=width, out_dtype="fp16") == make_flash_attention_kernel_simdgroup(
-        head_dim=width, v_head_dim=width, out_dtype="fp16")
+    assert make_flash_attention_kernel_simdgroup(
+        head_dim=width, out_dtype="fp16"
+    ) == make_flash_attention_kernel_simdgroup(head_dim=width, v_head_dim=width, out_dtype="fp16")

@@ -7,6 +7,7 @@ a kernel triton-msl accepts must be CORRECT, and one it cannot lower must be REF
 The matmul kernels below rebuild addresses from base each iteration (no loop-carried
 pointer) so they isolate issue #1 (reduction-extent arg name) from issue #2.
 """
+
 import pytest
 
 import triton
@@ -25,10 +26,13 @@ requires = pytest.mark.skipif(not HAS_TORCH, reason="torch needed")
 
 
 @triton.jit
-def _mm_K(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
-          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM); offn = pid_n * BN + tl.arange(0, BN)
+def _mm_K(
+    a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offm = pid_m * BM + tl.arange(0, BM)
+    offn = pid_n * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         offk = k + tl.arange(0, BK)
@@ -39,10 +43,13 @@ def _mm_K(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
 
 
 @triton.jit
-def _mm_DIM(a_ptr, b_ptr, c_ptr, M, N, DIM, sam, sak, sbk, sbn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM); offn = pid_n * BN + tl.arange(0, BN)
+def _mm_DIM(
+    a_ptr, b_ptr, c_ptr, M, N, DIM, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offm = pid_m * BM + tl.arange(0, BM)
+    offn = pid_n * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, DIM, BK):
         offk = k + tl.arange(0, BK)
@@ -53,10 +60,13 @@ def _mm_DIM(a_ptr, b_ptr, c_ptr, M, N, DIM, sam, sak, sbk, sbn, scm, scn,
 
 
 @triton.jit
-def _mm_depth(a_ptr, b_ptr, c_ptr, M, N, depth, sam, sak, sbk, sbn, scm, scn,
-              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM); offn = pid_n * BN + tl.arange(0, BN)
+def _mm_depth(
+    a_ptr, b_ptr, c_ptr, M, N, depth, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offm = pid_m * BM + tl.arange(0, BM)
+    offn = pid_n * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, depth, BK):
         offk = k + tl.arange(0, BK)
@@ -67,8 +77,7 @@ def _mm_depth(a_ptr, b_ptr, c_ptr, M, N, depth, sam, sak, sbk, sbn, scm, scn,
 
 
 @requires
-@pytest.mark.parametrize("kernel", [_mm_K, _mm_DIM, _mm_depth],
-                         ids=["K", "DIM", "depth"])
+@pytest.mark.parametrize("kernel", [_mm_K, _mm_DIM, _mm_depth], ids=["K", "DIM", "depth"])
 def test_reduction_extent_correct_or_refuse(kernel):
     """#1: the K-loop must reduce over the FULL extent regardless of the reduction
     arg's name, or refuse -- never silently drop the loop and return the first tile."""
@@ -79,9 +88,21 @@ def test_reduction_extent_correct_or_refuse(kernel):
     C = torch.empty(M, N, device="cpu", dtype=torch.float32)
     try:
         kernel[(M // 32, N // 32)](
-            A, B, C, M, N, KK,
-            A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
-            BM=32, BN=32, BK=32,
+            A,
+            B,
+            C,
+            M,
+            N,
+            KK,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
+            BM=32,
+            BN=32,
+            BK=32,
         )
     except MetalNonRecoverableError:
         return  # refused loudly -- contract satisfied
@@ -159,11 +180,13 @@ def test_loop_carried_pointer_correct_or_refuse(nw):
 
 
 @triton.jit
-def _mm_square(a_ptr, b_ptr, c_ptr, N, K, sam, sak, sbk, sbn, scm, scn,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _mm_square(
+    a_ptr, b_ptr, c_ptr, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
     """Square (N x N) matmul whose output mask bounds BOTH axes by the single extent
     arg N -- the row axis is clipped by N (not by an arg named M)."""
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     offm = pid_m * BM + tl.arange(0, BM)
     offn = pid_n * BN + tl.arange(0, BN)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
@@ -186,21 +209,47 @@ def test_square_matmul_one_extent_arg_computes():
     B = torch.randn(KK, NN, device="cpu", dtype=torch.float32)
     C = torch.empty(NN, NN, device="cpu", dtype=torch.float32)
     _mm_square[(NN // 32, NN // 32)](
-        A, B, C, NN, KK,
-        A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
-        BM=32, BN=32, BK=32,
+        A,
+        B,
+        C,
+        NN,
+        KK,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+        BM=32,
+        BN=32,
+        BK=32,
     )
     assert (C - A @ B).abs().max().item() < 1e-3
 
 
 @triton.jit
 def _fa_shared_kv(
-    Q, KV, Out,
-    sqz, sqh, sqm, sqk,
-    skz, skh, skn, skk,
-    soz, soh, som, sok,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    KV,
+    Out,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     """FA v2 forward where K and V are BOTH read through the ``KV`` pointer arg (K in
     rows [0, N_CTX), V in rows [N_CTX, 2*N_CTX)) -- shared-KV attention. Routes to the
@@ -247,6 +296,16 @@ def test_shared_kv_fa_refuses():
     out = torch.empty(Z, H, N, HD, device="cpu", dtype=torch.float32)
     with pytest.raises(MetalNonRecoverableError):
         _fa_shared_kv[(N // 32, Z * H)](
-            q, kv, out, *q.stride(), *kv.stride(), *out.stride(), Z, H, N,
-            BLOCK_M=32, BLOCK_N=32, HEAD_DIM=HD,
+            q,
+            kv,
+            out,
+            *q.stride(),
+            *kv.stride(),
+            *out.stride(),
+            Z,
+            H,
+            N,
+            BLOCK_M=32,
+            BLOCK_N=32,
+            HEAD_DIM=HD,
         )

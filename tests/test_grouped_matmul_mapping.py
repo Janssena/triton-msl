@@ -108,59 +108,75 @@ def _observe_grouped_routes(monkeypatch):
     from tests.cache_helpers import patch_live_singleton_method
     from triton_msl.backend import driver
 
-    host=[];direct=[];launchers=[]
-    def observe_host(instance,real):
-        def wrapper(pipeline,grid,group,buffers,**kw):
-            result=real(pipeline,grid,group,buffers,**kw)
-            host.append((pipeline,grid,group))
+    host = []
+    direct = []
+    launchers = []
+
+    def observe_host(instance, real):
+        def wrapper(pipeline, grid, group, buffers, **kw):
+            result = real(pipeline, grid, group, buffers, **kw)
+            host.append((pipeline, grid, group))
             return result
+
         return wrapper
-    def observe_direct(instance,real):
-        def wrapper(lib,name,args,**kw):
-            result=real(lib,name,args,**kw)
-            direct.append((lib,name,args,kw))
+
+    def observe_direct(instance, real):
+        def wrapper(lib, name, args, **kw):
+            result = real(lib, name, args, **kw)
+            direct.append((lib, name, args, kw))
             return result
+
         return wrapper
-    launch=driver.MetalLauncher.__call__
-    def observe_launcher(self,*args,**kw):
-        launchers.append((self,args))
-        return launch(self,*args,**kw)
-    utils=patch_live_singleton_method(monkeypatch,driver._get_utils,'launch',observe_host)
-    runtime=patch_live_singleton_method(monkeypatch,driver._get_compile_shader_runtime,'dispatch',observe_direct)
-    monkeypatch.setattr(driver.MetalLauncher,'__call__',observe_launcher)
-    return host,direct,launchers,runtime
+
+    launch = driver.MetalLauncher.__call__
+
+    def observe_launcher(self, *args, **kw):
+        launchers.append((self, args))
+        return launch(self, *args, **kw)
+
+    utils = patch_live_singleton_method(monkeypatch, driver._get_utils, "launch", observe_host)
+    runtime = patch_live_singleton_method(monkeypatch, driver._get_compile_shader_runtime, "dispatch", observe_direct)
+    monkeypatch.setattr(driver.MetalLauncher, "__call__", observe_launcher)
+    return host, direct, launchers, runtime
 
 
-@pytest.mark.parametrize('route',['host','direct'])
-def test_grouped_route_observer_records_shadowed_singleton_cpu(monkeypatch,route):
+@pytest.mark.parametrize("route", ["host", "direct"])
+def test_grouped_route_observer_records_shadowed_singleton_cpu(monkeypatch, route):
     from types import SimpleNamespace
     from tests.cache_helpers import patch_live_singleton_method
     from triton_msl.backend import driver
     from triton_msl.backend.compile_shader_runtime import CompileShaderRuntime
 
-    runtime=CompileShaderRuntime();utils=object.__new__(driver.MetalUtils)
-    actual=[]
-    def host_call(self,*args,**kw):actual.append((args,kw));return 'host returned'
-    monkeypatch.setattr(driver.MetalUtils,'launch',host_call)
-    monkeypatch.setattr(driver,'_metal_utils',utils)
-    monkeypatch.setattr(driver,'_COMPILE_SHADER_RUNTIME',runtime)
+    runtime = CompileShaderRuntime()
+    utils = object.__new__(driver.MetalUtils)
+    actual = []
+
+    def host_call(self, *args, **kw):
+        actual.append((args, kw))
+        return "host returned"
+
+    monkeypatch.setattr(driver.MetalUtils, "launch", host_call)
+    monkeypatch.setattr(driver, "_metal_utils", utils)
+    monkeypatch.setattr(driver, "_COMPILE_SHADER_RUNTIME", runtime)
     with pytest.MonkeyPatch.context() as previous:
-        for getter,method in ((driver._get_utils,'launch'),(driver._get_compile_shader_runtime,'dispatch')):
-            patch_live_singleton_method(previous,getter,method,lambda owner,real:lambda *a,**kw:real(*a,**kw))
-    assert 'launch' in vars(utils) and 'dispatch' in vars(runtime)
-    host,direct,launchers,observed_runtime=_observe_grouped_routes(monkeypatch)
+        for getter, method in ((driver._get_utils, "launch"), (driver._get_compile_shader_runtime, "dispatch")):
+            patch_live_singleton_method(previous, getter, method, lambda owner, real: lambda *a, **kw: real(*a, **kw))
+    assert "launch" in vars(utils) and "dispatch" in vars(runtime)
+    host, direct, launchers, observed_runtime = _observe_grouped_routes(monkeypatch)
     assert observed_runtime is runtime and not host and not direct and not launchers
-    if route=='host':
-        pipeline=object();buffers=[]
-        assert utils.launch(pipeline,(9,1,1),(128,1,1),buffers,tag='test')=='host returned'
-        assert host==[(pipeline,(9,1,1),(128,1,1))] and not direct
-        assert actual==[((pipeline,(9,1,1),(128,1,1),buffers),dict(tag='test'))]
+    if route == "host":
+        pipeline = object()
+        buffers = []
+        assert utils.launch(pipeline, (9, 1, 1), (128, 1, 1), buffers, tag="test") == "host returned"
+        assert host == [(pipeline, (9, 1, 1), (128, 1, 1))] and not direct
+        assert actual == [((pipeline, (9, 1, 1), (128, 1, 1), buffers), dict(tag="test"))]
     else:
-        lib=SimpleNamespace(kernel=lambda *a,**kw:actual.append((a,kw)))
-        args=[42];geometry=dict(threads=(1152,1,1),group_size=(128,1,1))
-        runtime.dispatch(lib,'kernel',args,**geometry)
-        assert direct==[(lib,'kernel',args,geometry)] and not host
-        assert actual==[((42,),geometry)]
+        lib = SimpleNamespace(kernel=lambda *a, **kw: actual.append((a, kw)))
+        args = [42]
+        geometry = dict(threads=(1152, 1, 1), group_size=(128, 1, 1))
+        runtime.dispatch(lib, "kernel", args, **geometry)
+        assert direct == [(lib, "kernel", args, geometry)] and not host
+        assert actual == [((42,), geometry)]
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
@@ -179,30 +195,30 @@ def test_grouped_full_tail_and_partial_launch_compute_source(monkeypatch, m, n, 
     out = torch.full((m, n), -8192.0, dtype=torch.float16, device="mps")
     cm, cn = triton.cdiv(m, 32), triton.cdiv(n, 32)
     count = cm * cn if programs is None else programs
-    host,direct,launchers,runtime=_observe_grouped_routes(monkeypatch)
+    host, direct, launchers, runtime = _observe_grouped_routes(monkeypatch)
     logical_m = 2147483647 if overflow else m
     compiled = _grouped[(count,)](a, b, out, logical_m, n, 32, 32, 1, n, 1, n, 1, BM=32, BN=32, BK=32, GM=8, MUT=0)
     torch.mps.synchronize()
-    assert len(launchers)==1
-    launcher,args=launchers[0]
-    assert tuple(args[:3])==(count,1,1) and args[4] is compiled.function
-    assert launcher.kernel_name==compiled.metadata.name
-    assert launcher._msl==compiled.asm['msl']
-    group=launcher._msl_block_size
-    assert 0<group<=1024 and group==args[5][3]
-    if compile_shader=='0':
-        assert len(host)==1 and not direct
+    assert len(launchers) == 1
+    launcher, args = launchers[0]
+    assert tuple(args[:3]) == (count, 1, 1) and args[4] is compiled.function
+    assert launcher.kernel_name == compiled.metadata.name
+    assert launcher._msl == compiled.asm["msl"]
+    group = launcher._msl_block_size
+    assert 0 < group <= 1024 and group == args[5][3]
+    if compile_shader == "0":
+        assert len(host) == 1 and not direct
         assert host[0][0] is compiled.function
-        assert tuple(host[0][1])==(count,1,1)
-        assert tuple(host[0][2])==(group,1,1)
+        assert tuple(host[0][1]) == (count, 1, 1)
+        assert tuple(host[0][2]) == (group, 1, 1)
     else:
-        assert len(direct)==1 and not host
-        lib,name,bound,geometry=direct[0]
+        assert len(direct) == 1 and not host
+        lib, name, bound, geometry = direct[0]
         assert runtime._lib_cache[launcher._msl] is lib
-        assert name==launcher.kernel_name
-        assert len(bound)>=3 and bound[0] is a and bound[1] is b and bound[2] is out
+        assert name == launcher.kernel_name
+        assert len(bound) >= 3 and bound[0] is a and bound[1] is b and bound[2] is out
         assert args[5][5] is True and all(v is None for v in args[5][6:11])
-        assert geometry==dict(threads=(count*group,1,1),group_size=(group,1,1))
+        assert geometry == dict(threads=(count * group, 1, 1), group_size=(group, 1, 1))
     assert any("grouped source tile mapping" in value for value in compiled.asm.values() if isinstance(value, str))
     # Enumerate rows in groups independently of the shader's quotient/remainder DAG.
     tile_order = [

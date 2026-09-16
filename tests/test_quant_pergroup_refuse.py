@@ -5,6 +5,7 @@ template (make_int8_matmul_pergroup) so it now ROUTES and computes correctly for
 weight ([K,N]/[N,K]) and scale/zero ([n_groups,N]/[N,n_groups]) layout. This test
 asserts routing + correctness (never silently-wrong) across layouts and group sizes.
 """
+
 import pytest
 import torch
 import triton
@@ -18,9 +19,28 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _int8_pergroup_gemm(
-    a_ptr, w_ptr, c_ptr, scale_ptr, zero_ptr, M, N, K,
-    sam, sak, swk, swn, ssg, ssn, zsg, zsn, scm, scn,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    scale_ptr,
+    zero_ptr,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    swk,
+    swn,
+    ssg,
+    ssn,
+    zsg,
+    zsn,
+    scm,
+    scn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -50,27 +70,52 @@ def test_pergroup_int8_gemm_routes_and_computes(M, N, K, G, wl, sl):
     ng = K // G
     a = torch.randn(M, K, device=dev, dtype=torch.float32)
     wkn = torch.randint(-127, 127, (K, N), device=dev, dtype=torch.int8)
-    s_ng = (torch.rand(ng, N, device=dev) * 0.05 + 0.01)  # DIFFERING per group
+    s_ng = torch.rand(ng, N, device=dev) * 0.05 + 0.01  # DIFFERING per group
     z_ng = torch.randint(-8, 8, (ng, N), device=dev).float()
     gidx = torch.arange(K, device=dev) // G
     ref = a @ ((wkn.float() - z_ng[gidx]) * s_ng[gidx])
 
     # logical (k,n) weight strides + (g,n) scale/zero strides for each layout
     if wl == "kn":
-        wbuf = wkn.contiguous(); swk, swn = wbuf.stride(0), wbuf.stride(1)
+        wbuf = wkn.contiguous()
+        swk, swn = wbuf.stride(0), wbuf.stride(1)
     else:
-        wbuf = wkn.t().contiguous(); swk, swn = wbuf.stride(1), wbuf.stride(0)
+        wbuf = wkn.t().contiguous()
+        swk, swn = wbuf.stride(1), wbuf.stride(0)
     if sl == "gn":
-        sbuf = s_ng.contiguous(); zbuf = z_ng.contiguous()
+        sbuf = s_ng.contiguous()
+        zbuf = z_ng.contiguous()
         ssg, ssn, zsg, zsn = sbuf.stride(0), sbuf.stride(1), zbuf.stride(0), zbuf.stride(1)
     else:
-        sbuf = s_ng.t().contiguous(); zbuf = z_ng.t().contiguous()
+        sbuf = s_ng.t().contiguous()
+        zbuf = z_ng.t().contiguous()
         ssg, ssn, zsg, zsn = sbuf.stride(1), sbuf.stride(0), zbuf.stride(1), zbuf.stride(0)
 
     out = torch.zeros(M, N, device=dev, dtype=torch.float32)
     st = lambda t: t.stride()
     _int8_pergroup_gemm[(triton.cdiv(M, 32), triton.cdiv(N, 32))](
-        a, wbuf, out, sbuf, zbuf, M, N, K,
-        st(a)[0], st(a)[1], swk, swn, ssg, ssn, zsg, zsn, st(out)[0], st(out)[1], 32, 32, 32, G)
+        a,
+        wbuf,
+        out,
+        sbuf,
+        zbuf,
+        M,
+        N,
+        K,
+        st(a)[0],
+        st(a)[1],
+        swk,
+        swn,
+        ssg,
+        ssn,
+        zsg,
+        zsn,
+        st(out)[0],
+        st(out)[1],
+        32,
+        32,
+        32,
+        G,
+    )
     torch.mps.synchronize()
     assert (out - ref).abs().max().item() < 1e-2 * max(ref.abs().max().item(), 1.0)

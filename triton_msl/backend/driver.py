@@ -160,19 +160,29 @@ def _batched_dot_host_bounds_reason(descriptor, kargs, grid):
 def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloads=None):
     """Return a refusal reason for an unmasked rounded-K access plan, else None."""
     try:
-        if not (type(descriptor) in (tuple, list) and len(descriptor) == 6
-                and descriptor[0] == "matmul_full_k_storage_v1"):
+        if not (
+            type(descriptor) in (tuple, list) and len(descriptor) == 6 and descriptor[0] == "matmul_full_k_storage_v1"
+        ):
             return "the K-tail allocation descriptor is missing or malformed; mask the K tail"
         block_k, tensor_indices, extent_refs, stride_refs, arithmetic = descriptor[1:]
-        if (type(block_k) is not int or block_k <= 0
-                or type(tensor_indices) not in (tuple, list) or len(tensor_indices) != 3
-                or type(extent_refs) not in (tuple, list) or len(extent_refs) != 3
-                or type(stride_refs) not in (tuple, list) or len(stride_refs) != 6
-                or type(arithmetic) not in (tuple, list) or len(arithmetic) != 3):
+        if (
+            type(block_k) is not int
+            or block_k <= 0
+            or type(tensor_indices) not in (tuple, list)
+            or len(tensor_indices) != 3
+            or type(extent_refs) not in (tuple, list)
+            or len(extent_refs) != 3
+            or type(stride_refs) not in (tuple, list)
+            or len(stride_refs) != 6
+            or type(arithmetic) not in (tuple, list)
+            or len(arithmetic) != 3
+        ):
             return "the K-tail allocation descriptor is malformed; mask the K tail"
         limits = {
-            "i32": (-(1 << 31), (1 << 31) - 1), "u32": (0, (1 << 32) - 1),
-            "i64": (-(1 << 63), (1 << 63) - 1), "u64": (0, (1 << 64) - 1),
+            "i32": (-(1 << 31), (1 << 31) - 1),
+            "u32": (0, (1 << 32) - 1),
+            "i64": (-(1 << 63), (1 << 63) - 1),
+            "u64": (0, (1 << 64) - 1),
         }
 
         def _value(ref):
@@ -182,7 +192,11 @@ def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloa
                 index = int(ref[1])
                 if signatures is not None and scalar_payloads is not None:
                     from triton_msl.backend._launch_signature import scalar_bytes
-                    if signatures[index] != ref[2] or scalar_bytes(kargs[index], signatures[index]) != scalar_payloads[index]:
+
+                    if (
+                        signatures[index] != ref[2]
+                        or scalar_bytes(kargs[index], signatures[index]) != scalar_payloads[index]
+                    ):
                         raise ValueError("runtime scalar changed after its captured launch payload")
                 value = int(kargs[index])
             else:
@@ -210,9 +224,13 @@ def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloa
         for role, tensor_index, extents, role_strides, arith in roles:
             if 0 in extents:
                 continue
-            if (type(arith) not in (tuple, list) or len(arith) != 3
-                    or arith[0] not in ("i32", "i64") or arith[1] not in ("i32", "i64")
-                    or type(arith[2]) is not bool):
+            if (
+                type(arith) not in (tuple, list)
+                or len(arith) != 3
+                or arith[0] not in ("i32", "i64")
+                or arith[1] not in ("i32", "i64")
+                or type(arith[2]) is not bool
+            ):
                 return f"{role} source address widths are malformed; mask the K tail"
             term_ranges = []
             for extent, stride, width in zip(extents, role_strides, arith[:2]):
@@ -230,8 +248,9 @@ def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloa
                     return f"{role} fused source address can wrap; mask the K tail"
             tensor = kargs[int(tensor_index)]
             layout = tensor if hasattr(tensor, "untyped_storage") else getattr(tensor, "base", None)
-            if layout is None or any(not hasattr(layout, name) for name in
-                                     ("element_size", "storage_offset", "untyped_storage", "data_ptr")):
+            if layout is None or any(
+                not hasattr(layout, name) for name in ("element_size", "storage_offset", "untyped_storage", "data_ptr")
+            ):
                 return f"{role} backing storage cannot be inspected; mask the K tail"
             lower = upper = 0
             for extent, stride in zip(extents, role_strides):
@@ -250,14 +269,20 @@ def _matmul_tail_bounds_reason(descriptor, kargs, signatures=None, scalar_payloa
             storage = layout.untyped_storage()
             storage_nbytes = int(storage.nbytes())
             base_byte = int(layout.storage_offset()) * elem_size
-            if (elem_size <= 0 or storage_nbytes <= 0 or base_byte < 0
-                    or int(tensor.data_ptr()) != int(storage.data_ptr()) + base_byte):
+            if (
+                elem_size <= 0
+                or storage_nbytes <= 0
+                or base_byte < 0
+                or int(tensor.data_ptr()) != int(storage.data_ptr()) + base_byte
+            ):
                 return f"{role} tensor/storage identity cannot be proven; mask the K tail"
             lower_byte = base_byte + lower * elem_size
             upper_byte = base_byte + (upper + 1) * elem_size
             if lower_byte < 0 or upper_byte > storage_nbytes:
-                return (f"{role} full-block K tail reaches outside its {storage_nbytes}-byte backing allocation; "
-                        "pad the backing allocation or mask the K tail")
+                return (
+                    f"{role} full-block K tail reaches outside its {storage_nbytes}-byte backing allocation; "
+                    "pad the backing allocation or mask the K tail"
+                )
         return None
     except Exception:
         return "the K-tail runtime allocation bounds could not be proven; mask the K tail"
@@ -592,11 +617,16 @@ def _compile_shader_scalars_ok(launcher, kargs, *, checked=None) -> bool:
             # that proof only for the same exact immutable value, declaration
             # and source position, as observed HERE after hooks/runtime calls.
             # Changed declarations, positions or custom values still repack.
-            if (checked is not None and type(sig) is str
-                    and (type(a) is int or type(a) is bool or type(a) is float)
-                    and j < len(checked[0]) and checked[0][j] is a
-                    and checked[1][j] is sig and checked[2][j] == oi
-                    and type(checked[3][j]) is bytes):
+            if (
+                checked is not None
+                and type(sig) is str
+                and (type(a) is int or type(a) is bool or type(a) is float)
+                and j < len(checked[0])
+                and checked[0][j] is a
+                and checked[1][j] is sig
+                and checked[2][j] == oi
+                and type(checked[3][j]) is bytes
+            ):
                 continue
             from triton_msl.backend._launch_signature import scalar_bytes
 
@@ -729,7 +759,8 @@ class MetalLauncher:
             flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments(args, self.arg_names, self.signature)
         else:
             flat_args, flat_sigs, flat_origin, scalar_payloads = bind_arguments_with_plan(
-                args, self.arg_names, self.signature, binding_plan)
+                args, self.arg_names, self.signature, binding_plan
+            )
         if kernel_metadata[4] is not None and any(i >= len(flat_args) for i in kernel_metadata[4]):
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -751,6 +782,7 @@ class MetalLauncher:
         if address_bounds is not None:
             if not isinstance(address_bounds, (tuple, list)) or not address_bounds:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "Refusing launch: packed address-bounds contract is malformed",
                     op_name="tt.dot",
@@ -761,24 +793,25 @@ class MetalLauncher:
                 batched_dot_bounds = address_bounds
             else:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "Refusing launch: packed address-bounds contract has an unknown discriminator",
                     op_name="tt.dot",
                 )
         if tail_access_bounds is not None:
-            _tail_reason = _matmul_tail_bounds_reason(
-                tail_access_bounds, flat_args, flat_sigs, scalar_payloads)
+            _tail_reason = _matmul_tail_bounds_reason(tail_access_bounds, flat_args, flat_sigs, scalar_payloads)
             if _tail_reason is not None:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "Refusing unmasked partial-K matmul launch: " + _tail_reason,
                     op_name="tt.dot",
                 )
         if batched_dot_bounds is not None:
-            _bounds_reason = _batched_dot_host_bounds_reason(
-                batched_dot_bounds, flat_args, (gridX, gridY, gridZ))
+            _bounds_reason = _batched_dot_host_bounds_reason(batched_dot_bounds, flat_args, (gridX, gridY, gridZ))
             if _bounds_reason is not None:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "Refusing batched dot on the host-roundtrip launch path: " + _bounds_reason,
                     op_name="tt.dot",
@@ -833,7 +866,8 @@ class MetalLauncher:
                     all_mps = bool(tensors) and all(
                         # TensorWrapper has data_ptr/device but compile_shader cannot
                         # bind it. This is eligibility, not an ambiguous dispatch retry.
-                        isinstance(a, _torch.Tensor) and str(a.device).startswith("mps") for a in tensors
+                        isinstance(a, _torch.Tensor) and str(a.device).startswith("mps")
+                        for a in tensors
                     )
 
                     # --- Quantized-matmul dispatch (compile_shader-only) ---
@@ -845,8 +879,13 @@ class MetalLauncher:
                         from triton_msl.autotuning._quant_matmul_dispatch import dispatch_quant_matmul
 
                         if dispatch_quant_matmul(
-                            _rt, quant_matmul, kargs, grid=(gridX, gridY, gridZ),
-                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
+                            _rt,
+                            quant_matmul,
+                            kargs,
+                            grid=(gridX, gridY, gridZ),
+                            launch_exit_hook=launch_exit_hook,
+                            launch_metadata=launch_metadata,
+                            submission_state=_submission,
                         ):
                             return
 
@@ -859,8 +898,13 @@ class MetalLauncher:
                         from triton_msl.autotuning._fast_matmul_dispatch import dispatch_fast_matmul
 
                         if dispatch_fast_matmul(
-                            _rt, fast_matmul, kargs, grid=(gridX, gridY, gridZ),
-                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
+                            _rt,
+                            fast_matmul,
+                            kargs,
+                            grid=(gridX, gridY, gridZ),
+                            launch_exit_hook=launch_exit_hook,
+                            launch_metadata=launch_metadata,
+                            submission_state=_submission,
                         ):
                             return
 
@@ -883,7 +927,8 @@ class MetalLauncher:
                             gridY,
                             gridZ,
                             launch_exit_hook=launch_exit_hook,
-                            launch_metadata=launch_metadata, submission_state=_submission,
+                            launch_metadata=launch_metadata,
+                            submission_state=_submission,
                         ):
                             return
 
@@ -903,18 +948,23 @@ class MetalLauncher:
                         # Every NON-tensor scalar arg must have a compile_shader-safe
                         # declared type (fp16/bf16 scalars mis-bind to 0.0). (Fix 4.)
                         scalars_ok = _compile_shader_scalars_ok(
-                            self, kargs, checked=(flat_args, flat_sigs, flat_origin, scalar_payloads))
+                            self, kargs, checked=(flat_args, flat_sigs, flat_origin, scalar_payloads)
+                        )
                         _generic_geometry = None
                         if all_mps and scalars_ok and needs_2d_grid:
                             from ._generic_launch import generic_2d_geometry
+
                             # The direct positional list must be identical to
                             # the binder's constexpr-free leaves. Aggregates
                             # and argument-buffer packing keep the host route.
                             if len(kargs) == len(flat_args) and all(a is b for a, b in zip(kargs, flat_args)):
                                 _generic_geometry = generic_2d_geometry(
-                                    self, kargs, flat_sigs, kernel_metadata, (gridX, gridY, gridZ))
-                        if all_mps and scalars_ok and (
-                            (not needs_2d_grid and gridY == 1 and gridZ == 1) or _generic_geometry is not None
+                                    self, kargs, flat_sigs, kernel_metadata, (gridX, gridY, gridZ)
+                                )
+                        if (
+                            all_mps
+                            and scalars_ok
+                            and ((not needs_2d_grid and gridY == 1 and gridZ == 1) or _generic_geometry is not None)
                         ):
                             # The stashed MSL's OWN threadgroup size — NOT the
                             # metadata block_size, which the C++ LLVM path may have
@@ -932,10 +982,11 @@ class MetalLauncher:
                             if _assert_desc is not None:
                                 from ._device_assert import check_binding, check_failure
                                 import torch as _assert_torch
+
                                 check_binding(_dk, _assert_desc)
                                 # Fresh per invocation; neither a failed launch nor
                                 # another concurrent launch can poison this flag.
-                                _assert_flag = _assert_torch.zeros(1, dtype=_assert_torch.int32, device='mps')
+                                _assert_flag = _assert_torch.zeros(1, dtype=_assert_torch.int32, device="mps")
                                 _dk = list(_dk) + [_assert_flag]
                             _submission.begin()
                             _rt.dispatch(lib, self.kernel_name, _dk, threads=threads, group_size=group_size)
@@ -1101,8 +1152,11 @@ class MetalLauncher:
                         f"float64 tensor argument {arg_idx} must cover one complete contiguous storage; "
                         "Metal's fp32 conversion path cannot preserve a partial or strided fp64 backing span"
                     )
-                f64_key = ("mps" if hasattr(layout, "device") and str(layout.device).startswith("mps")
-                           else "host", storage_ptr, storage_nbytes)
+                f64_key = (
+                    "mps" if hasattr(layout, "device") and str(layout.device).startswith("mps") else "host",
+                    storage_ptr,
+                    storage_nbytes,
+                )
                 if f64_key in float64_storage_owners or f64_key in storage_groups:
                     _storage_refusal(
                         "aliased float64 arguments cannot preserve storage identity through separate fp32 conversions"
@@ -1420,6 +1474,7 @@ class MetalLauncher:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
         from ._generic_launch import host_launch_geometry
+
         grid, threadgroup_size = host_launch_geometry((gridX, gridY, gridZ), block_size, needs_2d_grid)
 
         # Two-kernel split (#159): for a fully-aligned float matmul, dispatch the
@@ -1446,13 +1501,14 @@ class MetalLauncher:
         _assert_desc = kernel_metadata[11]
         if _assert_desc is not None:
             from ._device_assert import check_binding, check_failure
+
             check_binding(buffers, _assert_desc)
             _assert_buffer = utils.make_buffer_with_data(bytes(4), 4)
             buffers.append((_assert_buffer, 0))
         utils.launch(dispatch_fn, grid, threadgroup_size, buffers)
 
         if _assert_desc is not None:
-            check_failure(int.from_bytes(_assert_buffer.contents().as_buffer(4), 'little'), _assert_desc)
+            check_failure(int.from_bytes(_assert_buffer.contents().as_buffer(4), "little"), _assert_desc)
 
         # Copy results back from Metal buffers to tensor memory.
         for entry in tensor_copies:

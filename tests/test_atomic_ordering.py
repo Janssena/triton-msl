@@ -1,4 +1,5 @@
 """Closed atomic metadata and fence placement at the lowering boundary (190/201)."""
+
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -50,19 +51,35 @@ def _mixed_regions(P, O, COUNT):
     tl.store(O + x, old)
 
 
-FAMILIES = [("add", "i32"), ("add", "u32"), ("add", "fp32"),
-            ("exchange", "fp32"), ("add", "fp16"), ("exchange", "fp16"),
-            ("add", "bf16"), ("exchange", "bf16"), ("cas", "i32"), ("cas", "fp32"),
-            ("and", "i32"), ("or", "i32"), ("xor", "i32"), ("max", "i32"),
-            ("min", "i32"), ("max", "u32"), ("min", "u32")]
+FAMILIES = [
+    ("add", "i32"),
+    ("add", "u32"),
+    ("add", "fp32"),
+    ("exchange", "fp32"),
+    ("add", "fp16"),
+    ("exchange", "fp16"),
+    ("add", "bf16"),
+    ("exchange", "bf16"),
+    ("cas", "i32"),
+    ("cas", "fp32"),
+    ("and", "i32"),
+    ("or", "i32"),
+    ("xor", "i32"),
+    ("max", "i32"),
+    ("min", "i32"),
+    ("max", "u32"),
+    ("min", "u32"),
+]
 SEMS = ["relaxed", "acquire", "release", "acq_rel"]
 
 
 @pytest.fixture(autouse=True)
 def known_cpu_target(monkeypatch):
     # This is a CPU codegen contract test, not evidence about the machine's GPU.
-    monkeypatch.setattr("triton_msl.backend.device_detect.get_device_info", lambda: SimpleNamespace(
-        chip_family="M4", metal_version="3.2", metal_std_flag="-std=metal3.2"))
+    monkeypatch.setattr(
+        "triton_msl.backend.device_detect.get_device_info",
+        lambda: SimpleNamespace(chip_family="M4", metal_version="3.2", metal_std_flag="-std=metal3.2"),
+    )
 
 
 def _lowerer(kind="add", dt="i32", sem="acq_rel", scope="gpu", n=32, version="3.2"):
@@ -70,10 +87,13 @@ def _lowerer(kind="add", dt="i32", sem="acq_rel", scope="gpu", n=32, version="3.
     # exchange branch. Exercise that branch with an explicit typed graph mutation,
     # not a claim that the unsupported Python spelling currently compiles.
     word_exchange = kind == "exchange" and dt in ("fp16", "bf16")
-    low = _build_lowerer(_atomic, {"P": "*" + dt, "O": "*" + dt, "V": "fp32" if "f" in dt else dt},
-                         {"SEM": sem, "SCOPE": scope, "KIND": "add" if word_exchange else kind, "N": n})
+    low = _build_lowerer(
+        _atomic,
+        {"P": "*" + dt, "O": "*" + dt, "V": "fp32" if "f" in dt else dt},
+        {"SEM": sem, "SCOPE": scope, "KIND": "add" if word_exchange else kind, "N": n},
+    )
     if word_exchange:
-        atomic, = [op for op in low.graph.ops if op.op == "tt.atomic_rmw"]
+        (atomic,) = [op for op in low.graph.ops if op.op == "tt.atomic_rmw"]
         atomic.attrs["rmw_op"] = "exch"
     low.options = replace(low.options, target_metal_version=version)
     return low
@@ -84,7 +104,7 @@ def _lowerer(kind="add", dt="i32", sem="acq_rel", scope="gpu", n=32, version="3.
 @pytest.mark.parametrize("scope", ["gpu", "cta"])
 def test_each_family_brackets_one_logical_atomic(family, sem, scope):
     low = _lowerer(*family, sem, scope)
-    atomic, = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
+    (atomic,) = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
     assert atomic.attrs["sem"] == sem and atomic.attrs["scope"] == scope
     if family[0] != "cas":
         expected_op = {"exchange": "exch"}.get(family[0], family[0])
@@ -94,13 +114,23 @@ def test_each_family_brackets_one_logical_atomic(family, sem, scope):
             expected_op = "fadd"
         assert atomic.attrs["rmw_op"] == expected_op
     msl = low.lower()
-    fence = ("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, "
-             "memory_order_seq_cst, thread_scope_" + ("device" if scope == "gpu" else "threadgroup") + ");")
+    fence = (
+        "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, "
+        "memory_order_seq_cst, thread_scope_" + ("device" if scope == "gpu" else "threadgroup") + ");"
+    )
     expected = int(sem in ("release", "acq_rel")) + int(sem in ("acquire", "acq_rel"))
     assert msl.count("atomic_thread_fence(") == expected
     assert msl.count(fence) == expected
-    first_atomic = min(msl.index(s) for s in ("atomic_load_explicit(", "atomic_fetch_", "atomic_exchange_", "atomic_compare_exchange_") if s in msl)
-    last_atomic = max(msl.rindex(s) for s in ("atomic_load_explicit(", "atomic_fetch_", "atomic_exchange_", "atomic_compare_exchange_") if s in msl)
+    first_atomic = min(
+        msl.index(s)
+        for s in ("atomic_load_explicit(", "atomic_fetch_", "atomic_exchange_", "atomic_compare_exchange_")
+        if s in msl
+    )
+    last_atomic = max(
+        msl.rindex(s)
+        for s in ("atomic_load_explicit(", "atomic_fetch_", "atomic_exchange_", "atomic_compare_exchange_")
+        if s in msl
+    )
     if sem in ("release", "acq_rel"):
         assert msl.index(fence) < first_atomic
     if sem in ("acquire", "acq_rel"):
@@ -125,7 +155,7 @@ def test_each_family_brackets_one_logical_atomic(family, sem, scope):
 @pytest.mark.parametrize("kind", ["add", "cas"])
 def test_native_walker_retains_semantics_and_scope(scope, sem, kind):
     low = _lowerer(kind=kind, sem=sem, scope=scope)
-    atomic, = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
+    (atomic,) = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
     assert atomic.attrs["sem"] == sem
     assert atomic.attrs["scope"] == scope
 
@@ -136,11 +166,13 @@ def test_system_scope_refuses_even_when_relaxed(sem):
         _lowerer(sem=sem, scope="sys").lower()
 
 
-@pytest.mark.parametrize("field,bad", [("sem", None), ("sem", "unknown"), ("scope", None),
-                                     ("scope", "unknown"), ("rmw_op", None), ("rmw_op", "unknown")])
+@pytest.mark.parametrize(
+    "field,bad",
+    [("sem", None), ("sem", "unknown"), ("scope", None), ("scope", "unknown"), ("rmw_op", None), ("rmw_op", "unknown")],
+)
 def test_missing_or_unknown_metadata_never_defaults(field, bad):
     low = _lowerer()
-    atomic, = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
+    (atomic,) = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
     if bad is None:
         atomic.attrs.pop(field, None)
     else:
@@ -156,15 +188,19 @@ def test_ordered_atomic_requires_a_proved_language_target(version):
 
 
 def test_auto_target_is_checked_not_assumed(monkeypatch):
-    monkeypatch.setattr("triton_msl.backend.device_detect.get_device_info", lambda: SimpleNamespace(
-        chip_family="M1", metal_version="3.1"))
+    monkeypatch.setattr(
+        "triton_msl.backend.device_detect.get_device_info",
+        lambda: SimpleNamespace(chip_family="M1", metal_version="3.1"),
+    )
     with pytest.raises(MetalNonRecoverableError, match="Metal"):
         _lowerer(version="auto").lower()
 
 
 def test_explicit_language_does_not_override_device_capability(monkeypatch):
-    monkeypatch.setattr("triton_msl.backend.device_detect.get_device_info", lambda: SimpleNamespace(
-        chip_family="M1", metal_version="3.1"))
+    monkeypatch.setattr(
+        "triton_msl.backend.device_detect.get_device_info",
+        lambda: SimpleNamespace(chip_family="M1", metal_version="3.1"),
+    )
     with pytest.raises(MetalNonRecoverableError, match="Metal"):
         _lowerer(version="3.2").lower()
 
@@ -175,8 +211,10 @@ def test_detected_chip_family_normalization_reaches_ordered_atomic_gate(monkeypa
     # family token, not a display name such as "M4 Max".
     family, variant = _parse_chip("Apple M4 Max")
     assert (family, variant) == ("M4", "Max")
-    monkeypatch.setattr("triton_msl.backend.device_detect.get_device_info", lambda: SimpleNamespace(
-        chip_family=family, metal_version="3.2", metal_std_flag="-std=metal3.2"))
+    monkeypatch.setattr(
+        "triton_msl.backend.device_detect.get_device_info",
+        lambda: SimpleNamespace(chip_family=family, metal_version="3.2", metal_std_flag="-std=metal3.2"),
+    )
     msl = _lowerer(version="3.2").lower()
     assert msl.count("atomic_thread_fence(") == 2
 
@@ -188,7 +226,7 @@ def test_relaxed_old_target_needs_no_fence():
 def test_source_default_is_acq_rel_not_relaxed():
     low = _build_lowerer(_default, {"P": "*i32", "O": "*i32"}, {})
     low.options = replace(low.options, target_metal_version="3.2")
-    atomic, = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
+    (atomic,) = [op for op in low.graph.ops if op.op.startswith("tt.atomic_")]
     assert atomic.attrs["sem"] == "acq_rel" and atomic.attrs["scope"] == "gpu"
     assert low.lower().count("atomic_thread_fence(") == 2
 
@@ -196,15 +234,19 @@ def test_source_default_is_acq_rel_not_relaxed():
 def test_native_metadata_stays_with_its_operation_across_regions():
     low = _build_lowerer(_mixed_regions, {"P": "*i32", "O": "*i32", "COUNT": "i32"}, {})
     low.options = replace(low.options, target_metal_version="3.2")
+
     def walk(ops):
         for op in ops:
             yield op
             yield from walk(op.region_ops or [])
             yield from walk(op.else_ops or [])
+
     atomics = [op for op in walk(low.graph.ops) if op.op == "tt.atomic_rmw"]
     assert len(atomics) == 2
     assert {(op.attrs["rmw_op"], op.attrs["sem"], op.attrs["scope"]) for op in atomics} == {
-        ("add", "release", "cta"), ("exch", "acquire", "gpu")}
+        ("add", "release", "cta"),
+        ("exch", "acquire", "gpu"),
+    }
     msl = low.lower()
     cta = msl.index("thread_scope_threadgroup")
     gpu = msl.index("thread_scope_device")

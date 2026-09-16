@@ -11,6 +11,7 @@ _detect_layer_norm (+ the LN template eps):
 Each kernel below computes correctly now (via the fixed fast template OR, for the
 scaled case, by falling through to the generic lowering).
 """
+
 import math
 import pytest
 import torch
@@ -25,7 +26,9 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _ln_eps(x_ptr, o_ptr, N, BLOCK: tl.constexpr, EPS: tl.constexpr):
-    row = tl.program_id(0); cols = tl.arange(0, BLOCK); m = cols < N
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    m = cols < N
     x = tl.load(x_ptr + row * N + cols, mask=m, other=0.0)
     mean = tl.sum(x, axis=0) / N
     xc = tl.where(m, x - mean, 0.0)
@@ -35,17 +38,23 @@ def _ln_eps(x_ptr, o_ptr, N, BLOCK: tl.constexpr, EPS: tl.constexpr):
 
 @triton.jit
 def _softmax_outfirst(o_ptr, x_ptr, N, BLOCK: tl.constexpr):
-    row = tl.program_id(0); cols = tl.arange(0, BLOCK); m = cols < N
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    m = cols < N
     x = tl.load(x_ptr + row * N + cols, mask=m, other=-float("inf"))
-    x = x - tl.max(x, axis=0); e = tl.exp(x)
+    x = x - tl.max(x, axis=0)
+    e = tl.exp(x)
     tl.store(o_ptr + row * N + cols, e / tl.sum(e, axis=0), mask=m)
 
 
 @triton.jit
 def _softmax_scaled(x_ptr, o_ptr, N, BLOCK: tl.constexpr, SCALE: tl.constexpr):
-    row = tl.program_id(0); cols = tl.arange(0, BLOCK); m = cols < N
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    m = cols < N
     x = tl.load(x_ptr + row * N + cols, mask=m, other=-float("inf")) * SCALE
-    x = x - tl.max(x, axis=0); e = tl.exp(x)
+    x = x - tl.max(x, axis=0)
+    e = tl.exp(x)
     tl.store(o_ptr + row * N + cols, e / tl.sum(e, axis=0), mask=m)
 
 
@@ -53,7 +62,9 @@ def _softmax_scaled(x_ptr, o_ptr, N, BLOCK: tl.constexpr, SCALE: tl.constexpr):
 @pytest.mark.parametrize("eps", [1e-5, 1e-6, 1e-3])
 def test_layernorm_uses_kernel_eps(eps):
     """F1: the LN fast template must use the kernel's eps, not a hardcoded 1e-6."""
-    dev = "mps"; torch.manual_seed(0); R, N = 8, 64
+    dev = "mps"
+    torch.manual_seed(0)
+    R, N = 8, 64
     x = torch.randn(R, N, device=dev)
     o = torch.zeros(R, N, device=dev)
     _ln_eps[(R,)](x, o, N, 64, eps)
@@ -65,7 +76,9 @@ def test_layernorm_uses_kernel_eps(eps):
 @requires_mps
 def test_softmax_output_first_signature():
     """F2: a (out_ptr, x_ptr, n) output-first softmax must not swap the buffers."""
-    dev = "mps"; torch.manual_seed(1); R, N = 8, 64
+    dev = "mps"
+    torch.manual_seed(1)
+    R, N = 8, 64
     x = torch.randn(R, N, device=dev)
     o = torch.zeros(R, N, device=dev)
     _softmax_outfirst[(R,)](o, x, N, 64)
@@ -77,7 +90,9 @@ def test_softmax_output_first_signature():
 @pytest.mark.parametrize("scale", [3.0, 0.5])
 def test_softmax_constexpr_scale_not_dropped(scale):
     """F3: softmax(x * SCALE) with a constexpr scale must not drop the scale."""
-    dev = "mps"; torch.manual_seed(2); R, N = 8, 64
+    dev = "mps"
+    torch.manual_seed(2)
+    R, N = 8, 64
     x = torch.randn(R, N, device=dev)
     o = torch.zeros(R, N, device=dev)
     _softmax_scaled[(R,)](x, o, N, 64, scale)

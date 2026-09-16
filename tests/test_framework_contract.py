@@ -2,6 +2,7 @@
 
 Synthetic restart/selection tests are cache-contract evidence, not GPU wrongs.
 """
+
 from pathlib import Path
 
 import pytest
@@ -19,10 +20,12 @@ def test_framework_change_moves_every_product_boundary(monkeypatch, boundary):
     monkeypatch.setattr(cache, "toolchain_identity", lambda: "controlled-toolchain")
     monkeypatch.setattr(cache, "framework_identity", lambda: "framework-one", raising=False)
     backend = MetalBackend(GPUTarget("metal", "apple-m4", 32))
-    read = {"source": lambda: cache.source_key("same-ir", "same-options"),
-            "resident": cache.execution_contract,
-            "binary": lambda: cache.binary_key("same-msl", "same-options", "msl", ["-std=metal3.2"]),
-            "backend": backend.hash}[boundary]
+    read = {
+        "source": lambda: cache.source_key("same-ir", "same-options"),
+        "resident": cache.execution_contract,
+        "binary": lambda: cache.binary_key("same-msl", "same-options", "msl", ["-std=metal3.2"]),
+        "backend": backend.hash,
+    }[boundary]
     first = read()
     monkeypatch.setattr(cache, "framework_identity", lambda: "framework-two", raising=False)
     assert read() != first
@@ -43,10 +46,12 @@ def framework(tmp_path, monkeypatch):
 
     root = tmp_path / "torch"
     root.mkdir()
-    for name, content in [("__init__.py", b"VERSION = 'unchanged'"),
-                          ("runtime.so", b"native implementation"),
-                          ("shader.h", b"float shader_function(float x) { return x; }"),
-                          ("resource.json", b'{"runtime": true}')]:
+    for name, content in [
+        ("__init__.py", b"VERSION = 'unchanged'"),
+        ("runtime.so", b"native implementation"),
+        ("shader.h", b"float shader_function(float x) { return x; }"),
+        ("resource.json", b'{"runtime": true}'),
+    ]:
         (root / name).write_bytes(content)
     roots = {"torch": (root,), "triton": (root,), "mlx": ()}
     metadata = {"python_abi": "controlled", "python_version": "3.x", "byteorder": "little"}
@@ -130,9 +135,11 @@ def test_framework_snapshot_does_not_rehash_every_launch(framework, monkeypatch)
     module, _, _ = framework
     calls = []
     original = module._tree_manifest
+
     def read(*args, **kwargs):
         calls.append(args[0])
         return original(*args, **kwargs)
+
     monkeypatch.setattr(module, "_tree_manifest", read)
     first = module.framework_identity()
     assert module.framework_identity() == first
@@ -156,6 +163,7 @@ def test_unknown_required_framework_is_not_an_absent_identity(monkeypatch):
 
 def test_identical_relocated_framework_retains_identity(framework, monkeypatch, tmp_path):
     import shutil
+
     module, roots, _ = framework
     first = module.framework_identity()
     relocated = tmp_path / "relocated"
@@ -174,16 +182,25 @@ def discovery(tmp_path, monkeypatch):
     root.mkdir()
     (root / "__init__.py").write_text("pass\n")
     # Isolate import-state experiments from pytest and the real Torch module.
-    fake_sys = SimpleNamespace(**{name: getattr(module.sys, name) for name in (
-        "platform", "version", "implementation", "byteorder", "meta_path", "path_hooks")})
+    fake_sys = SimpleNamespace(
+        **{
+            name: getattr(module.sys, name)
+            for name in ("platform", "version", "implementation", "byteorder", "meta_path", "path_hooks")
+        }
+    )
     fake_sys.path = list(module.sys.path)
     fake_sys.modules = {}
     calls = []
+
     def find(name):
         calls.append(name)
         loaded = fake_sys.modules.get(name)
-        return loaded.__spec__ if loaded else SimpleNamespace(origin=str(root / "__init__.py"),
-                                                              submodule_search_locations=[str(root)])
+        return (
+            loaded.__spec__
+            if loaded
+            else SimpleNamespace(origin=str(root / "__init__.py"), submodule_search_locations=[str(root)])
+        )
+
     monkeypatch.setattr(module, "sys", fake_sys)
     monkeypatch.setattr(module.importlib.util, "find_spec", find)
     monkeypatch.setattr(module, "_snapshot", None)
@@ -199,8 +216,10 @@ def test_warm_selection_needs_no_repeated_filesystem_resolution(discovery, monke
     module, _, _, calls = discovery
     first = module.framework_identity()
     count = len(calls)
+
     def forbidden(*args, **kwargs):
         pytest.fail("unchanged import selection must not resolve the filesystem per launch")
+
     monkeypatch.setattr(Path, "resolve", forbidden)
     monkeypatch.setattr(module, "_format_selection", forbidden)
     assert module.framework_identity() == first
@@ -209,6 +228,7 @@ def test_warm_selection_needs_no_repeated_filesystem_resolution(discovery, monke
 
 def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, monkeypatch):
     from types import MappingProxyType
+
     module, _, root, _ = discovery
     roots, metadata = module._discover_selection()
     expected = module._format_selection(dict(roots), dict(metadata))
@@ -223,9 +243,11 @@ def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, m
     foreign_roots = {"torch": [root]}
     foreign_metadata = {"nested": ["old"]}
     assert module._json_metadata(foreign_metadata) is foreign_metadata
+
     class ForeignMetadata(dict):
         def items(self):
             return [("provider", "custom-items-provider")]
+
     custom = ForeignMetadata(foreign_metadata)
     assert module._json_metadata(custom) is custom
     assert module.json.dumps(custom) != module.json.dumps(dict(custom))
@@ -249,6 +271,7 @@ def test_only_owned_deeply_immutable_selection_reuses_serialization(discovery, m
 
 def test_new_loaded_module_cannot_hide_behind_discovery_memo(discovery, tmp_path):
     from types import SimpleNamespace
+
     module, fake_sys, _, _ = discovery
     module.framework_identity()
     other = tmp_path / "different"
@@ -261,6 +284,7 @@ def test_new_loaded_module_cannot_hide_behind_discovery_memo(discovery, tmp_path
 
 def test_same_loaded_module_mutated_spec_is_rechecked(discovery, tmp_path):
     from types import SimpleNamespace
+
     module, fake_sys, root, _ = discovery
     spec = SimpleNamespace(origin=str(root / "__init__.py"), submodule_search_locations=[str(root)])
     fake_sys.modules["torch"] = SimpleNamespace(__spec__=spec)
@@ -292,10 +316,18 @@ def test_process_initialized_torch_policy_cannot_change_under_old_handle(discove
         module.framework_identity()
 
 
-@pytest.mark.parametrize("name", [
-    "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
-    "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX", "DYLD_VERSIONED_LIBRARY_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "DYLD_FRAMEWORK_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FALLBACK_FRAMEWORK_PATH",
+        "DYLD_ROOT_PATH",
+        "DYLD_IMAGE_SUFFIX",
+        "DYLD_VERSIONED_LIBRARY_PATH",
+        "DYLD_VERSIONED_FRAMEWORK_PATH",
+    ],
+)
 def test_untracked_native_search_override_refuses_even_after_snapshot(monkeypatch, name):
     from triton_msl.backend import _toolchain_contract as toolchain
 
@@ -310,6 +342,7 @@ def test_untracked_native_search_override_refuses_even_after_snapshot(monkeypatc
 
 def _selected_cpp(discovery, tmp_path):
     from types import SimpleNamespace
+
     module, fake_sys, _, _ = discovery
     outside = tmp_path / "editable-native-provider.so"
     outside.write_bytes(b"selected native bytes")
@@ -345,6 +378,10 @@ def test_selected_native_child_change_refuses_in_same_process(discovery, tmp_pat
 def test_optional_native_child_absence_is_explicit(discovery, monkeypatch):
     module, _, _, _ = discovery
     original = module.importlib.util.find_spec
-    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None if name == "triton_msl._triton_msl_cpp" else original(name))
+    monkeypatch.setattr(
+        module.importlib.util,
+        "find_spec",
+        lambda name: None if name == "triton_msl._triton_msl_cpp" else original(name),
+    )
     roots, _ = module._discover_selection()
     assert roots["triton_msl._triton_msl_cpp"] == ()

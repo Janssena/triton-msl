@@ -248,12 +248,16 @@ def _shared_memory_phases(msl: str):
         match = barrier.fullmatch(line)
         # Reject an unbraced control header on the preceding nonempty line.
         # Known generated statements/blocks end with these delimiters.
-        if stack and match and previous.endswith((";", "{", "}")) and all(
-            blocks[b][0] in ("function", "for") for b in stack
+        if (
+            stack
+            and match
+            and previous.endswith((";", "{", "}"))
+            and all(blocks[b][0] in ("function", "for") for b in stack)
         ):
             flags = {f.strip() for f in match.group(1).split("|")}
             if "mem_flags::mem_threadgroup" in flags and flags <= {
-                "mem_flags::mem_threadgroup", "mem_flags::mem_device"
+                "mem_flags::mem_threadgroup",
+                "mem_flags::mem_device",
             }:
                 barriers.append(i)
         for char in line:
@@ -381,8 +385,7 @@ def _alias_shared_memory(msl: str, *, allocation_aliases=None) -> str:
         # A barrier inside a nested loop might execute zero times. Only one in
         # the same unconditional scope (or an enclosing scope) can certify this
         # transition. Conditional scopes were excluded when collecting barriers.
-        return any(first < i < last and scope[:len(contexts[i])] == contexts[i]
-                   for i in barriers)
+        return any(first < i < last and scope[: len(contexts[i])] == contexts[i] for i in barriers)
 
     # 3. Textual separation alone is not cross-thread read completion.
     def overlaps(a, b):
@@ -410,14 +413,13 @@ def _alias_shared_memory(msl: str, *, allocation_aliases=None) -> str:
             # loop, or an array whose lifetime extends outside that loop.
             for i in barriers:
                 scope = contexts[i]
-                if not a1 < i < b0 or scope[:len(common)] != tuple(common):
+                if not a1 < i < b0 or scope[: len(common)] != tuple(common):
                     continue
-                extra = scope[len(common):]
+                extra = scope[len(common) :]
                 if extra and all(
-                    blocks[block][0] == "for" and (
-                        block < a0 <= a1 < blocks[block][1]
-                        or block < b0 <= b1 < blocks[block][1]
-                    ) for block in extra
+                    blocks[block][0] == "for"
+                    and (block < a0 <= a1 < blocks[block][1] or block < b0 <= b1 < blocks[block][1])
+                    for block in extra
                 ):
                     forward = True
                     break
@@ -431,7 +433,7 @@ def _alias_shared_memory(msl: str, *, allocation_aliases=None) -> str:
         for level, block in enumerate(common):
             kind, end = blocks[block]
             if kind == "for" and block < a0 <= a1 < b0 <= b1 < end:
-                scope = tuple(common[:level + 1])
+                scope = tuple(common[: level + 1])
                 if not (separates(block, a0, scope) or separates(b1, end, scope)):
                     return True
         return False
@@ -548,14 +550,27 @@ def _check_replay_shared_memory_budget(allocations, aliases, *, extra_bytes=0, l
     from .msl_emitter import _msl_compute_type
     from triton_msl.errors import MetalNonRecoverableError, MetalResourceError
 
-    widths = {"bool": 1, "char": 1, "uchar": 1, "short": 2, "ushort": 2,
-              "half": 2, "bfloat": 2, "int": 4, "uint": 4, "float": 4,
-              "long": 8, "ulong": 8}
+    widths = {
+        "bool": 1,
+        "char": 1,
+        "uchar": 1,
+        "short": 2,
+        "ushort": 2,
+        "half": 2,
+        "bfloat": 2,
+        "int": 4,
+        "uint": 4,
+        "float": 4,
+        "long": 8,
+        "ulong": 8,
+    }
     logical = {}
     for name, dtype, count in allocations:
         ty = _msl_compute_type(dtype)
         if name in logical or ty not in widths or type(count) is not int or count <= 0:
-            raise MetalNonRecoverableError("source replay has an unproved threadgroup allocation", op_name="threadgroup")
+            raise MetalNonRecoverableError(
+                "source replay has an unproved threadgroup allocation", op_name="threadgroup"
+            )
         logical[name] = (ty, count)
     if any(name not in logical or target not in logical for name, target in aliases.items()):
         raise MetalNonRecoverableError("source replay scratch alias has no typed allocation", op_name="threadgroup")
@@ -563,7 +578,9 @@ def _check_replay_shared_memory_budget(allocations, aliases, *, extra_bytes=0, l
     for name, (ty, count) in logical.items():
         target = aliases.get(name, name)
         if aliases.get(target, target) != target or logical[target][0] != ty:
-            raise MetalNonRecoverableError("source replay scratch alias has incompatible storage", op_name="threadgroup")
+            raise MetalNonRecoverableError(
+                "source replay scratch alias has incompatible storage", op_name="threadgroup"
+            )
         previous = physical.get(target, (ty, 0))
         physical[target] = (ty, max(previous[1], count))
     if type(extra_bytes) is not int or extra_bytes < 0:

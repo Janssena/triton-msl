@@ -91,28 +91,16 @@ def _bwd_kv_v_offsets_swapped(
     d_idxs = tl.arange(0, DIM)
 
     q_ptrs = (
-        q_ptr
-        + start_h * stride_qh
-        + start_i * stride_qi
-        + j_idxs[:, None] * stride_qn
-        + d_idxs[None, :] * stride_qd
+        q_ptr + start_h * stride_qh + start_i * stride_qi + j_idxs[:, None] * stride_qn + d_idxs[None, :] * stride_qd
     )
     kt_ptrs = (
-        k_ptr
-        + start_h * stride_kh
-        + start_i * stride_ki
-        + d_idxs[:, None] * stride_kd
-        + k_idxs[None, :] * stride_kn
+        k_ptr + start_h * stride_kh + start_i * stride_ki + d_idxs[:, None] * stride_kd + k_idxs[None, :] * stride_kn
     )
     b_ptrs = b_ptr + start_h * stride_bh + j_idxs[:, None] * stride_bm + k_idxs[None, :] * stride_bn
 
     # Same two offset SSAs as Q/K, but paired with the opposite scalar stride legs.
     vt_ptrs = (
-        v_ptr
-        + start_i * stride_vh
-        + start_h * stride_vi
-        + d_idxs[:, None] * stride_vd
-        + k_idxs[None, :] * stride_vn
+        v_ptr + start_i * stride_vh + start_h * stride_vi + d_idxs[:, None] * stride_vd + k_idxs[None, :] * stride_vn
     )
     l_ptrs = l_ptr + start_h * stride_lh + start_i * stride_li + j_idxs * stride_ln
     mask_ptrs = m_ptr + mask_start_h * stride_mh + start_i * stride_mi + k_idxs * stride_mn
@@ -261,6 +249,5 @@ def test_backward_swapped_offset_pairing_correct_or_refuse(monkeypatch):
     err = (dk[h, instance] - dk_ref).abs().max().item()
     print(f"BWD_FA_OFFSET_ORDER_PROBE route={route} err={err}")
     assert err < 1e-2, (
-        "biased-FA backward violated correct-or-refuse for swapped offset/stride pairing: "
-        f"route={route}, max_err={err}"
+        f"biased-FA backward violated correct-or-refuse for swapped offset/stride pairing: route={route}, max_err={err}"
     )

@@ -8,8 +8,7 @@ from triton_msl.errors import MetalNonRecoverableError
 
 
 def _op(oid, kind, operands=()):
-    return SSAValue(oid, f"v{oid}", kind, list(operands), {},
-                    "tensor<32x32xf32>", "f32", True)
+    return SSAValue(oid, f"v{oid}", kind, list(operands), {}, "tensor<32x32xf32>", "f32", True)
 
 
 def _lowerer(source_op, orientation=None):
@@ -18,12 +17,8 @@ def _lowerer(source_op, orientation=None):
     lowerer.env = {source_op.id: "shared"}
     lowerer.env_types = {source_op.id: "fp32"}
     lowerer.env_shapes = {source_op.id: (32, 32)}
-    lowerer._shared_mem_descs = {
-        source_op.id: ("shared", (32, 32), "fp32")
-    }
-    lowerer._shared_mem_orientations = (
-        {} if orientation is None else {source_op.id: orientation}
-    )
+    lowerer._shared_mem_descs = {source_op.id: ("shared", (32, 32), "fp32")}
+    lowerer._shared_mem_orientations = {} if orientation is None else {source_op.id: orientation}
     return lowerer
 
 

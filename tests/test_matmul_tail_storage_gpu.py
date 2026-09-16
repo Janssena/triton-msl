@@ -1,4 +1,5 @@
 """Bounded real-launch acceptance for the partial-K backing-allocation guard."""
+
 import hashlib
 import pytest
 import torch
@@ -14,8 +15,7 @@ requires_gpu = pytest.mark.skipif(not torch.backends.mps.is_available(), reason=
 
 
 @triton.jit
-def _reordered(C, B, A, M, N, K, SA, SB, SC,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _reordered(C, B, A, M, N, K, SA, SB, SC, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     rn = tl.program_id(1) * BN + tl.arange(0, BN)
     rk = tl.arange(0, BK)
@@ -26,8 +26,7 @@ def _reordered(C, B, A, M, N, K, SA, SB, SC,
         acc += tl.dot(tl.load(ap), tl.load(bp))
         ap += BK
         bp += BK * SB
-    tl.store(C + rm[:, None] * SC + rn[None, :], acc,
-             (rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(C + rm[:, None] * SC + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N))
 
 
 def _data(size):
@@ -51,7 +50,7 @@ def _positive(case):
     canary = 17391.0
     ah = _data(a_size)
     bh = _data(b_size)
-    ch = torch.full((c_lead + m*n + 5,), canary)
+    ch = torch.full((c_lead + m * n + 5,), canary)
     if a_lead:
         ah[:a_lead] = canary
         bh[:b_lead] = canary
@@ -63,37 +62,40 @@ def _positive(case):
     a, b, c = ah.to("mps"), bh.to("mps"), ch.to("mps")
     a_view, b_view, c_view = a[a_ptr:], b[b_lead:], c[c_lead:]
     if reordered:
-        kernel, args = _reordered, (c_view,b_view,a_view,m,n,k,sa,n,n)
+        kernel, args = _reordered, (c_view, b_view, a_view, m, n, k, sa, n, n)
     else:
-        kernel, args = (_masked if case == "masked" else _unmasked), (a_view,b_view,c_view,m,n,k)
-    return kernel,args,(a,b,c),(ah,bh,ch),oracle,c_lead
+        kernel, args = (_masked if case == "masked" else _unmasked), (a_view, b_view, c_view, m, n, k)
+    return kernel, args, (a, b, c), (ah, bh, ch), oracle, c_lead
 
 
 @requires_gpu
 @pytest.mark.parametrize("compile_shader", ["0", "1"])
-@pytest.mark.parametrize("case", ["padded", "aligned", "masked", "reordered_padded",
-                                 "reordered_offset", "reordered_negative"])
+@pytest.mark.parametrize(
+    "case", ["padded", "aligned", "masked", "reordered_padded", "reordered_offset", "reordered_negative"]
+)
 def test_tail_storage_gpu_positive(case, compile_shader, monkeypatch, executed, record_property):
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", compile_shader)
-    kernel,args,backing,before,oracle,c_lead = _positive(case)
+    kernel, args, backing, before, oracle, c_lead = _positive(case)
     executed.clear()
-    handle = kernel[(1,1)](*args, BM=32, BN=32, BK=32)
+    handle = kernel[(1, 1)](*args, BM=32, BN=32, BK=32)
     torch.mps.synchronize()
     assert torch.equal(backing[0].cpu().view(torch.int32), before[0].view(torch.int32))
     assert torch.equal(backing[1].cpu().view(torch.int32), before[1].view(torch.int32))
     got = backing[2].cpu()
-    assert torch.equal(got[c_lead:c_lead+1024].reshape(32,32), oracle.float())
+    assert torch.equal(got[c_lead : c_lead + 1024].reshape(32, 32), oracle.float())
     assert torch.equal(got[:c_lead], before[2][:c_lead])
-    assert torch.equal(got[c_lead+1024:], before[2][c_lead+1024:])
+    assert torch.equal(got[c_lead + 1024 :], before[2][c_lead + 1024 :])
     assert len(executed) == 1
     if case == "aligned" and compile_shader == "0":
         from triton_msl.backend.driver import _MM_DIRECT_PIPELINES
+
         entry = _MM_DIRECT_PIPELINES[id(handle.function)]
         assert entry[0] is handle.function and executed[0]["pipeline"] is entry[1]
         assert handle.name + "__mmdirect" in handle.asm["msl"]
         source, route = handle.asm["msl"], "host_mmdirect"
     elif case == "aligned" and compile_shader == "1":
         from triton_msl.autotuning._fast_matmul_dispatch import _VARIANT_MSL_CACHE
+
         source = executed[0]["msl"]
         assert source in [handle.metadata.fast_matmul[0], *_VARIANT_MSL_CACHE.values()]
         assert "kernel void simdgroup_matmul_fast(" in source
@@ -105,8 +107,9 @@ def test_tail_storage_gpu_positive(case, compile_shader, monkeypatch, executed, 
     record_property("executed_route", route)
     record_property("executed_shader_sha256", hashlib.sha256(source.encode()).hexdigest())
     record_property("output_backing_sha256", hashlib.sha256(got.numpy().tobytes()).hexdigest())
-    record_property("input_backing_sha256", ",".join(
-        hashlib.sha256(x.numpy().tobytes()).hexdigest() for x in before[:2]))
+    record_property(
+        "input_backing_sha256", ",".join(hashlib.sha256(x.numpy().tobytes()).hexdigest() for x in before[:2])
+    )
     descriptor = handle.metadata.batched_dot_bounds
     if case == "masked":
         assert descriptor is None
@@ -134,10 +137,10 @@ def test_tail_storage_gpu_refuses_without_dispatch(bad_role, compile_shader, mon
     patch_live_singleton_method(monkeypatch, _get_utils, "launch", lambda *a: forbidden)
     m = n = 32
     k = 33
-    a = _data(m*k if bad_role == "A" else (m-1)*k+64).to("mps")
-    b = _data(k*n if bad_role == "B" else 64*n).to("mps")
-    c = torch.full((m*n,), 17391.0, device="mps")
-    before = [x.cpu().view(torch.int32).clone() for x in (a,b,c)]
+    a = _data(m * k if bad_role == "A" else (m - 1) * k + 64).to("mps")
+    b = _data(k * n if bad_role == "B" else 64 * n).to("mps")
+    c = torch.full((m * n,), 17391.0, device="mps")
+    before = [x.cpu().view(torch.int32).clone() for x in (a, b, c)]
     with pytest.raises(MetalNonRecoverableError, match="mask the K tail"):
-        _unmasked[(1,1)](a,b,c,m,n,k,BM=32,BN=32,BK=32)
-    assert all(torch.equal(x.cpu().view(torch.int32), y) for x,y in zip((a,b,c),before))
+        _unmasked[(1, 1)](a, b, c, m, n, k, BM=32, BN=32, BK=32)
+    assert all(torch.equal(x.cpu().view(torch.int32), y) for x, y in zip((a, b, c), before))

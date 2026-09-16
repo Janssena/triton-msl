@@ -27,7 +27,6 @@ strides, Z,H,N). The 2-D dispatch is threads=(gridX*tg, gridY, gridZ),
 group_size=(tg, 1, 1) -- exactly the (validated) native-grid launch.
 """
 
-
 from triton_msl.autotuning._submission import SubmissionState
 
 
@@ -42,8 +41,12 @@ _MLA_STR = "".__class__
 _MLA_ISINSTANCE, _MLA_HASATTR, _MLA_LEN = isinstance, hasattr, len
 _MLA_RESOLVER_BUILTINS = True
 for _mla_fn, _mla_name in ((_MLA_ISINSTANCE, "isinstance"), (_MLA_HASATTR, "hasattr"), (_MLA_LEN, "len")):
-    _MLA_RESOLVER_BUILTINS = (_MLA_RESOLVER_BUILTINS and _MLA_TYPE(_mla_fn) is [].append.__class__
-                            and _mla_fn.__module__ == "builtins" and _mla_fn.__name__ == _mla_name)
+    _MLA_RESOLVER_BUILTINS = (
+        _MLA_RESOLVER_BUILTINS
+        and _MLA_TYPE(_mla_fn) is [].append.__class__
+        and _mla_fn.__module__ == "builtins"
+        and _mla_fn.__name__ == _mla_name
+    )
 del _mla_fn, _mla_name
 
 
@@ -54,8 +57,15 @@ def _mla_builtin_strides(kargs, refs):
     user conversions or attribute reads; a miss leaves those to the original
     resolver, in its original order.
     """
-    if not (_MLA_RESOLVER_BUILTINS and int is _MLA_INT and bool is _MLA_BOOL and tuple is _MLA_TUPLE
-            and isinstance is _MLA_ISINSTANCE and hasattr is _MLA_HASATTR and len is _MLA_LEN):
+    if not (
+        _MLA_RESOLVER_BUILTINS
+        and int is _MLA_INT
+        and bool is _MLA_BOOL
+        and tuple is _MLA_TUPLE
+        and isinstance is _MLA_ISINSTANCE
+        and hasattr is _MLA_HASATTR
+        and len is _MLA_LEN
+    ):
         return None
     args_type, refs_type = _MLA_TYPE(kargs), _MLA_TYPE(refs)
     if args_type is not _MLA_LIST and args_type is not _MLA_TUPLE:
@@ -65,8 +75,13 @@ def _mla_builtin_strides(kargs, refs):
     if len(refs) != 4:
         return None
     a, b, c, d = refs
-    if (_MLA_TYPE(a) is not _MLA_INT or _MLA_TYPE(b) is not _MLA_INT or _MLA_TYPE(c) is not _MLA_INT
-            or _MLA_TYPE(d) is not _MLA_STR or d != "c1"):
+    if (
+        _MLA_TYPE(a) is not _MLA_INT
+        or _MLA_TYPE(b) is not _MLA_INT
+        or _MLA_TYPE(c) is not _MLA_INT
+        or _MLA_TYPE(d) is not _MLA_STR
+        or d != "c1"
+    ):
         return None
     size = len(kargs)
     if not (0 <= a < size and 0 <= b < size and 0 <= c < size):
@@ -91,7 +106,9 @@ def _launch_grid_ok(grid, expected):
     return len(g) == 3 and len(e) == 3 and g == e
 
 
-def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_mla(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """MLA (nope/rope) dispatch: concat the split QK tensors and run the qk=head_dim /
     v=v_head_dim kernel. descriptor = ('mla', msl, name, tg, q_nope, q_rope, k_nope,
     k_rope, v, out, Z, H, N) with the last 9 being indices into kargs. FAIL-CLOSED in the
@@ -141,15 +158,34 @@ def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, la
         # Packet 109 A: the template declares ONE pointer type for Q/K/V/Out — all six roles
         # must share it (f16 or f32; the template has no bf16 variant), and each host
         # tensor must carry exactly that dtype.
-        _dt = {"f16": torch.float16, "fp16": torch.float16, "half": torch.float16, "f32": torch.float32, "fp32": torch.float32, "float": torch.float32}
+        _dt = {
+            "f16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "f32": torch.float32,
+            "fp32": torch.float32,
+            "float": torch.float32,
+        }
         if len(elems) != 6 or len({_dt.get(str(e)) for e in elems}) != 1 or _dt.get(str(elems[0])) is None:
             return False
-        roles = (("q", qn_i, DN), ("q_rope", qr_i, DR), ("k", kn_i, DN), ("k_rope", kr_i, DR), ("v", v_i, DV), ("out", o_i, DV))
+        roles = (
+            ("q", qn_i, DN),
+            ("q_rope", qr_i, DR),
+            ("k", kn_i, DN),
+            ("k_rope", kr_i, DR),
+            ("v", v_i, DV),
+            ("out", o_i, DV),
+        )
         views = {}
         for (role, idx, last), elem in zip(roles, elems):
             t = kargs[idx] if 0 <= int(idx) < len(kargs) else None
             want = _dt.get(str(elem))
-            if t is None or want is None or not hasattr(t, "data_ptr") or not str(getattr(t, "device", "")).startswith("mps"):
+            if (
+                t is None
+                or want is None
+                or not hasattr(t, "data_ptr")
+                or not str(getattr(t, "device", "")).startswith("mps")
+            ):
                 return False
             if t.dtype != want:
                 return False
@@ -205,8 +241,13 @@ def dispatch_flash_attention(
     try:
         if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 10 and descriptor[0] == "mla":
             return _dispatch_mla(
-                rt, descriptor, kargs, grid=(gridX, gridY, gridZ),
-                launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata, submission_state=_submission,
+                rt,
+                descriptor,
+                kargs,
+                grid=(gridX, gridY, gridZ),
+                launch_exit_hook=launch_exit_hook,
+                launch_metadata=launch_metadata,
+                submission_state=_submission,
             )
         if not (isinstance(descriptor, (tuple, list)) and len(descriptor) >= 3 and descriptor[0] == "flash_attention"):
             return False
@@ -223,6 +264,7 @@ def dispatch_flash_attention(
         # the pointers (issue #4.7); pack the dispatch args to match (the biased 3-D
         # backward kernels have ~40 args). <=31 -> positional, unchanged.
         from triton_msl.backend.driver import _pack_overflow_scalars, _MAX_METAL_BUFFERS
+
         _dk = _pack_overflow_scalars(kargs) if len(kargs) > _MAX_METAL_BUFFERS else kargs
         # Native 2-D/3-D grid: gx*gy*gz threadgroups, tg threads each (in x).
         # threadgroup_position_in_grid -> (q_block, zh, 0); thread_index -> 0..tg-1.

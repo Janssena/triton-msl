@@ -22,7 +22,6 @@ import triton
 import triton.language as tl
 
 
-
 requires_mps = pytest.mark.skipif(
     not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")),
     reason="needs MPS + compile_shader",

@@ -89,12 +89,44 @@ if HAS:
 
     @triton.jit
     def _mla_value_path(
-        Qn, Qr, Kn, Kr, V, Out,
-        qnz, qnh, qnm, qnk, qrz, qrh, qrm, qrk,
-        knz, knh, knn, knk, krz, krh, krn, krk,
-        vz, vh, vn, vk, oz, oh, om, ok_,
-        Z, H, N_CTX,
-        BM: tl.constexpr, BN: tl.constexpr, DN: tl.constexpr, DR: tl.constexpr, DV: tl.constexpr,
+        Qn,
+        Qr,
+        Kn,
+        Kr,
+        V,
+        Out,
+        qnz,
+        qnh,
+        qnm,
+        qnk,
+        qrz,
+        qrh,
+        qrm,
+        qrk,
+        knz,
+        knh,
+        knn,
+        knk,
+        krz,
+        krh,
+        krn,
+        krk,
+        vz,
+        vh,
+        vn,
+        vk,
+        oz,
+        oh,
+        om,
+        ok_,
+        Z,
+        H,
+        N_CTX,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        DN: tl.constexpr,
+        DR: tl.constexpr,
+        DV: tl.constexpr,
         MODE: tl.constexpr,
     ):
         """GPT's packet-109 harness: MODE 0 is the canonical MLA kernel; each other MODE adds
@@ -148,10 +180,33 @@ if HAS:
 
     @triton.jit
     def _sym_fa_masked(
-        Q, K, V, Out,
-        qz, qh, qm, qk_, kz, kh, kn, kk, vz, vh, vn, vk, oz, oh, om, ok_,
-        Z, H, N_CTX,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, MODE: tl.constexpr,
+        Q,
+        K,
+        V,
+        Out,
+        qz,
+        qh,
+        qm,
+        qk_,
+        kz,
+        kh,
+        kn,
+        kk,
+        vz,
+        vh,
+        vn,
+        vk,
+        oz,
+        oh,
+        om,
+        ok_,
+        Z,
+        H,
+        N_CTX,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        MODE: tl.constexpr,
     ):
         """The canonical symmetric FA spelling (as tests/test_flash_attention.py) with the Q
         load mask varied: MODE 0 = the boundary mask the template applies itself, MODE 1 = a
@@ -235,8 +290,25 @@ def _run_mla(fn, tensors, out, mode, dims=(DN, DR, DV)):
         fn.device_caches.clear()
     try:
         fn[(N // 32, Z * H)](
-            qn, qr, kn, kr, v, out, *_st(qn), *_st(qr), *_st(kn), *_st(kr), *_st(v), *_st(out),
-            Z, H, N, 32, 32, *dims, mode,
+            qn,
+            qr,
+            kn,
+            kr,
+            v,
+            out,
+            *_st(qn),
+            *_st(qr),
+            *_st(kn),
+            *_st(kr),
+            *_st(v),
+            *_st(out),
+            Z,
+            H,
+            N,
+            32,
+            32,
+            *dims,
+            mode,
         )
         torch.mps.synchronize()
     except MetalNonRecoverableError:
@@ -328,8 +400,27 @@ def test_mixed_role_dtypes_never_route_to_the_one_type_template(cold_gpu_caches,
     out = torch.full((Z, H, n, DV), float("nan"), device=D, dtype=out_dtype)
     try:
         fn[(n // 32, Z * H)](
-            qn, qr, kn, kr, v, out, *_st(qn), *_st(qr), *_st(kn), *_st(kr), *_st(v), *_st(out),
-            Z, H, n, 32, 32, DN, DR, DV, False,
+            qn,
+            qr,
+            kn,
+            kr,
+            v,
+            out,
+            *_st(qn),
+            *_st(qr),
+            *_st(kn),
+            *_st(kr),
+            *_st(v),
+            *_st(out),
+            Z,
+            H,
+            n,
+            32,
+            32,
+            DN,
+            DR,
+            DV,
+            False,
         )
         torch.mps.synchronize()
         state = "computed"
@@ -338,7 +429,9 @@ def test_mixed_role_dtypes_never_route_to_the_one_type_template(cold_gpu_caches,
     assert True not in mla_spy, "a mixed-type ABI must never reach the one-type template"
     if state == "computed":
         ref = F.scaled_dot_product_attention(
-            torch.cat([qn.float(), qr.float()], -1), torch.cat([kn.float(), kr.float()], -1), v.float(),
+            torch.cat([qn.float(), qr.float()], -1),
+            torch.cat([kn.float(), kr.float()], -1),
+            v.float(),
             scale=1.0 / math.sqrt(DN + DR),
         )
         assert (out.float() - ref).abs().max().item() < 5e-2
@@ -363,14 +456,37 @@ class _FakeRT:
 
 def _desc(**over):
     base = dict(
-        idx=(0, 1, 2, 3, 4, 5), z=30, h=31, n=32, bm=32, dims=(DN, DR, DV),
-        strides={"q": (6, 7, 8, "c1"), "q_rope": (10, 11, 12, "c1"), "k": (14, 15, 16, "c1"),
-                 "k_rope": (18, 19, 20, "c1"), "v": (22, 23, 24, "c1"), "out": (26, 27, 28, "c1")},
+        idx=(0, 1, 2, 3, 4, 5),
+        z=30,
+        h=31,
+        n=32,
+        bm=32,
+        dims=(DN, DR, DV),
+        strides={
+            "q": (6, 7, 8, "c1"),
+            "q_rope": (10, 11, 12, "c1"),
+            "k": (14, 15, 16, "c1"),
+            "k_rope": (18, 19, 20, "c1"),
+            "v": (22, 23, 24, "c1"),
+            "out": (26, 27, 28, "c1"),
+        },
         elems=("f16",) * 6,
     )
     base.update(over)
-    return ("mla", "#include <metal_stdlib>\n// mla", "mla_kernel", 256, *base["idx"], base["z"], base["h"], base["n"],
-            base["bm"], base["dims"], base["strides"], base["elems"])
+    return (
+        "mla",
+        "#include <metal_stdlib>\n// mla",
+        "mla_kernel",
+        256,
+        *base["idx"],
+        base["z"],
+        base["h"],
+        base["n"],
+        base["bm"],
+        base["dims"],
+        base["strides"],
+        base["elems"],
+    )
 
 
 def _kargs(dtypes):

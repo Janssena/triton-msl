@@ -3,6 +3,7 @@
 Kept separate so packet193's reviewed files remain byte-frozen. These tests pin
 both lowering and execution; source variance includes all BLOCK padded lanes.
 """
+
 import importlib
 from pathlib import Path
 import sys

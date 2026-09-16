@@ -1,4 +1,5 @@
 """KDA state-only replay trigger and finite bits across check relocation."""
+
 import pytest
 import triton  # noqa: F401 — complete backend discovery before backend imports
 
@@ -8,6 +9,7 @@ try:
     import torch
     import Metal
     from triton_msl.backend.compile_shader_runtime import CompileShaderRuntime
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None and CompileShaderRuntime().available()
 except Exception:
     HAS = False
@@ -31,8 +33,9 @@ def _recurrent(q, k, v, a, beta):
 def _dispatch(runtime, library, inputs):
     zh, length, _ = inputs[0].shape
     output = torch.empty_like(inputs[0])
-    runtime.dispatch(library, "kda_prefill", [*inputs, output, length],
-                     threads=(zh * 256, 1, 1), group_size=(256, 1, 1))
+    runtime.dispatch(
+        library, "kda_prefill", [*inputs, output, length], threads=(zh * 256, 1, 1), group_size=(256, 1, 1)
+    )
     torch.mps.synchronize()
     return output.cpu()
 
@@ -130,9 +133,11 @@ def test_state_check_relocation_preserves_finite_output_bits(fp16, length):
     previous = source.replace(producer + "\n      " + _STATE_CHECK + " }", producer + " }")
     anchor = "    for(uint idx=lid;idx<C*D;idx+=NT)\n      if(!isfinite(W[idx])"
     assert previous.count(anchor) == 1
-    previous = previous.replace(anchor,
+    previous = previous.replace(
+        anchor,
         "    for(uint idx=lid;idx<D*D;idx+=NT)\n"
-        "      if(!isfinite(S[idx])) atomic_store_explicit(&replay,1u,memory_order_relaxed);\n" + anchor)
+        "      if(!isfinite(S[idx])) atomic_store_explicit(&replay,1u,memory_order_relaxed);\n" + anchor,
+    )
     runtime = CompileShaderRuntime()
     baseline = runtime.get_library(previous)
     current = runtime.get_library(source)

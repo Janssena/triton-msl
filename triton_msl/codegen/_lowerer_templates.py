@@ -161,21 +161,26 @@ class _TemplateMixin:
         widths = self._dot_offset_arith_widths()
         if roles is None or len(roles) != 3 or strides is None or any(value is None for value in strides):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "unmasked K-loop full-block replay has no complete A/B/C address proof; mask the K tail",
                 op_name="tt.dot",
             )
         if widths is None or any(role not in widths for role in ("A", "B", "C")):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
-                "unmasked K-loop source address widths are unresolved; mask the K tail", op_name="tt.dot")
+                "unmasked K-loop source address widths are unresolved; mask the K tail", op_name="tt.dot"
+            )
         indices = {arg.id: index for index, arg in enumerate(self.graph.args)}
         try:
             tensor_indices = tuple(indices[arg.id] for arg in roles)
         except (KeyError, AttributeError):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
-                "unmasked K-loop pointer ownership is unresolved; mask the K tail", op_name="tt.dot")
+                "unmasked K-loop pointer ownership is unresolved; mask the K tail", op_name="tt.dot"
+            )
         m_ext, n_ext = self._matmul_output_extent_args()
         m_ref = self._tail_ref(m_ext if m_ext is not None else ("M" if has_m else block_m))
         n_ref = self._tail_ref(n_ext if n_ext is not None else ("N" if has_n else block_n))
@@ -183,20 +188,26 @@ class _TemplateMixin:
         stride_refs = tuple(self._tail_ref(value) for value in strides)
         if m_ref is None or n_ref is None or k_ref is None or any(ref is None for ref in stride_refs):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "unmasked K-loop affine bounds cannot be represented by the launch ABI; mask the K tail",
                 op_name="tt.dot",
             )
         descriptor = (
-            "matmul_full_k_storage_v1", int(block_k), tensor_indices,
-            (m_ref, n_ref, k_ref), stride_refs,
+            "matmul_full_k_storage_v1",
+            int(block_k),
+            tensor_indices,
+            (m_ref, n_ref, k_ref),
+            stride_refs,
             tuple(tuple(widths[role]) for role in ("A", "B", "C")),
         )
         previous = getattr(self, "_tail_access_bounds", None)
         if previous is not None and previous != descriptor:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
-                "matmul template produced inconsistent K-tail launch contracts; mask the K tail", op_name="tt.dot")
+                "matmul template produced inconsistent K-tail launch contracts; mask the K tail", op_name="tt.dot"
+            )
         self._tail_access_bounds = descriptor
 
     def _k_extent_line(self, info, BLOCK_K, has_K, BLOCK_M=None, BLOCK_N=None):
@@ -239,14 +250,18 @@ class _TemplateMixin:
                     from triton_msl.errors import MetalNonRecoverableError
 
                     raise MetalNonRecoverableError(
-                        "unmasked K-loop full-block replay extent exceeds the signed "
-                        "MSL reduction-index range",
+                        "unmasked K-loop full-block replay extent exceeds the signed MSL reduction-index range",
                         op_name="tt.dot",
                     )
                 scalar_names = {a.name for a in self.graph.args if not a.is_ptr}
                 self._record_full_block_tail_bounds(
-                    info, BLOCK_M, BLOCK_N, BLOCK_K, source,
-                    "M" in scalar_names, "N" in scalar_names,
+                    info,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_K,
+                    source,
+                    "M" in scalar_names,
+                    "N" in scalar_names,
                 )
                 return (
                     f"    long _K = (long){source_expr};\n"
@@ -349,8 +364,12 @@ class _TemplateMixin:
             # program (the kernel's semantics), never ``pid3.x`` / ``pid3.y``.
             has_m, has_n = tuple(info.get("pid_axes") or (True, True))
             return [
-                "    uint pid_m = pid3.x;" if has_m else "    uint pid_m = 0u;  // no program_id on rows in the source kernel",
-                "    uint pid_n = pid3.y;" if has_n else "    uint pid_n = 0u;  // no program_id on cols in the source kernel",
+                "    uint pid_m = pid3.x;"
+                if has_m
+                else "    uint pid_m = 0u;  // no program_id on rows in the source kernel",
+                "    uint pid_n = pid3.y;"
+                if has_n
+                else "    uint pid_n = 0u;  // no program_id on cols in the source kernel",
             ]
         from triton_msl.errors import MetalNonRecoverableError
 
@@ -425,11 +444,27 @@ class _TemplateMixin:
         # that reaches this gate in the passing project + upstream suites. Casts are
         # NOT in it (packet 079): only the proven output cast is admitted, by id.
         _REPLAYED = {
-            "arith.addi", "arith.andi", "arith.cmpi", "arith.constant", "arith.muli",
-            "scf.for", "scf.yield",
-            "tt.addptr", "tt.broadcast", "tt.dot", "tt.expand_dims", "tt.get_program_id",
-            "tt.get_num_programs", "tt.load", "tt.make_range", "tt.return", "tt.splat",
-            "tt.store", "ttg.convert_layout", "ttg.local_alloc", "ttg.local_load",
+            "arith.addi",
+            "arith.andi",
+            "arith.cmpi",
+            "arith.constant",
+            "arith.muli",
+            "scf.for",
+            "scf.yield",
+            "tt.addptr",
+            "tt.broadcast",
+            "tt.dot",
+            "tt.expand_dims",
+            "tt.get_program_id",
+            "tt.get_num_programs",
+            "tt.load",
+            "tt.make_range",
+            "tt.return",
+            "tt.splat",
+            "tt.store",
+            "ttg.convert_layout",
+            "ttg.local_alloc",
+            "ttg.local_load",
             "ttg.memdesc_trans",
         }
         # INTEGER arith is address / index / mask math (grid `pid // n`, `n - k`,
@@ -457,9 +492,7 @@ class _TemplateMixin:
             )
         # C must be THE single store's target, proven directly — not a first-store
         # convention inherited from the shared resolver.
-        _c_from_store = (
-            self._trace_ptr_source(stores[0].operand_ids[0], op_by_id) if stores[0].operand_ids else None
-        )
+        _c_from_store = self._trace_ptr_source(stores[0].operand_ids[0], op_by_id) if stores[0].operand_ids else None
         if _c_from_store is None or _c_from_store.name != _roles[2].name:
             raise MetalNonRecoverableError(
                 "matmul template could not resolve A/B/C pointer roles from dataflow "
@@ -848,8 +881,19 @@ class _TemplateMixin:
         ]
 
     def _scalar_tile_fallback_lines(
-        self, *, widths, descriptors, a_name, b_name, c_name, out_type,
-        block_m, block_n, threads, scalar_names, indent="        ",
+        self,
+        *,
+        widths,
+        descriptors,
+        a_name,
+        b_name,
+        c_name,
+        out_type,
+        block_m,
+        block_n,
+        threads,
+        scalar_names,
+        indent="        ",
     ):
         """Width-faithful scalar matmul over THIS threadgroup's output tile.
 
@@ -873,16 +917,22 @@ class _TemplateMixin:
         """
         a_row, a_col, b_row, b_col, c_row, c_col = descriptors
         a_addr = self._width_faithful_addr(
-            [("m", a_row), ("k", a_col)], *widths["A"],
-            what="K-loop matmul scalar fallback operand A", scalar_names=scalar_names,
+            [("m", a_row), ("k", a_col)],
+            *widths["A"],
+            what="K-loop matmul scalar fallback operand A",
+            scalar_names=scalar_names,
         )
         b_addr = self._width_faithful_addr(
-            [("k", b_row), ("n", b_col)], *widths["B"],
-            what="K-loop matmul scalar fallback operand B", scalar_names=scalar_names,
+            [("k", b_row), ("n", b_col)],
+            *widths["B"],
+            what="K-loop matmul scalar fallback operand B",
+            scalar_names=scalar_names,
         )
         c_addr = self._width_faithful_addr(
-            [("m", c_row), ("n", c_col)], *widths["C"],
-            what="K-loop matmul scalar fallback output C", scalar_names=scalar_names,
+            [("m", c_row), ("n", c_col)],
+            *widths["C"],
+            what="K-loop matmul scalar fallback output C",
+            scalar_names=scalar_names,
         )
         i = indent
         return [
@@ -2518,10 +2568,10 @@ class _TemplateMixin:
             # _inferred_stride_descriptors, which never yields a None slot; the
             # ``inner_dim`` / unit fallbacks are kept for defence and carry the same
             # width as the rest of that operand's address.
-            terms = [(row, row_stride if row_stride else str(inner_dim)),
-                     (col, col_stride if col_stride else "1")]
+            terms = [(row, row_stride if row_stride else str(inner_dim)), (col, col_stride if col_stride else "1")]
             expr = self._width_faithful_addr(
-                terms, *_widths[role],
+                terms,
+                *_widths[role],
                 what=f"fused matmul+softmax/epilogue operand {role}",
                 scalar_names=_scalar_names,
             )
@@ -3022,8 +3072,7 @@ class _TemplateMixin:
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
-                f"3-D reduce template cannot emit combine {combine_op!r}; "
-                "refusing rather than substitute a sum.",
+                f"3-D reduce template cannot emit combine {combine_op!r}; refusing rather than substitute a sum.",
                 op_name="tt.reduce",
             )
 
@@ -3535,7 +3584,14 @@ class _TemplateMixin:
         stride = -1
         if o is not None and o.op in ("arith.muli", "arith.mul") and len(o.operand_ids or []) == 2:
             sides = [_peel(x) for x in o.operand_ids]
-            sp = next((i for i, (_sid, so) in enumerate(sides) if so is not None and so.op == "tt.splat" and so.operand_ids and so.operand_ids[0] in arg_idx), None)
+            sp = next(
+                (
+                    i
+                    for i, (_sid, so) in enumerate(sides)
+                    if so is not None and so.op == "tt.splat" and so.operand_ids and so.operand_ids[0] in arg_idx
+                ),
+                None,
+            )
             if sp is None:
                 return None  # a stride that is not a runtime arg is not replayed
             stride = arg_idx[sides[sp][1].operand_ids[0]]
@@ -3563,7 +3619,12 @@ class _TemplateMixin:
         while o is not None and o.op in ("ttg.convert_layout", "tt.expand_dims", "tt.broadcast") and o.operand_ids:
             oid = o.operand_ids[0]
             o = op_by_id.get(oid)
-        if allow_div is not None and o is not None and o.op in ("arith.divsi", "arith.divui") and len(o.operand_ids or []) == 2:
+        if (
+            allow_div is not None
+            and o is not None
+            and o.op in ("arith.divsi", "arith.divui")
+            and len(o.operand_ids or []) == 2
+        ):
             if self._const_int(o.operand_ids[1], op_by_id) != allow_div:
                 return None
             oid = o.operand_ids[0]
@@ -3611,7 +3672,10 @@ class _TemplateMixin:
             _oid, o = _peel(oid)
             if o is not None and o.op in ("arith.addi", "arith.add") and len(o.operand_ids or []) == 2:
                 parts = [_peel(x) for x in o.operand_ids]
-                if not any(p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs for p in parts):
+                if not any(
+                    p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs
+                    for p in parts
+                ):
                     for x in o.operand_ids:
                         _flat(x)
                     return
@@ -3629,7 +3693,9 @@ class _TemplateMixin:
             spec = specs.get(kind)
             if spec is None:
                 return (False, None)
-            sh = self._quant_index_shape(idx, op_by_id, allow_iv=spec.get("allow_iv", False), allow_div=spec.get("allow_div"))
+            sh = self._quant_index_shape(
+                idx, op_by_id, allow_iv=spec.get("allow_iv", False), allow_div=spec.get("allow_div")
+            )
             if sh is None:
                 return (False, None)
             if sh["pid"] is not None and sh["pid"] != spec.get("want_pid"):
@@ -3798,7 +3864,10 @@ class _TemplateMixin:
             _oid, o = _peel(oid)
             if o is not None and o.op in ("arith.addi", "arith.add") and len(o.operand_ids or []) == 2:
                 parts = [_peel(x) for x in o.operand_ids]
-                if not any(p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs for p in parts):
+                if not any(
+                    p[1] is not None and p[1].op == "tt.splat" and p[1].operand_ids and p[1].operand_ids[0] in ivs
+                    for p in parts
+                ):
                     for x in o.operand_ids:
                         _flat(x)
                     return
@@ -3844,7 +3913,11 @@ class _TemplateMixin:
                 if g["pid"] is None or g["pid"][0] != want[1]:
                     return (False, None)
             mode = spec.get("stride", "unit")
-            if (mode == "unit" and g["strides"]) or (mode == "required" and len(g["strides"]) != 1) or len(g["strides"]) > 1:
+            if (
+                (mode == "unit" and g["strides"])
+                or (mode == "required" and len(g["strides"]) != 1)
+                or len(g["strides"]) > 1
+            ):
                 return (False, None)
             out[kind] = {"pid": g["pid"], "range": g["range"], "stride": g["strides"][0] if g["strides"] else -1}
         return (True, out)
@@ -4226,7 +4299,9 @@ class _TemplateMixin:
                 return None
             return _to_arg(o.operand_ids[0], d + 1)
 
-        if not self._quant_input_path_ok(x_bc, 0, op_by_id, role="gemv"):  # F3/102: plain load, x[None, :], exact address
+        if not self._quant_input_path_ok(
+            x_bc, 0, op_by_id, role="gemv"
+        ):  # F3/102: plain load, x[None, :], exact address
             return None
         if _to_arg(x_bc) != 0 or _to_arg(w_load.operand_ids[0]) != 1:
             return None
@@ -4247,9 +4322,11 @@ class _TemplateMixin:
             return None
         # make_int4_gemv declares scale/zero as ``device const float*``. Refuse a
         # half/bfloat buffer instead of reinterpreting its bits as fp32 in the template.
-        for _sza in (args[3:4] + args[4:5]):
+        for _sza in args[3:4] + args[4:5]:
             if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in (
-                "fp32", "f32", "float",
+                "fp32",
+                "f32",
+                "float",
             ):
                 return None
 
@@ -4286,23 +4363,43 @@ class _TemplateMixin:
         _N4 = dict(pid=("required", 0), iv=0, stride="required")
         _KV4 = dict(pid=None, iv=1, stride="unit")
         okx4, ix4 = self._quant_role_addr(_xl4.operand_ids[0], args[0], op_by_id, ivs=_ivs4, kinds={"vec": _KV4})
-        okw4, iw4 = self._quant_role_addr(w_load.operand_ids[0], args[1], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": dict(pid=None, iv=1, stride="unit", div=2)})
+        okw4, iw4 = self._quant_role_addr(
+            w_load.operand_ids[0],
+            args[1],
+            op_by_id,
+            ivs=_ivs4,
+            kinds={"row": _N4, "col": dict(pid=None, iv=1, stride="unit", div=2)},
+        )
         _CG4 = dict(pid=None, iv=1, stride="unit", div=group_size)
-        oks4, is4 = self._quant_role_addr(_sl4.operand_ids[0], args[3], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4})
-        okz4, iz4 = self._quant_role_addr(_zl4.operand_ids[0], args[4], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4})
+        oks4, is4 = self._quant_role_addr(
+            _sl4.operand_ids[0], args[3], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4}
+        )
+        okz4, iz4 = self._quant_role_addr(
+            _zl4.operand_ids[0], args[4], op_by_id, ivs=_ivs4, kinds={"row": _N4, "col": _CG4}
+        )
         if not (okx4 and okw4 and oks4 and okz4):
             return None
         _st4 = stores[0]
         if len(_st4.operand_ids or []) != 2:
             return None  # a masked store is not replayed
-        oko4, io4 = self._quant_role_addr(_st4.operand_ids[0], args[2], op_by_id, ivs=_ivs4, kinds={"vec": dict(pid=("required", 0), iv=0, stride="unit")})
+        oko4, io4 = self._quant_role_addr(
+            _st4.operand_ids[0],
+            args[2],
+            op_by_id,
+            ivs=_ivs4,
+            kinds={"vec": dict(pid=("required", 0), iv=0, stride="unit")},
+        )
         if not oko4:
             return None
         _bn4 = self._quant_tile_ok(iw4["row"])
-        if _bn4 is None or any(self._quant_tile_ok(t, block=_bn4) is None for t in (is4["row"], iz4["row"], io4["vec"])):
+        if _bn4 is None or any(
+            self._quant_tile_ok(t, block=_bn4) is None for t in (is4["row"], iz4["row"], io4["vec"])
+        ):
             return None
         _bk4 = self._quant_tile_ok(ix4["vec"], block=_step4)
-        if _bk4 is None or any(self._quant_tile_ok(t, block=_bk4) is None for t in (iw4["col"], is4["col"], iz4["col"])):
+        if _bk4 is None or any(
+            self._quant_tile_ok(t, block=_bk4) is None for t in (iw4["col"], is4["col"], iz4["col"])
+        ):
             return None
         if is4["row"]["stride"] != iz4["row"]["stride"]:
             return None  # the template applies ONE row stride to scale and zero
@@ -4467,7 +4564,9 @@ class _TemplateMixin:
         # --- Trace every leg to its arg and require the canonical binding. ---
         if _trace_to_arg(x_bc) != 0:
             return None  # input vector
-        if not self._quant_input_path_ok(x_bc, 0, op_by_id, role="gemv"):  # F3/102: plain load, x[None, :], exact address
+        if not self._quant_input_path_ok(
+            x_bc, 0, op_by_id, role="gemv"
+        ):  # F3/102: plain load, x[None, :], exact address
             return None
         if _trace_to_arg(w_load) != 1:
             return None  # weight
@@ -4529,7 +4628,13 @@ class _TemplateMixin:
         okx, ix = self._quant_role_addr(_xl.operand_ids[0], args[0], op_by_id, ivs=_ivs, kinds={"vec": _KV})
         oks, isc = self._quant_role_addr(_sl.operand_ids[0], args[3], op_by_id, ivs=_ivs, kinds={"vec": _N})
         okz, iz = self._quant_role_addr(_zl.operand_ids[0], args[4], op_by_id, ivs=_ivs, kinds={"vec": _N})
-        okw, iw = self._quant_role_addr(_wl.operand_ids[0], args[1], op_by_id, ivs=_ivs, kinds={"row": dict(pid=("required", 0), iv=0, stride="required"), "col": _KV})
+        okw, iw = self._quant_role_addr(
+            _wl.operand_ids[0],
+            args[1],
+            op_by_id,
+            ivs=_ivs,
+            kinds={"row": dict(pid=("required", 0), iv=0, stride="required"), "col": _KV},
+        )
         if not (okx and oks and okz and okw):
             return None
         if len(store.operand_ids or []) != 2:
@@ -4557,7 +4662,7 @@ class _TemplateMixin:
         # ``device const float*`` for scale/zero pointers — a non-f32 tensor (e.g. GPTQ's
         # fp16 scales) would be reinterpreted as float bits (garbage, no error). Refuse
         # the quant route; the generic lowering handles half/bf16 loads correctly.
-        for _sza in (args[3:4] + args[4:5]):
+        for _sza in args[3:4] + args[4:5]:
             if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in ("fp32", "f32", "float"):
                 return None
 
@@ -4731,8 +4836,7 @@ class _TemplateMixin:
             return _find_load(o.operand_ids[0], d + 1)
 
         _pergroup = any(
-            (_find_load(_bc) is not None and _find_load(_bc).id in _loop_op_ids)
-            for _bc in (scale_bc, zero_bc)
+            (_find_load(_bc) is not None and _find_load(_bc).id in _loop_op_ids) for _bc in (scale_bc, zero_bc)
         )
         if _pergroup:
             # PER-GROUP int8 (GPTQ): scale/zero loaded in the K-loop at k//G. The per-N
@@ -4759,7 +4863,12 @@ class _TemplateMixin:
             # == the dot A-operand's k index) or REFUSE — never route packed int4 to the
             # linear int8 template (that would dequantize the wrong nibble: silent-wrong).
             if _mlir_to_triton_dtype(args[1].elem_type) not in (
-                "int8", "i8", "si8", "uint8", "u8", "ui8",
+                "int8",
+                "i8",
+                "si8",
+                "uint8",
+                "u8",
+                "ui8",
             ):
                 return None
 
@@ -4774,7 +4883,7 @@ class _TemplateMixin:
                     return None
                 if o.op in names:
                     return o
-                for x in (o.operand_ids or []):
+                for x in o.operand_ids or []:
                     r = _q_find(x, names, seen, d + 1)
                     if r is not None:
                         return r
@@ -4803,12 +4912,20 @@ class _TemplateMixin:
                 if o is None or o.op in ("tt.make_range", "tt.load"):
                     return False
                 if o.op in ("arith.addi", "arith.subi"):
-                    for x in (o.operand_ids or []):
+                    for x in o.operand_ids or []:
                         xo = op_by_id.get(x)
-                        while xo is not None and xo.op in (
-                            "tt.splat", "tt.broadcast", "ttg.convert_layout",
-                            "tt.expand_dims", "tt.reshape",
-                        ) and xo.operand_ids:
+                        while (
+                            xo is not None
+                            and xo.op
+                            in (
+                                "tt.splat",
+                                "tt.broadcast",
+                                "ttg.convert_layout",
+                                "tt.expand_dims",
+                                "tt.reshape",
+                            )
+                            and xo.operand_ids
+                        ):
                             xo = op_by_id.get(xo.operand_ids[0])
                         if xo is not None and xo.op == "arith.constant":
                             return True
@@ -4843,14 +4960,20 @@ class _TemplateMixin:
                     _wload = _q_find(_shr.operand_ids[0], ("tt.load",))
                     if _muli is not None and _wload is not None and _wload.operand_ids and len(_muli.operand_ids) == 2:
                         _rem = _q_find(_muli.operand_ids[0], ("arith.remsi",)) or _q_find(
-                            _muli.operand_ids[1], ("arith.remsi",))
+                            _muli.operand_ids[1], ("arith.remsi",)
+                        )
                         _mul4 = any(_q_cval(x) == 4 for x in _muli.operand_ids)
                         _bdiv = _q_find(_wload.operand_ids[0], ("arith.divsi",))
-                        if (_rem is not None and _mul4 and len(_rem.operand_ids) == 2
-                                and _q_cval(_rem.operand_ids[1]) == 2
-                                and _bdiv is not None and len(_bdiv.operand_ids) == 2
-                                and _q_cval(_bdiv.operand_ids[1]) == 2
-                                and _rem.operand_ids[0] == _bdiv.operand_ids[0]):
+                        if (
+                            _rem is not None
+                            and _mul4
+                            and len(_rem.operand_ids) == 2
+                            and _q_cval(_rem.operand_ids[1]) == 2
+                            and _bdiv is not None
+                            and len(_bdiv.operand_ids) == 2
+                            and _q_cval(_bdiv.operand_ids[1]) == 2
+                            and _rem.operand_ids[0] == _bdiv.operand_ids[0]
+                        ):
                             # byte//2 and nibble%2 share ONE k index (same_k). FULL pin: that
                             # k must reach a tt.make_range (a real loop index) with NO constant
                             # additive offset down to it -> rules out a k-vs-(k+1) shift (the
@@ -4871,7 +4994,9 @@ class _TemplateMixin:
                 return None
             if not _sd or not all(_sd.get(x) for x in ("A", "B", "C")):
                 return None
-            _gc = self._quant_gemm_contract(op_by_id, k_arg=7, nk=_is_nk[0], b_kdiv=(2 if _is_int4 else 1))  # packet 104
+            _gc = self._quant_gemm_contract(
+                op_by_id, k_arg=7, nk=_is_nk[0], b_kdiv=(2 if _is_int4 else 1)
+            )  # packet 104
             if _gc is None:
                 return None
             _bn_expect = _gc["bn"]
@@ -4888,9 +5013,12 @@ class _TemplateMixin:
                 return _nti.get(nm)
 
             _stride_idx = [
-                _sidx(_sd["A"][0]), _sidx(_sd["A"][1]),   # isr, isc
-                _sidx(_sd["B"][0]), _sidx(_sd["B"][1]),   # wsk, wsn
-                _sidx(_sd["C"][0]), _sidx(_sd["C"][1]),   # osr, osc
+                _sidx(_sd["A"][0]),
+                _sidx(_sd["A"][1]),  # isr, isc
+                _sidx(_sd["B"][0]),
+                _sidx(_sd["B"][1]),  # wsk, wsn
+                _sidx(_sd["C"][0]),
+                _sidx(_sd["C"][1]),  # osr, osc
             ]
 
             def _vec_stride(tid):
@@ -4983,17 +5111,45 @@ class _TemplateMixin:
                 # B[0] (infer_dot_strides) is the packed weight's BYTE-row stride (wbk),
                 # which the int4 template applies at k//2 — exactly the kernel's addressing.
                 from triton_msl.codegen._msl_templates import (
-                    make_int4_matmul_pergroup, make_int4_matmul_pergroup_fast,
+                    make_int4_matmul_pergroup,
+                    make_int4_matmul_pergroup_fast,
                 )
+
                 _fast4 = make_int4_matmul_pergroup_fast(g_s, _rr, _rc, _bk) if (g_s % _bk == 0) else None
-                return ("pergroup_int4", make_int4_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx),
-                        _fast4, _rr, _rc, _bk, g_s, (_gc["bm"], _gc["bn"]))  # [11] source (BM, BN), packet 105 B
+                return (
+                    "pergroup_int4",
+                    make_int4_matmul_pergroup(g_s),
+                    5,
+                    6,
+                    7,
+                    tuple(_stride_idx),
+                    _fast4,
+                    _rr,
+                    _rc,
+                    _bk,
+                    g_s,
+                    (_gc["bm"], _gc["bn"]),
+                )  # [11] source (BM, BN), packet 105 B
             from triton_msl.codegen._msl_templates import (
-                make_int8_matmul_pergroup, make_int8_matmul_pergroup_fast,
+                make_int8_matmul_pergroup,
+                make_int8_matmul_pergroup_fast,
             )
+
             _fast = make_int8_matmul_pergroup_fast(g_s, _rr, _rc, _bk) if (g_s % _bk == 0) else None
-            return ("pergroup_int8", make_int8_matmul_pergroup(g_s), 5, 6, 7, tuple(_stride_idx),
-                    _fast, _rr, _rc, _bk, g_s, (_gc["bm"], _gc["bn"]))  # [11] source (BM, BN), packet 105 B
+            return (
+                "pergroup_int8",
+                make_int8_matmul_pergroup(g_s),
+                5,
+                6,
+                7,
+                tuple(_stride_idx),
+                _fast,
+                _rr,
+                _rc,
+                _bk,
+                g_s,
+                (_gc["bm"], _gc["bn"]),
+            )  # [11] source (BM, BN), packet 105 B
 
         # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
         try:
@@ -5017,7 +5173,9 @@ class _TemplateMixin:
             _ld = self._quant_find_load(_bc, op_by_id)
             if _ld is None or not _ld.operand_ids:
                 return None
-            _okn, _in = self._quant_role_addr(_ld.operand_ids[0], args[_ai], op_by_id, ivs={_gc["iv"]}, kinds={"vec": _NN})
+            _okn, _in = self._quant_role_addr(
+                _ld.operand_ids[0], args[_ai], op_by_id, ivs={_gc["iv"]}, kinds={"vec": _NN}
+            )
             if not _okn or self._quant_tile_ok(_in["vec"], block=_gc["bn"]) is None:
                 return None
 
@@ -5047,7 +5205,7 @@ class _TemplateMixin:
         # ``device const float*`` for scale/zero pointers — a non-f32 tensor (e.g. GPTQ's
         # fp16 scales) would be reinterpreted as float bits (garbage, no error). Refuse
         # the quant route; the generic lowering handles half/bf16 loads correctly.
-        for _sza in (args[3:4] + args[4:5]):
+        for _sza in args[3:4] + args[4:5]:
             if getattr(_sza, "is_ptr", False) and _mlir_to_triton_dtype(_sza.elem_type) not in ("fp32", "f32", "float"):
                 return None
 
@@ -5114,8 +5272,17 @@ class _TemplateMixin:
 
         def _peel(oid):
             o = op_by_id.get(oid)
-            while o is not None and o.operand_ids and o.op in (
-                "ttg.local_load", "ttg.local_alloc", "ttg.convert_layout", "tt.trans", "ttg.memdesc_trans",
+            while (
+                o is not None
+                and o.operand_ids
+                and o.op
+                in (
+                    "ttg.local_load",
+                    "ttg.local_alloc",
+                    "ttg.convert_layout",
+                    "tt.trans",
+                    "ttg.memdesc_trans",
+                )
             ):
                 o = op_by_id.get(o.operand_ids[0])
             return o
@@ -5173,7 +5340,11 @@ class _TemplateMixin:
             return None
         # SCALE dtype (re-review 2026-08-25): the template declares ``device const float*``
         # for the scale — a non-f32 scale (e.g. fp16) would be reinterpreted as float bits.
-        if getattr(args[3], "is_ptr", False) and _mlir_to_triton_dtype(args[3].elem_type) not in ("fp32", "f32", "float"):
+        if getattr(args[3], "is_ptr", False) and _mlir_to_triton_dtype(args[3].elem_type) not in (
+            "fp32",
+            "f32",
+            "float",
+        ):
             return None
 
         try:
@@ -5227,7 +5398,10 @@ class _TemplateMixin:
         # ``offs_n = program_id(1) * BN + range`` — ``_vec_stride`` read the stride and let a
         # ``+ 1`` on the index vanish (GPU: raw result stored, err 0 vs raw).
         _ok, _isym = self._quant_role_addr(
-            sld.operand_ids[0], args[3], op_by_id, ivs={_gc["iv"]},
+            sld.operand_ids[0],
+            args[3],
+            op_by_id,
+            ivs={_gc["iv"]},
             kinds={"vec": dict(pid=("required", 1), iv=0, stride="bound")},
         )
         if not _ok or self._quant_tile_ok(_isym["vec"], block=_gc["bn"]) is None:
@@ -5235,14 +5409,18 @@ class _TemplateMixin:
         ssn = _isym["vec"]["stride"]
 
         idxs = [
-            _sidx(sd["A"][0]), _sidx(sd["A"][1]),   # isr, isc
-            _sidx(sd["B"][0]), _sidx(sd["B"][1]),   # wsk, wsn
-            _sidx(sd["C"][0]), _sidx(sd["C"][1]),   # osr, osc
-            ssn,                                    # scale n-stride
+            _sidx(sd["A"][0]),
+            _sidx(sd["A"][1]),  # isr, isc
+            _sidx(sd["B"][0]),
+            _sidx(sd["B"][1]),  # wsk, wsn
+            _sidx(sd["C"][0]),
+            _sidx(sd["C"][1]),  # osr, osc
+            ssn,  # scale n-stride
         ]
         if any(i is None for i in idxs):
             return None
         from triton_msl.codegen._msl_templates import make_int8_matmul_pergroup
+
         # [6] = the SOURCE program mapping (BM on program_id(0), BN on program_id(1)) — packet 105 B.
         return ("sym_int8", make_int8_matmul_pergroup(32), 4, 5, 6, tuple(idxs), (_gc["bm"], _gc["bn"]))
 
@@ -5456,6 +5634,16 @@ class _TemplateMixin:
             if _tail_mode not in ("masked_zero", "full_blocks") or _block_k <= 0:
                 return None
         return (
-            fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out,
-            tuple(stride_checks), _grid_spec, _tail_mode, _block_k,
+            fast_msl,
+            3,
+            4,
+            5,
+            8 * rr,
+            32 * rc,
+            msl_dtype,
+            msl_out,
+            tuple(stride_checks),
+            _grid_spec,
+            _tail_mode,
+            _block_k,
         )

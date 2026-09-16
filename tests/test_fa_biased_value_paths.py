@@ -73,15 +73,47 @@ if HAS:
 
     @triton.jit
     def _biased_value(
-        o_ptr, o_sz, o_sh, o_sm, o_sk,
-        lse_ptr, lse_sz, lse_sh, lse_sm,
-        q_ptr, q_sz, q_sh, q_sm, q_sk,
-        k_ptr, k_sz, k_sh, k_sn, k_sk,
-        v_ptr, v_sz, v_sh, v_sn, v_sk,
-        b_ptr, b_sz, b_sh, b_sm, b_sn,
-        mask_ptr, m_sz, m_sh, m_sn,
-        sm_scale, neg_inf, Z, H, N,
-        DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        o_ptr,
+        o_sz,
+        o_sh,
+        o_sm,
+        o_sk,
+        lse_ptr,
+        lse_sz,
+        lse_sh,
+        lse_sm,
+        q_ptr,
+        q_sz,
+        q_sh,
+        q_sm,
+        q_sk,
+        k_ptr,
+        k_sz,
+        k_sh,
+        k_sn,
+        k_sk,
+        v_ptr,
+        v_sz,
+        v_sh,
+        v_sn,
+        v_sk,
+        b_ptr,
+        b_sz,
+        b_sh,
+        b_sm,
+        b_sn,
+        mask_ptr,
+        m_sz,
+        m_sh,
+        m_sn,
+        sm_scale,
+        neg_inf,
+        Z,
+        H,
+        N,
+        DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
         MODE: tl.constexpr,
     ):
         """GPT's 113 harness. 0 canonical; 1 Lse + 1; 2 Bias * 2; 3 inverted loaded Mask;
@@ -237,8 +269,29 @@ def _run(
     st = lambda t: tuple(t.stride())
     try:
         _biased_value[((n + 31) // 32, z * h)](
-            out, *st(out), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias), mask, *st(mask),
-            scale, neg_inf, z, h, n, d, 32, 32, mode,
+            out,
+            *st(out),
+            lse,
+            *st(lse),
+            q,
+            *st(q),
+            k,
+            *st(k),
+            v,
+            *st(v),
+            bias,
+            *st(bias),
+            mask,
+            *st(mask),
+            scale,
+            neg_inf,
+            z,
+            h,
+            n,
+            d,
+            32,
+            32,
+            mode,
         )
         torch.mps.synchronize()
         state = "computed"
@@ -312,9 +365,7 @@ def test_biased_unreplayed_values_refuse_or_match(cold_gpu_caches, fa_spy, mode,
 
 @requires_gpu
 @pytest.mark.parametrize("force_tiled,n", [(False, 64), (True, 64), (True, 48)])
-def test_literal_neg_inf_with_loaded_mask_is_exact(
-    cold_gpu_caches, fa_spy, force_tiled, n
-):
+def test_literal_neg_inf_with_loaded_mask_is_exact(cold_gpu_caches, fa_spy, force_tiled, n):
     """The old conservative guard can be relaxed only after the fully-masked row
     is exact.  This pin uses the literal in both source selects, forces every Mask
     entry true, and covers simd, tiled, and the partial final tile.
@@ -328,9 +379,7 @@ def test_literal_neg_inf_with_loaded_mask_is_exact(
     )
     assert state == "computed"
     assert True in fa_spy
-    _assert_nonfinite_matches(
-        out, lse, ref, f"literal -inf + loaded Mask, tiled={force_tiled}, n={n}"
-    )
+    _assert_nonfinite_matches(out, lse, ref, f"literal -inf + loaded Mask, tiled={force_tiled}, n={n}")
 
 
 @requires_gpu
@@ -353,9 +402,7 @@ def test_runtime_nonfinite_sentinel_is_exact_or_refuses_before_dispatch(
         force_tiled=force_tiled,
     )
     if state == "computed":
-        _assert_nonfinite_matches(
-            out, lse, ref, f"runtime sentinel {neg_inf}, tiled={force_tiled}, n={n}"
-        )
+        _assert_nonfinite_matches(out, lse, ref, f"runtime sentinel {neg_inf}, tiled={force_tiled}, n={n}")
     else:
         assert True not in fa_spy
 
@@ -364,15 +411,13 @@ def test_runtime_nonfinite_sentinel_is_exact_or_refuses_before_dispatch(
 @pytest.mark.parametrize(
     "force_tiled,n,rows",
     [
-        (False, 64, (0,)),      # simd: one bad row must not poison its 8-row MMA fragment
+        (False, 64, (0,)),  # simd: one bad row must not poison its 8-row MMA fragment
         (False, 64, tuple(range(64))),
-        (True, 64, (0,)),       # tiled fallback via a proven non-unit output stride
-        (True, 48, (0,)),       # tiled fallback + partial final key tile
+        (True, 64, (0,)),  # tiled fallback via a proven non-unit output stride
+        (True, 48, (0,)),  # tiled fallback + partial final key tile
     ],
 )
-def test_loaded_neg_inf_bias_is_exact_or_refuses_before_dispatch(
-    cold_gpu_caches, fa_spy, force_tiled, n, rows
-):
+def test_loaded_neg_inf_bias_is_exact_or_refuses_before_dispatch(cold_gpu_caches, fa_spy, force_tiled, n, rows):
     """Packet 115 P0-B: runtime data can make a source row nonfinite after detection."""
     state, out, lse, ref = _run(
         0,
@@ -384,9 +429,7 @@ def test_loaded_neg_inf_bias_is_exact_or_refuses_before_dispatch(
         force_tiled=force_tiled,
     )
     if state == "computed":
-        _assert_nonfinite_matches(
-            out, lse, ref, f"loaded -inf Bias, tiled={force_tiled}, n={n}, rows={rows}"
-        )
+        _assert_nonfinite_matches(out, lse, ref, f"loaded -inf Bias, tiled={force_tiled}, n={n}, rows={rows}")
     else:
         assert True not in fa_spy
 
@@ -421,7 +464,9 @@ def test_maskless_literal_neg_inf_sentinel_routes_and_matches(cold_gpu_caches, f
     o = torch.full((Z, H, N, DIM), float("nan"), device=D)
     lse = torch.full((Z, H, N), float("nan"), device=D)
     st = lambda t: tuple(t.stride())
-    fn[(triton.cdiv(N, 32), Z * H)](o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v), b, *st(b), sm, Z, H, N, DIM, 32, 32)
+    fn[(triton.cdiv(N, 32), Z * H)](
+        o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v), b, *st(b), sm, Z, H, N, DIM, 32, 32
+    )
     torch.mps.synchronize()
     assert True in fa_spy, "the biased replacement must be the path taken"
     raw = sm * (q @ k.transpose(-2, -1)) + b
@@ -453,8 +498,25 @@ def test_maskless_loaded_neg_inf_bias_row_is_exact(cold_gpu_caches, fa_spy, forc
     lse = torch.full((z, h, n), float("nan"), device=D)
     st = lambda t: tuple(t.stride())
     fn[(triton.cdiv(n, 32), z * h)](
-        out, *st(out), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v),
-        bias, *st(bias), sm, z, h, n, dim, 32, 32,
+        out,
+        *st(out),
+        lse,
+        *st(lse),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        sm,
+        z,
+        h,
+        n,
+        dim,
+        32,
+        32,
     )
     torch.mps.synchronize()
     assert True in fa_spy

@@ -113,10 +113,13 @@ def _lower(fn, dtype="i32", constants=None):
     ctx = ir.context()
     ir.load_dialects(ctx)
     constants = constants or {}
-    signature = {name: (f"*{dtype}" if name in ("X", "Z") else "*i32" if name == "COUNTER" else "constexpr")
-                 for name in fn.arg_names}
+    signature = {
+        name: (f"*{dtype}" if name in ("X", "Z") else "*i32" if name == "COUNTER" else "constexpr")
+        for name in fn.arg_names
+    }
     module = ASTSource(fn, signature, constants).make_ir(
-        backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
+        backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx
+    )
     module = backend.make_ttir(module, {}, options)
     module = backend.make_ttgir(module, {}, options)
     lowerer = GenericLowerer(walk_ttgir(module, options), options)
@@ -125,8 +128,10 @@ def _lower(fn, dtype="i32", constants=None):
 
 def test_canonical_flip_variants_retain_direct_template():
     for fn, shape, dtype in (
-        (_flip, (4, 4, 8), "i32"), (_flip_size_two, (4, 2, 8), "i32"),
-        (_flip, (4, 4, 8), "fp32"), (_flip_size_two, (4, 2, 8), "fp32"),
+        (_flip, (4, 4, 8), "i32"),
+        (_flip_size_two, (4, 2, 8), "i32"),
+        (_flip, (4, 4, 8), "fp32"),
+        (_flip_size_two, (4, 2, 8), "fp32"),
     ):
         lowerer, module, backend, options = _lower(fn, dtype)
         info = lowerer._detect_flip()
@@ -148,8 +153,11 @@ def test_xor_presence_does_not_bless_wrong_reducer_or_live_post_arithmetic():
 
 def test_direct_template_requires_exact_dense_shared_load_store_offset():
     for fn in (
-        _strided_flip, _different_store_offset, _masked_flip,
-        _permuted_coordinate_flip, _base_shifted_flip,
+        _strided_flip,
+        _different_store_offset,
+        _masked_flip,
+        _permuted_coordinate_flip,
+        _base_shifted_flip,
     ):
         lowerer, module, backend, options = _lower(fn)
         assert lowerer._detect_flip() is None

@@ -408,9 +408,7 @@ class KernelBuilder:
             ):
                 from triton_msl.errors import MetalNonRecoverableError
 
-                raise MetalNonRecoverableError(
-                    "ordered cmp/select reduction requires a complete float SIMD-group tile"
-                )
+                raise MetalNonRecoverableError("ordered cmp/select reduction requires a complete float SIMD-group tile")
             # All lanes execute the same five shuffle calls. Build adjacent
             # contiguous ranges ([0,1], [2,3], then [0,3], ...) rather than the
             # ordinary shuffle-down interleaving (0,16,8,24,...). The operator
@@ -427,16 +425,11 @@ class KernelBuilder:
                 # defined, convergent shuffle before the leader-only update.
                 self._var(
                     _right,
-                    f"simd_shuffle(ordered_{out_var}, "
-                    f"min((uint)tiisg + {_offset}u, {_last_active_lane}u))",
+                    f"simd_shuffle(ordered_{out_var}, min((uint)tiisg + {_offset}u, {_last_active_lane}u))",
                     ty=reduce_ty,
                 )
                 self.begin_if(f"(((uint)tiisg & {(2 * _offset) - 1}u) == 0u)")
-                self._emit(
-                    f"ordered_{out_var} = "
-                    + self.ordered_combine_expr(op, f"ordered_{out_var}", _right)
-                    + ";"
-                )
+                self._emit(f"ordered_{out_var} = " + self.ordered_combine_expr(op, f"ordered_{out_var}", _right) + ";")
                 self.end_block()
             n_simd_groups = (self.block_size + 31) // 32
             self.barrier("threadgroup")
@@ -452,11 +445,7 @@ class KernelBuilder:
             self._emit(f"{out_var} = {shared_var}[0];")
             self._emit(f"for (uint _ord_group = 1u; _ord_group < {n_simd_groups}u; ++_ord_group) {{")
             self._indent += 1
-            self._emit(
-                f"{out_var} = "
-                + self.ordered_combine_expr(op, out_var, f"{shared_var}[_ord_group]")
-                + ";"
-            )
+            self._emit(f"{out_var} = " + self.ordered_combine_expr(op, out_var, f"{shared_var}[_ord_group]") + ";")
             self._indent -= 1
             self._emit("}")
             self._emit(f"{shared_var}[0] = {out_var};")
@@ -764,7 +753,7 @@ def emit_msl(mod, metadata, options):
     # Native operation identity, including callees: no legacy fallback is allowed
     # to erase an assertion if walking, planning, or generic emission fails.
     retained_asserts = []
-    mod.walk(lambda op: retained_asserts.append(op) if op.get_name() == 'tt.assert' else None)
+    mod.walk(lambda op: retained_asserts.append(op) if op.get_name() == "tt.assert" else None)
 
     # Primary path: new walker + generic lowerer
     try:
@@ -774,6 +763,7 @@ def emit_msl(mod, metadata, options):
         graph = walk_ttgir(mod, options)
         if retained_asserts:
             from triton_msl.codegen._constant_assertions import discharge_scalar_true
+
             graph = discharge_scalar_true(graph, mod)
         metadata["name"] = _sanitize_msl_name(graph.func_name)
 
@@ -811,16 +801,22 @@ def emit_msl(mod, metadata, options):
             _tail_bounds = getattr(lowerer, "_tail_access_bounds", None)
             if _batched_bounds is not None and _tail_bounds is not None:
                 raise MetalNonRecoverableError(
-                    "lowering produced conflicting launch address contracts", op_name="tt.dot")
+                    "lowering produced conflicting launch address contracts", op_name="tt.dot"
+                )
             metadata["batched_dot_bounds"] = _batched_bounds or _tail_bounds
             plan = lowerer._assert_plan
-            metadata['device_assert'] = ({'schema': 1, 'messages': plan['messages'],
-                                          'buffer_index': len(graph.args)} if plan is not None else None)
+            metadata["device_assert"] = (
+                {"schema": 1, "messages": plan["messages"], "buffer_index": len(graph.args)}
+                if plan is not None
+                else None
+            )
             _mept_path_log("primary", metadata.get("name", "?"))
             return msl_src
 
         if retained_asserts:
-            raise MetalNonRecoverableError('retained assertion kernel has unsupported generic operations', op_name='tt.assert')
+            raise MetalNonRecoverableError(
+                "retained assertion kernel has unsupported generic operations", op_name="tt.assert"
+            )
         # Fall through to legacy parser if unsupported ops remain
         _mept_path_log("fallback-unsupported", metadata.get("name", "?"))
     except MetalResourceError:
@@ -837,7 +833,9 @@ def emit_msl(mod, metadata, options):
         raise
     except Exception as e:
         if retained_asserts:
-            raise MetalNonRecoverableError('retained assertion lowering failed; no legacy fallback is safe: ' + str(e), op_name='tt.assert') from e
+            raise MetalNonRecoverableError(
+                "retained assertion lowering failed; no legacy fallback is safe: " + str(e), op_name="tt.assert"
+            ) from e
         import warnings
 
         warnings.warn(

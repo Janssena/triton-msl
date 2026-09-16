@@ -1,4 +1,5 @@
 """A stride descriptor and cooperative fill must not erase a narrowing cast."""
+
 import pytest
 import triton
 import triton.language as tl
@@ -36,21 +37,25 @@ def _address_cast(A, B, C, stride, N, K, MODE: tl.constexpr, WIDTH: tl.constexpr
 
 def _source(mode, width):
     constants = dict(MODE=mode, WIDTH=width)
-    signature = dict(A='*fp32', B='*fp32', C='*fp32', stride='i32', N='i32', K='i32',
-                     MODE='constexpr', WIDTH='constexpr')
+    signature = dict(
+        A="*fp32", B="*fp32", C="*fp32", stride="i32", N="i32", K="i32", MODE="constexpr", WIDTH="constexpr"
+    )
     return _emit(_address_cast, signature, constants)
 
 
-@pytest.mark.parametrize('mode', [0, 1, 2])
-@pytest.mark.parametrize('width', [8, 16, -8, -16])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("width", [8, 16, -8, -16])
 def test_value_changing_address_cast_is_not_erased(mode, width):
     # Narrow plain dot formerly kept the template; fused cases may decline to
     # generic, whose cooperative staging must independently reject the same loss.
-    with pytest.raises(MetalNonRecoverableError, match='stride could not be inferred|cannot structurally resolve an offset|arith.trunci'):
+    with pytest.raises(
+        MetalNonRecoverableError,
+        match="stride could not be inferred|cannot structurally resolve an offset|arith.trunci",
+    ):
         _source(mode, width)
 
 
-@pytest.mark.parametrize('mode', [0, 1, 2])
+@pytest.mark.parametrize("mode", [0, 1, 2])
 def test_proven_widen_then_restore_keeps_canonical_emission(mode):
     assert _source(mode, 64) == _source(mode, 0)
 

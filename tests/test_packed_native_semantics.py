@@ -3,6 +3,7 @@
 The release/helper receipt must also state which implementation these executed;
 passing these on a Python-only installation is not native execution evidence.
 """
+
 import math
 
 import pytest
@@ -13,18 +14,19 @@ from triton_msl.errors import MetalNonRecoverableError
 
 @pytest.mark.parametrize("mode", ["same-nan", "same-custom", "comparison-error", "truth-error"])
 def test_copysign_result_comparison_cannot_use_identity_shortcut(monkeypatch, mode):
-    packed = [4, 1, 0, 32, [3], False, None, None, None,
-              ["flash_attention", "x" * 1500, -0.0], None, None]
+    packed = [4, 1, 0, 32, [3], False, None, None, None, ["flash_attention", "x" * 1500, -0.0], None, None]
     expected = c._canonical(packed)
     assert c._packed_snapshot_plan(expected) is not None
     events = []
     sentinel = ValueError("comparison callback witness")
+
     class Truth:
         def __bool__(self):
             events.append("truth")
             if mode == "truth-error":
                 raise sentinel
             return True
+
     class Different:
         def __ne__(self, other):
             assert other is self
@@ -32,10 +34,13 @@ def test_copysign_result_comparison_cannot_use_identity_shortcut(monkeypatch, mo
             if mode == "comparison-error":
                 raise sentinel
             return Truth()
+
     shared = float("nan") if mode == "same-nan" else Different()
+
     def copysign(a, b):
         events.append("copysign")
         return shared
+
     monkeypatch.setattr(math, "copysign", copysign)
     error_type = ValueError if mode.endswith("error") else MetalNonRecoverableError
     with pytest.raises(error_type) as raised:
@@ -49,9 +54,16 @@ def test_copysign_result_comparison_cannot_use_identity_shortcut(monkeypatch, mo
         assert events[3] == "truth"
 
 
-@pytest.mark.parametrize("mode", [
-    "true", "false", "comparison-error", "truth-error", "truth-reads-finalization",
-])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "true",
+        "false",
+        "comparison-error",
+        "truth-error",
+        "truth-reads-finalization",
+    ],
+)
 def test_comparison_temporary_lifetime_matches_original_python(monkeypatch, mode):
     """Use this interpreter's original order, not a CPython-version assumption."""
     outcomes = []

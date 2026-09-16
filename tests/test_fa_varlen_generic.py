@@ -9,6 +9,7 @@ subi(load(cu[b+1]), load(cu[b]))). If a future change loosens FA detection to fi
 varlen, this test catches the resulting silent-wrong (correctness diverges from the
 per-sequence reference) instead of it slipping through.
 """
+
 import math
 import pytest
 import torch
@@ -23,21 +24,40 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _varlen_fwd(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_bh = tl.program_id(1)
     off_b = off_bh // H
     off_h = off_bh % H
-    q_start = tl.load(cu_q + off_b); q_end = tl.load(cu_q + off_b + 1)
+    q_start = tl.load(cu_q + off_b)
+    q_end = tl.load(cu_q + off_b + 1)
     seqlen_q = q_end - q_start
-    k_start = tl.load(cu_k + off_b); k_end = tl.load(cu_k + off_b + 1)
+    k_start = tl.load(cu_k + off_b)
+    k_end = tl.load(cu_k + off_b + 1)
     seqlen_k = k_end - k_start
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -57,9 +77,12 @@ def _varlen_fwd(
         if IS_CAUSAL:
             valid = valid & (offs_m[:, None] >= kn[None, :])
         qk = tl.where(valid, qk, float("-inf"))
-        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
         v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
@@ -100,9 +123,8 @@ def test_varlen_lowers_generic_and_is_correct(lens, causal):
     max_seqlen = max(lens)
     grid = (triton.cdiv(max_seqlen, BM), len(lens) * H)
     _varlen_fwd[grid](
-        q, k, v, o, cu, cu,
-        *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        H, max_seqlen, causal, BM, BN, D)
+        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(), H, max_seqlen, causal, BM, BN, D
+    )
     torch.mps.synchronize()
     ref = _ref_varlen(q, k, v, cu, H, D, causal)
     assert (o - ref).abs().max().item() < 1e-2

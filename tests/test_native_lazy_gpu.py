@@ -1,4 +1,5 @@
 """Fresh-process, warm-JIT native-identity transition on the actual GPU."""
+
 from pathlib import Path
 import os
 import subprocess
@@ -23,25 +24,34 @@ def _copy_plus_one(x, output, BLOCK: tl.constexpr):
 def _probe(root, cache_dir):
     from triton_msl.backend import compiler, driver
     from triton_msl.errors import MetalNonRecoverableError
+
     assert Path(triton_msl.__file__).resolve().parent == root / "triton_msl"
     assert "z3" not in sys.modules, "Z3 must be imported after the warm control"
-    for key, leaf in (("TRITON_CACHE_DIR", "triton"), ("TRITON_MSL_CACHE_DIR", "msl"),
-                      ("TORCHINDUCTOR_CACHE_DIR", "inductor"), ("TORCH_EXTENSIONS_DIR", "extensions")):
+    for key, leaf in (
+        ("TRITON_CACHE_DIR", "triton"),
+        ("TRITON_MSL_CACHE_DIR", "msl"),
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+        ("TORCH_EXTENSIONS_DIR", "extensions"),
+    ):
         os.environ[key] = str(cache_dir / leaf)
     os.environ["TRITON_MSL_COMPILE_SHADER"] = "0"
     os.environ["TRITON_MSL_USE_CPP"] = "0"
     os.environ.pop("TRITON_ALWAYS_COMPILE", None)  # a genuine warm-cache witness
     calls, launches = [], []
     original_msl = compiler.MetalBackend.make_msl
+
     def emit(*args, **kwargs):
         calls.append(True)
         return original_msl(*args, **kwargs)
+
     compiler.MetalBackend.make_msl = staticmethod(emit)
     utils = driver._get_utils()
     original_launch = utils.launch
+
     def launch(*args, **kwargs):
         launches.append(True)
         return original_launch(*args, **kwargs)
+
     utils.launch = launch
     x = torch.arange(128, dtype=torch.float32)
     output = torch.full_like(x, -99.0)
@@ -52,6 +62,7 @@ def _probe(root, cache_dir):
     assert "z3" not in sys.modules
     print("WARM_CONTROL_VERIFIED; EMISSIONS=1; METALLIB_LAUNCHES=2", flush=True)
     import z3
+
     assert z3.simplify(z3.IntVal(1) + z3.IntVal(2)).as_long() == 3
     try:
         first[(1, 1, 1)](x, output)
@@ -71,11 +82,16 @@ def _probe(root, cache_dir):
 
 def test_lazy_z3_recompiles_warm_jit_and_rejects_old_handle_gpu(tmp_path):
     import importlib.util
+
     if not torch.backends.mps.is_available() or importlib.util.find_spec("z3") is None:
         pytest.skip("requires Metal and optional Z3")
     root = Path(triton_msl.__file__).resolve().parent.parent
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(root), str(tmp_path)],
-                            capture_output=True, text=True, timeout=180)
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), str(root), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "WARM_JIT_RECOMPILED; OLD_HANDLE_REFUSED_BEFORE_DISPATCH; METALLIB_LAUNCHES=3" in result.stdout
     print(result.stdout, end="")

@@ -12,6 +12,7 @@ Classifications are SOURCE-DERIVED (probed 2026-09-10, evidence
     non-finite, and m2 in {NaN, +Inf} and NEVER negative/-Inf (squared-delta * positive weight
     is >= 0). Clean reference uses float64.
 """
+
 import math
 import pytest
 
@@ -73,8 +74,7 @@ def test_layernorm_nonfinite_input_makes_row_all_nan_and_siblings_exact(bad):
     poison[1, 7] = bad
     op = _run_ln(poison)
     # source-exact: the poisoned row is ALL NaN (rejects an all-+Inf or any-finite row)
-    assert torch.isnan(op[1]).all(), \
-        f"poisoned row must be all-NaN for this source; got {op[1].tolist()}"
+    assert torch.isnan(op[1]).all(), f"poisoned row must be all-NaN for this source; got {op[1].tolist()}"
     # finite sibling rows: BITWISE identical to the clean run and matching the float64 oracle
     for r in (0, 2, 3):
         assert _bit_equal(op[r], oc[r]), f"row {r} perturbed by poison (bitwise)"
@@ -144,16 +144,18 @@ def test_checkers_reject_wrong_classifications():
     # layernorm predicate (isnan-all) must REJECT an all-+Inf row and a finite-beside-bad row.
     allnan = torch.full((64,), float("nan"))
     allposinf = torch.full((64,), float("inf"))
-    finite_beside = allnan.clone(); finite_beside[0] = 1.234
-    assert torch.isnan(allnan).all()                    # correct classification passes
-    assert not torch.isnan(allposinf).all()             # all-+Inf must FAIL (Astra's gap)
-    assert not torch.isnan(finite_beside).all()         # wrong-finite must FAIL
+    finite_beside = allnan.clone()
+    finite_beside[0] = 1.234
+    assert torch.isnan(allnan).all()  # correct classification passes
+    assert not torch.isnan(allposinf).all()  # all-+Inf must FAIL (Astra's gap)
+    assert not torch.isnan(finite_beside).all()  # wrong-finite must FAIL
     # Welford m2 predicate must REJECT m2 = -Inf and any negative m2.
     assert _m2_admissible_nonfinite(float("nan"))
     assert _m2_admissible_nonfinite(float("inf"))
     assert not _m2_admissible_nonfinite(float("-inf"))  # Astra's gap: -Inf must FAIL
     assert not _m2_admissible_nonfinite(-1.0)
     # bitwise sibling check must distinguish +0.0 from -0.0
-    pz = torch.zeros(4); nz = torch.tensor([-0.0, 0.0, 0.0, 0.0])
-    assert torch.equal(pz, nz)          # value-equal (the weaker check Astra flagged)
-    assert not _bit_equal(pz, nz)       # bitwise-distinct (the check we now use)
+    pz = torch.zeros(4)
+    nz = torch.tensor([-0.0, 0.0, 0.0, 0.0])
+    assert torch.equal(pz, nz)  # value-equal (the weaker check Astra flagged)
+    assert not _bit_equal(pz, nz)  # bitwise-distinct (the check we now use)

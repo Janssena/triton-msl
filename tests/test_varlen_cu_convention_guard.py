@@ -68,24 +68,14 @@ def _varlen_cu_probe(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    q_ptrs = (
-        Q
-        + (q_start + offs_m)[:, None] * stride_qt
-        + off_h * stride_qh
-        + offs_d[None, :] * stride_qd
-    )
+    q_ptrs = Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :] * stride_qd
     q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0) * SCALE
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for start_n in range(0, max_seqlen, BLOCK_N):
         kn = start_n + offs_n
-        k_ptrs = (
-            K
-            + (k_start + kn)[:, None] * stride_kt
-            + off_h * stride_kh
-            + offs_d[None, :] * stride_kd
-        )
+        k_ptrs = K + (k_start + kn)[:, None] * stride_kt + off_h * stride_kh + offs_d[None, :] * stride_kd
         k = tl.load(k_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         qk = tl.dot(q, tl.trans(k).to(q.dtype))
         qk = tl.where(kn[None, :] < seqlen_k, qk, float("-inf"))
@@ -94,22 +84,12 @@ def _varlen_cu_probe(
         p = tl.exp(qk - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
-        v_ptrs = (
-            V
-            + (k_start + kn)[:, None] * stride_vt
-            + off_h * stride_vh
-            + offs_d[None, :] * stride_vd
-        )
+        v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
         value = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         acc += tl.dot(p.to(tl.float32), value.to(tl.float32))
         m_i = m_new
 
-    o_ptrs = (
-        Out
-        + (q_start + offs_m)[:, None] * stride_ot
-        + off_h * stride_oh
-        + offs_d[None, :] * stride_od
-    )
+    o_ptrs = Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh + offs_d[None, :] * stride_od
     tl.store(
         o_ptrs,
         (acc / l_i[:, None]).to(Out.dtype.element_ty),
@@ -132,9 +112,7 @@ def test_varlen_shifted_cu_pair_correct_or_refuse(monkeypatch):
             if len(descriptor) > 1 and isinstance(descriptor[1], str):
                 source = descriptor[1]
                 route["hardcodes_unshifted_cu"] = (
-                    "CUQ[bb]" in source
-                    and ("CUQ[bb + 1u]" in source or "CUQ[bb+1u]" in source)
-                    and "CUK[bb]" in source
+                    "CUQ[bb]" in source and ("CUQ[bb + 1u]" in source or "CUQ[bb+1u]" in source) and "CUK[bb]" in source
                 )
         return real(*args, **kwargs)
 
@@ -189,8 +167,7 @@ def test_varlen_shifted_cu_pair_correct_or_refuse(monkeypatch):
     err = (out - ref).abs().max().item()
     print(f"VARLEN_CU_PROBE route={route} err={err}")
     assert err < 2e-2, (
-        "varlen FA violated correct-or-refuse for shifted cu[b+1]/cu[b+2] semantics: "
-        f"route={route}, max_err={err}"
+        f"varlen FA violated correct-or-refuse for shifted cu[b+1]/cu[b+2] semantics: route={route}, max_err={err}"
     )
 
 

@@ -32,7 +32,11 @@ def test_full_native_mlp128_refusal_does_not_claim_attention_pointer_roles():
         {"X": "*fp32", "W1": "*fp32", "W2": "*fp32", "Z": "*fp32", "D": "constexpr"},
         {"D": 128},
     ).make_ir(
-        backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx,
+        backend.target,
+        options,
+        backend.get_codegen_implementation(options),
+        backend.get_module_map(),
+        ctx,
     )
     module = backend.make_ttir(module, {}, options)
     module = backend.make_ttgir(module, {}, options)

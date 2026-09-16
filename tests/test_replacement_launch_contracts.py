@@ -83,8 +83,30 @@ if HAS:
         tl.store(o_ptr + on, acc)
 
     @triton.jit
-    def _pg(a_ptr, w_ptr, c_ptr, scale_ptr, zero_ptr, M, N, K, sam, sak, swk, swn, ssg, ssn, zsg, zsn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr):
+    def _pg(
+        a_ptr,
+        w_ptr,
+        c_ptr,
+        scale_ptr,
+        zero_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        swk,
+        swn,
+        ssg,
+        ssn,
+        zsg,
+        zsn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        G: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -104,8 +126,24 @@ if HAS:
         tl.store(c_ptr + om[:, None] * scm + on[None, :] * scn, acc)
 
     @triton.jit
-    def _sym(a_ptr, w_ptr, c_ptr, s_ptr, M, N, K, sam, sak, swk, swn, scm, scn,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _sym(
+        a_ptr,
+        w_ptr,
+        c_ptr,
+        s_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        swk,
+        swn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -122,8 +160,25 @@ if HAS:
         tl.store(c_ptr + om[:, None] * scm + on[None, :] * scn, acc)
 
     @triton.jit
-    def _pn(a_ptr, w_ptr, c_ptr, scale_ptr, zero_ptr, M, N, K, sam, sak, swk, swn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _pn(
+        a_ptr,
+        w_ptr,
+        c_ptr,
+        scale_ptr,
+        zero_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        swk,
+        swn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -142,8 +197,25 @@ if HAS:
         tl.store(c_ptr + om[:, None] * scm + on[None, :] * scn, acc)
 
     @triton.jit
-    def _fd(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ONE_D: tl.constexpr, MODE: tl.constexpr):
+    def _fd(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        sbk,
+        sbn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        ONE_D: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         if ONE_D:
             pid = tl.program_id(0)
             npm = tl.cdiv(M, BM)
@@ -189,7 +261,9 @@ if HAS:
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
         context = ir.context()
         ir.load_dialects(context)
-        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+        mod = src.make_ir(
+            target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+        )
         metadata = {}
         mod = backend.make_ttir(mod, metadata, options)
         mod = backend.make_ttgir(mod, metadata, options)
@@ -211,8 +285,12 @@ def spies(monkeypatch):
     """quant / fast replacement dispatch outcomes, recorded per launch."""
     q, f = [], []
     oq, of = quant_dispatch.dispatch_quant_matmul, fast_dispatch.dispatch_fast_matmul
-    monkeypatch.setattr(quant_dispatch, "dispatch_quant_matmul", lambda *a, **k: (lambda r: (q.append(bool(r)), r)[1])(oq(*a, **k)))
-    monkeypatch.setattr(fast_dispatch, "dispatch_fast_matmul", lambda *a, **k: (lambda r: (f.append(bool(r)), r)[1])(of(*a, **k)))
+    monkeypatch.setattr(
+        quant_dispatch, "dispatch_quant_matmul", lambda *a, **k: (lambda r: (q.append(bool(r)), r)[1])(oq(*a, **k))
+    )
+    monkeypatch.setattr(
+        fast_dispatch, "dispatch_fast_matmul", lambda *a, **k: (lambda r: (f.append(bool(r)), r)[1])(of(*a, **k))
+    )
     return q, f
 
 
@@ -243,7 +321,9 @@ def _g4_case(G, N=64, K=192, BN=32, BK=64):
     gi = torch.arange(K, device=D) // G
     ref = ((w4.float() - z[:, gi]) * s[:, gi]) @ x
     o = torch.full((N,), float("nan"), device=D)
-    launch = lambda grid=(N // BN,): _g4[grid](x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0), BN=BN, BK=BK, G=G)
+    launch = lambda grid=(N // BN,): _g4[grid](
+        x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0), BN=BN, BK=BK, G=G
+    )
     return launch, o, ref
 
 
@@ -266,7 +346,18 @@ def test_int4_gemv_even_group_routes_and_computes(cold_gpu_caches, spies, G):
     assert _cmp(o, ref) < 1e-2
 
 
-_SIG_G4 = {"x_ptr": "*fp32", "w_ptr": "*u8", "o_ptr": "*fp32", "s_ptr": "*fp32", "z_ptr": "*fp32", "N": "i32", "K": "i32", "ng": "i32", "swn": "i32", "ssn": "i32"}
+_SIG_G4 = {
+    "x_ptr": "*fp32",
+    "w_ptr": "*u8",
+    "o_ptr": "*fp32",
+    "s_ptr": "*fp32",
+    "z_ptr": "*fp32",
+    "N": "i32",
+    "K": "i32",
+    "ng": "i32",
+    "swn": "i32",
+    "ssn": "i32",
+}
 
 
 @requires
@@ -311,7 +402,27 @@ def _pg_case():
     full = a @ ((w.float() - z[gi]) * s[gi])
     c = torch.full((M, N), float("nan"), device=D)
     st = lambda t: t.stride()
-    launch = lambda grid: _pg[grid](a, w, c, s, z, M, N, K, *st(a), *st(w), s.stride(0), s.stride(1), z.stride(0), z.stride(1), *st(c), BM=BM, BN=BN, BK=BK, G=G)
+    launch = lambda grid: _pg[grid](
+        a,
+        w,
+        c,
+        s,
+        z,
+        M,
+        N,
+        K,
+        *st(a),
+        *st(w),
+        s.stride(0),
+        s.stride(1),
+        z.stride(0),
+        z.stride(1),
+        *st(c),
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        G=G,
+    )
     return launch, c, full, (2, 2, 1), "gemm"
 
 
@@ -323,7 +434,9 @@ def _sym_case():
     sc = torch.rand(N, device=D) * 0.05 + 0.01
     full = a @ (w.float() * sc)
     c = torch.full((M, N), float("nan"), device=D)
-    launch = lambda grid: _sym[grid](a, w, c, sc, M, N, K, a.stride(0), a.stride(1), w.stride(0), w.stride(1), c.stride(0), c.stride(1), BM, BN, BK)
+    launch = lambda grid: _sym[grid](
+        a, w, c, sc, M, N, K, a.stride(0), a.stride(1), w.stride(0), w.stride(1), c.stride(0), c.stride(1), BM, BN, BK
+    )
     return launch, c, full, (2, 2, 1), "gemm"
 
 
@@ -336,7 +449,25 @@ def _pn_case():
     z = torch.randint(-3, 4, (N,), device=D).float()
     full = a @ ((w.float() - z[None, :]) * s[None, :])
     c = torch.full((M, N), float("nan"), device=D)
-    launch = lambda grid: _pn[grid](a, w, c, s, z, M, N, K, a.stride(0), a.stride(1), w.stride(0), w.stride(1), c.stride(0), c.stride(1), BM=BM, BN=BN, BK=BK)
+    launch = lambda grid: _pn[grid](
+        a,
+        w,
+        c,
+        s,
+        z,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        w.stride(0),
+        w.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=BM,
+        BN=BN,
+        BK=BK,
+    )
     return launch, c, full, (2, 2, 1), "gemm"
 
 
@@ -347,9 +478,27 @@ def _fd_case(one_d, dtype=torch.float16, mode=0, cpu=False):
     torch.manual_seed(7)
     a = torch.randn(M, K, device=dev, dtype=dtype)
     b = torch.randn(K, N, device=dev, dtype=dtype)
-    full = (a.float() @ b.float())
+    full = a.float() @ b.float()
     c = torch.full((M, N), float("nan"), device=dev)
-    launch = lambda grid: _fd[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM, BN, BK, ONE_D=one_d, MODE=mode)
+    launch = lambda grid: _fd[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM,
+        BN,
+        BK,
+        ONE_D=one_d,
+        MODE=mode,
+    )
     full_grid = (4, 1, 1) if one_d else (2, 2, 1)
     return launch, c, full, full_grid, ("fast1d" if one_d else "fast2d")
 
@@ -375,7 +524,7 @@ def _expected_partial(kind, full, full_grid, grid):
         npm = 2
         for pid in range(grid[0]):
             pm, pn = pid % npm, pid // npm
-            e[pm * 32:(pm + 1) * 32, pn * 32:(pn + 1) * 32] = full[pm * 32:(pm + 1) * 32, pn * 32:(pn + 1) * 32]
+            e[pm * 32 : (pm + 1) * 32, pn * 32 : (pn + 1) * 32] = full[pm * 32 : (pm + 1) * 32, pn * 32 : (pn + 1) * 32]
     return e
 
 
@@ -436,8 +585,20 @@ def test_extra_grid_axis_never_runs_the_replacement(cold_gpu_caches, spies, case
 
 
 # ---------------------------------------------------------------- C. bare-template coordinates
-_SIG_FD = {"a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32",
-           "sam": "i32", "sak": "constexpr", "sbk": "i32", "sbn": "constexpr", "scm": "i32", "scn": "constexpr"}
+_SIG_FD = {
+    "a_ptr": "*fp32",
+    "b_ptr": "*fp32",
+    "c_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "sam": "i32",
+    "sak": "constexpr",
+    "sbk": "i32",
+    "sbn": "constexpr",
+    "scm": "i32",
+    "scn": "constexpr",
+}
 _CEX_FD = {"BM": 32, "BN": 32, "BK": 32, "sak": 1, "sbn": 1, "scn": 1, "ONE_D": False}
 
 
@@ -459,7 +620,9 @@ def test_kloop_template_untiled_axes_are_tile_zero(cold_gpu_caches, spies):
     if state == "computed":
         exp = torch.full_like(full, float("nan"))
         exp[:32, :32] = full[:32, :32]
-        assert _cmp(c, exp) < 1e-2 * max(1.0, full.abs().max().item()), "tiled by program_id although the kernel does not"
+        assert _cmp(c, exp) < 1e-2 * max(1.0, full.abs().max().item()), (
+            "tiled by program_id although the kernel does not"
+        )
 
 
 @requires
@@ -481,7 +644,7 @@ def test_lowering_boundary_direct_variant_replays_1d_split():
     """The host path's ``__mmdirect`` variant must carry the tutorial's 1-D split, not pid3.y."""
     msl, _ = _emit_for(_fd, _SIG_FD, {**_CEX_FD, "ONE_D": True, "MODE": 0})
     if "__mmdirect" in msl:
-        direct = msl[msl.index("__mmdirect"):]
+        direct = msl[msl.index("__mmdirect") :]
         assert "pid3.x % _npm" in direct and "pid_n = pid3.y" not in direct
 
 

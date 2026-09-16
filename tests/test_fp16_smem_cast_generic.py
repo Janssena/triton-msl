@@ -36,10 +36,35 @@ requires_mps = pytest.mark.skipif(
 
 
 @triton.jit
-def _gqa_varlen_generic(Q, K, V, Out, OutFP32, cu_q, cu_k,
-                        sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
-                        H, GROUP, max_seqlen, SCALE: tl.constexpr, STORE_FP32: tl.constexpr,
-                        BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
+def _gqa_varlen_generic(
+    Q,
+    K,
+    V,
+    Out,
+    OutFP32,
+    cu_q,
+    cu_k,
+    sqt,
+    sqh,
+    sqd,
+    skt,
+    skh,
+    skd,
+    svt,
+    svh,
+    svd,
+    sot,
+    soh,
+    sod,
+    H,
+    GROUP,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    STORE_FP32: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
     """Varlen FA whose K/V use a GQA head (``h // GROUP``), so the varlen detector's
     head-parity guard refuses the specialized route and the kernel lowers generically —
     the path that emitted invalid MSL for an fp16 output."""
@@ -55,33 +80,32 @@ def _gqa_varlen_generic(Q, K, V, Out, OutFP32, cu_q, cu_k,
     om = sm * BM + tl.arange(0, BM)
     on = tl.arange(0, BN)
     od = tl.arange(0, D)
-    q = tl.load(Q + (qs + om)[:, None] * sqt + h * sqh + od[None, :] * sqd,
-                mask=om[:, None] < slq, other=0.) * SCALE
+    q = tl.load(Q + (qs + om)[:, None] * sqt + h * sqh + od[None, :] * sqd, mask=om[:, None] < slq, other=0.0) * SCALE
     mi = tl.full([BM], float("-inf"), tl.float32)
     li = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
     for sn in range(0, max_seqlen, BN):
         kn = sn + on
-        k = tl.load(K + (ks + kn)[:, None] * skt + hkv * skh + od[None, :] * skd,
-                    mask=kn[:, None] < slk, other=0.)
+        k = tl.load(K + (ks + kn)[:, None] * skt + hkv * skh + od[None, :] * skd, mask=kn[:, None] < slk, other=0.0)
         qk = tl.where(kn[None, :] < slk, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
         m2 = tl.maximum(mi, tl.max(qk, 1))
         a = tl.exp(mi - m2)
         p = tl.exp(qk - m2[:, None])
         li = li * a + tl.sum(p, 1)
         acc = acc * a[:, None]
-        vv = tl.load(V + (ks + kn)[:, None] * svt + hkv * svh + od[None, :] * svd,
-                     mask=kn[:, None] < slk, other=0.)
+        vv = tl.load(V + (ks + kn)[:, None] * svt + hkv * svh + od[None, :] * svd, mask=kn[:, None] < slk, other=0.0)
         acc += tl.dot(p.to(tl.float32), vv.to(tl.float32))
         mi = m2
     result = acc / li[:, None]
-    tl.store(Out + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod,
-             result.to(Out.dtype.element_ty), mask=om[:, None] < slq)
+    tl.store(
+        Out + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod,
+        result.to(Out.dtype.element_ty),
+        mask=om[:, None] < slq,
+    )
     if STORE_FP32:
         # A second consumer of `result` pins SSA semantics for the shared-memory cast:
         # producing the fp16 output must not quantize this original fp32 value in place.
-        tl.store(OutFP32 + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod,
-                 result, mask=om[:, None] < slq)
+        tl.store(OutFP32 + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod, result, mask=om[:, None] < slq)
 
 
 def _run_generic_varlen(dtype, lens, D=64, nw=4, H=4, Hkv=2):
@@ -98,8 +122,27 @@ def _run_generic_varlen(dtype, lens, D=64, nw=4, H=4, Hkv=2):
     scale = 1.0 / math.sqrt(D)
     mx = max(lens)
     _gqa_varlen_generic[(triton.cdiv(mx, 32), len(lens) * H)](
-        q, k, v, o, o_fp32, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        H, group, mx, scale, False, 32, 32, D, num_warps=nw)
+        q,
+        k,
+        v,
+        o,
+        o_fp32,
+        cu,
+        cu,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *o.stride(),
+        H,
+        group,
+        mx,
+        scale,
+        False,
+        32,
+        32,
+        D,
+        num_warps=nw,
+    )
     torch.mps.synchronize()
     ref = torch.zeros_like(o)
     for b in range(len(lens)):
@@ -184,7 +227,24 @@ def test_smem_cast_with_second_source_consumer_refuses():
 
     with pytest.raises(MetalNonRecoverableError, match="another consumer"):
         _gqa_varlen_generic[(2, 8)](
-            q, k, v, o, o_fp32, cu, cu,
-            *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-            H, group, 48, scale, True, 32, 32, D, num_warps=4,
+            q,
+            k,
+            v,
+            o,
+            o_fp32,
+            cu,
+            cu,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            *o.stride(),
+            H,
+            group,
+            48,
+            scale,
+            True,
+            32,
+            32,
+            D,
+            num_warps=4,
         )

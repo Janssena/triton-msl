@@ -5,6 +5,7 @@ are bound by the separate OS-build contract. Third-party images are hashed in
 full. Unsupported loader semantics fail closed; no basename/search-path guess
 is permitted. Constants/layouts follow the installed mach-o/loader.h and fat.h.
 """
+
 from dataclasses import dataclass
 import hashlib
 import mmap
@@ -12,19 +13,63 @@ from pathlib import Path
 import struct
 
 
-_THIN = {b"\xce\xfa\xed\xfe": ("<", 28), b"\xcf\xfa\xed\xfe": ("<", 32),
-         b"\xfe\xed\xfa\xce": (">", 28), b"\xfe\xed\xfa\xcf": (">", 32)}
-_FAT = {b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
-        b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True)}
+_THIN = {
+    b"\xce\xfa\xed\xfe": ("<", 28),
+    b"\xcf\xfa\xed\xfe": ("<", 32),
+    b"\xfe\xed\xfa\xce": (">", 28),
+    b"\xfe\xed\xfa\xcf": (">", 32),
+}
+_FAT = {
+    b"\xca\xfe\xba\xbe": (">", False),
+    b"\xbe\xba\xfe\xca": ("<", False),
+    b"\xca\xfe\xba\xbf": (">", True),
+    b"\xbf\xba\xfe\xca": ("<", True),
+}
 _DEPENDENCIES = {0xC, 0x80000018, 0x8000001F, 0x80000023, 0x20}
 # Obsolete FVM/prebound/sub-framework loading, environment commands and the new
 # lazy-load-info trie are not proved by this parser. Ordinary segment/symbol/
 # signing/build-version commands do not select a different provider.
-_NON_PROVIDER = {0x1, 0x2, 0x3, 0x4, 0x5, 0x8, 0xA, 0xB, 0x11, 0x16, 0x17,
-                 0x19, 0x1A, 0x1B, 0x1D, 0x1E, 0x21, 0x22, 0x80000022, 0x24,
-                 0x25, 0x26, 0x80000028, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E,
-                 0x2F, 0x30, 0x31, 0x32, 0x80000033, 0x80000034, 0x36, 0x37,
-                 0x38, 0x39}
+_NON_PROVIDER = {
+    0x1,
+    0x2,
+    0x3,
+    0x4,
+    0x5,
+    0x8,
+    0xA,
+    0xB,
+    0x11,
+    0x16,
+    0x17,
+    0x19,
+    0x1A,
+    0x1B,
+    0x1D,
+    0x1E,
+    0x21,
+    0x22,
+    0x80000022,
+    0x24,
+    0x25,
+    0x26,
+    0x80000028,
+    0x29,
+    0x2A,
+    0x2B,
+    0x2C,
+    0x2D,
+    0x2E,
+    0x2F,
+    0x30,
+    0x31,
+    0x32,
+    0x80000033,
+    0x80000034,
+    0x36,
+    0x37,
+    0x38,
+    0x39,
+}
 _STRINGS = _DEPENDENCIES | {0xD, 0xE, 0xF, 0x8000001C}
 
 
@@ -72,7 +117,7 @@ def _parse(data, cpu_type):
         if len(matches) != 1:
             raise ValueError("missing or ambiguous native CPU slice")
         offset, size = matches[0]
-        magic = data[offset:offset + 4]
+        magic = data[offset : offset + 4]
     if magic not in _THIN:
         raise ValueError("unproved native Mach-O magic")
     endian, header = _THIN[magic]
@@ -110,7 +155,7 @@ def _parse(data, cpu_type):
                 weak = weak or bool(flags & 1)
             if not fixed <= string_offset < command_size:
                 raise ValueError("invalid native command string offset")
-            raw = data[cursor + string_offset:cursor + command_size]
+            raw = data[cursor + string_offset : cursor + command_size]
             stop = raw.find(b"\0")
             if stop <= 0:
                 raise ValueError("unterminated/empty native command string")
@@ -142,7 +187,11 @@ def parse_image(path, cpu_type):
         digest = hashlib.sha256(data).hexdigest()
     after = path.stat()
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
     ):
         raise ValueError(f"native provider changed while reading: {path}")
     return NativeImage(digest, dependencies, rpaths, file_type, install_name)
@@ -151,6 +200,7 @@ def parse_image(path, cpu_type):
 def _system(path):
     # Normalize '..' before granting the system-build classification.
     import os
+
     value = os.path.normpath(str(path))
     return value.startswith(("/System/Library/", "/usr/lib/"))
 
@@ -158,7 +208,7 @@ def _system(path):
 def _expand(reference, loader, executable):
     for token, root in (("@loader_path", loader.parent), ("@executable_path", executable.parent)):
         if reference == token or reference.startswith(token + "/"):
-            return root / reference[len(token):].lstrip("/")
+            return root / reference[len(token) :].lstrip("/")
     if reference.startswith("/"):
         return Path(reference)
     raise ValueError(f"unproved native dependency provider: {reference}")
@@ -167,17 +217,17 @@ def _expand(reference, loader, executable):
 def dependency_graph(seed_paths, *, cpu_type, executable, loaded_paths=()):
     """Ordered provider graph, with indices preserving each root/edge association.
 
-Logical root order is supplied by the package inventory. Absolute resolved paths
-are traversal guards only, not persistent identity. Separate RPATH contexts are
-separate graph nodes; identical bytes in two directories cannot erase their
-different dependency providers. Cycles terminate by path+deduplicated context.
+    Logical root order is supplied by the package inventory. Absolute resolved paths
+    are traversal guards only, not persistent identity. Separate RPATH contexts are
+    separate graph nodes; identical bytes in two directories cannot erase their
+    different dependency providers. Cycles terminate by path+deduplicated context.
 
-For @rpath references dyld first checks already-loaded images by their full
-install name (Loader::getLoader / JustInTimeLoader::matchesPath). The caller
-must supply an actual stable dyld snapshot, not a package inventory or search
-directory. Bind the selected image's bytes and transitive edges. Conflicting
-loaded install names remain unproved; basename matches never qualify.
-"""
+    For @rpath references dyld first checks already-loaded images by their full
+    install name (Loader::getLoader / JustInTimeLoader::matchesPath). The caller
+    must supply an actual stable dyld snapshot, not a package inventory or search
+    directory. Bind the selected image's bytes and transitive edges. Conflicting
+    loaded install names remain unproved; basename matches never qualify.
+    """
     executable = Path(executable).resolve(strict=True)
     parsed, indices, pending, rows = {}, {}, [], []
     loaded_names = {}
@@ -217,7 +267,7 @@ loaded install names remain unproved; basename matches never qualify.
                 edges.append((reference, ("provider", intern(loaded_names[reference], context))))
                 continue
             if reference.startswith("@rpath/"):
-                candidates = [p / reference[len("@rpath/"):] for p in context]
+                candidates = [p / reference[len("@rpath/") :] for p in context]
                 if not candidates:
                     raise ValueError(f"unproved native rpath provider: {reference}")
             else:

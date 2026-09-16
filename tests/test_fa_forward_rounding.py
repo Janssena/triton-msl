@@ -87,13 +87,17 @@ def _faithful(p, dtype):
     rd = (lambda t: t) if dtype == torch.float32 else (lambda t: t.to(dtype).float())
     scale = p["sm"] if dtype == torch.float32 else torch.tensor(p["sm"], dtype=dtype).float().item()
     qs = rd(q * scale)
-    mh = mask[torch.arange(Hc, device=D) // Hh].bool()          # [Hc, I, N]
+    mh = mask[torch.arange(Hc, device=D) // Hh].bool()  # [Hc, I, N]
     m = torch.full((Hc, I, N), -float("inf"), device=D)
     l = torch.zeros(Hc, I, N, device=D)
     acc = torch.zeros(Hc, I, N, p["DIM"], device=D)
     for k0 in range(0, N, BK):
-        kb, vb, bb, mb = k[:, :, k0:k0 + BK], v[:, :, k0:k0 + BK], bias[:, k0:k0 + BK, :], mh[:, :, k0:k0 + BK]
-        s = torch.einsum("hijd,hikd->hijk", qs, kb) + bb.transpose(1, 2)[:, None] if False else torch.einsum("hijd,hikd->hijk", qs, kb) + bias[:, None, :, k0:k0 + BK]
+        kb, vb, bb, mb = k[:, :, k0 : k0 + BK], v[:, :, k0 : k0 + BK], bias[:, k0 : k0 + BK, :], mh[:, :, k0 : k0 + BK]
+        s = (
+            torch.einsum("hijd,hikd->hijk", qs, kb) + bb.transpose(1, 2)[:, None]
+            if False
+            else torch.einsum("hijd,hikd->hijk", qs, kb) + bias[:, None, :, k0 : k0 + BK]
+        )
         s = s * INV_LN2
         s = s.masked_fill(mb[:, :, None, :], -1e9)
         m_new = torch.maximum(m, s.amax(-1))
@@ -114,24 +118,52 @@ def _launch(p, dtype):
     if hasattr(_biased_tri_fa, "device_caches"):
         _biased_tri_fa.device_caches.clear()
     _biased_tri_fa[(triton.cdiv(p["N"], 32), p["I"], p["Hc"])](
-        o, *st(o), lse, *st(lse), p["q"], *st(p["q"]), p["k"], *st(p["k"]), p["v"], *st(p["v"]),
-        p["bias"], *st(p["bias"]), p["mask"], *st(p["mask"]), p["sm"], -1e9, p["N"], p["Hh"], p["DIM"], 32, p["BK"])
+        o,
+        *st(o),
+        lse,
+        *st(lse),
+        p["q"],
+        *st(p["q"]),
+        p["k"],
+        *st(p["k"]),
+        p["v"],
+        *st(p["v"]),
+        p["bias"],
+        *st(p["bias"]),
+        p["mask"],
+        *st(p["mask"]),
+        p["sm"],
+        -1e9,
+        p["N"],
+        p["Hh"],
+        p["DIM"],
+        32,
+        p["BK"],
+    )
     torch.mps.synchronize()
     return o.float(), lse
 
 
 def _ulp(o_ref, dtype):
     bits = {torch.float32: 23, torch.float16: 10, torch.bfloat16: 7}[dtype]
-    return o_ref.abs().clamp(min=2.0 ** -20).log2().floor().exp2() * (2.0 ** -bits)
+    return o_ref.abs().clamp(min=2.0**-20).log2().floor().exp2() * (2.0**-bits)
 
 
 @requires_gpu
 @pytest.mark.parametrize("N", [64, 128])
-@pytest.mark.parametrize("dtype,maker,rq,rp", [
-    (torch.float32, "simdgroup", None, None),
-    (torch.bfloat16, "tiled", "bfloat", "bfloat"),
-    (torch.float16, "tiled", "half", "half"),   # P rounding with a 32-wide source block: exact only on the tiled maker
-])
+@pytest.mark.parametrize(
+    "dtype,maker,rq,rp",
+    [
+        (torch.float32, "simdgroup", None, None),
+        (torch.bfloat16, "tiled", "bfloat", "bfloat"),
+        (
+            torch.float16,
+            "tiled",
+            "half",
+            "half",
+        ),  # P rounding with a 32-wide source block: exact only on the tiled maker
+    ],
+)
 def test_biased_forward_replays_source_rounding(cold_gpu_caches, maker_spy, dtype, maker, rq, rp, N):
     """Correct-or-refuse against the SOURCE's online loop: the template must route to the named
     maker with the recorded rounding points and match the source's own rounded semantics — every
@@ -148,7 +180,9 @@ def test_biased_forward_replays_source_rounding(cold_gpu_caches, maker_spy, dtyp
         assert err.max().item() < 2e-6, f"fp32 N={N}: max |template - source replay| = {err.max():.3e}"
     elif dtype == torch.bfloat16:
         # measured BIT-EXACT at N = 64 and 128 (0 differing elements); allow one output-ulp tie
-        assert bool((err <= _ulp(o_ref, dtype) * 1.01).all()) and frac < 0.02, f"bf16 N={N}: max err {err.max():.3e}, {frac*100:.2f}% differ"
+        assert bool((err <= _ulp(o_ref, dtype) * 1.01).all()) and frac < 0.02, (
+            f"bf16 N={N}: max err {err.max():.3e}, {frac * 100:.2f}% differ"
+        )
     else:
         # fp16: the source evaluates exp2 on inv_ln2-scaled scores, the template exp on natural
         # scores (the equivalence packet 117 accepted); they differ by a few fp32 ulps BEFORE P is
@@ -156,7 +190,9 @@ def test_biased_forward_replays_source_rounding(cold_gpu_caches, maker_spy, dtyp
         # (measured: 1–3 P flips, 0.2 % of outputs, max 1.22e-4). A log2-unit template would make
         # this bit-exact too (ledgered). Anything systematic (the pre-164 9.8e-4 on 40 % of
         # elements) fails both bounds.
-        assert err.max().item() < 2.5e-4 and frac < 0.01, f"fp16 N={N}: max err {err.max():.3e}, {frac*100:.2f}% differ (systematic = not replayed)"
+        assert err.max().item() < 2.5e-4 and frac < 0.01, (
+            f"fp16 N={N}: max err {err.max():.3e}, {frac * 100:.2f}% differ (systematic = not replayed)"
+        )
     fin = torch.isfinite(lse_ref)
     assert (lse[fin] - lse_ref[fin]).abs().max().item() < 2e-4
 
@@ -166,7 +202,15 @@ def test_biased_forward_fp32_msl_unchanged(tmp_path):
     """fp32 sources record no rounding points; the emitted MSL carries no rounding and no s_scale."""
     fn = _biased_tri_fa
     cex = {n: (32 if n in ("DIM", "BLOCK_J", "BLOCK_K") else 256) for n in [fn.arg_names[i] for i in fn.constexprs]}
-    sig = {n: ("*u8" if "mask" in n or n == "m_ptr" else "*fp32") if n.endswith("_ptr") else "fp32" if n in ("sm_scale", "neg_inf") else "i32" for n in fn.arg_names if n not in cex}
+    sig = {
+        n: ("*u8" if "mask" in n or n == "m_ptr" else "*fp32")
+        if n.endswith("_ptr")
+        else "fp32"
+        if n in ("sm_scale", "neg_inf")
+        else "i32"
+        for n in fn.arg_names
+        if n not in cex
+    }
     lw = _build_lowerer(fn, sig, cex)
     msl = lw.lower()
     assert "s_scale" not in msl and "bfloat(" not in msl and "half(" not in msl
@@ -182,7 +226,15 @@ def test_verifier_records_the_rounding_points(dtype, rq, rp):
     fn = _biased_tri_fa
     dt = "bf16" if dtype == torch.bfloat16 else "fp16"
     cex = {n: (32 if n in ("DIM", "BLOCK_J", "BLOCK_K") else 256) for n in [fn.arg_names[i] for i in fn.constexprs]}
-    sig = {n: ("*u8" if "mask" in n or n == "m_ptr" else ("*fp32" if n.startswith("lse") else f"*{dt}")) if n.endswith("_ptr") else "fp32" if n in ("sm_scale", "neg_inf") else "i32" for n in fn.arg_names if n not in cex}
+    sig = {
+        n: ("*u8" if "mask" in n or n == "m_ptr" else ("*fp32" if n.startswith("lse") else f"*{dt}"))
+        if n.endswith("_ptr")
+        else "fp32"
+        if n in ("sm_scale", "neg_inf")
+        else "i32"
+        for n in fn.arg_names
+        if n not in cex
+    }
     lw = _build_lowerer(fn, sig, cex)
     msl = lw.lower()
     assert isinstance(msl, str) and "kernel void" in msl

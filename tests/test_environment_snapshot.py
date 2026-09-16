@@ -1,4 +1,5 @@
 """Hot-path reuse requires equal contents, not equal mapping identity or size."""
+
 import os
 import importlib.util
 import sys
@@ -15,13 +16,24 @@ from triton_msl.errors import MetalNonRecoverableError
 
 def _isolated_snapshot(monkeypatch, foreign=None):
     """Clone functions so code-mutation witnesses never alter installed code."""
-    def clone(fn, namespace=None):
-        return FunctionType(fn.__code__, fn.__globals__ if namespace is None else namespace,
-                            fn.__name__, fn.__defaults__, fn.__closure__)
 
-    functions = {"get": clone(Mapping.get), "getitem": clone(os._Environ.__getitem__),
-                 "iter": clone(os._Environ.__iter__), "copy": clone(os._Environ.copy),
-                 "encode": clone(os.environ.encodekey), "decode": clone(os.environ.decodekey)}
+    def clone(fn, namespace=None):
+        return FunctionType(
+            fn.__code__,
+            fn.__globals__ if namespace is None else namespace,
+            fn.__name__,
+            fn.__defaults__,
+            fn.__closure__,
+        )
+
+    functions = {
+        "get": clone(Mapping.get),
+        "getitem": clone(os._Environ.__getitem__),
+        "iter": clone(os._Environ.__iter__),
+        "copy": clone(os._Environ.copy),
+        "encode": clone(os.environ.encodekey),
+        "decode": clone(os.environ.decodekey),
+    }
     if foreign is not None:
         name, overrides = foreign
         fn = functions[name]
@@ -29,9 +41,13 @@ def _isolated_snapshot(monkeypatch, foreign=None):
     monkeypatch.setattr(Mapping, "get", functions["get"])
     for name, attribute in (("getitem", "__getitem__"), ("iter", "__iter__"), ("copy", "copy")):
         monkeypatch.setattr(os._Environ, attribute, functions[name])
-    private = os._Environ({b"TRITON_MSL_FA_HALF_ACCUM": b"0", b"ALT": b"1"},
-                          functions["encode"], functions["decode"],
-                          functions["encode"], functions["decode"])
+    private = os._Environ(
+        {b"TRITON_MSL_FA_HALF_ACCUM": b"0", b"ALT": b"1"},
+        functions["encode"],
+        functions["decode"],
+        functions["encode"],
+        functions["decode"],
+    )
     monkeypatch.setattr(os, "environ", private)
     spec = importlib.util.spec_from_file_location("isolated_environment_recognition", environment.__file__)
     module = importlib.util.module_from_spec(spec)
@@ -41,11 +57,14 @@ def _isolated_snapshot(monkeypatch, foreign=None):
 
 def _changed_codec(encoding, *, encode=False):
     if encode:
+
         def changed(value):
             return ("ALT" if value == "TRITON_MSL_FA_HALF_ACCUM" else value).encode(encoding)
     else:
+
         def changed(value):
             return "1" if value == b"0" else value.decode(encoding)
+
     return changed
 
 
@@ -59,14 +78,21 @@ def test_same_function_code_change_after_admission_stays_live(monkeypatch, name)
         assert module.environment_snapshot() is before  # Positive unchanged reuse.
         fn = functions[name]
         raw = dict(private._data)
+
         def changed_iter(self):
             yield "ALT"
-        replacements = {"get": lambda self, key, default=None: "1",
-                        "getitem": lambda self, key: "1",
-                        "iter": changed_iter,
-                        "copy": lambda self: {"changed": "1"}}
-        changed = (_changed_codec(fn.__closure__[0].cell_contents, encode=name == "encode")
-                   if name in ("encode", "decode") else replacements[name])
+
+        replacements = {
+            "get": lambda self, key, default=None: "1",
+            "getitem": lambda self, key: "1",
+            "iter": changed_iter,
+            "copy": lambda self: {"changed": "1"},
+        }
+        changed = (
+            _changed_codec(fn.__closure__[0].cell_contents, encode=name == "encode")
+            if name in ("encode", "decode")
+            else replacements[name]
+        )
         original_code = fn.__code__
         fn.__code__ = changed.__code__
         after = module.environment_snapshot()
@@ -95,13 +121,16 @@ def test_same_getter_defaults_change_after_admission_stays_live(monkeypatch):
         assert after.get("absent") == "changed-default"
 
 
-@pytest.mark.parametrize("name,overrides", (
-    ("get", {"KeyError": ValueError}),
-    ("getitem", {"KeyError": ValueError}),
-    ("iter", {"list": lambda value: [b"ALT"]}),
-    ("copy", {"dict": lambda value: {"changed": "1"}}),
-    ("encode", {"str": bytes}),
-))
+@pytest.mark.parametrize(
+    "name,overrides",
+    (
+        ("get", {"KeyError": ValueError}),
+        ("getitem", {"KeyError": ValueError}),
+        ("iter", {"list": lambda value: [b"ALT"]}),
+        ("copy", {"dict": lambda value: {"changed": "1"}}),
+        ("encode", {"str": bytes}),
+    ),
+)
 def test_equal_frozen_code_with_foreign_globals_is_not_admitted(monkeypatch, name, overrides):
     with monkeypatch.context() as patch:
         module, private, _ = _isolated_snapshot(patch, (name, overrides))
@@ -195,18 +224,22 @@ def test_custom_mapping_and_getter_keep_live_semantics(monkeypatch):
     try:
         with monkeypatch.context() as patch:
             patch.setenv("TRITON_MSL_FA_FAST", "1")
-            patch.setattr(original, "get", lambda key, default=None:
-                          "0" if key == "TRITON_MSL_FA_FAST" else prior(key, default))
+            patch.setattr(
+                original, "get", lambda key, default=None: "0" if key == "TRITON_MSL_FA_FAST" else prior(key, default)
+            )
             assert environment.environment_snapshot() is original
             assert cache.effective_policy()["FA_FAST"] is False
             patch.setattr(original, "get", MethodType(environment._get, {"TRITON_MSL_FA_FAST": "0"}))
             assert environment.environment_snapshot() is original
             assert cache.effective_policy()["FA_FAST"] is False
+
             class PretendMethod:
                 __func__ = environment._get
                 __self__ = original
+
                 def __call__(self, key, default=None):
                     return "0" if key == "TRITON_MSL_FA_FAST" else prior(key, default)
+
             patch.setattr(original, "get", PretendMethod())
             assert environment.environment_snapshot() is original
             assert cache.effective_policy()["FA_FAST"] is False
@@ -230,14 +263,18 @@ def test_policy_copy_and_same_mapping_changes_cannot_stale(monkeypatch):
         monkeypatch.setenv("TRITON_MSL_FA_FAST", "0")
         assert cache.effective_policy()["FA_FAST"] is False  # Prime ordinary bytes.
         state = ["0"]
+
         class PretendBytes(type):
             def __hash__(cls):
                 return hash(bytes)
+
             def __eq__(cls, other):
                 return other is bytes or type.__eq__(cls, other)
+
         class EncodedValue(bytes, metaclass=PretendBytes):
             def decode(self, *args, **kwargs):
                 return state[0]
+
         monkeypatch.setitem(os.environb, b"TRITON_MSL_FA_FAST", EncodedValue(b"0"))
         assert environment.environment_snapshot() is os.environ
         assert cache.effective_policy()["FA_FAST"] is False
@@ -266,28 +303,40 @@ def test_preimport_overrides_are_not_certified_as_standard(monkeypatch):
                 original = type(os.environ).get
                 if "get" in vars(os.environ):
                     patch.delattr(os.environ, "get")
-                patch.setattr(type(os.environ), "get", lambda self, key, default=None:
-                              "snapshot-altered" if key == "SNAPSHOT_PREIMPORT_WITNESS"
-                              else original(self, key, default))
+                patch.setattr(
+                    type(os.environ),
+                    "get",
+                    lambda self, key, default=None: "snapshot-altered"
+                    if key == "SNAPSHOT_PREIMPORT_WITNESS"
+                    else original(self, key, default),
+                )
             elif mode == "getitem":
                 original = type(os.environ).__getitem__
-                patch.setattr(type(os.environ), "__getitem__", lambda self, key:
-                              "snapshot-altered" if key == "SNAPSHOT_PREIMPORT_WITNESS"
-                              else original(self, key))
+                patch.setattr(
+                    type(os.environ),
+                    "__getitem__",
+                    lambda self, key: "snapshot-altered"
+                    if key == "SNAPSHOT_PREIMPORT_WITNESS"
+                    else original(self, key),
+                )
             elif mode == "codec":
                 original = os.environ.decodevalue
-                patch.setattr(os.environ, "decodevalue", lambda value:
-                              "snapshot-altered" if value == b"snapshot-original" else original(value))
+                patch.setattr(
+                    os.environ,
+                    "decodevalue",
+                    lambda value: "snapshot-altered" if value == b"snapshot-original" else original(value),
+                )
             else:
                 original = os.environ.encodekey
                 if not hasattr(original, "__code__") or not original.__closure__:
                     # No recognized codec optimization exists in this context.
                     assert environment.environment_snapshot() is os.environ
                     continue
+
                 def cell(value):
                     return (lambda: value).__closure__[0]
-                borrowed = FunctionType(original.__code__, original.__globals__,
-                                        closure=(cell("utf-16"),))
+
+                borrowed = FunctionType(original.__code__, original.__globals__, closure=(cell("utf-16"),))
                 patch.setattr(os.environ, "encodekey", borrowed)
                 expected = None  # The altered key codec cannot find the UTF-8 key.
             spec = importlib.util.spec_from_file_location("snapshot_preimport_probe", environment.__file__)
@@ -307,6 +356,7 @@ def test_decode_uses_private_copy_even_when_live_values_change_and_return(monkey
     monkeypatch.setenv("TRITON_MSL_FA_FAST", "0")
     monkeypatch.setattr(environment, "_cached", None)
     events = []
+
     def trace(frame, event, arg):
         if frame.f_code is environment.environment_snapshot.__code__ and event == "line":
             if "raw" in frame.f_locals and "values" not in frame.f_locals and not events:
@@ -316,6 +366,7 @@ def test_decode_uses_private_copy_even_when_live_values_change_and_return(monkey
                 os.environ["TRITON_MSL_FA_FAST"] = "0"
                 events.append("restored-after-decode")
         return trace
+
     previous_trace = sys.gettrace()
     try:
         sys.settrace(trace)

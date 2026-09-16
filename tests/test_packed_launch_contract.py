@@ -3,6 +3,7 @@
 Independent literal record builder permits running the same pins before the
 producer/consumer contract exists. These are CPU boundary witnesses, not GPU math.
 """
+
 import json
 from types import SimpleNamespace
 
@@ -12,9 +13,20 @@ from triton.backends.compiler import GPUTarget
 from triton_msl.backend import _cache_contract as contract, compiler, driver
 from triton_msl.errors import MetalNonRecoverableError
 
-FIELDS = ("num_warps", "num_ctas", "shared", "block_size", "output_arg_indices",
-          "needs_2d_grid", "mm_two_kernel", "fast_matmul", "quant_matmul",
-          "flash_attention", "batched_dot_bounds", "device_assert")
+FIELDS = (
+    "num_warps",
+    "num_ctas",
+    "shared",
+    "block_size",
+    "output_arg_indices",
+    "needs_2d_grid",
+    "mm_two_kernel",
+    "fast_matmul",
+    "quant_matmul",
+    "flash_attention",
+    "batched_dot_bounds",
+    "device_assert",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -29,24 +41,35 @@ def controlled_dependencies(monkeypatch, tmp_path):
 
 
 def _stamp():
-    return json.dumps({"schema": 1, "source": contract.source_contract(),
-                       "toolchain": contract.toolchain_identity()},
-                      sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        {"schema": 1, "source": contract.source_contract(), "toolchain": contract.toolchain_identity()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _metadata():
     data = dict(zip(FIELDS, (4, 1, 0, 128, [1], False, None, None, None, None, None, None)))
     data.update(name="packed_contract", execution_contract=_stamp())
     data["launch_contract"] = json.dumps(
-        {"schema": 2, "kind": "metal-packed-launch", "name": data["name"],
-         "execution_contract": data["execution_contract"], "fields": {f: data[f] for f in FIELDS}},
-        sort_keys=True, separators=(",", ":"), allow_nan=False)
+        {
+            "schema": 2,
+            "kind": "metal-packed-launch",
+            "name": data["name"],
+            "execution_contract": data["execution_contract"],
+            "fields": {f: data[f] for f in FIELDS},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return SimpleNamespace(**data)
 
 
 def _launcher(metadata):
-    src = SimpleNamespace(constants={}, signature={"X": "*fp32", "O": "*fp32"},
-                          fn=SimpleNamespace(arg_names=["X", "O"]))
+    src = SimpleNamespace(
+        constants={}, signature={"X": "*fp32", "O": "*fp32"}, fn=SimpleNamespace(arg_names=["X", "O"])
+    )
     return driver.MetalLauncher(src, metadata)
 
 
@@ -58,13 +81,20 @@ def test_restored_metadata_missing_any_packed_field_refuses(field):
         compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32)).pack_metadata(metadata)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("name", "other_kernel"), ("block_size", 256), ("output_arg_indices", []),
-    ("needs_2d_grid", True), ("num_ctas", True), ("shared", 4096),
-    ("flash_attention", ["flash_attention", "wrong shader", 1024]),
-    ("batched_dot_bounds", {"new": "unproved bounds"}),
-    ("device_assert", {'schema': 1, 'messages': ['altered'], 'buffer_index': 2}),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("name", "other_kernel"),
+        ("block_size", 256),
+        ("output_arg_indices", []),
+        ("needs_2d_grid", True),
+        ("num_ctas", True),
+        ("shared", 4096),
+        ("flash_attention", ["flash_attention", "wrong shader", 1024]),
+        ("batched_dot_bounds", {"new": "unproved bounds"}),
+        ("device_assert", {"schema": 1, "messages": ["altered"], "buffer_index": 2}),
+    ],
+)
 def test_restored_descriptor_change_refuses_before_stash(field, value, monkeypatch):
     metadata = _metadata()
     setattr(metadata, field, value)
@@ -103,10 +133,13 @@ def test_current_packed_descriptor_reaches_runtime(monkeypatch):
     metadata = _metadata()
     launcher = _launcher(metadata)
     packed = compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32)).pack_metadata(metadata)
+
     class ReachedRuntime(Exception):
         pass
+
     def runtime():
         raise ReachedRuntime
+
     monkeypatch.setattr(driver, "_get_utils", runtime)
     with pytest.raises(ReachedRuntime):
         pointer = SimpleNamespace(data_ptr=lambda: 0)
@@ -115,6 +148,7 @@ def test_current_packed_descriptor_reaches_runtime(monkeypatch):
 
 def test_checked_snapshot_cannot_be_changed_through_caller_aliases():
     from triton_msl.backend import _launch_contract
+
     metadata = _metadata()
     expected = _launch_contract.validate_launch_metadata(metadata)
     packed = [getattr(metadata, f) for f in FIELDS]
@@ -127,5 +161,6 @@ def test_checked_snapshot_cannot_be_changed_through_caller_aliases():
 @pytest.mark.parametrize("container", [None, (), "legacy", 1])
 def test_unknown_metadata_container_refuses(container):
     from triton_msl.backend import _launch_contract
+
     with pytest.raises(MetalNonRecoverableError, match="packed launch contract"):
         _launch_contract.validate_launch_metadata(container)

@@ -35,8 +35,7 @@ def _require_mps(name, tensor):
 
 def _state_layout_injective(state):
     """Prove positive-stride indices occupy distinct storage locations."""
-    dimensions = sorted((stride, size) for size, stride in zip(state.shape, state.stride())
-                        if size > 1)
+    dimensions = sorted((stride, size) for size, stride in zip(state.shape, state.stride()) if size > 1)
     span = 1
     for stride, size in dimensions:
         if stride < span:
@@ -149,9 +148,10 @@ def kda_decode_step(q, k, v, a, beta, S):
     if not _state_layout_injective(S):
         raise ValueError("S state layout cannot be proven non-overlapping")
     readonly = (q, k, v, a, beta)
-    prepared = [tensor.clone(memory_format=torch.contiguous_format)
-                if torch._C._overlaps(S, tensor) else tensor.contiguous()
-                for tensor in readonly]
+    prepared = [
+        tensor.clone(memory_format=torch.contiguous_format) if torch._C._overlaps(S, tensor) else tensor.contiguous()
+        for tensor in readonly
+    ]
     rt, lib = _decode_kernel()
     out = torch.empty(ZH, D, device=q.device, dtype=torch.float32)
     state = S if S.is_contiguous() else S.contiguous()

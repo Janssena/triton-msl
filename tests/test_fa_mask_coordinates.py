@@ -71,14 +71,36 @@ def _st(t):
 
 
 if HAS:
-
     # ------------------------------------------------------------------ dense simd
     @triton.jit
     def _fa_mask_coordinate(
-        Q, K, V, Out,
-        qz, qh, qm, qk_, kz, kh, kn, kk, vz, vh, vn, vk, oz, oh, om, ok_,
-        Z, H, N_CTX,
-        BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr, MODE: tl.constexpr,
+        Q,
+        K,
+        V,
+        Out,
+        qz,
+        qh,
+        qm,
+        qk_,
+        kz,
+        kh,
+        kn,
+        kk,
+        vz,
+        vh,
+        vn,
+        vk,
+        oz,
+        oh,
+        om,
+        ok_,
+        Z,
+        H,
+        N_CTX,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        D: tl.constexpr,
+        MODE: tl.constexpr,
     ):
         """GPT's 111 harness (modes 0-4) + two positives: 5 = boundary mask with NO ``other``,
         6 = K and V masked at their own column boundary."""
@@ -134,10 +156,31 @@ if HAS:
     # ------------------------------------------------------------------ varlen
     @triton.jit
     def _varlen_mask(
-        Q, K, V, Out, CUQ, CUK,
-        sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
-        H, MAXS,
-        SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr, MODE: tl.constexpr,
+        Q,
+        K,
+        V,
+        Out,
+        CUQ,
+        CUK,
+        sqt,
+        sqh,
+        sqd,
+        skt,
+        skh,
+        skd,
+        svt,
+        svh,
+        svd,
+        sot,
+        soh,
+        sod,
+        H,
+        MAXS,
+        SCALE: tl.constexpr,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        D: tl.constexpr,
+        MODE: tl.constexpr,
     ):
         """GPT's 111 varlen harness (modes 0-2) + V value mask (3), Out store value mask (4),
         Out store UNMASKED (5), Q mask bound = seqlen_k (6)."""
@@ -193,15 +236,48 @@ if HAS:
     # ------------------------------------------------------------------ biased (trifast)
     @triton.jit
     def _biased_mask(
-        o_ptr, o_sz, o_sh, o_sm, o_sk,
-        lse_ptr, lse_sz, lse_sh, lse_sm,
-        q_ptr, q_sz, q_sh, q_sm, q_sk,
-        k_ptr, k_sz, k_sh, k_sn, k_sk,
-        v_ptr, v_sz, v_sh, v_sn, v_sk,
-        b_ptr, b_sz, b_sh, b_sm, b_sn,
-        mask_ptr, m_sz, m_sh, m_sn,
-        sm_scale, neg_inf, Z, H, N,
-        DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, MODE: tl.constexpr,
+        o_ptr,
+        o_sz,
+        o_sh,
+        o_sm,
+        o_sk,
+        lse_ptr,
+        lse_sz,
+        lse_sh,
+        lse_sm,
+        q_ptr,
+        q_sz,
+        q_sh,
+        q_sm,
+        q_sk,
+        k_ptr,
+        k_sz,
+        k_sh,
+        k_sn,
+        k_sk,
+        v_ptr,
+        v_sz,
+        v_sh,
+        v_sn,
+        v_sk,
+        b_ptr,
+        b_sz,
+        b_sh,
+        b_sm,
+        b_sn,
+        mask_ptr,
+        m_sz,
+        m_sh,
+        m_sn,
+        sm_scale,
+        neg_inf,
+        Z,
+        H,
+        N,
+        DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        MODE: tl.constexpr,
     ):
         """tests/test_fa_biased_routing.py::_biased_fa (trifast's forward spelling) with ONE
         memory boundary varied per MODE: 1 Q value mask, 2 K value mask, 3 V value mask,
@@ -332,7 +408,9 @@ def _run_dense(mode):
 
 
 @requires_gpu
-@pytest.mark.parametrize("mode,label", [(0, "canonical row boundary"), (5, "row boundary, no other"), (6, "K/V column boundary")])
+@pytest.mark.parametrize(
+    "mode,label", [(0, "canonical row boundary"), (5, "row boundary, no other"), (6, "K/V column boundary")]
+)
 def test_dense_exact_boundary_masks_route_and_match(cold_gpu_caches, fa_spy, mode, label):
     state, q, k, v, out = _run_dense(mode)
     assert state == "computed", label
@@ -372,8 +450,8 @@ def _varlen_oracle(q, k, v, cuq, cuk, mode, sentinel):
         qb, kb, vb = q[:, hh].float().clone(), k[:, hh].float().clone(), v[:, hh].float().clone()
         q_valid = 16 if mode == 1 else (klen if mode == 6 else qlen)
         qb[q_valid:].zero_()
-        kb[(16 if mode == 2 else klen):].zero_()
-        vb[(16 if mode == 3 else klen):].zero_()
+        kb[(16 if mode == 2 else klen) :].zero_()
+        vb[(16 if mode == 3 else klen) :].zero_()
         s = (qb @ kb.transpose(0, 1)) / (d**0.5)
         s[:, klen:] = float("-inf")
         o = torch.softmax(s, dim=-1) @ vb
@@ -488,8 +566,29 @@ def _run_biased(mode):
     st = lambda t: tuple(t.stride())
     try:
         _biased_mask[(N // 32, Z * H)](
-            o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v), b, *st(b), mask, *st(mask),
-            sm, -1e9, Z, H, N, DIM, 32, 32, mode,
+            o,
+            *st(o),
+            lse,
+            *st(lse),
+            q,
+            *st(q),
+            k,
+            *st(k),
+            v,
+            *st(v),
+            b,
+            *st(b),
+            mask,
+            *st(mask),
+            sm,
+            -1e9,
+            Z,
+            H,
+            N,
+            DIM,
+            32,
+            32,
+            mode,
         )
         torch.mps.synchronize()
         state = "computed"

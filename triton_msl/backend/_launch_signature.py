@@ -3,6 +3,7 @@
 This is not yet the full dynamic argument/pipeline certificate. Pointer storage,
 tuple-copyback mapping and pre-hook validation are separate consumers to audit.
 """
+
 import struct
 from collections import namedtuple
 from types import MappingProxyType
@@ -31,22 +32,30 @@ def ordered_source_signature(src):
     fn = getattr(src, "fn", None)
     if fn is not None and hasattr(fn, "arg_names"):
         original = list(fn.arg_names)
-        if (len(set(original)) != len(original)
-                or any(type(k) is not str or k not in original for k in signature)):
+        if len(set(original)) != len(original) or any(type(k) is not str or k not in original for k in signature):
             _refuse("AST signature does not match the declared parameter names")
         # JIT signatures include constexpr entries; direct ASTSource signatures
         # may omit them. Do not insert an omitted parameter into runtime positions.
         names = [name for name in original if name in signature]
     else:
-        if (any(type(k) is not int for k in signature)
-                or sorted(signature) != list(range(len(signature)))):
+        if any(type(k) is not int for k in signature) or sorted(signature) != list(range(len(signature))):
             _refuse("IRSource positions must be dense integers starting at zero")
         names = list(range(len(signature)))
     return names, {name: _canonical_type(signature[name]) for name in names}
 
 
-_INTEGER = {"i1": "?", "u1": "?", "i8": "b", "u8": "B", "i16": "h", "u16": "H",
-            "i32": "i", "u32": "I", "i64": "q", "u64": "Q"}
+_INTEGER = {
+    "i1": "?",
+    "u1": "?",
+    "i8": "b",
+    "u8": "B",
+    "i16": "h",
+    "u16": "H",
+    "i32": "i",
+    "u32": "I",
+    "i64": "q",
+    "u64": "Q",
+}
 
 
 def scalar_bytes(value, declared_type):
@@ -63,6 +72,7 @@ def scalar_bytes(value, declared_type):
             if ty == "bf16":
                 # Preserve the existing host bf16 rounding/NaN behavior.
                 import torch
+
                 bits = torch.tensor([value], dtype=torch.float32).to(torch.bfloat16).view(torch.int16).item()
                 return struct.pack("<h", bits)
             return struct.pack("<" + ("e" if ty == "fp16" else "f"), value)
@@ -92,6 +102,7 @@ def bind_arguments(args, names, signature, *, _plan=None):
         ty = signature[name]
         if type(ty) is not str:
             if bind is None:
+
                 def bind(value, ty, origin):
                     if isinstance(ty, tuple):
                         if not isinstance(value, tuple) or len(value) != len(ty):
@@ -110,8 +121,9 @@ def bind_arguments(args, names, signature, *, _plan=None):
                     else:
                         packing = packers.get(ty) if packers is not None and type(ty) is str else None
                         value_type = type(value)
-                        if packing is not None and (value_type is int or value_type is bool
-                                                    or (packing[0] and value_type is float)):
+                        if packing is not None and (
+                            value_type is int or value_type is bool or (packing[0] and value_type is float)
+                        ):
                             if ty in ("i1", "u1") and value not in (0, 1):
                                 _refuse(f"{ty} requires a representable integer value")
                             try:
@@ -126,6 +138,7 @@ def bind_arguments(args, names, signature, *, _plan=None):
                     types.append(ty)
                     origins.append(origin)
                     payloads.append(payload)
+
             bind(value, ty, index)
             continue
         if ty == "constexpr":
@@ -139,8 +152,9 @@ def bind_arguments(args, names, signature, *, _plan=None):
         else:
             packing = packers.get(ty) if packers is not None and type(ty) is str else None
             value_type = type(value)
-            if packing is not None and (value_type is int or value_type is bool
-                                        or (packing[0] and value_type is float)):
+            if packing is not None and (
+                value_type is int or value_type is bool or (packing[0] and value_type is float)
+            ):
                 if ty in ("i1", "u1") and value not in (0, 1):
                     _refuse(f"{ty} requires a representable integer value")
                 try:
@@ -197,6 +211,7 @@ def _select_binder_native():
     from importlib import import_module
     from importlib.util import find_spec
     import sys
+
     name = __package__ + "._binder_native"
     if name not in sys.modules and find_spec(name) is None:
         return None

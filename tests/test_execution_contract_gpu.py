@@ -1,4 +1,5 @@
 """Real resident-JIT policy transitions; no cross-version upgrade claim."""
+
 import pytest
 import torch
 import triton
@@ -41,9 +42,11 @@ def test_live_policy_change_recompiles_only_own_jit_and_preserves_user_hook(cold
     x, y = cold
     calls, events = [], []
     real = compiler.MetalBackend.make_msl
+
     def emit(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
+
     monkeypatch.setattr(compiler.MetalBackend, "make_msl", staticmethod(emit))
     user_hook = lambda *a, **kw: events.append("user")
     _resident_add.add_pre_run_hook(user_hook)
@@ -72,12 +75,26 @@ def test_direct_old_resident_handle_refuses_before_launch_hook_or_write(cold, mo
     torch.mps.synchronize()
     monkeypatch.setenv("TRITON_MSL_INFER_LAYOUT", "0")
     events = []
+
     def forbidden_runtime():
         pytest.fail("stale direct handle reached runtime access")
+
     monkeypatch.setattr(driver, "_get_utils", forbidden_runtime)
     with pytest.raises(MetalNonRecoverableError, match="execution contract"):
-        first.run(1, 1, 1, None, first.function, first.packed_metadata, None,
-                  lambda _: events.append("launch-enter"), None, x, y, 32)
+        first.run(
+            1,
+            1,
+            1,
+            None,
+            first.function,
+            first.packed_metadata,
+            None,
+            lambda _: events.append("launch-enter"),
+            None,
+            x,
+            y,
+            32,
+        )
     torch.mps.synchronize()
     assert events == []
     torch.testing.assert_close(y, torch.full_like(y, -99), rtol=0, atol=0)

@@ -1848,8 +1848,10 @@ def _fa_scale_chain_expr(expr, scale_chain, round_q):
         if target == "half":
             expr = f"float(half({expr}))"
         else:
-            expr = (f"(isnan({expr}) ? {expr} : as_type<float>((as_type<uint>({expr}) + "
-                    f"0x7FFFu + ((as_type<uint>({expr}) >> 16u) & 1u)) & 0xFFFF0000u))")
+            expr = (
+                f"(isnan({expr}) ? {expr} : as_type<float>((as_type<uint>({expr}) + "
+                f"0x7FFFu + ((as_type<uint>({expr}) >> 16u) & 1u)) & 0xFFFF0000u))"
+            )
     return expr
 
 
@@ -1860,21 +1862,24 @@ def _fa_source_tail_guard(source_kv_block, staging_block):
     is guarded by the first disjunct; unlike ceil(N/B)*B, it does not overflow at
     the length boundary. Defaults on all other maker callers remain unchanged.
     """
-    if (type(source_kv_block) is not int or source_kv_block <= 0
-            or staging_block % source_kv_block != 0):
+    if type(source_kv_block) is not int or source_kv_block <= 0 or staging_block % source_kv_block != 0:
         raise ValueError("source KV block must be a positive divisor of the staging block")
     b = source_kv_block
-    return (f"((kv_row < N_CTX) || (kv_row - N_CTX < (({b}u - N_CTX % {b}u) % {b}u)))"
-            f" /* source KV tail: {b} */")
+    return f"((kv_row < N_CTX) || (kv_row - N_CTX < (({b}u - N_CTX % {b}u) % {b}u))) /* source KV tail: {b} */"
 
 
 def _fa_initial_values(values, source_kv_block):
     """Finite f32 numerator/denominator initializers, opt-in from the dense proof."""
     import math
+
     if values is None:
         return "0.0f", "0.0f"
-    if (source_kv_block is None or not isinstance(values, tuple) or len(values) != 2
-            or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
+    if (
+        source_kv_block is None
+        or not isinstance(values, tuple)
+        or len(values) != 2
+        or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
+    ):
         raise ValueError("attention initial values require the proved dense source and two finite constants")
     return tuple(f"{float(v)!r}f" for v in values)
 
@@ -1967,9 +1972,9 @@ def make_flash_attention_kernel_simdgroup(
     # path Dv==D so retain its existing text; asymmetric callers need the V
     # width, not the QK contraction width, at all three memory boundaries.
     _v_bound = "D" if Dv == D else f"{Dv}u"
-    _ct_off = f"(ct*8u < {_v_bound} ? ct*8u : 0u)" if need_ct_guard else "ct*8u"   # full V-load clamp
-    _ct_tail_g = f" && (ct*8u + cc < {_v_bound})" if need_ct_guard else ""          # tail V-staging value
-    _ct_store_g = f" && (dc2 < {_v_bound})" if need_ct_guard else ""                # final store value
+    _ct_off = f"(ct*8u < {_v_bound} ? ct*8u : 0u)" if need_ct_guard else "ct*8u"  # full V-load clamp
+    _ct_tail_g = f" && (ct*8u + cc < {_v_bound})" if need_ct_guard else ""  # tail V-staging value
+    _ct_store_g = f" && (dc2 < {_v_bound})" if need_ct_guard else ""  # final store value
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(D))
     if out_dtype in ("fp16", "f16"):
         elem, store_cast = "half", lambda e: f"half({e})"
@@ -2064,10 +2069,12 @@ def make_flash_attention_kernel_simdgroup(
     bind_lines = "\n".join(f"    const uint {nm} = {bindings[nm]};" for nm in _LOGICAL)
 
     # ---- biased/3-D helper strings (interpolated as VALUES -> single braces) ----
-    _scale_value = bindings['scale'] if runtime_scale else f"{SCALE!r}f"
+    _scale_value = bindings["scale"] if runtime_scale else f"{SCALE!r}f"
     scale_decl = f"const float scale = {_fa_scale_chain_expr(_scale_value, scale_chain, round_q)};"
     if round_q:
-        scale_decl += "\n    const float s_scale = 1.0f;  // packet 164: the scale is applied to Q in the source's dtype"
+        scale_decl += (
+            "\n    const float s_scale = 1.0f;  // packet 164: the scale is applied to Q in the source's dtype"
+        )
     if runtime_neg_inf:
         if not bindings or "neg_inf" not in bindings:
             raise ValueError("simd FA: runtime_neg_inf requires bindings['neg_inf']")
@@ -2119,12 +2126,19 @@ def make_flash_attention_kernel_simdgroup(
     # separate constant so the fp32 path stays byte-identical). round_p: round P before P @ V.
     _q_raw = "Q[q_base + qr*q_sm + (i%D)*q_sk]"
     # (elem == round_q on the half maker: one conversion rounds and stages)
-    _q_stage = (f"{round_q}(float({_q_raw}) * float({round_q}(scale)))" if elem == round_q
-                else f"{elem}({round_q}(float({_q_raw}) * float({round_q}(scale))))") if round_q else _q_raw
+    _q_stage = (
+        (
+            f"{round_q}(float({_q_raw}) * float({round_q}(scale)))"
+            if elem == round_q
+            else f"{elem}({round_q}(float({_q_raw}) * float({round_q}(scale))))"
+        )
+        if round_q
+        else _q_raw
+    )
     _s_scale = "s_scale" if round_q else "scale"
     if elem == "half":
         p_buffers = f"    threadgroup half tgP[{BM} * {BN}];\n    threadgroup {acc_buf} on_scratch[{n_groups} * 64];"
-        p_write, p_src = "tgP[r*BN+cj] = half(p);", "tgP"      # fp16 P is rounded by construction (== round_p 'half')
+        p_write, p_src = "tgP[r*BN+cj] = half(p);", "tgP"  # fp16 P is rounded by construction (== round_p 'half')
         p_zero = "tgP[pr*BN+cj] = half(0.0f);"
         if round_p == "bfloat":
             raise ValueError("bf16 P rounding on the half simdgroup maker is not a source shape")
@@ -2133,8 +2147,7 @@ def make_flash_attention_kernel_simdgroup(
         p_write, p_src = (f"tg_S[r*BN+cj] = float({round_p}(p));" if round_p else "tg_S[r*BN+cj] = p;"), "tg_S"
         p_zero = "tg_S[pr*BN+cj] = 0.0f;"
     _score_store_update = (
-        "                tg_S[pr*BN+cj] = s;\n"
-        "                pm = (isnan(pm) || isnan(s)) ? NAN : max(pm, s);"
+        "                tg_S[pr*BN+cj] = s;\n                pm = (isnan(pm) || isnan(s)) ? NAN : max(pm, s);"
         if runtime_neg_inf
         else "                tg_S[pr*BN+cj] = s; pm = max(pm, s);"
     )
@@ -2209,8 +2222,11 @@ def make_flash_attention_kernel_simdgroup(
     if source_causal_stop is not None and (_source_tail is None or type(source_causal_stop) is not bool):
         raise ValueError("source loop stop requires a proved dense source block")
     _stop = "source_kv_stop" if source_causal_stop else "N_CTX"
-    _visited = (_source_tail.replace("N_CTX", _stop).replace("kv_row", "kvr")
-                .replace("source KV tail:", "source KV visit:") if _source_tail else None)
+    _visited = (
+        _source_tail.replace("N_CTX", _stop).replace("kv_row", "kvr").replace("source KV tail:", "source KV visit:")
+        if _source_tail
+        else None
+    )
     _k_tail = _visited if "K" in unmasked_kv else "(kvr < N_CTX)"
     _v_tail = _visited if "V" in unmasked_kv else "kvr < N_CTX"
     if source_causal_stop:
@@ -2250,7 +2266,9 @@ def make_flash_attention_kernel_simdgroup(
                 "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "            for (uint e = lid; e < %(BN)du*%(Dct)du; e += NT) {\n"
                 "                uint rr = e / %(Dct)du, cc = e %% %(Dct)du; uint kvr = kv_start + rr;\n"
-                "                tgKV[rr*%(Dct)du + cc] = " + _k_tail + " ? K[k_base + kvr*k_sn + (kc+cc)*k_sk] : %(elem)s(0);\n"
+                "                tgKV[rr*%(Dct)du + cc] = "
+                + _k_tail
+                + " ? K[k_base + kvr*k_sn + (kc+cc)*k_sk] : %(elem)s(0);\n"
                 "            }\n"
                 "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "            simdgroup_load(kf, tgKV + (sgitg*8u)*%(Dct)du, %(Dct)du, 0, true);\n"
@@ -2259,7 +2277,9 @@ def make_flash_attention_kernel_simdgroup(
         if mode == "full":
             vload = (
                 "            for (uint kk=0u;kk<BN;kk+=8u)\n"
-                "                simdgroup_load(vfs[kk/8u], V + v_base + (kv_start + kk)*v_sn + (" + _ct_off + ")*v_sk, v_sn);"
+                "                simdgroup_load(vfs[kk/8u], V + v_base + (kv_start + kk)*v_sn + ("
+                + _ct_off
+                + ")*v_sk, v_sn);"
             )
         else:
             vload = (
@@ -2267,7 +2287,10 @@ def make_flash_attention_kernel_simdgroup(
                 "                threadgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "                for (uint e = lid%%32u; e < 64u; e += 32u) {\n"
                 "                    uint rr = e / 8u, cc = e %% 8u; uint kvr = kv_start + kk + rr;\n"
-                "                    tgKV[sgitg*64u + rr*8u + cc] = (" + _v_tail + _ct_tail_g + ") ? V[v_base + kvr*v_sn + (ct*8u + cc)*v_sk] : %(elem)s(0);\n"
+                "                    tgKV[sgitg*64u + rr*8u + cc] = ("
+                + _v_tail
+                + _ct_tail_g
+                + ") ? V[v_base + kvr*v_sn + (ct*8u + cc)*v_sk] : %(elem)s(0);\n"
                 "                }\n"
                 "                simdgroup_barrier(mem_flags::mem_threadgroup);\n"
                 "                simdgroup_load(vfs[kk/8u], tgKV + sgitg*64u, 8u);\n"
@@ -2371,12 +2394,10 @@ def make_flash_attention_kernel_simdgroup(
     # is present.  Plain/MLA routes cannot form an empty masked row; a
     # nonfinite denominator there necessarily came from source data.
     _preserve_nonfinite = runtime_neg_inf or not bias
-    _normalized = f"{acc_buf}(on_scratch[sgitg*64u+e] * {acc_buf}((tg_l[rb*8u+dr]>0.0f) ? (1.0f/tg_l[rb*8u+dr]) : 0.0f))"
-    _final_value = (
-        f"!isfinite(tg_l[rb*8u+dr]) ? NAN : {_normalized}"
-        if _preserve_nonfinite
-        else _normalized
+    _normalized = (
+        f"{acc_buf}(on_scratch[sgitg*64u+e] * {acc_buf}((tg_l[rb*8u+dr]>0.0f) ? (1.0f/tg_l[rb*8u+dr]) : 0.0f))"
     )
+    _final_value = f"!isfinite(tg_l[rb*8u+dr]) ? NAN : {_normalized}" if _preserve_nonfinite else _normalized
     final_store = (
         "            simdgroup_store(o[rb][t], on_scratch + sgitg*64u, 8u);\n"
         "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -2437,7 +2458,7 @@ kernel void {kernel_name}(
     threadgroup {elem} tgKV[{BN} * {Dc_tail}u];
 
     {acc_frag} o[4][TPG];
-    for (uint rb=0u;rb<4u;rb++) for (uint t=0u;t<TPG;t++) o[rb][t]={acc_frag}({acc_zero if _initial_acc == '0.0f' else _initial_acc});
+    for (uint rb=0u;rb<4u;rb++) for (uint t=0u;t<TPG;t++) o[rb][t]={acc_frag}({acc_zero if _initial_acc == "0.0f" else _initial_acc});
 
     for (uint i = lid; i < BM*D; i += NT) {{
         uint qr = q_start + i/D;
@@ -2551,8 +2572,11 @@ def make_flash_attention_bwd_kv_kernel(
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
     # packet 174: the source's rounding points (None = fp32 source, text unchanged).
     _rd = lambda t: (lambda e: f"float({t}({e}))") if t else (lambda e: e)
-    _scale_r = ("(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
-                if round_k == "bfloat" else f"float({round_k}(scale))")
+    _scale_r = (
+        "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
+        if round_k == "bfloat"
+        else f"float({round_k}(scale))"
+    )
     _k_stage = (lambda e: f"float({round_k}(float({e}) * {_scale_r}))") if round_k else (lambda e: f"float({e})")
     _s_scaled = "s" if round_k else "s*scale"
     _p_rd, _ds_rd = _rd(round_p), _rd(round_ds)
@@ -2563,24 +2587,56 @@ def make_flash_attention_bwd_kv_kernel(
     KS = _bwd_kv_subtile_size(D, BJ, BK)
     if KS is None:
         raise ValueError(
-            f"bwd_kv: head_dim={D} too large to tile within 32 KB / 1024 threads "
-            f"(BLOCK_J={BJ}, BLOCK_K={BK})")
+            f"bwd_kv: head_dim={D} too large to tile within 32 KB / 1024 threads (BLOCK_J={BJ}, BLOCK_K={BK})"
+        )
     TPG = KS * D
     _LOGICAL = [
-        "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-        "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
-        "mask_sz", "mask_sh", "mask_sn", "lse_sz", "lse_sh", "lse_sm",
-        "dlt_sz", "dlt_sh", "dlt_sm", "do_sz", "do_sh", "do_sm", "do_sk",
-        "dk_sz", "dk_sh", "dk_sn", "dk_sk", "dv_sz", "dv_sh", "dv_sn", "dv_sk",
-        "H", "N_CTX", "scale",
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "b_sz",
+        "b_sh",
+        "b_sm",
+        "b_sn",
+        "mask_sz",
+        "mask_sh",
+        "mask_sn",
+        "lse_sz",
+        "lse_sh",
+        "lse_sm",
+        "dlt_sz",
+        "dlt_sh",
+        "dlt_sm",
+        "do_sz",
+        "do_sh",
+        "do_sm",
+        "do_sk",
+        "dk_sz",
+        "dk_sh",
+        "dk_sn",
+        "dk_sk",
+        "dv_sz",
+        "dv_sh",
+        "dv_sn",
+        "dv_sk",
+        "H",
+        "N_CTX",
+        "scale",
     ]
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
         raise ValueError(f"bwd_kv bindings missing {missing}")
     sig = ",\n".join(arg_decls)
-    bind_lines = "\n".join(
-        f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale"
-    )
+    bind_lines = "\n".join(f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale")
     scale_decl = f"const float scale = {bindings['scale']};"
     if runtime_neg_inf:
         # packet 134: the source applies ONE sentinel to masked / out-of-range score
@@ -2776,8 +2832,11 @@ def make_flash_attention_bwd_kv_kernel_simd(
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
     # packet 174: the source's rounding points (None = fp32 source, text unchanged).
     _rd = lambda t: (lambda e: f"float({t}({e}))") if t else (lambda e: e)
-    _scale_r = ("(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
-                if round_k == "bfloat" else f"float({round_k}(scale))")
+    _scale_r = (
+        "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
+        if round_k == "bfloat"
+        else f"float({round_k}(scale))"
+    )
     _k_stage = (lambda e: f"float({round_k}(float({e}) * {_scale_r}))") if round_k else (lambda e: f"float({e})")
     _s_scaled = "s" if round_k else "s*scale"
     _p_rd, _ds_rd = _rd(round_p), _rd(round_ds)
@@ -2804,20 +2863,52 @@ def make_flash_attention_bwd_kv_kernel_simd(
     TPG = 128  # NG=4 simdgroups
 
     _LOGICAL = [
-        "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-        "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
-        "mask_sz", "mask_sh", "mask_sn", "lse_sz", "lse_sh", "lse_sm",
-        "dlt_sz", "dlt_sh", "dlt_sm", "do_sz", "do_sh", "do_sm", "do_sk",
-        "dk_sz", "dk_sh", "dk_sn", "dk_sk", "dv_sz", "dv_sh", "dv_sn", "dv_sk",
-        "H", "N_CTX", "scale",
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "b_sz",
+        "b_sh",
+        "b_sm",
+        "b_sn",
+        "mask_sz",
+        "mask_sh",
+        "mask_sn",
+        "lse_sz",
+        "lse_sh",
+        "lse_sm",
+        "dlt_sz",
+        "dlt_sh",
+        "dlt_sm",
+        "do_sz",
+        "do_sh",
+        "do_sm",
+        "do_sk",
+        "dk_sz",
+        "dk_sh",
+        "dk_sn",
+        "dk_sk",
+        "dv_sz",
+        "dv_sh",
+        "dv_sn",
+        "dv_sk",
+        "H",
+        "N_CTX",
+        "scale",
     ]
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
         raise ValueError(f"bwd_kv(simd) bindings missing {missing}")
     sig = ",\n".join(arg_decls)
-    bind_lines = "\n".join(
-        f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale"
-    )
+    bind_lines = "\n".join(f"    const uint {n} = {bindings[n]};" for n in _LOGICAL if n != "scale")
     scale_decl = f"const float scale = {bindings['scale']};"
     if runtime_neg_inf:
         # packet 134: the source applies ONE sentinel to masked / out-of-range score
@@ -3058,9 +3149,7 @@ def make_flash_attention_bwd_q_kernel(
     if arg_decls is None or bindings is None:
         raise ValueError("make_flash_attention_bwd_q_kernel is route-only (needs arg_decls/bindings)")
     if round_delta is not None:
-        raise ValueError(
-            "narrow delta reduction requires the proved D=32 simdgroup binary/XOR route"
-        )
+        raise ValueError("narrow delta reduction requires the proved D=32 simdgroup binary/XOR route")
 
     store_cast_q, store_cast_delta = _bwd_output_casts(output_casts, ("dq", "delta"), store_cast)
 
@@ -3068,14 +3157,17 @@ def make_flash_attention_bwd_q_kernel(
     # packet 174: the source's rounding points (None = fp32 source, text unchanged). With round_k
     # the staged K IS the source's rounded k * scale, which also feeds the dQ dot: no store-time scale.
     _rd = lambda t: (lambda e: f"float({t}({e}))") if t else (lambda e: e)
-    _scale_r = ("(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
-                if round_k == "bfloat" else f"float({round_k}(scale))")
+    _scale_r = (
+        "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
+        if round_k == "bfloat"
+        else f"float({round_k}(scale))"
+    )
     _k_stage = (lambda e: f"float({round_k}(float({e}) * {_scale_r}))") if round_k else (lambda e: f"float({e})")
     _s_scaled = "s" if round_k else "s*scale"
     _dq_out = "dq_acc[i]" if round_k else "dq_acc[i] * scale"
     _dq_out_simd = "tg_P[i]" if round_k else "tg_P[i] * scale"
     _ds_rd = _rd(round_ds)
-    _dp_rd = _rd(round_dprod)   # each O*dO product rounded before the fp32 rowsum (delta)
+    _dp_rd = _rd(round_dprod)  # each O*dO product rounded before the fp32 rowsum (delta)
     # J-SUB-TILE so a large head_dim fits: TPG = JS*D <= 1024 threads and the threadgroup
     # footprint < 32 KB (see _bwd_q_subtile_size). JS == BJ for head_dim<=32 (single
     # subtile) -> emitted kernel semantically identical to the pre-subtile template; the
@@ -3085,15 +3177,50 @@ def make_flash_attention_bwd_q_kernel(
         raise ValueError(
             f"bwd_q: head_dim={D} too large to tile within 32 KB / 1024 threads "
             f"(BLOCK_J={BJ}, BLOCK_K={BK}); the J-independent K/V staging (2*BK*D) exceeds "
-            f"the budget — dK/dV still lower via the K-subtiled bwd_kv.")
+            f"the budget — dK/dV still lower via the K-subtiled bwd_kv."
+        )
     TPG = JS * D
     _LOGICAL = [
-        "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-        "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
-        "mask_sz", "mask_sh", "mask_sn", "lse_sz", "lse_sh", "lse_sm",
-        "o_sz", "o_sh", "o_sm", "o_sk", "do_sz", "do_sh", "do_sm", "do_sk",
-        "dq_sz", "dq_sh", "dq_sm", "dq_sk", "dlt_sz", "dlt_sh", "dlt_sm",
-        "H", "N_CTX", "scale",
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "b_sz",
+        "b_sh",
+        "b_sm",
+        "b_sn",
+        "mask_sz",
+        "mask_sh",
+        "mask_sn",
+        "lse_sz",
+        "lse_sh",
+        "lse_sm",
+        "o_sz",
+        "o_sh",
+        "o_sm",
+        "o_sk",
+        "do_sz",
+        "do_sh",
+        "do_sm",
+        "do_sk",
+        "dq_sz",
+        "dq_sh",
+        "dq_sm",
+        "dq_sk",
+        "dlt_sz",
+        "dlt_sh",
+        "dlt_sm",
+        "H",
+        "N_CTX",
+        "scale",
     ]
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
@@ -3284,14 +3411,17 @@ def make_flash_attention_bwd_q_kernel_simd(
     # packet 174: the source's rounding points (None = fp32 source, text unchanged). With round_k
     # the staged K IS the source's rounded k * scale, which also feeds the dQ dot: no store-time scale.
     _rd = lambda t: (lambda e: f"float({t}({e}))") if t else (lambda e: e)
-    _scale_r = ("(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
-                if round_k == "bfloat" else f"float({round_k}(scale))")
+    _scale_r = (
+        "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
+        if round_k == "bfloat"
+        else f"float({round_k}(scale))"
+    )
     _k_stage = (lambda e: f"float({round_k}(float({e}) * {_scale_r}))") if round_k else (lambda e: f"float({e})")
     _s_scaled = "s" if round_k else "s*scale"
     _dq_out = "dq_acc[i]" if round_k else "dq_acc[i] * scale"
     _dq_out_simd = "tg_P[i]" if round_k else "tg_P[i] * scale"
     _ds_rd = _rd(round_ds)
-    _dp_rd = _rd(round_dprod)   # each O*dO product rounded before the fp32 rowsum (delta)
+    _dp_rd = _rd(round_dprod)  # each O*dO product rounded before the fp32 rowsum (delta)
     if round_delta not in (None, "half", "bfloat"):
         raise ValueError("round_delta must be None, 'half' or 'bfloat'")
     if round_delta is None:
@@ -3309,6 +3439,7 @@ def make_flash_attention_bwd_q_kernel_simd(
         tg_lse[i] = (jrow < N_CTX) ? Lse[lse_base + jrow*lse_sm] : 0.0f;
     }}"""
     else:
+
         def _delta_round(expr):
             if round_delta == "half":
                 return f"float(half({expr}))"
@@ -3316,20 +3447,13 @@ def make_flash_attention_bwd_q_kernel_simd(
 
         products = "\n".join(
             f"        float dl{d} = "
-            + _dp_rd(
-                f"float(O[o_base + jrow*o_sm + (delta_d_base + {d}u)*o_sk])"
-                f" * tg_dO[i*D + delta_d_base + {d}u]"
-            )
+            + _dp_rd(f"float(O[o_base + jrow*o_sm + (delta_d_base + {d}u)*o_sk]) * tg_dO[i*D + delta_d_base + {d}u]")
             + ";"
             for d in range(8)
         )
-        pairs = "\n".join(
-            f"        float ds{i // 2} = {_delta_round(f'dl{i} + dl{i + 1}')};"
-            for i in range(0, 8, 2)
-        )
+        pairs = "\n".join(f"        float ds{i // 2} = {_delta_round(f'dl{i} + dl{i + 1}')};" for i in range(0, 8, 2))
         quarters = "\n".join(
-            f"        float dt{i // 2} = {_delta_round(f'ds{i} + ds{i + 1}')};"
-            for i in range(0, 4, 2)
+            f"        float dt{i // 2} = {_delta_round(f'ds{i} + ds{i + 1}')};" for i in range(0, 4, 2)
         )
         _delta_block = f"""    // Narrow delta runtime layout: eight contiguous D values per lane,
     // four adjacent lanes per row, eight rows per simdgroup. Replay the
@@ -3361,12 +3485,46 @@ def make_flash_attention_bwd_q_kernel_simd(
     NJ, NK, ND = BJ // 8, BK // 8, D // 8
     TPG = 128
     _LOGICAL = [
-        "q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-        "v_sz", "v_sh", "v_sn", "v_sk", "b_sz", "b_sh", "b_sm", "b_sn",
-        "mask_sz", "mask_sh", "mask_sn", "lse_sz", "lse_sh", "lse_sm",
-        "o_sz", "o_sh", "o_sm", "o_sk", "do_sz", "do_sh", "do_sm", "do_sk",
-        "dq_sz", "dq_sh", "dq_sm", "dq_sk", "dlt_sz", "dlt_sh", "dlt_sm",
-        "H", "N_CTX", "scale",
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "b_sz",
+        "b_sh",
+        "b_sm",
+        "b_sn",
+        "mask_sz",
+        "mask_sh",
+        "mask_sn",
+        "lse_sz",
+        "lse_sh",
+        "lse_sm",
+        "o_sz",
+        "o_sh",
+        "o_sm",
+        "o_sk",
+        "do_sz",
+        "do_sh",
+        "do_sm",
+        "do_sk",
+        "dq_sz",
+        "dq_sh",
+        "dq_sm",
+        "dq_sk",
+        "dlt_sz",
+        "dlt_sh",
+        "dlt_sm",
+        "H",
+        "N_CTX",
+        "scale",
     ]
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
@@ -3597,8 +3755,11 @@ def make_flash_attention_bwd_b_kernel(
 
     D, BJ, BK = head_dim, BLOCK_J, BLOCK_K
     # packet 174: the source's rounding point q * full(scale, dtype) (None = fp32 source, text unchanged).
-    _scale_r = ("(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
-                if round_q == "bfloat" else f"float({round_q}(scale))")
+    _scale_r = (
+        "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))"
+        if round_q == "bfloat"
+        else f"float({round_q}(scale))"
+    )
     _q_stage = (lambda e: f"float({round_q}(float({e}) * {_scale_r}))") if round_q else (lambda e: f"float({e})")
     _s_scaled = "s" if round_q else "s*scale"
     TPG = BJ * BK
@@ -3608,13 +3769,43 @@ def make_flash_attention_bwd_b_kernel(
     if not _fits:
         raise ValueError(
             f"bwd_b: head_dim={D} too large to fit dbias scratch within 32 KB "
-            f"(BLOCK_J={BJ}, BLOCK_K={BK}); the J-independent K/V staging exceeds the budget")
+            f"(BLOCK_J={BJ}, BLOCK_K={BK}); the J-independent K/V staging exceeds the budget"
+        )
     _LOGICAL = [
-        "q_sh", "q_si", "q_sm", "q_sk", "k_sh", "k_si", "k_sn", "k_sk",
-        "v_sh", "v_si", "v_sn", "v_sk", "b_sh", "b_sm", "b_sn",
-        "mask_sz", "mask_si", "mask_sn", "lse_sh", "lse_si", "lse_sm",
-        "dlt_sh", "dlt_si", "dlt_sm", "do_sh", "do_si", "do_sm", "do_sk",
-        "db_sh", "db_sm", "db_sn", "H", "N_CTX", "scale",
+        "q_sh",
+        "q_si",
+        "q_sm",
+        "q_sk",
+        "k_sh",
+        "k_si",
+        "k_sn",
+        "k_sk",
+        "v_sh",
+        "v_si",
+        "v_sn",
+        "v_sk",
+        "b_sh",
+        "b_sm",
+        "b_sn",
+        "mask_sz",
+        "mask_si",
+        "mask_sn",
+        "lse_sh",
+        "lse_si",
+        "lse_sm",
+        "dlt_sh",
+        "dlt_si",
+        "dlt_sm",
+        "do_sh",
+        "do_si",
+        "do_sm",
+        "do_sk",
+        "db_sh",
+        "db_sm",
+        "db_sn",
+        "H",
+        "N_CTX",
+        "scale",
     ]
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
@@ -3641,7 +3832,9 @@ def make_flash_attention_bwd_b_kernel(
         tg_q_load = (
             "        for (uint i = lid; i < BJ*D; i += TPG) {\n"
             "            uint jj = i / D, dd = i % D; uint jrow = j_start + jj;\n"
-            "            tg_Q[i] = (jrow < N_CTX) ? " + _q_stage("Q[q_hbase + ii*q_si + jrow*q_sm + dd*q_sk]") + " : 0.0f;\n"
+            "            tg_Q[i] = (jrow < N_CTX) ? "
+            + _q_stage("Q[q_hbase + ii*q_si + jrow*q_sm + dd*q_sk]")
+            + " : 0.0f;\n"
             "        }"
         )
         q_score = "tg_Q[jj*D + d]"
@@ -3758,8 +3951,7 @@ def flash_attention_tiled_threads(block_m, block_n):
     threadgroups at 1024; logical score tiles may be larger, physical strides may
     not. This does not change or relax the template's shared-memory requirement.
     """
-    if (type(block_m) is not int or type(block_n) is not int
-            or not 1 <= block_m <= 1024 or block_n < 1):
+    if type(block_m) is not int or type(block_n) is not int or not 1 <= block_m <= 1024 or block_n < 1:
         from triton_msl.errors import MetalNonRecoverableError
 
         raise MetalNonRecoverableError(
@@ -3916,19 +4108,27 @@ def make_flash_attention_kernel_tiled(
     # larger dense autotuner configurations, not the biased/MLA callers.
     _initial_acc, _initial_den = _fa_initial_values(initial_values, source_kv_block)
     source_block_m = BLOCK_M
-    if query_length is not None and (head_dim != 64 or BLOCK_M not in (8,16)
-                                    or BLOCK_N != 32 or bias or mask or lse or query_tile is not None):
+    if query_length is not None and (
+        head_dim != 64 or BLOCK_M not in (8, 16) or BLOCK_N != 32 or bias or mask or lse or query_tile is not None
+    ):
         raise ValueError("separate query bounds require the proved small-query D64 dense route")
     _query_bound = query_length if query_length is not None else "N_CTX"
     if query_tile is not None:
-        if (type(query_tile) is not int or query_tile != 32 or head_dim != 64
-                or BLOCK_M not in (32, 64) or BLOCK_N not in (32, 64)
-                or bias or mask or lse or source_kv_block != BLOCK_N):
+        if (
+            type(query_tile) is not int
+            or query_tile != 32
+            or head_dim != 64
+            or BLOCK_M not in (32, 64)
+            or BLOCK_N not in (32, 64)
+            or bias
+            or mask
+            or lse
+            or source_kv_block != BLOCK_N
+        ):
             raise ValueError("query subtiles require the proved dense D64, 32/64 source envelope")
         BLOCK_M = query_tile
         # This matches every declaration below, including max(BM, BN) staging.
-        _smem_bytes = 4 * (BLOCK_M * BLOCK_N + BLOCK_M * head_dim
-                           + max(BLOCK_M, BLOCK_N) * Dc + 2 * BLOCK_M)
+        _smem_bytes = 4 * (BLOCK_M * BLOCK_N + BLOCK_M * head_dim + max(BLOCK_M, BLOCK_N) * Dc + 2 * BLOCK_M)
         if _smem_bytes > 32768:
             raise ValueError("query-subtile working set exceeds the 32768-byte staging budget")
     # Causal mask expression: emitted into the online-softmax row loop.
@@ -3943,8 +4143,7 @@ def make_flash_attention_kernel_tiled(
         prob_guard = "(kv_row < N_CTX)"
     _source_tail = None
     if source_kv_block is not None:
-        if (bias or mask or runtime_neg_inf or source_kv_block != BLOCK_N
-                or (causal and not mask_tail_scores)):
+        if bias or mask or runtime_neg_inf or source_kv_block != BLOCK_N or (causal and not mask_tail_scores):
             raise ValueError("tiled source KV tail replay requires its exact plain dense source block")
         _source_tail = _fa_source_tail_guard(source_kv_block, BLOCK_N)
         if not mask_tail_scores:
@@ -3957,8 +4156,11 @@ def make_flash_attention_kernel_tiled(
     if source_causal_stop is not None and (_source_tail is None or type(source_causal_stop) is not bool):
         raise ValueError("source loop stop requires a proved dense source block")
     _stop = "source_kv_stop" if source_causal_stop else "N_CTX"
-    _source_stop_decl = ("    const uint source_kv_stop = min(q_start + BM, N_CTX); // source KV loop stop\n"
-                         if source_causal_stop else "")
+    _source_stop_decl = (
+        "    const uint source_kv_stop = min(q_start + BM, N_CTX); // source KV loop stop\n"
+        if source_causal_stop
+        else ""
+    )
     if query_tile is not None and source_causal_stop:
         _source_stop_decl = (
             "    const uint source_kv_stop = min((q_block + 1u) * SOURCE_BM, N_CTX); // source KV loop stop\n"
@@ -4068,10 +4270,12 @@ def make_flash_attention_kernel_tiled(
 
     # Scale: baked compile-time constant, or a runtime buffer arg (trifast passes
     # sm_scale at runtime and folds it into Q; we apply it to the QK score instead).
-    _scale_value = bindings['scale'] if runtime_scale else f"{SCALE!r}f"
+    _scale_value = bindings["scale"] if runtime_scale else f"{SCALE!r}f"
     scale_decl = f"const float scale = {_fa_scale_chain_expr(_scale_value, scale_chain, round_q)};"
     if round_q:
-        scale_decl += "\n    const float s_scale = 1.0f;  // packet 164: the scale is applied to Q in the source's dtype"
+        scale_decl += (
+            "\n    const float s_scale = 1.0f;  // packet 164: the scale is applied to Q in the source's dtype"
+        )
     if runtime_neg_inf:
         # the source sentinel lives in its exp domain (after the c_eff multiply); convert
         # to this template's natural units: sentinel_nat = sentinel * (1 / c_eff)
@@ -4105,17 +4309,14 @@ def make_flash_attention_kernel_tiled(
     # These strings are interpolated as VALUES into the outer f-string, so they use
     # single braces (real MSL), not f-string-doubled braces.
     if bias or mask:
-        _bias_add = (
-            "\n                    s += float(Bias[bias_base + q_row * b_sm + kv_row * b_sn]);" if bias else ""
-        )
+        _bias_add = "\n                    s += float(Bias[bias_base + q_row * b_sm + kv_row * b_sn]);" if bias else ""
         _mask_apply = (
             "\n                    if (Mask[mask_base + kv_row * mask_sn] != 0) s = " + _NI + ";" if mask else ""
         )
         score_compute_block = (
             "float s;\n"
             "                if (" + score_guard + ") {\n"
-            "                    s = tg_S[r * BN + cj] * " + _s_scale + ";"
-            + _bias_add + _mask_apply + "\n"
+            "                    s = tg_S[r * BN + cj] * " + _s_scale + ";" + _bias_add + _mask_apply + "\n"
             "                } else {\n"
             "                    s = " + _NI + ";\n"
             "                }"
@@ -4150,9 +4351,7 @@ def make_flash_attention_kernel_tiled(
         lse_store_block = ""
 
     _mnew_update = (
-        "m_new = (isnan(m_new) || isnan(s)) ? NAN : max(m_new, s);"
-        if runtime_neg_inf
-        else "m_new = max(m_new, s);"
+        "m_new = (isnan(m_new) || isnan(s)) ? NAN : max(m_new, s);" if runtime_neg_inf else "m_new = max(m_new, s);"
     )
     # Route-lowered biased kernels always set runtime_neg_inf: their source
     # recurrence distinguishes a nonfinite denominator from an empty row.  The
@@ -5383,9 +5582,9 @@ def make_int8_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     sub = []
     for kk in range(0, bk, 8):
         for r in range(rr):
-            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r*8}u) * K + k0 + {kk}u, K);")
+            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r * 8}u) * K + k0 + {kk}u, K);")
         for c in range(rc):
-            sub.append(f"simdgroup_load(b{c}, bdeq + {kk*BN}u + {c*8}u, {BN}u);")
+            sub.append(f"simdgroup_load(b{c}, bdeq + {kk * BN}u + {c * 8}u, {BN}u);")
         for r in range(rr):
             for c in range(rc):
                 sub.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a{r}, b{c}, c{r}_{c});")
@@ -5393,9 +5592,10 @@ def make_int8_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     epi = "\n    ".join(
         f"simdgroup_store(c{r}_{c}, cbuf, 8);\n    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
         f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
-        f"output[(m0 + {r*8}u + mm) * N + (n0 + {c*8}u + nn)] = cbuf[e]; }}\n"
+        f"output[(m0 + {r * 8}u + mm) * N + (n0 + {c * 8}u + nn)] = cbuf[e]; }}\n"
         f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
-        for r in range(rr) for c in range(rc)
+        for r in range(rr)
+        for c in range(rc)
     )
     return f"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -5413,14 +5613,14 @@ kernel void int8_matmul_pergroup_fast(
 ) {{
     const uint GROUP = {group_size}u;
     uint ntn = N / {BN}u;
-    uint m0 = (tgid / ntn) * {8*rr}u;
+    uint m0 = (tgid / ntn) * {8 * rr}u;
     uint n0 = (tgid % ntn) * {BN}u;
-    threadgroup float bdeq[{bk*BN}];
+    threadgroup float bdeq[{bk * BN}];
     {accs}
     {afrags} {bfrags}
     for (uint k0 = 0u; k0 < K; k0 += {bk}u) {{
         uint g = k0 / GROUP;
-        for (uint e = tid; e < {bk*BN}u; e += 32u) {{
+        for (uint e = tid; e < {bk * BN}u; e += 32u) {{
             uint kk = e / {BN}u, nn = e % {BN}u;
             float sc = scales[g * ssg + (n0 + nn) * ssn];
             float ze = zeros[g * ssg + (n0 + nn) * ssn];
@@ -5437,8 +5637,13 @@ kernel void int8_matmul_pergroup_fast(
 
 
 def make_varlen_flash_attention(
-    head_dim=64, causal=False, out_dtype="fp32",
-    arg_decls=None, bindings=None, kernel_name="varlen_fa", scale=None,
+    head_dim=64,
+    causal=False,
+    out_dtype="fp32",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="varlen_fa",
+    scale=None,
 ):
     """VARLEN FlashAttention-2 (packed cu_seqlens, route-only ABI). One thread per query
     row; K/V tiles staged in threadgroup memory; online softmax with a register acc.
@@ -5470,9 +5675,27 @@ def make_varlen_flash_attention(
     # the canonical 1/sqrt(head_dim) only for the route-free template smoke test.
     scale = float(D) ** -0.5 if scale is None else float(scale)
     inv_ln2 = 1.4426950408889634
-    _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
-             "q_st", "q_sh", "q_sk", "k_st", "k_sh", "k_sk",
-             "v_st", "v_sh", "v_sk", "o_st", "o_sh", "o_sk"]
+    _need = [
+        "Q",
+        "K",
+        "V",
+        "O",
+        "CUQ",
+        "CUK",
+        "H",
+        "q_st",
+        "q_sh",
+        "q_sk",
+        "k_st",
+        "k_sh",
+        "k_sk",
+        "v_st",
+        "v_sh",
+        "v_sk",
+        "o_st",
+        "o_sh",
+        "o_sk",
+    ]
     missing = [n for n in _need if n not in bindings]
     if missing:
         raise ValueError(f"varlen FA bindings missing {missing}")
@@ -5496,19 +5719,19 @@ kernel void {kernel_name}(
 ) {{
     const uint D = {D}u, BM = {BM}u, BN = {BN}u;
     const float scale = {scale}f, inv_ln2 = {inv_ln2}f;
-    const uint nheads = {b['H']};
-    const uint q_st = {b['q_st']}, q_sh = {b['q_sh']}, q_sk = {b['q_sk']};
-    const uint k_st = {b['k_st']}, k_sh = {b['k_sh']}, k_sk = {b['k_sk']};
-    const uint v_st = {b['v_st']}, v_sh = {b['v_sh']}, v_sk = {b['v_sk']};
-    const uint o_st = {b['o_st']}, o_sh = {b['o_sh']}, o_sk = {b['o_sk']};
+    const uint nheads = {b["H"]};
+    const uint q_st = {b["q_st"]}, q_sh = {b["q_sh"]}, q_sk = {b["q_sk"]};
+    const uint k_st = {b["k_st"]}, k_sh = {b["k_sh"]}, k_sk = {b["k_sk"]};
+    const uint v_st = {b["v_st"]}, v_sh = {b["v_sh"]}, v_sk = {b["v_sk"]};
+    const uint o_st = {b["o_st"]}, o_sh = {b["o_sh"]}, o_sk = {b["o_sk"]};
     uint m_block = tgpos.x, bh = tgpos.y;
     uint bb = bh / nheads, h = bh % nheads;
 
-    uint q_start = uint({b['CUQ']}[bb]);
-    uint seqlen_q = uint({b['CUQ']}[bb + 1u]) - q_start;
+    uint q_start = uint({b["CUQ"]}[bb]);
+    uint seqlen_q = uint({b["CUQ"]}[bb + 1u]) - q_start;
     if (m_block * BM >= seqlen_q) return;
-    uint k_start = uint({b['CUK']}[bb]);
-    uint seqlen_k = uint({b['CUK']}[bb + 1u]) - k_start;
+    uint k_start = uint({b["CUK"]}[bb]);
+    uint seqlen_k = uint({b["CUK"]}[bb + 1u]) - k_start;
 
     uint row = lid;
     uint qrow = m_block * BM + row;
@@ -5517,7 +5740,7 @@ kernel void {kernel_name}(
     float q_reg[{D}];
     float acc[{D}];
     for (uint d = 0u; d < D; d++) {{
-        q_reg[d] = valid ? float({b['Q']}[(q_start + qrow) * q_st + h * q_sh + d * q_sk]) : 0.0f;
+        q_reg[d] = valid ? float({b["Q"]}[(q_start + qrow) * q_st + h * q_sh + d * q_sk]) : 0.0f;
         acc[d] = 0.0f;
     }}
     float m_i = -INFINITY, l_i = 0.0f;
@@ -5530,8 +5753,8 @@ kernel void {kernel_name}(
         for (uint e = lid; e < BN * D; e += BM) {{
             uint kk = e / D, dd = e % D; uint krow = kt + kk;
             bool kv = (krow < kmax);
-            tg_K[e] = kv ? float({b['K']}[(k_start + krow) * k_st + h * k_sh + dd * k_sk]) : 0.0f;
-            tg_V[e] = kv ? float({b['V']}[(k_start + krow) * v_st + h * v_sh + dd * v_sk]) : 0.0f;
+            tg_K[e] = kv ? float({b["K"]}[(k_start + krow) * k_st + h * k_sh + dd * k_sk]) : 0.0f;
+            tg_V[e] = kv ? float({b["V"]}[(k_start + krow) * v_st + h * v_sh + dd * v_sk]) : 0.0f;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (valid) {{
@@ -5554,15 +5777,20 @@ kernel void {kernel_name}(
     }}
     if (valid) {{
         for (uint d = 0u; d < D; d++)
-            {b['O']}[(q_start + qrow) * o_st + h * o_sh + d * o_sk] = {store_cast("acc[d] / l_i")};
+            {b["O"]}[(q_start + qrow) * o_st + h * o_sh + d * o_sk] = {store_cast("acc[d] / l_i")};
     }}
 }}
 """
 
 
 def make_varlen_flash_attention_mma(
-    head_dim=64, causal=False, out_dtype="fp16",
-    arg_decls=None, bindings=None, kernel_name="varlen_fa_mma", scale=None,
+    head_dim=64,
+    causal=False,
+    out_dtype="fp16",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="varlen_fa_mma",
+    scale=None,
 ):
     """FAST varlen FlashAttention-2 via simdgroup_matrix MMA (fp16 in/out, fp32 accumulate).
 
@@ -5600,10 +5828,30 @@ def make_varlen_flash_attention_mma(
     # reused as SIMD-private rescale/output scratch) + tg_m/tg_l/tg_alpha.
     tg_bytes = BM * D * TB + BN * D * TB * 2 + BM * BN * TB + BM * BN * 4 + BM * 4 * 3
     if tg_bytes > 32768:
-        raise ValueError(f"varlen MMA FA threadgroup memory {tg_bytes}B > 32KB for head_dim={D}; use the scalar template")
-    _need = ["Q", "K", "V", "O", "CUQ", "CUK", "H",
-             "q_st", "q_sh", "q_sk", "k_st", "k_sh", "k_sk",
-             "v_st", "v_sh", "v_sk", "o_st", "o_sh", "o_sk"]
+        raise ValueError(
+            f"varlen MMA FA threadgroup memory {tg_bytes}B > 32KB for head_dim={D}; use the scalar template"
+        )
+    _need = [
+        "Q",
+        "K",
+        "V",
+        "O",
+        "CUQ",
+        "CUK",
+        "H",
+        "q_st",
+        "q_sh",
+        "q_sk",
+        "k_st",
+        "k_sh",
+        "k_sk",
+        "v_st",
+        "v_sh",
+        "v_sk",
+        "o_st",
+        "o_sh",
+        "o_sk",
+    ]
     missing = [n for n in _need if n not in bindings]
     if missing:
         raise ValueError(f"varlen MMA FA bindings missing {missing}")
@@ -5626,11 +5874,11 @@ kernel void {kernel_name}(
 ) {{
     const uint D = {D}u, BM = {BM}u, BN = {BN}u, NT = {NT}u;
     const float SCALE = {SCALE}f;
-    const uint nheads = {b['H']};
-    const uint q_st = {b['q_st']}, q_sh = {b['q_sh']}, q_sk = {b['q_sk']};
-    const uint k_st = {b['k_st']}, k_sh = {b['k_sh']}, k_sk = {b['k_sk']};
-    const uint v_st = {b['v_st']}, v_sh = {b['v_sh']}, v_sk = {b['v_sk']};
-    const uint o_st = {b['o_st']}, o_sh = {b['o_sh']}, o_sk = {b['o_sk']};
+    const uint nheads = {b["H"]};
+    const uint q_st = {b["q_st"]}, q_sh = {b["q_sh"]}, q_sk = {b["q_sk"]};
+    const uint k_st = {b["k_st"]}, k_sh = {b["k_sh"]}, k_sk = {b["k_sk"]};
+    const uint v_st = {b["v_st"]}, v_sh = {b["v_sh"]}, v_sk = {b["v_sk"]};
+    const uint o_st = {b["o_st"]}, o_sh = {b["o_sh"]}, o_sk = {b["o_sk"]};
     threadgroup {TILE} tg_Q[BM*D];
     threadgroup {TILE} tg_K[BN*D];
     threadgroup {TILE} tg_V[BN*D];
@@ -5642,14 +5890,14 @@ kernel void {kernel_name}(
 
     uint m_block = tgpos.x, bh = tgpos.y;
     uint bb = bh / nheads, h = bh % nheads;
-    uint q_start = uint({b['CUQ']}[bb]);   uint seqlen_q = uint({b['CUQ']}[bb+1u]) - q_start;
-    uint k_start = uint({b['CUK']}[bb]);   uint seqlen_k = uint({b['CUK']}[bb+1u]) - k_start;
+    uint q_start = uint({b["CUQ"]}[bb]);   uint seqlen_q = uint({b["CUQ"]}[bb+1u]) - q_start;
+    uint k_start = uint({b["CUK"]}[bb]);   uint seqlen_k = uint({b["CUK"]}[bb+1u]) - k_start;
     if (m_block * BM >= seqlen_q) return;
     uint kmax = {kmax_expr};
 
     for (uint i = lid; i < BM*D; i += NT) {{
         uint r = i / D, c = i % D; uint qr = m_block*BM + r;
-        tg_Q[i] = qr < seqlen_q ? {TILE}({b['Q']}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : {TILE}(0);
+        tg_Q[i] = qr < seqlen_q ? {TILE}({b["Q"]}[(q_start+qr)*q_st + h*q_sh + c*q_sk]) : {TILE}(0);
     }}
     for (uint i = lid; i < BM; i += NT) {{ tg_m[i] = -INFINITY; tg_l[i] = 0.0f; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5661,8 +5909,8 @@ kernel void {kernel_name}(
     for (uint kt = 0u; kt < kmax; kt += BN) {{
         for (uint i = lid; i < BN*D; i += NT) {{
             uint r = i / D, c = i % D; uint kr = kt + r; bool ok = kr < kmax;
-            tg_K[i] = ok ? {TILE}({b['K']}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : {TILE}(0);
-            tg_V[i] = ok ? {TILE}({b['V']}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : {TILE}(0);
+            tg_K[i] = ok ? {TILE}({b["K"]}[(k_start+kr)*k_st + h*k_sh + c*k_sk]) : {TILE}(0);
+            tg_V[i] = ok ? {TILE}({b["V"]}[(k_start+kr)*v_st + h*v_sh + c*v_sk]) : {TILE}(0);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -5727,7 +5975,7 @@ kernel void {kernel_name}(
             uint r = sg*8u + lane; uint qrow = m_block*BM + r;
             if (qrow < seqlen_q)
                 for (uint c = 0u; c < 8u; c++)
-                    {b['O']}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] =
+                    {b["O"]}[(q_start+qrow)*o_st + h*o_sh + (et*8u+c)*o_sk] =
                         (!isfinite(tg_l[r]) || tg_l[r] == 0.0f)
                             ? {TILE}(NAN) : {TILE}(tg_S[sg*64u + lane*8u + c] * (1.0f/tg_l[r]));
         }}
@@ -5752,9 +6000,9 @@ def make_int4_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     sub = []
     for kk in range(0, bk, 8):
         for r in range(rr):
-            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r*8}u) * K + k0 + {kk}u, K);")
+            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r * 8}u) * K + k0 + {kk}u, K);")
         for c in range(rc):
-            sub.append(f"simdgroup_load(b{c}, bdeq + {kk*BN}u + {c*8}u, {BN}u);")
+            sub.append(f"simdgroup_load(b{c}, bdeq + {kk * BN}u + {c * 8}u, {BN}u);")
         for r in range(rr):
             for c in range(rc):
                 sub.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a{r}, b{c}, c{r}_{c});")
@@ -5762,9 +6010,10 @@ def make_int4_matmul_pergroup_fast(group_size=128, rr=4, rc=2, bk=32):
     epi = "\n    ".join(
         f"simdgroup_store(c{r}_{c}, cbuf, 8);\n    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
         f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
-        f"output[(m0 + {r*8}u + mm) * N + (n0 + {c*8}u + nn)] = cbuf[e]; }}\n"
+        f"output[(m0 + {r * 8}u + mm) * N + (n0 + {c * 8}u + nn)] = cbuf[e]; }}\n"
         f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
-        for r in range(rr) for c in range(rc)
+        for r in range(rr)
+        for c in range(rc)
     )
     return f"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -5782,14 +6031,14 @@ kernel void int4_matmul_pergroup_fast(
 ) {{
     const uint GROUP = {group_size}u;
     uint ntn = N / {BN}u;
-    uint m0 = (tgid / ntn) * {8*rr}u;
+    uint m0 = (tgid / ntn) * {8 * rr}u;
     uint n0 = (tgid % ntn) * {BN}u;
-    threadgroup float bdeq[{bk*BN}];
+    threadgroup float bdeq[{bk * BN}];
     {accs}
     {afrags} {bfrags}
     for (uint k0 = 0u; k0 < K; k0 += {bk}u) {{
         uint g = k0 / GROUP;
-        for (uint e = tid; e < {bk*BN}u; e += 32u) {{
+        for (uint e = tid; e < {bk * BN}u; e += 32u) {{
             uint kk = e / {BN}u, nn = e % {BN}u;
             uint kki = k0 + kk;
             float sc = scales[g * ssg + (n0 + nn) * ssn];

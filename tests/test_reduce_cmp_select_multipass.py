@@ -72,9 +72,7 @@ def _softmax_msl(tmp_path, monkeypatch, n, mode):
 def test_package_identity_is_the_861_checkout():
     root = Path(__file__).resolve().parents[1]
     assert Path(base.triton_msl.__file__).resolve().is_relative_to(root)
-    assert Path(base.generic_lowerer.__file__).resolve() == (
-        root / "triton_msl/codegen/generic_lowerer.py"
-    ).resolve()
+    assert Path(base.generic_lowerer.__file__).resolve() == (root / "triton_msl/codegen/generic_lowerer.py").resolve()
 
 
 @requires
@@ -90,9 +88,7 @@ def test_package_identity_is_the_861_checkout():
     ],
 )
 @pytest.mark.parametrize("n", [4096])
-def test_ordered_multipass_stages_full_adjacent_source_tree(
-    mode, nan_side, comparison, n, tmp_path, monkeypatch
-):
+def test_ordered_multipass_stages_full_adjacent_source_tree(mode, nan_side, comparison, n, tmp_path, monkeypatch):
     msl = _softmax_msl(tmp_path, monkeypatch, n, mode)
     stage_decl = f"threadgroup float shared_ordered_multipass_0[{n}];"
     assert stage_decl in msl
@@ -104,10 +100,7 @@ def test_ordered_multipass_stages_full_adjacent_source_tree(
     if nan_side == "left":
         assert "[_ord_left] != shared_ordered_multipass_0[_ord_left]" in msl
     elif nan_side == "right":
-        assert (
-            "[_ord_left + 1u] != shared_ordered_multipass_0[_ord_left + 1u]"
-            in msl
-        )
+        assert "[_ord_left + 1u] != shared_ordered_multipass_0[_ord_left + 1u]" in msl
     # The normal publication path consumes the already-complete result. It must
     # retain the ordered combiner rather than silently substituting simd min/max.
     assert msl.count("simd_shuffle(ordered_") == 5
@@ -115,25 +108,19 @@ def test_ordered_multipass_stages_full_adjacent_source_tree(
 
 
 @requires
-def test_ordered_multipass_has_barrier_between_every_adjacent_round(
-    tmp_path, monkeypatch
-):
+def test_ordered_multipass_has_barrier_between_every_adjacent_round(tmp_path, monkeypatch):
     msl = _softmax_msl(tmp_path, monkeypatch, 4096, 0)
     first = msl.index("for (uint _ord_mp = lid;")
     last = msl.index("float _local_acc_", first)
     tree = msl[first:last]
     # One publication barrier immediately before the tree plus one after every round.
-    assert msl[:first].rstrip().endswith(
-        "threadgroup_barrier(mem_flags::mem_threadgroup);"
-    )
+    assert msl[:first].rstrip().endswith("threadgroup_barrier(mem_flags::mem_threadgroup);")
     assert tree.count("threadgroup_barrier(mem_flags::mem_threadgroup)") == 12
 
 
 @requires
 @pytest.mark.parametrize("mode", range(6))
-def test_block1024_preserves_existing_single_pass_ordered_route(
-    mode, tmp_path, monkeypatch
-):
+def test_block1024_preserves_existing_single_pass_ordered_route(mode, tmp_path, monkeypatch):
     msl = _softmax_msl(tmp_path, monkeypatch, 1024, mode)
     assert "shared_ordered_multipass_" not in msl
     assert msl.count("simd_shuffle(ordered_") > 0
@@ -148,9 +135,7 @@ def test_ordered_multipass_register_array_helper_still_refuses():
 
 
 @requires
-def test_ordered_multipass_singleton_rank2_is_a_full_logical_reduce(
-    tmp_path, monkeypatch
-):
+def test_ordered_multipass_singleton_rank2_is_a_full_logical_reduce(tmp_path, monkeypatch):
     msl = base._compile_msl(
         base._reduce_prop_2d,
         {"x": "*fp32", "z": "*fp32", "m": "constexpr", "n": "constexpr"},
@@ -163,9 +148,7 @@ def test_ordered_multipass_singleton_rank2_is_a_full_logical_reduce(
 
 
 @requires
-def test_ordered_multipass_never_flattens_multivalue_rank2_axis_reduce(
-    tmp_path, monkeypatch
-):
+def test_ordered_multipass_never_flattens_multivalue_rank2_axis_reduce(tmp_path, monkeypatch):
     with pytest.raises(base.MetalNonRecoverableError):
         base._compile_msl(
             base._reduce_prop_2d,
@@ -190,12 +173,7 @@ def test_ordered_multipass_never_flattens_multivalue_rank2_axis_reduce(
     ],
 )
 def test_ordered_multipass_native_shape_gate(shape, axis, total, expected):
-    assert (
-        base.generic_lowerer.GenericLowerer._ordered_multipass_shape_is_full(
-            shape, axis, total
-        )
-        is expected
-    )
+    assert base.generic_lowerer.GenericLowerer._ordered_multipass_shape_is_full(shape, axis, total) is expected
 
 
 def _emitted_tree_bits(words, kind, multipass):
@@ -220,9 +198,7 @@ def _emitted_tree_bits(words, kind, multipass):
 @pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("kind,kernel", base._GPU_CASES)
 @pytest.mark.parametrize("pattern", ["mixed", "finite", "signed_zero", "all_nan"])
-def test_ordered_multipass_gpu_bits_canaries_and_live_route(
-    kind, kernel, n, pattern, executed
-):
+def test_ordered_multipass_gpu_bits_canaries_and_live_route(kind, kernel, n, pattern, executed):
     words = [0x80000000 if i % 2 else 0x00000000 for i in range(n)]
     for i, word in (
         (0, 0x7FC01001),
@@ -243,12 +219,12 @@ def test_ordered_multipass_gpu_bits_canaries_and_live_route(
         words = [0x7FC01000 + (i % 13) for i in range(n)]
     canary = 0x4A617283
     signed = lambda word: word if word < 0x80000000 else word - 0x100000000
-    x_storage = base.torch.tensor(
-        [canary, *map(signed, words), canary], dtype=base.torch.int32
-    ).view(base.torch.float32).to("mps")
-    out_storage = base.torch.tensor(
-        [canary, canary, canary], dtype=base.torch.int32
-    ).view(base.torch.float32).to("mps")
+    x_storage = (
+        base.torch.tensor([canary, *map(signed, words), canary], dtype=base.torch.int32)
+        .view(base.torch.float32)
+        .to("mps")
+    )
+    out_storage = base.torch.tensor([canary, canary, canary], dtype=base.torch.int32).view(base.torch.float32).to("mps")
     before = x_storage.cpu().view(base.torch.int32).clone()
     executed.clear()
     handle = kernel[(1,)](x_storage[1:-1], out_storage[1:2], n=n)
@@ -256,9 +232,7 @@ def test_ordered_multipass_gpu_bits_canaries_and_live_route(
     assert base.torch.equal(x_storage.cpu().view(base.torch.int32), before)
     actual = out_storage.cpu().view(base.torch.int32)
     assert int(actual[0]) == canary and int(actual[2]) == canary
-    assert int(actual[1]) & 0xFFFFFFFF == _emitted_tree_bits(
-        words, kind, multipass=n == 4096
-    )
+    assert int(actual[1]) & 0xFFFFFFFF == _emitted_tree_bits(words, kind, multipass=n == 4096)
     source = base._executed_source(executed, handle)
     assert source == handle.asm["msl"]
     assert ("shared_ordered_multipass_" in source) is (n == 4096)

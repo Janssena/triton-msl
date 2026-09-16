@@ -28,13 +28,11 @@ def _native_repeated_row_term(A, B, C):
 
 def _op(oid, kind, operands=(), *, axis=None, tensor=False):
     attrs = {} if axis is None else {"axis": axis}
-    return SSAValue(oid, f"v{oid}", kind, list(operands), attrs,
-                    "tensor<32xi32>" if tensor else "i32", "i32", tensor)
+    return SSAValue(oid, f"v{oid}", kind, list(operands), attrs, "tensor<32xi32>" if tensor else "i32", "i32", tensor)
 
 
 def _lowerer(ops):
-    args = [FuncArg(i, name, "!tt.ptr<f32>", "f32", True, i)
-            for i, name in enumerate(("A", "B", "C"), 1)]
+    args = [FuncArg(i, name, "!tt.ptr<f32>", "f32", True, i) for i, name in enumerate(("A", "B", "C"), 1)]
     lowerer = GenericLowerer.__new__(GenericLowerer)
     lowerer.graph = IRGraph("depth", args, ops)
     lowerer._resolve_dot_ptr_roles = types.MethodType(lambda self, dot, ptrs: ptrs, lowerer)
@@ -118,9 +116,7 @@ def _deep_add_batch_graph(with_pid, count=1200):
 
 
 def test_stride_proof_crosses_old_wrapper_boundary():
-    assert _stride_graph(wrapper_count=40).infer_dot_strides() == {
-        "A": ("1", "1"), "B": ("1", "1"), "C": ("1", "1")
-    }
+    assert _stride_graph(wrapper_count=40).infer_dot_strides() == {"A": ("1", "1"), "B": ("1", "1"), "C": ("1", "1")}
 
 
 def test_repeated_addptr_terms_do_not_collapse_to_unit_stride():

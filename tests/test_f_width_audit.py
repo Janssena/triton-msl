@@ -67,13 +67,16 @@ def route_spy(monkeypatch):
     cls = importlib.import_module("triton_msl.codegen.generic_lowerer").GenericLowerer
     hits = []
     for name in dir(cls):
-        if name.startswith("_lower_") and any(k in name for k in ("softmax", "norm", "dot", "matmul", "reduce", "epilogue")):
+        if name.startswith("_lower_") and any(
+            k in name for k in ("softmax", "norm", "dot", "matmul", "reduce", "epilogue")
+        ):
             real = getattr(cls, name)
 
             def mk(_r, _n):
                 def spy(self, *a, **k):
                     hits.append(_n)
                     return _r(self, *a, **k)
+
                 return spy
 
             monkeypatch.setattr(cls, name, mk(real, name))
@@ -97,7 +100,7 @@ def _lower(fn, sig, cex):
 # F-h: softmax and layer-norm store chains
 # ----------------------------------------------------------------------------------------------
 
-_SM = '''
+_SM = """
 @triton.jit
 def _sm(x_ptr, o_ptr, N, BLOCK: tl.constexpr, MODE: tl.constexpr):
     row = tl.program_id(0); cols = tl.arange(0, BLOCK); m = cols < N
@@ -111,9 +114,9 @@ def _sm(x_ptr, o_ptr, N, BLOCK: tl.constexpr, MODE: tl.constexpr):
     if MODE == 3:
         y = y.to(tl.float16)
     tl.store(o_ptr + row * N + cols, y, mask=m)
-'''
+"""
 
-_LN = '''
+_LN = """
 @triton.jit
 def _ln(x_ptr, o_ptr, N, BLOCK: tl.constexpr, EPS: tl.constexpr, MODE: tl.constexpr):
     row = tl.program_id(0); cols = tl.arange(0, BLOCK); m = cols < N
@@ -132,7 +135,7 @@ def _ln(x_ptr, o_ptr, N, BLOCK: tl.constexpr, EPS: tl.constexpr, MODE: tl.conste
     if MODE == 3:
         y = y.to(tl.float16)
     tl.store(o_ptr + row * N + cols, y, mask=m)
-'''
+"""
 
 
 def _sm_ref(x, mode):
@@ -148,7 +151,9 @@ def _sm_ref(x, mode):
 
 def _ln_ref(x, mode, eps=1e-5):
     N = x.shape[-1]
-    mean = x.mean(-1, keepdim=True); xc = x - mean; var = (xc * xc).sum(-1, keepdim=True) / N
+    mean = x.mean(-1, keepdim=True)
+    xc = x - mean
+    var = (xc * xc).sum(-1, keepdim=True) / N
     e = torch.tensor(eps, dtype=torch.float16).float().item() if mode == 4 else eps
     y = xc * torch.rsqrt(var + e)
     if mode == 1 or mode == 3:
@@ -159,10 +164,20 @@ def _ln_ref(x, mode, eps=1e-5):
 
 
 @pytest.mark.skipif(not HAS_GPU, reason="Triton frontend + Metal backend import needed")
-@pytest.mark.parametrize("family,mode,expect", [
-    ("sm", 0, "template"), ("sm", 1, "refuse-or-generic"), ("sm", 2, "refuse-or-generic"), ("sm", 3, "template"),
-    ("ln", 0, "template"), ("ln", 1, "refuse-or-generic"), ("ln", 2, "refuse-or-generic"), ("ln", 3, "template"), ("ln", 4, "template"),
-])
+@pytest.mark.parametrize(
+    "family,mode,expect",
+    [
+        ("sm", 0, "template"),
+        ("sm", 1, "refuse-or-generic"),
+        ("sm", 2, "refuse-or-generic"),
+        ("sm", 3, "template"),
+        ("ln", 0, "template"),
+        ("ln", 1, "refuse-or-generic"),
+        ("ln", 2, "refuse-or-generic"),
+        ("ln", 3, "template"),
+        ("ln", 4, "template"),
+    ],
+)
 def test_store_chain_casts_direct_lowering(route_spy, tmp_path, family, mode, expect):
     """Direct lowering: a round trip or an integer cast on the store chain must NOT reach the
     softmax / layer-norm template (it refuses or the generic lowering, which replays every op,
@@ -187,13 +202,16 @@ def test_store_chain_casts_direct_lowering(route_spy, tmp_path, family, mode, ex
 
 
 @requires_gpu
-@pytest.mark.parametrize("family,mode", [("sm", 0), ("sm", 1), ("sm", 2), ("sm", 3), ("ln", 0), ("ln", 1), ("ln", 2), ("ln", 3), ("ln", 4)])
+@pytest.mark.parametrize(
+    "family,mode", [("sm", 0), ("sm", 1), ("sm", 2), ("sm", 3), ("ln", 0), ("ln", 1), ("ln", 2), ("ln", 3), ("ln", 4)]
+)
 def test_store_chain_casts_correct_or_refuse(cold_gpu_caches, route_spy, tmp_path, family, mode):
     """GPU, two-arm: refuse before any template, or equal the mutated source's semantics. On
     `cbff49c` the softmax template computed the raw division for modes 1 and 2."""
     src, fn_name = (_SM, "_sm") if family == "sm" else (_LN, "_ln")
     fn = _load_src(tmp_path, src, f"gpu_{family}_{mode}", fn_name)
-    torch.manual_seed(2); R, N = 8, 64
+    torch.manual_seed(2)
+    R, N = 8, 64
     x = torch.randn(R, N, device=D) * 3
     o = torch.zeros(R, N, device=D, dtype=torch.float16 if mode == 3 else torch.float32)
     if hasattr(fn, "device_caches"):
@@ -209,7 +227,9 @@ def test_store_chain_casts_correct_or_refuse(cold_gpu_caches, route_spy, tmp_pat
         return
     ref = _sm_ref(x, mode) if family == "sm" else _ln_ref(x, mode)
     err = (o.float() - ref).abs().max().item()
-    assert err < (2e-3 if mode == 3 else 1e-4), f"{family} mode {mode}: err {err:.3e} vs the mutated source (route {sorted(set(route_spy))})"
+    assert err < (2e-3 if mode == 3 else 1e-4), (
+        f"{family} mode {mode}: err {err:.3e} vs the mutated source (route {sorted(set(route_spy))})"
+    )
     if mode in (0, 3, 4):
         tmpl = "_lower_softmax_template" if family == "sm" else "_lower_layer_norm_template"
         assert tmpl in route_spy, route_spy
@@ -219,16 +239,28 @@ def test_store_chain_casts_correct_or_refuse(cold_gpu_caches, route_spy, tmp_pat
 # F-b: matmul + epilogue — contract + the probed positives (K-chunk replays)
 # ----------------------------------------------------------------------------------------------
 
+
 def test_epilogue_allow_lists_hold_no_conversions():
     """Contract pin (160 F-b): the substituting epilogue emitter may only pass layout ops through."""
     from triton_msl.codegen._lowerer_detection import _EPI_PASSTHROUGH, _DetectionMixin
 
-    conv = {"arith.truncf", "arith.extf", "arith.sitofp", "arith.fptosi", "arith.uitofp", "arith.fptoui", "tt.fp_to_fp", "arith.trunci", "arith.extsi", "arith.extui"}
+    conv = {
+        "arith.truncf",
+        "arith.extf",
+        "arith.sitofp",
+        "arith.fptosi",
+        "arith.uitofp",
+        "arith.fptoui",
+        "tt.fp_to_fp",
+        "arith.trunci",
+        "arith.extsi",
+        "arith.extui",
+    }
     assert not (_EPI_PASSTHROUGH & conv), _EPI_PASSTHROUGH & conv
     assert not (_DetectionMixin._EPILOGUE_ALLOWED & conv), _DetectionMixin._EPILOGUE_ALLOWED & conv
 
 
-_EPI = '''
+_EPI = """
 @triton.jit
 def _dot_epi(X, Y, B, Z, S: tl.constexpr, MODE: tl.constexpr):
     om = tl.arange(0, S); on = tl.arange(0, S); ok = tl.arange(0, S)
@@ -240,7 +272,7 @@ def _dot_epi(X, Y, B, Z, S: tl.constexpr, MODE: tl.constexpr):
         z = z.to(tl.float16).to(tl.float32)
     z = tl.maximum(z * 0.5 + tl.load(B + on)[None, :], 0.0)
     tl.store(Z + om[:, None] * S + on[None, :], z)
-'''
+"""
 
 
 @requires_gpu
@@ -249,8 +281,11 @@ def test_epilogue_casts_replayed_or_refused(cold_gpu_caches, route_spy, tmp_path
     """A conversion inside a matmul epilogue: the K-chunk path replays it exactly (probed: err 0);
     the substituting epilogue emitter may not claim it. Two-arm: refuse, or equal the mutated source."""
     fn = _load_src(tmp_path, _EPI, f"epi_{mode}", "_dot_epi")
-    torch.manual_seed(3); S = 32
-    x = torch.randn(S, S, device=D) * 3; y = torch.randn(S, S, device=D) * 3; b = torch.randn(S, device=D)
+    torch.manual_seed(3)
+    S = 32
+    x = torch.randn(S, S, device=D) * 3
+    y = torch.randn(S, S, device=D) * 3
+    b = torch.randn(S, device=D)
     z = torch.zeros(S, S, device=D)
     if hasattr(fn, "device_caches"):
         fn.device_caches.clear()
@@ -274,7 +309,7 @@ def test_epilogue_casts_replayed_or_refused(cold_gpu_caches, route_spy, tmp_path
 # Census sites already closed — pinned so the census stays executable
 # ----------------------------------------------------------------------------------------------
 
-_DOT32 = '''
+_DOT32 = """
 @triton.jit
 def _dot32(a_ptr, b_ptr, c_ptr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
     om = tl.arange(0, BM)
@@ -288,9 +323,9 @@ def _dot32(a_ptr, b_ptr, c_ptr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.const
     if MODE == 2:
         c = c.to(tl.int32).to(tl.float32)
     tl.store(c_ptr + om[:, None] * BN + on[None, :], c)
-'''
+"""
 
-_KLOOP = '''
+_KLOOP = """
 @triton.jit
 def _kloop(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
     rm = tl.arange(0, M); rn = tl.arange(0, N); rk = tl.arange(0, BK)
@@ -303,14 +338,20 @@ def _kloop(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BK: tl.co
             a = a.to(tl.float16); b = b.to(tl.float16)
         acc = tl.dot(a, b, acc)
     tl.store(C + rm[:, None] * N + rn[None, :], acc)
-'''
+"""
 
 
 @pytest.mark.skipif(not HAS_GPU, reason="Triton frontend + Metal backend import needed")
-@pytest.mark.parametrize("family,mode,needle", [
-    ("dot32", 1, "round-trip"), ("dot32", 2, "sitofp"), ("dot32", 3, "trunci"),
-    ("kloop", 1, "extf"), ("kloop", 2, "truncf"),
-])
+@pytest.mark.parametrize(
+    "family,mode,needle",
+    [
+        ("dot32", 1, "round-trip"),
+        ("dot32", 2, "sitofp"),
+        ("dot32", 3, "trunci"),
+        ("kloop", 1, "extf"),
+        ("kloop", 2, "truncf"),
+    ],
+)
 def test_closed_sites_still_refuse(route_spy, tmp_path, family, mode, needle):
     """Single-dot output round trips / narrowed row index and K-loop input casts refuse by name
     (closed by packets 079–083 and 139–140; re-pinned by the 160 census)."""
@@ -324,11 +365,11 @@ def test_closed_sites_still_refuse(route_spy, tmp_path, family, mode, needle):
         _lower(fn, sig, cex)
 
 
-_RSUM = '''
+_RSUM = """
 @triton.jit
 def _r1d_sum(a, o, N: tl.constexpr):
     tl.store(o, tl.sum(tl.load(a + tl.arange(0, N)), 0).to(tl.int32))
-'''
+"""
 
 
 @requires_gpu

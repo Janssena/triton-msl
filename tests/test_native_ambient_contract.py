@@ -1,4 +1,5 @@
 """Already-loaded providers are hashed inputs, never library-name exemptions."""
+
 from pathlib import Path
 import struct
 
@@ -93,12 +94,15 @@ def test_ambient_provider_requires_a_complete_native_proof(ambient, damage):
 
 def test_native_load_during_inventory_is_not_silently_admitted(ambient, monkeypatch):
     from triton_msl.backend import _native_dependencies as native
+
     module, roots, names, _, second = ambient
     original = native.dependency_graph
+
     def graph(*args, **kwargs):
         result = original(*args, **kwargs)
         names.append(str(second).encode())
         return result
+
     monkeypatch.setattr(native, "dependency_graph", graph)
     with pytest.raises(RuntimeError, match="changed during|outside.*proved"):
         module._native_dependencies(roots)
@@ -115,11 +119,11 @@ def test_loaded_dependency_outside_package_is_content_bound(ambient):
 
 def test_loaded_install_name_is_a_provider_not_a_guessed_search_directory(ambient):
     from test_native_dependency_contract import _command
+
     module, roots, names, first, second = ambient
     # A wheel can carry an obsolete build-time RPATH yet legitimately bind an
     # already-loaded dylib by its full LC_ID_DYLIB name (e.g. torchvision).
-    first.write_bytes(image(dependency("@rpath/exact/provider.dylib"),
-                            _command(0x8000001C, "/nonexistent/build/lib")))
+    first.write_bytes(image(dependency("@rpath/exact/provider.dylib"), _command(0x8000001C, "/nonexistent/build/lib")))
     second.write_bytes(image(_command(0xD, "@rpath/exact/provider.dylib"), payload=b"v1"))
     names.append(str(second).encode())
     before = module._native_dependencies(roots)
@@ -131,6 +135,7 @@ def test_loaded_install_name_is_a_provider_not_a_guessed_search_directory(ambien
 @pytest.mark.parametrize("damage", ["unloaded", "different_full_name", "duplicate_install_name"])
 def test_loaded_install_name_near_misses_do_not_supply_a_provider(ambient, damage):
     from test_native_dependency_contract import _command
+
     module, roots, names, first, second = ambient
     first.write_bytes(image(dependency("@rpath/exact/provider.dylib")))
     name = "@rpath/other/provider.dylib" if damage == "different_full_name" else "@rpath/exact/provider.dylib"
@@ -183,8 +188,7 @@ assert Path(regex._regex.__file__).resolve() in contract._native_guard.providers
 assert before == contract.framework_identity()
 print('REGEX_NATIVE_BOUND_IDENTITY_VERIFIED', triton_msl.__file__)
 """
-    result = subprocess.run([sys.executable, "-c", program, str(root)],
-                            text=True, capture_output=True, timeout=90)
+    result = subprocess.run([sys.executable, "-c", program, str(root)], text=True, capture_output=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "REGEX_NATIVE_BOUND_IDENTITY_VERIFIED" in result.stdout
 
@@ -219,7 +223,6 @@ assert (Path(torchvision.__file__).parent / '_C.so').resolve() in providers
 assert (Path(torch.__file__).parent / 'lib/libc10.dylib').resolve() in providers
 print('TORCHVISION_NATIVE_BOUND_IDENTITY_VERIFIED', triton_msl.__file__)
 """
-    result = subprocess.run([sys.executable, "-c", program, str(root)],
-                            text=True, capture_output=True, timeout=120)
+    result = subprocess.run([sys.executable, "-c", program, str(root)], text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "TORCHVISION_NATIVE_BOUND_IDENTITY_VERIFIED" in result.stdout

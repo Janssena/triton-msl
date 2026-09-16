@@ -6,6 +6,7 @@ and remove, monotonically even within one clock tick. No private getter or
 Python callback under the loader lock is used. Unknown ABI keeps full scanning.
 Concurrent loader/installation mutation during compilation remains unsupported.
 """
+
 import ctypes as C
 import platform
 import sys
@@ -13,17 +14,30 @@ import sys
 
 class _ImageInfosPrefix(C.Structure):
     _fields_ = [
-        ("version", C.c_uint32), ("infoArrayCount", C.c_uint32), ("infoArray", C.c_void_p),
-        ("notification", C.c_void_p), ("processDetachedFromSharedRegion", C.c_bool),
-        ("libSystemInitialized", C.c_bool), ("dyldImageLoadAddress", C.c_void_p),
-        ("jitInfo", C.c_void_p), ("dyldVersion", C.c_void_p), ("errorMessage", C.c_void_p),
-        ("terminationFlags", C.c_uint64), ("coreSymbolicationShmPage", C.c_void_p),
-        ("systemOrderFlag", C.c_uint64), ("uuidArrayCount", C.c_uint64),
-        ("uuidArray", C.c_void_p), ("dyldAllImageInfosAddress", C.c_void_p),
-        ("initialImageCount", C.c_uint64), ("errorKind", C.c_uint64),
-        ("errorClientOfDylibPath", C.c_void_p), ("errorTargetDylibPath", C.c_void_p),
-        ("errorSymbol", C.c_void_p), ("sharedCacheSlide", C.c_uint64),
-        ("sharedCacheUUID", C.c_uint8 * 16), ("sharedCacheBaseAddress", C.c_uint64),
+        ("version", C.c_uint32),
+        ("infoArrayCount", C.c_uint32),
+        ("infoArray", C.c_void_p),
+        ("notification", C.c_void_p),
+        ("processDetachedFromSharedRegion", C.c_bool),
+        ("libSystemInitialized", C.c_bool),
+        ("dyldImageLoadAddress", C.c_void_p),
+        ("jitInfo", C.c_void_p),
+        ("dyldVersion", C.c_void_p),
+        ("errorMessage", C.c_void_p),
+        ("terminationFlags", C.c_uint64),
+        ("coreSymbolicationShmPage", C.c_void_p),
+        ("systemOrderFlag", C.c_uint64),
+        ("uuidArrayCount", C.c_uint64),
+        ("uuidArray", C.c_void_p),
+        ("dyldAllImageInfosAddress", C.c_void_p),
+        ("initialImageCount", C.c_uint64),
+        ("errorKind", C.c_uint64),
+        ("errorClientOfDylibPath", C.c_void_p),
+        ("errorTargetDylibPath", C.c_void_p),
+        ("errorSymbol", C.c_void_p),
+        ("sharedCacheSlide", C.c_uint64),
+        ("sharedCacheUUID", C.c_uint8 * 16),
+        ("sharedCacheBaseAddress", C.c_uint64),
         ("infoArrayChangeTimestamp", C.c_uint64),
     ]
 
@@ -67,13 +81,19 @@ def _task_image_info():
 
 def create_generation_reader():
     """None means use the existing full name scan, never an unknown identity."""
-    if (sys.platform != "darwin" or platform.machine() != "arm64"
-            or sys.byteorder != "little" or C.sizeof(C.c_void_p) != 8):
+    if (
+        sys.platform != "darwin"
+        or platform.machine() != "arm64"
+        or sys.byteorder != "little"
+        or C.sizeof(C.c_void_p) != 8
+    ):
         return None
     try:
-        if (C.sizeof(_ImageInfosPrefix) != 192
-                or _ImageInfosPrefix.dyldAllImageInfosAddress.offset != 104
-                or _ImageInfosPrefix.infoArrayChangeTimestamp.offset != 184):
+        if (
+            C.sizeof(_ImageInfosPrefix) != 192
+            or _ImageInfosPrefix.dyldAllImageInfosAddress.offset != 104
+            or _ImageInfosPrefix.infoArrayChangeTimestamp.offset != 184
+        ):
             return None
         address, size, layout = _task_image_info()
         if layout != 1 or not 0 < address < 1 << 64 or address % 8 or size < C.sizeof(_ImageInfosPrefix):

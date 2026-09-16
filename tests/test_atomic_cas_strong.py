@@ -61,25 +61,31 @@ def _k_cas_float(ptr, out_ptr, cmp, val):
 @triton.jit
 def _k_cas_tensor(ptr, out_ptr, N: tl.constexpr):
     offs = tl.arange(0, N)
-    cmp = offs.to(tl.int32)               # lane i expects value i
+    cmp = offs.to(tl.int32)  # lane i expects value i
     val = tl.full((N,), -1, tl.int32)
     old = tl.atomic_cas(ptr + offs, cmp, val)
     tl.store(out_ptr + offs, old)
 
 
-_ONE_SHOT = re.compile(r"^\s*atomic_compare_exchange_weak_explicit\(", re.M)   # a bare statement = one shot
-_LOOP = re.compile(r"while \(!atomic_compare_exchange_weak_explicit\([^\n]*\n[^\n]*\n\s*if \((expected_\d+) != (cmp_(?:bits|val)_\d+)\) break;")
+_ONE_SHOT = re.compile(r"^\s*atomic_compare_exchange_weak_explicit\(", re.M)  # a bare statement = one shot
+_LOOP = re.compile(
+    r"while \(!atomic_compare_exchange_weak_explicit\([^\n]*\n[^\n]*\n\s*if \((expected_\d+) != (cmp_(?:bits|val)_\d+)\) break;"
+)
 
 
 def _msl(fn, sig, cex):
     return _build_lowerer(fn, sig, cex).lower()
 
 
-@pytest.mark.parametrize("fn,sig,cex,n_cas", [
-    (_k_claim, {"lock_ptr": "*i32", "out_ptr": "*i32"}, {}, 1),
-    (_k_cas_float, {"ptr": "*fp32", "out_ptr": "*fp32", "cmp": "fp32", "val": "fp32"}, {}, 1),
-    (_k_cas_tensor, {"ptr": "*i32", "out_ptr": "*i32"}, {"N": 32}, 1),
-], ids=["scalar-int", "scalar-float", "tensor-int"])
+@pytest.mark.parametrize(
+    "fn,sig,cex,n_cas",
+    [
+        (_k_claim, {"lock_ptr": "*i32", "out_ptr": "*i32"}, {}, 1),
+        (_k_cas_float, {"ptr": "*fp32", "out_ptr": "*fp32", "cmp": "fp32", "val": "fp32"}, {}, 1),
+        (_k_cas_tensor, {"ptr": "*i32", "out_ptr": "*i32"}, {"N": 32}, 1),
+    ],
+    ids=["scalar-int", "scalar-float", "tensor-int"],
+)
 def test_cas_emits_the_strong_emulation_loop(fn, sig, cex, n_cas):
     """Direct lowering (CPU): every tt.atomic_cas lowers to the retry loop that stops only on a
     genuine mismatch; no bare one-shot weak call remains. Pre-168: one-shot call, no loop."""
@@ -89,7 +95,7 @@ def test_cas_emits_the_strong_emulation_loop(fn, sig, cex, n_cas):
     loops = _LOOP.findall(msl)
     assert len(loops) == n_cas, msl
     for expected, cmp in loops:
-        assert expected.split("_")[-1] == cmp.split("_")[-1]     # the loop compares against ITS cmp
+        assert expected.split("_")[-1] == cmp.split("_")[-1]  # the loop compares against ITS cmp
 
 
 @requires_gpu
@@ -107,12 +113,15 @@ def test_claim_has_exactly_one_winner(cold_gpu_caches):
 
 
 @requires_gpu
-@pytest.mark.parametrize("stored,cmp,val,swaps", [
-    (0.0, -0.0, 5.0, False),      # bit comparison: -0.0 != +0.0 (CUDA atomicCAS semantics)
-    (0.0, 0.0, 5.0, True),
-    (2.5, 2.5, -1.0, True),
-    (2.5, 2.0, -1.0, False),
-])
+@pytest.mark.parametrize(
+    "stored,cmp,val,swaps",
+    [
+        (0.0, -0.0, 5.0, False),  # bit comparison: -0.0 != +0.0 (CUDA atomicCAS semantics)
+        (0.0, 0.0, 5.0, True),
+        (2.5, 2.5, -1.0, True),
+        (2.5, 2.0, -1.0, False),
+    ],
+)
 def test_float_cas_compares_bits(cold_gpu_caches, stored, cmp, val, swaps):
     """Control: the float CAS compares the 32-bit patterns; the old value comes back either way."""
     x = torch.tensor([stored], device=D, dtype=torch.float32)
@@ -129,7 +138,7 @@ def test_tensor_cas_swaps_each_lane_independently(cold_gpu_caches):
     the others keep their value, and every lane returns its old value."""
     N = 32
     x = torch.arange(N, device=D, dtype=torch.int32)
-    x[::2] += 100                       # even lanes hold a non-matching value
+    x[::2] += 100  # even lanes hold a non-matching value
     before = x.clone()
     out = torch.zeros(N, device=D, dtype=torch.int32)
     _k_cas_tensor[(1,)](x, out, N=N, num_warps=1)

@@ -1,4 +1,5 @@
 """Late native imports rekey products; no stale resident stamp is re-certified."""
+
 from pathlib import Path
 import importlib.util
 
@@ -6,7 +7,9 @@ import pytest
 
 # Load the fixture from this test file's actual sibling, not whichever foreign
 # worktree's tests directory a cross-tree baseline runner happens to put first.
-_spec = importlib.util.spec_from_file_location("native_ambient_fixture", Path(__file__).with_name("test_native_ambient_contract.py"))
+_spec = importlib.util.spec_from_file_location(
+    "native_ambient_fixture", Path(__file__).with_name("test_native_ambient_contract.py")
+)
 _fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fixtures)
 ambient = _fixtures.ambient
@@ -53,13 +56,17 @@ def test_late_provider_rekeys_every_product_boundary(runtime, monkeypatch, bound
     from triton_msl.backend import _cache_contract as cache
     from triton_msl.backend.compiler import MetalBackend
     from triton.backends.compiler import GPUTarget
+
     module, _, names, _, second = runtime
     monkeypatch.setattr(cache, "framework_identity", module.framework_identity)
     monkeypatch.setattr(cache, "toolchain_identity", lambda: "controlled-toolchain")
     backend = MetalBackend(GPUTarget("metal", "apple-m4", 32))
-    read = {"source": lambda: cache.source_key("same-ir", "same-options"),
-            "binary": lambda: cache.binary_key("same-msl", "same-options", "msl", ["-std=metal3.2"]),
-            "resident": cache.execution_contract, "backend": backend.hash}[boundary]
+    read = {
+        "source": lambda: cache.source_key("same-ir", "same-options"),
+        "binary": lambda: cache.binary_key("same-msl", "same-options", "msl", ["-std=metal3.2"]),
+        "resident": cache.execution_contract,
+        "backend": backend.hash,
+    }[boundary]
     before = read()
     names.append(str(second).encode())
     assert read() != before
@@ -68,6 +75,7 @@ def test_late_provider_rekeys_every_product_boundary(runtime, monkeypatch, bound
 def test_old_resident_stamp_is_rejected_after_lazy_import(runtime, monkeypatch):
     from triton_msl.backend import _cache_contract as cache
     from triton_msl.errors import MetalNonRecoverableError
+
     module, _, names, _, second = runtime
     monkeypatch.setattr(cache, "framework_identity", module.framework_identity)
     monkeypatch.setattr(cache, "toolchain_identity", lambda: "controlled-toolchain")
@@ -82,6 +90,7 @@ def test_old_resident_stamp_is_rejected_after_lazy_import(runtime, monkeypatch):
 
 def test_failed_lazy_inventory_never_certifies_the_old_snapshot(runtime):
     from triton_msl.errors import MetalNonRecoverableError
+
     module, _, names, _, second = runtime
     old = module.framework_identity()
     guard = module._native_guard
@@ -96,14 +105,17 @@ def test_failed_lazy_inventory_never_certifies_the_old_snapshot(runtime):
 
 def test_post_inventory_failure_rolls_back_the_native_guard(runtime, monkeypatch):
     from triton_msl.errors import MetalNonRecoverableError
+
     module, roots, names, _, second = runtime
     old = module.framework_identity()
     guard = module._native_guard
     names.append(str(second).encode())
     calls = []
+
     def unstable():
         calls.append(True)
         return roots, ({"changed": True} if len(calls) == 2 else {})
+
     monkeypatch.setattr(module, "_discover_selection", unstable)
     with pytest.raises(MetalNonRecoverableError):
         module.framework_identity()
@@ -119,10 +131,12 @@ def test_interrupted_inventory_rolls_back_digest_and_guard(runtime, monkeypatch)
     guard = module._native_guard
     names.append(str(second).encode())
     original = module.json.dumps
+
     def interrupted(value, *args, **kwargs):
         if isinstance(value, dict) and "packages" in value:
             raise KeyboardInterrupt("controlled post-inventory interruption")
         return original(value, *args, **kwargs)
+
     monkeypatch.setattr(module.json, "dumps", interrupted)
     with pytest.raises(KeyboardInterrupt):
         module.framework_identity()
@@ -134,15 +148,19 @@ def test_interrupted_inventory_rolls_back_digest_and_guard(runtime, monkeypatch)
 
 def test_jit_owner_cache_is_cleared_under_the_new_native_identity(runtime, monkeypatch):
     from triton_msl.backend import _cache_contract as cache
+
     module, _, names, _, second = runtime
     monkeypatch.setattr(cache, "framework_identity", module.framework_identity)
     monkeypatch.setattr(cache, "toolchain_identity", lambda: "controlled-toolchain")
+
     class Owner:
         def __init__(self):
             self.device_caches = {0: "old executable"}
             self.hooks = []
+
         def add_pre_run_hook(self, hook):
             self.hooks.append(hook)
+
     owner, unrelated = Owner(), Owner()
     assert cache.install_jit_policy_guard(owner, cache.execution_contract())
     owner.hooks[0]()
@@ -158,6 +176,7 @@ def test_real_z3_lazy_import_rekeys_without_certifying_old_identity():
     import subprocess
     import sys
     import triton_msl
+
     if sys.platform != "darwin" or importlib.util.find_spec("z3") is None:
         pytest.skip("requires Darwin and the optional Z3 package")
     root = Path(triton_msl.__file__).resolve().parent.parent
@@ -178,7 +197,6 @@ assert after != before
 assert contract.framework_identity() == after
 print('LAZY_Z3_REKEY_VERIFIED', triton_msl.__file__, before, after)
 """
-    result = subprocess.run([sys.executable, "-c", program, str(root)], capture_output=True,
-                            text=True, timeout=90)
+    result = subprocess.run([sys.executable, "-c", program, str(root)], capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "LAZY_Z3_REKEY_VERIFIED" in result.stdout

@@ -2704,9 +2704,7 @@ def test_lower_store_array_path_with_array_mask():
             is_tensor=False,
         )
         lowerer.env_array[102] = ("msk", 2, "bool")
-        with pytest.raises(
-            MetalNonRecoverableError, match="mask register-array width"
-        ):
+        with pytest.raises(MetalNonRecoverableError, match="mask register-array width"):
             lowerer._lower_store(store)
         lowerer.env_array[102] = ("msk", 3, "bool")
         lowerer._lower_store(store)
@@ -2764,9 +2762,7 @@ def test_lower_store_array_path_with_uniform_tensor_mask():
             elem_type="f32",
             is_tensor=False,
         )
-        with pytest.raises(
-            MetalNonRecoverableError, match="not a proved uniform splat"
-        ):
+        with pytest.raises(MetalNonRecoverableError, match="not a proved uniform splat"):
             lowerer._lower_store(store)
 
         lowerer._is_splat.add(102)

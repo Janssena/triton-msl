@@ -3,6 +3,7 @@
 This binds descriptor contents, not the dynamic tensor argument ABI or a foreign
 pipeline's binary. Those boundaries must not infer protection from this record.
 """
+
 import json
 import math
 from functools import lru_cache
@@ -10,9 +11,20 @@ from functools import lru_cache
 from triton_msl.errors import MetalNonRecoverableError
 
 
-FIELDS = ("num_warps", "num_ctas", "shared", "block_size", "output_arg_indices",
-          "needs_2d_grid", "mm_two_kernel", "fast_matmul", "quant_matmul",
-          "flash_attention", "batched_dot_bounds", "device_assert")
+FIELDS = (
+    "num_warps",
+    "num_ctas",
+    "shared",
+    "block_size",
+    "output_arg_indices",
+    "needs_2d_grid",
+    "mm_two_kernel",
+    "fast_matmul",
+    "quant_matmul",
+    "flash_attention",
+    "batched_dot_bounds",
+    "device_assert",
+)
 
 
 def _refuse(reason):
@@ -40,25 +52,35 @@ def _record(metadata):
     if type(metadata["needs_2d_grid"]) is not bool:
         _refuse("invalid grid mode")
     outputs = metadata["output_arg_indices"]
-    assertion = metadata['device_assert']
+    assertion = metadata["device_assert"]
     if assertion is not None:
-        if (type(assertion) is not dict or set(assertion) != {'schema', 'messages', 'buffer_index'}
-            or type(assertion['schema']) is not int or assertion['schema'] != 1
-            or type(assertion['buffer_index']) is not int or not 0 <= assertion['buffer_index'] < 31
-            or type(assertion['messages']) is not list or not assertion['messages']
-            or any(type(m) is not str for m in assertion['messages'])):
-            _refuse('invalid device assertion descriptor')
+        if (
+            type(assertion) is not dict
+            or set(assertion) != {"schema", "messages", "buffer_index"}
+            or type(assertion["schema"]) is not int
+            or assertion["schema"] != 1
+            or type(assertion["buffer_index"]) is not int
+            or not 0 <= assertion["buffer_index"] < 31
+            or type(assertion["messages"]) is not list
+            or not assertion["messages"]
+            or any(type(m) is not str for m in assertion["messages"])
+        ):
+            _refuse("invalid device assertion descriptor")
         if any(metadata[name] is not None for name in FIELDS[6:11]):
-            _refuse('device assertions require the generic launch ABI')
+            _refuse("device assertions require the generic launch ABI")
     if outputs is not None and (
         type(outputs) not in (list, tuple)
         or any(type(i) is not int or i < 0 for i in outputs)
         or len(set(outputs)) != len(outputs)
     ):
         _refuse("invalid output indices")
-    return {"schema": 2, "kind": "metal-packed-launch", "name": metadata["name"],
-            "execution_contract": metadata["execution_contract"],
-            "fields": {name: metadata[name] for name in FIELDS}}
+    return {
+        "schema": 2,
+        "kind": "metal-packed-launch",
+        "name": metadata["name"],
+        "execution_contract": metadata["execution_contract"],
+        "fields": {name: metadata[name] for name in FIELDS},
+    }
 
 
 def seal_launch_metadata(metadata):
@@ -69,9 +91,13 @@ def seal_launch_metadata(metadata):
     """
     if "num_warps" not in metadata or "num_ctas" not in metadata:
         _refuse("compiler omitted launch options")
-    defaults = {"shared": 0, "block_size": metadata["num_warps"] * 32,
-                "output_arg_indices": None, "needs_2d_grid": False,
-                **{name: None for name in FIELDS[6:]}}
+    defaults = {
+        "shared": 0,
+        "block_size": metadata["num_warps"] * 32,
+        "output_arg_indices": None,
+        "needs_2d_grid": False,
+        **{name: None for name in FIELDS[6:]},
+    }
     for name, value in defaults.items():
         metadata.setdefault(name, value)
     metadata["launch_contract"] = _canonical(_record(metadata))
@@ -169,8 +195,7 @@ def _checked_packed_copy(value, plan):
         observed = tuple(value)
         if len(observed) != len(wanted):
             _refuse("descriptor changed after launcher construction")
-        return [_checked_packed_copy(child, child_plan)
-                for child, child_plan in zip(observed, wanted)]
+        return [_checked_packed_copy(child, child_plan) for child, child_plan in zip(observed, wanted)]
     if kind is dict:
         if type(value) is not dict:
             raise _UsePackedJSON
@@ -181,16 +206,14 @@ def _checked_packed_copy(value, plan):
             # An explicit Unicode surrogate pair and its decoded character
             # can spell the same JSON object key. Let the encoder decide.
             raise _UsePackedJSON
-        return {key: _checked_packed_copy(observed[key], child_plan)
-                for key, child_plan in wanted}
+        return {key: _checked_packed_copy(observed[key], child_plan) for key, child_plan in wanted}
     if type(value) is not kind:
         raise _UsePackedJSON
     if kind is str and value != wanted:
         # JSON's ASCII escaping can equate a surrogate pair with one Unicode
         # character even though the Python strings compare unequal.
         raise _UsePackedJSON
-    if value != wanted or (kind is float and value == 0.0
-                           and math.copysign(1.0, value) != math.copysign(1.0, wanted)):
+    if value != wanted or (kind is float and value == 0.0 and math.copysign(1.0, value) != math.copysign(1.0, wanted)):
         _refuse("descriptor changed after launcher construction")
     return wanted
 
@@ -222,9 +245,11 @@ def _select_checked_copy(import_module, find_spec, modules):
 from importlib import import_module as _import_module
 from importlib.util import find_spec as _find_spec
 import sys as _sys
+
 _checked_packed_copy_python = _checked_packed_copy
 _packed_native = _select_checked_copy(_import_module, _find_spec, _sys.modules)
 PACKED_COPY_IMPLEMENTATION = "python" if _packed_native is None else "native"
 if _packed_native is not None:
+
     def _checked_packed_copy(value, plan):
         return _packed_native.copy(value, plan, globals())

@@ -3,6 +3,7 @@
 a subf/zero); now routes to the stride-generic per-group scalar template with a
 synthesized all-zero zeros buffer (ssg=0 -> per-N). Correct-or-refuse.
 """
+
 import pytest
 import torch
 import triton
@@ -15,8 +16,24 @@ requires_mps = pytest.mark.skipif(
 
 
 @triton.jit
-def _sym_int8(a_ptr, w_ptr, c_ptr, s_ptr, M, N, K, sam, sak, swk, swn, scm, scn,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _sym_int8(
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    s_ptr,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    swk,
+    swn,
+    scm,
+    scn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     om = pid_m * BM + tl.arange(0, BM)
@@ -27,7 +44,7 @@ def _sym_int8(a_ptr, w_ptr, c_ptr, s_ptr, M, N, K, sam, sak, swk, swn, scm, scn,
     scale = tl.load(s_ptr + on)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for _ in range(0, K, BK):
-        w = tl.load(wp).to(tl.float32) * scale[None, :]   # symmetric: no zero-point
+        w = tl.load(wp).to(tl.float32) * scale[None, :]  # symmetric: no zero-point
         acc += tl.dot(tl.load(ap), w)
         ap += BK * sak
         wp += BK * swk
@@ -42,15 +59,18 @@ def test_symmetric_int8_gemm_routes_and_computes(M, N, K, wl):
     torch.manual_seed(0)
     a = torch.randn(M, K, device=dev, dtype=torch.float32)
     wkn = torch.randint(-127, 127, (K, N), device=dev, dtype=torch.int8)
-    scale = (torch.rand(N, device=dev) * 0.05 + 0.01)
+    scale = torch.rand(N, device=dev) * 0.05 + 0.01
     ref = a @ (wkn.float() * scale)
     if wl == "kn":
-        wbuf = wkn.contiguous(); swk, swn = wbuf.stride(0), wbuf.stride(1)
+        wbuf = wkn.contiguous()
+        swk, swn = wbuf.stride(0), wbuf.stride(1)
     else:
-        wbuf = wkn.t().contiguous(); swk, swn = wbuf.stride(1), wbuf.stride(0)
+        wbuf = wkn.t().contiguous()
+        swk, swn = wbuf.stride(1), wbuf.stride(0)
     out = torch.zeros(M, N, device=dev, dtype=torch.float32)
     st = lambda t: t.stride()
     _sym_int8[(triton.cdiv(M, 32), triton.cdiv(N, 32))](
-        a, wbuf, out, scale, M, N, K, st(a)[0], st(a)[1], swk, swn, st(out)[0], st(out)[1], 32, 32, 32)
+        a, wbuf, out, scale, M, N, K, st(a)[0], st(a)[1], swk, swn, st(out)[0], st(out)[1], 32, 32, 32
+    )
     torch.mps.synchronize()
     assert (out - ref).abs().max().item() < 1e-2 * max(ref.abs().max().item(), 1.0)

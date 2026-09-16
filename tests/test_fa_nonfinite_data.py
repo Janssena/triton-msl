@@ -97,9 +97,7 @@ def _clear_kernel_cache(kernel):
         ("tiled", 128, True, ["tiled"]),
     ],
 )
-def test_dense_nan_q_row_is_row_local(
-    cold_gpu_caches, maker_spy, route, d, force_tiled, expected_maker
-):
+def test_dense_nan_q_row_is_row_local(cold_gpu_caches, maker_spy, route, d, force_tiled, expected_maker):
     z = h = 1
     n = 64
     torch.manual_seed(11501)
@@ -115,9 +113,21 @@ def test_dense_nan_q_row_is_row_local(
 
     _clear_kernel_cache(_flash_attn_fwd)
     _flash_attn_fwd[(n // 32, 1)](
-        q, k, v, out,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        z, h, n, 32, 32, d, False,
+        q,
+        k,
+        v,
+        out,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        z,
+        h,
+        n,
+        32,
+        32,
+        d,
+        False,
     )
     torch.mps.synchronize()
     assert maker_spy == expected_maker
@@ -139,9 +149,27 @@ def test_mla_nan_q_row_is_row_local(cold_gpu_caches, fa_spy, maker_spy):
 
     _clear_kernel_cache(_mla_value_path)
     _mla_value_path[(1, MLA_Z * MLA_H)](
-        qn, qr, kn, kr, v, out,
-        *st(qn), *st(qr), *st(kn), *st(kr), *st(v), *st(out),
-        MLA_Z, MLA_H, MLA_N, 32, 32, DN, DR, DV, 0,
+        qn,
+        qr,
+        kn,
+        kr,
+        v,
+        out,
+        *st(qn),
+        *st(qr),
+        *st(kn),
+        *st(kr),
+        *st(v),
+        *st(out),
+        MLA_Z,
+        MLA_H,
+        MLA_N,
+        32,
+        32,
+        DN,
+        DR,
+        DV,
+        0,
     )
     torch.mps.synchronize()
     assert fa_spy == [True]
@@ -174,9 +202,22 @@ def test_varlen_nan_q_row_is_row_local(cold_gpu_caches, maker_spy, dtype, d):
 
     _clear_kernel_cache(_varlen_fwd)
     _varlen_fwd[(1, 2 * h)](
-        q, k, v, out, cu_q, cu_k,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        h, 32, scale, 32, 32, d,
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        cu_k,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        h,
+        32,
+        scale,
+        32,
+        32,
+        d,
     )
     torch.mps.synchronize()
     assert maker_spy == (["varlen_mma"] if dtype == torch.float16 else ["varlen_scalar"])
@@ -188,12 +229,8 @@ def test_varlen_nan_q_row_is_row_local(cold_gpu_caches, maker_spy, dtype, d):
             kb = k[batch_start : batch_start + 32, head].float()
             vb = v[batch_start : batch_start + 32, head].float()
             scores = (qb @ kb.transpose(-2, -1)) * scale
-            ref[batch_start : batch_start + 32, head] = (
-                torch.softmax(scores, dim=-1) @ vb
-            ).to(dtype)
-    _assert_only_first_row_nan(
-        out.permute(1, 0, 2), ref.permute(1, 0, 2), f"varlen {dtype} d={d}"
-    )
+            ref[batch_start : batch_start + 32, head] = (torch.softmax(scores, dim=-1) @ vb).to(dtype)
+    _assert_only_first_row_nan(out.permute(1, 0, 2), ref.permute(1, 0, 2), f"varlen {dtype} d={d}")
 
 
 @requires_mps
@@ -202,9 +239,7 @@ def test_varlen_nan_q_row_is_row_local(cold_gpu_caches, maker_spy, dtype, d):
     [(torch.float16, 64), (torch.float32, 128)],
     ids=["mma", "scalar"],
 )
-def test_varlen_empty_k_sequence_preserves_zero_denominator_semantics(
-    cold_gpu_caches, maker_spy, dtype, d
-):
+def test_varlen_empty_k_sequence_preserves_zero_denominator_semantics(cold_gpu_caches, maker_spy, dtype, d):
     """A cross-attention batch item may have query rows but zero keys.  The
     source's all-masked tile produces NaN; the templates reach l==0 by taking
     no K iterations.  Both representations must store the same NaN rows without
@@ -222,9 +257,22 @@ def test_varlen_empty_k_sequence_preserves_zero_denominator_semantics(
 
     _clear_kernel_cache(_varlen_fwd)
     _varlen_fwd[(1, 2 * h)](
-        q, k, v, out, cu_q, cu_k,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        h, 32, scale, 32, 32, d,
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        cu_k,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        h,
+        32,
+        scale,
+        32,
+        32,
+        d,
     )
     torch.mps.synchronize()
     assert maker_spy == (["varlen_mma"] if dtype == torch.float16 else ["varlen_scalar"])

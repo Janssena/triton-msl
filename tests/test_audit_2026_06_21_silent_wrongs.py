@@ -1129,7 +1129,8 @@ def test_mixed_dtype_multivalue_scan_keeps_every_slot():
     torch.mps.synchronize()
     assert (oc.cpu() == torch.arange(1, N + 1, dtype=torch.int32)).all(), "int slot wrong"
     assert torch.allclose(osu.cpu(), torch.cumsum(b.cpu(), 0), atol=1e-5), (
-        "fp32 slot truncated to int (the re-audit #14 silent-wrong)")
+        "fp32 slot truncated to int (the re-audit #14 silent-wrong)"
+    )
 
 
 @triton.jit

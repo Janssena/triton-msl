@@ -1,4 +1,5 @@
 """Cold native selection must precede the first recorded execution identity."""
+
 import os
 from pathlib import Path
 import shutil
@@ -11,26 +12,34 @@ import pytest
 import triton_msl
 
 ROOT = Path(triton_msl.__file__).resolve().parent.parent
-IMAGE = ROOT / 'triton_msl/backend' / ('_binder_native' + sysconfig.get_config_var('EXT_SUFFIX'))
+IMAGE = ROOT / "triton_msl/backend" / ("_binder_native" + sysconfig.get_config_var("EXT_SUFFIX"))
 
 
 def _run(tmp_path, source, root=ROOT, *args):
-    script = tmp_path / 'cold.py'
+    script = tmp_path / "cold.py"
     script.write_text(textwrap.dedent(source))
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
-    env.pop('PYTHONPATH', None)
-    result = subprocess.run([sys.executable, '-I', '-B', str(script), str(root), *args],
-                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
-    (tmp_path / 'stdout.log').write_text(result.stdout)
-    (tmp_path / 'stderr.log').write_text(result.stderr)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", str(script), str(root), *args],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    (tmp_path / "stdout.log").write_text(result.stdout)
+    (tmp_path / "stderr.log").write_text(result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert 'COLD_INITIALIZATION_PASS' in result.stdout
+    assert "COLD_INITIALIZATION_PASS" in result.stdout
 
 
-@pytest.mark.skipif(not IMAGE.is_file(), reason='requires optional native binder image')
-@pytest.mark.parametrize('order', ['cache', 'signature', 'raw-native'])
+@pytest.mark.skipif(not IMAGE.is_file(), reason="requires optional native binder image")
+@pytest.mark.parametrize("order", ["cache", "signature", "raw-native"])
 def test_native_initialization_precedes_stamp_and_later_pointer_only_plan(tmp_path, order):
-    _run(tmp_path, '''
+    _run(
+        tmp_path,
+        """
         import importlib
         from pathlib import Path
         import sys
@@ -64,19 +73,24 @@ def test_native_initialization_precedes_stamp_and_later_pointer_only_plan(tmp_pa
         assert cache.execution_contract() == before
         assert cache.validate_execution_contract(before) == before
         print('COLD_INITIALIZATION_PASS')
-    ''', ROOT, order)
+    """,
+        ROOT,
+        order,
+    )
 
 
 def test_actual_pure_package_initializes_binding_without_native_helpers(tmp_path):
-    pure = tmp_path / 'pure'
-    package = pure / 'triton_msl'
-    for source in (ROOT / 'triton_msl').rglob('*'):
-        if source.is_file() and source.suffix in ('.py', '.c') and '__pycache__' not in source.parts:
-            target = package / source.relative_to(ROOT / 'triton_msl')
+    pure = tmp_path / "pure"
+    package = pure / "triton_msl"
+    for source in (ROOT / "triton_msl").rglob("*"):
+        if source.is_file() and source.suffix in (".py", ".c") and "__pycache__" not in source.parts:
+            target = package / source.relative_to(ROOT / "triton_msl")
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-    assert not list(package.rglob('*.so'))
-    _run(tmp_path, '''
+    assert not list(package.rglob("*.so"))
+    _run(
+        tmp_path,
+        """
         from pathlib import Path
         import sys
         root = Path(sys.argv[1]).resolve()
@@ -92,12 +106,16 @@ def test_actual_pure_package_initializes_binding_without_native_helpers(tmp_path
         plan = binding.make_binding_plan(names, signature)
         assert binding.bind_arguments_with_plan((17,), names, signature, plan)[3] == [b'\\x11\\x00\\x00\\x00']
         print('COLD_INITIALIZATION_PASS')
-    ''', pure)
+    """,
+        pure,
+    )
 
 
-@pytest.mark.parametrize('error_type', ['ImportError', 'RuntimeError'])
+@pytest.mark.parametrize("error_type", ["ImportError", "RuntimeError"])
 def test_discoverable_broken_binder_is_not_hidden_by_cold_cache_import(tmp_path, error_type):
-    _run(tmp_path, '''
+    _run(
+        tmp_path,
+        """
         import importlib.abc
         import importlib.util
         import sys
@@ -120,4 +138,7 @@ def test_discoverable_broken_binder_is_not_hidden_by_cold_cache_import(tmp_path,
             raise AssertionError('cold cache import hid broken binder')
         assert 'triton_msl.backend._cache_contract' not in sys.modules
         print('COLD_INITIALIZATION_PASS')
-    ''', ROOT, error_type)
+    """,
+        ROOT,
+        error_type,
+    )

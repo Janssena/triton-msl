@@ -505,11 +505,7 @@ class GenericLowerer(
                 op_name=op_name,
             )
         if facts.is_tensor:
-            if (
-                shape is None
-                or not shape
-                or any(type(dim) is not int or dim <= 0 for dim in shape)
-            ):
+            if shape is None or not shape or any(type(dim) is not int or dim <= 0 for dim in shape):
                 raise MetalNonRecoverableError(
                     f"{op_name} native metadata does not prove a positive static tensor shape for SSA value {ssa_id}",
                     op_name=op_name,
@@ -878,7 +874,9 @@ class GenericLowerer(
             called_funcs=self.graph.called_funcs or [],
             find_op_type_str=self._find_op_type_str,
             extract_shape=_extract_shape,
-            supported_assert_ids=frozenset(self._assert_plan['ids']) if getattr(self, '_assert_plan', None) else frozenset(),
+            supported_assert_ids=frozenset(self._assert_plan["ids"])
+            if getattr(self, "_assert_plan", None)
+            else frozenset(),
         )
         violation = _rc.check_all(ctx)
         if violation is not None:
@@ -887,6 +885,7 @@ class GenericLowerer(
     def lower(self) -> str:
         """Lower the IRGraph to MSL source code."""
         from .assertions import prepare
+
         self._assert_plan = prepare(self)
         # Integrity prescan (PR1): some ops have no correct lowering on this
         # backend AND the legacy fallback can't help — emitting anything for
@@ -970,6 +969,7 @@ class GenericLowerer(
                             _fa_mindim = min([_fa_mindim] + _dims)
             if _fa_mindim in (8, 16) and _fa_maxdim == 64:
                 from ._decode_template import detect as _detect_small_query
+
                 _decode_info = _detect_small_query(self)
                 if _decode_info is not None:
                     return self._lower_flash_attention_template(_decode_info)
@@ -991,6 +991,7 @@ class GenericLowerer(
                 return _lower_wide_biased_rows(self, _wide_row_plan)
 
             from ._biased_replay import eligible as _biased_replay_eligible
+
             if _biased_replay_eligible(self):
                 self._source_biased_replay = True
                 return "// Source-replayed biased attention\n" + self._lower_generic()
@@ -1093,11 +1094,7 @@ class GenericLowerer(
                 # A scalar divisor is the P-side scale the guard exists to catch.
                 if _is_scalar_splat(_operands[1]):
                     return False
-                _direct = [
-                    _op
-                    for _op in _fa_ops
-                    if _dot_ids.intersection(_op.operand_ids or [])
-                ]
+                _direct = [_op for _op in _fa_ops if _dot_ids.intersection(_op.operand_ids or [])]
                 if _direct != [_consumer]:
                     return False
                 _stores = [_op for _op in _fa_ops if _op.op == "tt.store"]
@@ -1112,9 +1109,7 @@ class GenericLowerer(
                 }
                 _seen = set()
                 while _cur not in _seen:
-                    if _cur == _consumer.id or _cur in set(
-                        getattr(_consumer, "result_ids", None) or []
-                    ):
+                    if _cur == _consumer.id or _cur in set(getattr(_consumer, "result_ids", None) or []):
                         return True
                     _seen.add(_cur)
                     _op = _fa_by_id.get(_cur)
@@ -1135,10 +1130,7 @@ class GenericLowerer(
                     op_name="tt.dot",
                 )
 
-            _terminal_pv_normalization = any(
-                _is_terminal_pv_normalization(_fa_dots[-1], _s)
-                for _s in _fa_ops
-            )
+            _terminal_pv_normalization = any(_is_terminal_pv_normalization(_fa_dots[-1], _s) for _s in _fa_ops)
             _scaled_dots = [_d for _d in _fa_dots if _dot_result_scaled(_d)]
             _constant_result_scale = None
             if _scaled_dots:
@@ -1147,13 +1139,8 @@ class GenericLowerer(
                 # The varlen route already ran above; dense routing below must consume
                 # this proof, otherwise falling into generic lowering is still unsafe.
                 if len(_fa_dots) == 2 and _scaled_dots == [_fa_dots[0]]:
-                    _constant_result_scale = self._fa_analyze_constant_score_scale(
-                        _fa_dots[0], _fa_dots[1]
-                    )
-                if (
-                    _constant_result_scale is None
-                    or not _constant_result_scale["op_ids"]
-                ):
+                    _constant_result_scale = self._fa_analyze_constant_score_scale(_fa_dots[0], _fa_dots[1])
+                if _constant_result_scale is None or not _constant_result_scale["op_ids"]:
                     _refuse_dot_result_epilogue()
             # Empirically mapped failure boundary (2026-06-17): the attention
             # lowering is validated only at BLOCK_M = BLOCK_N = 32, head_dim in
@@ -1196,7 +1183,10 @@ class GenericLowerer(
                 # neutral subject. This changes wording only, never admission.
                 _fa_arg_names = {str(a.name).lower() for a in self.graph.args}
                 _named_fa_abi = {
-                    "stride_qm", "stride_qk", "stride_kn", "stride_kk",
+                    "stride_qm",
+                    "stride_qk",
+                    "stride_kn",
+                    "stride_kk",
                 }.issubset(_fa_arg_names)
                 info = self._detect_flash_attention(
                     unresolved_subject=None if _named_fa_abi else "multi-dot softmax-shaped kernel",
@@ -1219,11 +1209,7 @@ class GenericLowerer(
                         return self._lower_mla_attention_template(info)
                     # Asymmetric single-tensor (qk != v): simd-only. Route iff simd-eligible
                     # (contiguous, v in {64,128}, fp16 for qk>128); else fall through -> refuse.
-                    if (
-                        not info.get("is_mla")
-                        and _v_head_dim_of(info) != info["head_dim"]
-                        and _simd_fa_eligible(info)
-                    ):
+                    if not info.get("is_mla") and _v_head_dim_of(info) != info["head_dim"] and _simd_fa_eligible(info):
                         return self._lower_flash_attention_template(info)
 
             elif _fa_maxdim == 64:
@@ -1266,10 +1252,7 @@ class GenericLowerer(
                     # the tiled maker promotes the same bfloat loads to fp32.
                     and not _fa_has_bf16
                     and not _info64.get("is_mla")
-                    and all(
-                        str(self.graph.args[_info64[role]].elem_type) == "bf16"
-                        for role in ("q", "k", "v", "out")
-                    )
+                    and all(str(self.graph.args[_info64[role]].elem_type) == "bf16" for role in ("q", "k", "v", "out"))
                 )
                 if (
                     _info64 is not None
@@ -1420,6 +1403,7 @@ class GenericLowerer(
 
         if _loop_epilogue_eligible(self):
             from ._loop_epilogue import deferred_wide_ops
+
             self._source_epilogue_replay = True
             self._skip_ids.update(deferred_wide_ops(self))
             return "// Source-replayed K-loop epilogue\n" + self._lower_generic()
@@ -1535,10 +1519,15 @@ class GenericLowerer(
         The caller separately excludes both protected dot-result epilogue classes.
         No name-based length guess or exception-driven fallback is used here.
         """
-        if (info.get("head_dim") != 64 or info.get("v_head_dim", 64) != 64
-                or info.get("block_m") != 32 or info.get("block_n") != 32
-                or info.get("out_dtype") not in ("f16", "f32") or info.get("is_mla")
-                or type(info.get("N_CTX")) is not int):
+        if (
+            info.get("head_dim") != 64
+            or info.get("v_head_dim", 64) != 64
+            or info.get("block_m") != 32
+            or info.get("block_n") != 32
+            or info.get("out_dtype") not in ("f16", "f32")
+            or info.get("is_mla")
+            or type(info.get("N_CTX")) is not int
+        ):
             return False
 
         def walk(ops):
@@ -1559,15 +1548,19 @@ class GenericLowerer(
         if len(loops) != 1:
             return False
         loop = loops[0]
-        if (len(loop.operand_ids or []) < 3 or loop.operand_ids[1] != length.id
-                or self._const_int(loop.operand_ids[0], by_id) != 0
-                or self._const_int(loop.operand_ids[2], by_id) != 32):
+        if (
+            len(loop.operand_ids or []) < 3
+            or loop.operand_ids[1] != length.id
+            or self._const_int(loop.operand_ids[0], by_id) != 0
+            or self._const_int(loop.operand_ids[2], by_id) != 32
+        ):
             return False
         iv = (loop.attrs.get("block_arg_ids") or [None])[0]
         if iv is None:
             return False
 
         wrappers = {"tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout"}
+
         def core(vid):
             seen = set()
             while vid not in seen:
@@ -1587,15 +1580,23 @@ class GenericLowerer(
                 if vid in args:
                     return args[vid].index if args[vid].is_ptr else None
                 op = by_id.get(vid)
-                if op is None or op.op not in ("tt.addptr", "tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout") or not op.operand_ids:
+                if (
+                    op is None
+                    or op.op not in ("tt.addptr", "tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout")
+                    or not op.operand_ids
+                ):
                     return None
                 vid = op.operand_ids[0]
             return None
 
         def boundary(mask, row):
             cmp = by_id.get(core(mask))
-            if (cmp is None or cmp.op != "arith.cmpi" or len(cmp.operand_ids or []) != 2
-                    or cmp.attrs.get("predicate_name") != "slt"):
+            if (
+                cmp is None
+                or cmp.op != "arith.cmpi"
+                or len(cmp.operand_ids or []) != 2
+                or cmp.attrs.get("predicate_name") != "slt"
+            ):
                 return False
             lhs, rhs = cmp.operand_ids
             rhs = core(rhs)
@@ -1607,13 +1608,21 @@ class GenericLowerer(
             sh = self._index_shape(lhs, by_id, args, iv, 1)
             if sh["bad"] or sh["mod"] is not None or sh["index_casts"] or sh["range"] != 1 or sh["bounds"] != (0, 32):
                 return False
-            return (sh["iv"] == 0 and sh["pid"] == 0 and sh["pid_div"] is None and sh["coef"] == 32) if row else (sh["iv"] == 1 and sh["pid"] is None)
+            return (
+                (sh["iv"] == 0 and sh["pid"] == 0 and sh["pid_div"] is None and sh["coef"] == 32)
+                if row
+                else (sh["iv"] == 1 and sh["pid"] is None)
+            )
 
         memory = [op for op in ops if op.op in ("tt.load", "tt.store")]
         if len(memory) != 4:
             return False
-        expected = {info["q"]: ("tt.load", True), info["k"]: ("tt.load", False),
-                    info["v"]: ("tt.load", False), info["out"]: ("tt.store", True)}
+        expected = {
+            info["q"]: ("tt.load", True),
+            info["k"]: ("tt.load", False),
+            info["v"]: ("tt.load", False),
+            info["out"]: ("tt.store", True),
+        }
         if len(expected) != 4:
             return False
         seen = set()
@@ -1864,7 +1873,7 @@ class GenericLowerer(
         _scan_top_by_result = {}
         for _s in _top_ops:
             _scan_top_by_result[_s.id] = _s
-            for _rid in (_s.result_ids or []):
+            for _rid in _s.result_ids or []:
                 _scan_top_by_result[_rid] = _s
 
         def _scan_region_is_exact(sc):
@@ -1873,9 +1882,7 @@ class GenericLowerer(
                 contract = self._prove_scan_native_contract(sc)
             except MetalNonRecoverableError as exc:
                 reason = str(exc).splitlines()[0]
-                self._scan_native_errors[sc.id] = reason.removeprefix(
-                    "Refusing to emit silently-wrong output: "
-                )
+                self._scan_native_errors[sc.id] = reason.removeprefix("Refusing to emit silently-wrong output: ")
                 return False
             self._scan_native_contracts[sc.id] = contract
             _shape = contract["shape"]
@@ -1918,11 +1925,7 @@ class GenericLowerer(
                 # Kernel arguments are scalar values or scalar pointer bases.
                 # Tensor uses of them must still pass through a proved splat,
                 # addptr or load before becoming a scan operand.
-                return (
-                    "uniform"
-                    if vid in _scan_arg_ids and not _facts.is_tensor and _facts.shape == ()
-                    else None
-                )
+                return "uniform" if vid in _scan_arg_ids and not _facts.is_tensor and _facts.shape == () else None
             if _op.op == "tt.make_range":
                 return "coordinate"
             if _op.op == "tt.scan":
@@ -1931,21 +1934,13 @@ class GenericLowerer(
                 # MLIR's ``dense<scalar>`` is a splat, but ``dense<[...]>`` is
                 # not.  The walker leaves a non-splat payload as a string; do
                 # not silently replay it as one scalar in every array slot.
-                return (
-                    "uniform"
-                    if isinstance((_op.attrs or {}).get("value"), (bool, int, float))
-                    else None
-                )
+                return "uniform" if isinstance((_op.attrs or {}).get("value"), (bool, int, float)) else None
             if _op.op in ("tt.get_program_id", "tt.get_num_programs"):
                 return "uniform"
             if _op.op == "tt.splat":
                 if len(_op.operand_ids or []) != 1:
                     return None
-                return (
-                    "uniform"
-                    if _scan_value_proof(_op.operand_ids[0], set(seen)) == "uniform"
-                    else None
-                )
+                return "uniform" if _scan_value_proof(_op.operand_ids[0], set(seen)) == "uniform" else None
             if _op.op == "ttg.convert_layout":
                 if len(_op.operand_ids or []) != 1:
                     return None
@@ -1955,9 +1950,7 @@ class GenericLowerer(
             if _op.op in _MEPT_SAFE_OPS or _op.op in ("tt.expand_dims", "tt.broadcast"):
                 if not _op.operand_ids:
                     return None
-                proofs = [
-                    _scan_value_proof(o, set(seen)) for o in _op.operand_ids
-                ]
+                proofs = [_scan_value_proof(o, set(seen)) for o in _op.operand_ids]
                 if any(p is None for p in proofs):
                     return None
                 return "coordinate" if "coordinate" in proofs else "uniform"
@@ -1986,35 +1979,24 @@ class GenericLowerer(
                 and tuple(dest_shape) == tuple(_scan_shape)
             )
 
-        _scan_allowed_top = _MEPT_SAFE_OPS | {
-            "tt.expand_dims", "tt.broadcast", "tt.scan", "ttg.convert_layout"
-        }
+        _scan_allowed_top = _MEPT_SAFE_OPS | {"tt.expand_dims", "tt.broadcast", "tt.scan", "ttg.convert_layout"}
         # Establish the common scan shape before asking whether layout
         # conversions are identities with respect to that shape.  Doing this
         # inside the later boolean expression made the answer depend on
         # evaluation order: a conversion was queried while ``_scan_shape``
         # was still None, over-refusing the four-warp bf16 layouts while the
         # independently-resolvable sixteen-warp spellings happened to pass.
-        _scan_regions_exact = bool(_scan_ops) and all(
-            _scan_region_is_exact(s) for s in _scan_ops
-        )
+        _scan_regions_exact = bool(_scan_ops) and all(_scan_region_is_exact(s) for s in _scan_ops)
         mept_scan_eligible = (
             self.mept_enabled
             and bool(_scan_ops)
             and not any(s.op == "tt.reduce" for s in all_ops_iter)
             and all(s.op in _scan_allowed_top for s in _top_ops)
             and all(
-                s.op != "ttg.convert_layout"
-                or _convert_resolves(s)
-                or _scan_convert_is_flat_noop(s)
-                for s in _top_ops
+                s.op != "ttg.convert_layout" or _convert_resolves(s) or _scan_convert_is_flat_noop(s) for s in _top_ops
             )
             and _scan_regions_exact
-            and all(
-                _scan_value_proof(o) in ("coordinate", "uniform")
-                for s in _scan_ops
-                for o in (s.operand_ids or [])
-            )
+            and all(_scan_value_proof(o) in ("coordinate", "uniform") for s in _scan_ops for o in (s.operand_ids or []))
             and not any(_op_is_fp8(s) for s in all_ops_iter)
         )
 
@@ -2114,9 +2096,7 @@ class GenericLowerer(
             for ssa in all_ops_iter:
                 if ssa.op == "tt.reduce" and ssa.operand_ids:
                     reduce_axis = ssa.attrs.get("axis", 0)
-                    inp_shape = self._native_shape(
-                        ssa.operand_ids[0], op_name=ssa.op
-                    )
+                    inp_shape = self._native_shape(ssa.operand_ids[0], op_name=ssa.op)
                     # A true axis-specific reduce: multi-dim input where more
                     # than one non-reduced axis has size > 1. For N-D, check
                     # whether the non-reduced axes together have > 1 element.
@@ -2183,9 +2163,7 @@ class GenericLowerer(
                 nonlocal max_reduce_size
                 for op in ops:
                     if op.op == "tt.reduce" and op.operand_ids:
-                        inp_shape = self._native_shape(
-                            op.operand_ids[0], op_name=op.op
-                        )
+                        inp_shape = self._native_shape(op.operand_ids[0], op_name=op.op)
                         if inp_shape:
                             rs = 1
                             for d in inp_shape:
@@ -2306,20 +2284,26 @@ class GenericLowerer(
         self._actual_dispatch_threads = actual_dispatch_threads
         self.effective_block_size = actual_dispatch_threads
 
-        if self._assert_plan is not None and not self._is_2d and any(
-            op.op == 'tt.make_range'
-            and op.attrs.get('end', 0) - op.attrs.get('start', 0) != self._total_elements
-            for op in all_ops_iter
+        if (
+            self._assert_plan is not None
+            and not self._is_2d
+            and any(
+                op.op == "tt.make_range" and op.attrs.get("end", 0) - op.attrs.get("start", 0) != self._total_elements
+                for op in all_ops_iter
+            )
         ):
             from .assertions import refuse
-            refuse('mixed 1-D tile widths lack a predicate ownership proof')
+
+            refuse("mixed 1-D tile widths lack a predicate ownership proof")
 
         if self._assert_plan is not None and (
-            use_multipass or self._mept_single_pass
+            use_multipass
+            or self._mept_single_pass
             or (self._needs_wrapping and self._total_elements % actual_dispatch_threads != 0)
         ):
             from .assertions import refuse
-            refuse('execution multiplicity does not prove uniform assertion rendezvous')
+
+            refuse("execution multiplicity does not prove uniform assertion rendezvous")
 
         # COVERAGE BACKSTOP -- should be unreachable, and is kept because the thing it
         # guards already regressed once.
@@ -2399,10 +2383,12 @@ class GenericLowerer(
         self._register_args()
 
         if self._assert_plan is not None:
-            self.kb.add_ptr_arg('_assert_status', dtype='u32')
-            self.kb.raw_line('    threadgroup atomic_uint _assert_group_failed;')
-            self.kb.raw_line('    if (lid == 0u) atomic_store_explicit(&_assert_group_failed, 0u, memory_order_relaxed);')
-            self.kb.raw_line('    threadgroup_barrier(mem_flags::mem_threadgroup);')
+            self.kb.add_ptr_arg("_assert_status", dtype="u32")
+            self.kb.raw_line("    threadgroup atomic_uint _assert_group_failed;")
+            self.kb.raw_line(
+                "    if (lid == 0u) atomic_store_explicit(&_assert_group_failed, 0u, memory_order_relaxed);"
+            )
+            self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         if use_multipass:
             # Multi-pass reduction: split kernel into phases separated by
@@ -2464,11 +2450,13 @@ class GenericLowerer(
             msl = _alias_shared_memory(msl, allocation_aliases=allocation_aliases)
         if getattr(self, "_source_epilogue_replay", False) or getattr(self, "_source_biased_replay", False):
             from ._lowerer_helpers import _check_replay_shared_memory_budget
+
             # Every source op/proof has already lowered. Capacity must not hide
             # an integrity failure. The bounded replay families use builder
             # arrays; the assertion channel, if present, adds one atomic uint.
             self._replay_shared_bytes = _check_replay_shared_memory_budget(
-                self.kb._threadgroup_arrays, allocation_aliases,
+                self.kb._threadgroup_arrays,
+                allocation_aliases,
                 extra_bytes=4 if self._assert_plan is not None else 0,
             )
         return msl
@@ -2665,12 +2653,7 @@ class GenericLowerer(
                 return False
             return False
 
-        return any(
-            _reshape_fed(opnd)
-            for d in by_id.values()
-            if d.op == "tt.dot"
-            for opnd in (d.operand_ids or [])[:2]
-        )
+        return any(_reshape_fed(opnd) for d in by_id.values() if d.op == "tt.dot" for opnd in (d.operand_ids or [])[:2])
 
     def _dot_generic_eligible(self, *, allow_flat: bool = False) -> bool:
         """True iff every tt.dot sits inside the PROVEN envelope of the generic
@@ -2883,11 +2866,7 @@ class GenericLowerer(
                         return False
                     terminal_stores.add(consumer.id)
                     continue
-                if (
-                    consumer.op not in passthrough
-                    or not consumer.operand_ids
-                    or consumer.operand_ids[0] != value_id
-                ):
+                if consumer.op not in passthrough or not consumer.operand_ids or consumer.operand_ids[0] != value_id:
                     return False
                 frontier.append(consumer.id)
         return len(terminal_stores) == 1
@@ -2979,7 +2958,11 @@ class GenericLowerer(
             if len(_dots) > 1:
                 return False
             _by = {o.id: o for o in self.graph.ops}
-            if _dots and len(_dots[0].operand_ids or []) >= 3 and not self._acc_init_is_literal_zero(_dots[0].operand_ids[2], _by):
+            if (
+                _dots
+                and len(_dots[0].operand_ids or []) >= 3
+                and not self._acc_init_is_literal_zero(_dots[0].operand_ids[2], _by)
+            ):
                 return False
 
         return True
@@ -3289,18 +3272,50 @@ class GenericLowerer(
         # the stage-1 walk below; these are the value-combining ops that can sit between a
         # range and its broadcast (casts, comparisons, select, arithmetic, gather/load).
         _VALUE_PRESERVING = (
-            "arith.extsi", "arith.extui", "arith.trunci", "arith.truncf",
-            "arith.index_cast", "arith.index_castui",
-            "arith.sitofp", "arith.uitofp", "arith.fptosi", "arith.fptoui",
-            "arith.bitcast", "tt.bitcast", "tt.fp_to_fp", "ttg.convert_layout",
-            "arith.cmpi", "arith.cmpf", "arith.select",
-            "arith.addi", "arith.subi", "arith.muli", "arith.divsi", "arith.divui",
-            "arith.remsi", "arith.remui", "arith.andi", "arith.ori", "arith.xori",
-            "arith.minsi", "arith.maxsi", "arith.minui", "arith.maxui",
-            "arith.shli", "arith.shrsi", "arith.shrui",
-            "arith.addf", "arith.subf", "arith.mulf", "arith.divf",
-            "arith.minnumf", "arith.maxnumf", "arith.minimumf", "arith.maximumf",
-            "tt.load", "tt.addptr",
+            "arith.extsi",
+            "arith.extui",
+            "arith.trunci",
+            "arith.truncf",
+            "arith.index_cast",
+            "arith.index_castui",
+            "arith.sitofp",
+            "arith.uitofp",
+            "arith.fptosi",
+            "arith.fptoui",
+            "arith.bitcast",
+            "tt.bitcast",
+            "tt.fp_to_fp",
+            "ttg.convert_layout",
+            "arith.cmpi",
+            "arith.cmpf",
+            "arith.select",
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "arith.divsi",
+            "arith.divui",
+            "arith.remsi",
+            "arith.remui",
+            "arith.andi",
+            "arith.ori",
+            "arith.xori",
+            "arith.minsi",
+            "arith.maxsi",
+            "arith.minui",
+            "arith.maxui",
+            "arith.shli",
+            "arith.shrsi",
+            "arith.shrui",
+            "arith.addf",
+            "arith.subf",
+            "arith.mulf",
+            "arith.divf",
+            "arith.minnumf",
+            "arith.maxnumf",
+            "arith.minimumf",
+            "arith.maximumf",
+            "tt.load",
+            "tt.addptr",
         )
 
         def _is_coord_invariant(_vid):
@@ -3346,7 +3361,7 @@ class GenericLowerer(
                 return frozenset((_vid,))
             if _o.op in _VALUE_PRESERVING:
                 _acc = frozenset()
-                for _oid in (_o.operand_ids or ()):
+                for _oid in _o.operand_ids or ():
                     if _is_coord_invariant(_oid):
                         continue
                     _sub = _ranges_of(_oid, _seen)
@@ -3483,12 +3498,7 @@ class GenericLowerer(
                     # e.g., "tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>"
                     # to pair with siblings from the same tile.
                     layout_value_id = src_id if src_id in self.graph.result_meta else mr_id
-                    src_layout = (
-                        self._native_value_facts(
-                            layout_value_id, op_name="2-D shape prescan"
-                        ).layout
-                        or ""
-                    )
+                    src_layout = self._native_value_facts(layout_value_id, op_name="2-D shape prescan").layout or ""
                     # Extract the parent layout identifier. The type string
                     # may use aliases (#blocked, #blocked1) or inline defs
                     # (#ttg.blocked<{...}>).  Use a nested-brace-aware match.
@@ -3827,6 +3837,7 @@ class GenericLowerer(
             self._lower_fp_to_fp(ssa)
         elif op == "tt.assert":
             from .assertions import emit
+
             emit(self, ssa)
         elif op in ("tt.print", "tt.device_print"):
             # Device-side print: Apple GPUs have no device printf channel. This
@@ -3920,12 +3931,7 @@ class GenericLowerer(
             scan_shape = getattr(self, "_scan_mept_shape", None)
             scan_width = getattr(self, "_scan_mept_width", 0)
             if getattr(self, "_mept_single_pass", False) and scan_shape is not None:
-                if (
-                    len(scan_shape) != 2
-                    or dim not in (0, 1)
-                    or range_size != scan_shape[dim]
-                    or scan_width <= 1
-                ):
+                if len(scan_shape) != 2 or dim not in (0, 1) or range_size != scan_shape[dim] or scan_width <= 1:
                     raise MetalNonRecoverableError(
                         "tt.scan: a 2-D make_range is outside the proved flat "
                         "row/column projection cone; refusing rather than inventing "
@@ -4017,12 +4023,7 @@ class GenericLowerer(
                 # The prescan must have identified this make_range's axis and
                 # its extent must match that axis exactly.
                 dim = self._make_range_dim.get(ssa.id)
-                if (
-                    len(scan_shape) != 2
-                    or dim not in (0, 1)
-                    or range_size != scan_shape[dim]
-                    or scan_width <= 1
-                ):
+                if len(scan_shape) != 2 or dim not in (0, 1) or range_size != scan_shape[dim] or scan_width <= 1:
                     raise MetalNonRecoverableError(
                         "tt.scan: a 2-D make_range is outside the proved flat "
                         "row/column projection cone; refusing rather than inventing "
@@ -4082,9 +4083,7 @@ class GenericLowerer(
                 # Scan option A promises contiguous flattened ownership, not
                 # the source layout's register basis.
                 exprs = [
-                    f"{start}u + {lid} * {n_per_thread}u + {i}u"
-                    if start != 0
-                    else f"{lid} * {n_per_thread}u + {i}u"
+                    f"{start}u + {lid} * {n_per_thread}u + {i}u" if start != 0 else f"{lid} * {n_per_thread}u + {i}u"
                     for i in range(n_per_thread)
                 ]
             elif ll is not None and ll.num_registers_per_thread == n_per_thread:
@@ -4223,6 +4222,7 @@ class GenericLowerer(
         """
         if getattr(self, "_source_biased_replay", False):
             from ._biased_replay import emit_row_broadcast
+
             if emit_row_broadcast(self, ssa):
                 return
         self._emit_passthrough(ssa)
@@ -4367,10 +4367,7 @@ class GenericLowerer(
                         # addptr may contribute a negative runtime offset.
                         # Widen before the addition so C++ usual conversions
                         # cannot turn that offset into a huge unsigned index.
-                        combined_exprs = [
-                            f"long({parent_arr}[{i}]) + long({offset_arr}[{i}])"
-                            for i in range(n)
-                        ]
+                        combined_exprs = [f"long({parent_arr}[{i}]) + long({offset_arr}[{i}])" for i in range(n)]
                         combined_name = self._var_array("off", combined_exprs, "long")
                         self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
                         # env[ssa.id] is mostly informational here;
@@ -4380,10 +4377,7 @@ class GenericLowerer(
                         return
                 if parent_ptr_info:
                     base_ptr, existing_offset = parent_ptr_info
-                    combined_exprs = [
-                        f"long({existing_offset}) + long({offset_arr}[{i}])"
-                        for i in range(n)
-                    ]
+                    combined_exprs = [f"long({existing_offset}) + long({offset_arr}[{i}])" for i in range(n)]
                     combined_name = self._var_array("off", combined_exprs, "long")
                     self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
                     self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
@@ -4407,10 +4401,7 @@ class GenericLowerer(
                 parent_ptr_array = self.env_ptr_array.get(ptr_id)
                 if parent_ptr_array:
                     base_ptr, parent_arr, parent_n = parent_ptr_array
-                    combined_exprs = [
-                        f"long({parent_arr}[{i}]) + long({offset_var})"
-                        for i in range(parent_n)
-                    ]
+                    combined_exprs = [f"long({parent_arr}[{i}]) + long({offset_var})" for i in range(parent_n)]
                     combined_name = self._var_array("off", combined_exprs, "long")
                     self.env_ptr_array[ssa.id] = (base_ptr, combined_name, parent_n)
                     self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
@@ -4644,57 +4635,39 @@ class GenericLowerer(
         # lengths may corroborate this relation, but cannot establish it.
         native_ptr_shape = self._native_shape(ptr_id, op_name="tt.store")
         native_val_shape = self._native_shape(val_id, op_name="tt.store")
-        if (
-            (not native_ptr_shape and native_val_shape)
-            or (
-                native_ptr_shape
-                and native_val_shape
-                and native_ptr_shape != native_val_shape
-            )
+        if (not native_ptr_shape and native_val_shape) or (
+            native_ptr_shape and native_val_shape and native_ptr_shape != native_val_shape
         ):
             raise MetalNonRecoverableError(
-                "tt.store native pointer/value shapes disagree "
-                f"({native_ptr_shape} vs {native_val_shape})",
+                f"tt.store native pointer/value shapes disagree ({native_ptr_shape} vs {native_val_shape})",
                 op_name="tt.store",
             )
         native_mask_id = ssa.operand_ids[2] if len(ssa.operand_ids) >= 3 else None
         if native_mask_id is not None:
-            mask_facts = self._native_value_facts(
-                native_mask_id, op_name="tt.store"
-            )
-            native_mask_shape = self._native_shape(
-                native_mask_id, op_name="tt.store"
-            )
-            if (
-                mask_facts.kind != "integer"
-                or mask_facts.elem != "i1"
-                or mask_facts.width != 1
-            ):
+            mask_facts = self._native_value_facts(native_mask_id, op_name="tt.store")
+            native_mask_shape = self._native_shape(native_mask_id, op_name="tt.store")
+            if mask_facts.kind != "integer" or mask_facts.elem != "i1" or mask_facts.width != 1:
                 raise MetalNonRecoverableError(
                     "tt.store native mask is not an i1 value",
                     op_name="tt.store",
                 )
-            if (
-                (not native_ptr_shape and native_mask_shape)
-                or (
-                    native_ptr_shape
-                    and native_mask_shape
-                    and native_ptr_shape != native_mask_shape
-                )
+            if (not native_ptr_shape and native_mask_shape) or (
+                native_ptr_shape and native_mask_shape and native_ptr_shape != native_mask_shape
             ):
                 raise MetalNonRecoverableError(
-                    "tt.store native pointer/mask shapes disagree "
-                    f"({native_ptr_shape} vs {native_mask_shape})",
+                    f"tt.store native pointer/mask shapes disagree ({native_ptr_shape} vs {native_mask_shape})",
                     op_name="tt.store",
                 )
 
         if getattr(self, "_source_epilogue_replay", False):
             from ._loop_epilogue import emit_store
+
             if emit_store(self, ssa):
                 return
 
         if getattr(self, "_source_biased_replay", False):
             from ._biased_replay import emit_small_store
+
             if emit_small_store(self, ssa):
                 return
 
@@ -4742,8 +4715,7 @@ class GenericLowerer(
                     mask_var, mask_n, _ = self.env_array[native_mask_id]
                     if mask_n != n:
                         raise MetalNonRecoverableError(
-                            "tt.store MEPT mask register-array width does not "
-                            "match the pointer/value width",
+                            "tt.store MEPT mask register-array width does not match the pointer/value width",
                             op_name="tt.store",
                         )
                     mask_is_array = True
@@ -4753,13 +4725,9 @@ class GenericLowerer(
                     # tensor only when its producer proved a uniform splat;
                     # otherwise one lane's predicate would be broadcast over
                     # every register-array position.
-                    if (
-                        native_mask_shape
-                        and native_mask_id not in self._is_splat
-                    ):
+                    if native_mask_shape and native_mask_id not in self._is_splat:
                         raise MetalNonRecoverableError(
-                            "tt.store MEPT tensor mask has no per-position "
-                            "array and is not a proved uniform splat",
+                            "tt.store MEPT tensor mask has no per-position array and is not a proved uniform splat",
                             op_name="tt.store",
                         )
                     mask_var = self._lookup(native_mask_id)
@@ -4886,10 +4854,7 @@ class GenericLowerer(
                     if mask_id is not None:
                         mask_expr = self._rebuild_staged_fill_mask(mask_id, op_by_id, M, N)
 
-                    self.kb.raw_line(
-                        f"    for (uint _st = lid; _st < {val_total}u; "
-                        f"_st += {dispatch_threads}u) {{"
-                    )
+                    self.kb.raw_line(f"    for (uint _st = lid; _st < {val_total}u; _st += {dispatch_threads}u) {{")
                     self.kb.raw_line(f"        uint _fill_row = _st / {N}u;")
                     self.kb.raw_line(f"        uint _fill_col = _st % {N}u;")
 
@@ -5063,8 +5028,8 @@ class GenericLowerer(
                     if isinstance(op.attrs.get("value"), (bool, int, float)):
                         return
                     raise MetalNonRecoverableError(
-                        "blocked 1-D store address/mask contains a nonuniform "
-                        "or unparsed tensor constant", op_name="tt.store"
+                        "blocked 1-D store address/mask contains a nonuniform or unparsed tensor constant",
+                        op_name="tt.store",
                     )
                 if op is not None and op.op == "tt.make_range":
                     start = int(op.attrs.get("start", 0))
@@ -5209,8 +5174,13 @@ class GenericLowerer(
         # not the argument name, replay cache, or a printed signature.
         if any(arg.id == ssa_id for arg in self.graph.args):
             facts = self._native_value_facts(ssa_id, op_name="mask")
-            return (not facts.is_tensor and facts.shape == () and
-                    facts.kind == "integer" and facts.elem == "i1" and facts.width == 1)
+            return (
+                not facts.is_tensor
+                and facts.shape == ()
+                and facts.kind == "integer"
+                and facts.elem == "i1"
+                and facts.width == 1
+            )
         if ssa_id in self.env_is_mask:
             return True
 
@@ -5908,9 +5878,7 @@ class GenericLowerer(
 
                 _src_id = ssa.operand_ids[0]
                 _other_consumers = [
-                    _op
-                    for _op in _all_ops(self.graph.ops)
-                    if _op is not ssa and _src_id in (_op.operand_ids or [])
+                    _op for _op in _all_ops(self.graph.ops) if _op is not ssa and _src_id in (_op.operand_ids or [])
                 ]
                 if _other_consumers:
                     from triton_msl.errors import MetalNonRecoverableError
@@ -6121,33 +6089,47 @@ class GenericLowerer(
             return
         if "!tt.ptr<" in (ssa.type_str or ""):
             from triton_msl.errors import MetalNonRecoverableError
-            if (ssa.operand_ids[0] in self.env_array
-                    or any(oid in self.env_ptr_array for oid in ssa.operand_ids[1:])):
+
+            if ssa.operand_ids[0] in self.env_array or any(oid in self.env_ptr_array for oid in ssa.operand_ids[1:]):
                 raise MetalNonRecoverableError(
                     "pointer-valued arith.select has a per-thread register-array operand; "
                     "address-array selection is not implemented and numeric fallback is unsafe",
-                    op_name="arith.select")
+                    op_name="arith.select",
+                )
             true_ptr = self._loop_pointer_parts(ssa.operand_ids[1])
             false_ptr = self._loop_pointer_parts(ssa.operand_ids[2])
             meta = self.graph.result_meta.get(ssa.id)
-            if (true_ptr is None or false_ptr is None or meta is None
-                    or meta.schema_version != 1 or meta.value_id != ssa.id
-                    or meta.kind != "result" or meta.producer_id != ssa.id
-                    or meta.result_index != 0 or meta.type.kind != "pointer"
-                    or meta.type.address_space != 1 or meta.type.pointee is None
-                    or meta.type.pointee.unknown_reason or meta.type.pointee.elem is None):
+            if (
+                true_ptr is None
+                or false_ptr is None
+                or meta is None
+                or meta.schema_version != 1
+                or meta.value_id != ssa.id
+                or meta.kind != "result"
+                or meta.producer_id != ssa.id
+                or meta.result_index != 0
+                or meta.type.kind != "pointer"
+                or meta.type.address_space != 1
+                or meta.type.pointee is None
+                or meta.type.pointee.unknown_reason
+                or meta.type.pointee.elem is None
+            ):
                 raise MetalNonRecoverableError(
                     "pointer-valued arith.select lacks two proved addresses or native result metadata",
-                    op_name="arith.select")
+                    op_name="arith.select",
+                )
             cond = self._lookup(ssa.operand_ids[0])
+
             def _address(info):
                 base, offset = info
                 return base if not offset or offset == "0" else f"({base} + {offset})"
+
             dtype = _mlir_to_triton_dtype(meta.type.pointee.elem)
             var_name = self._next_var("ptr")
             self.kb.raw_line(
                 f"    volatile device {triton_type_to_msl(dtype)}* {var_name} = "
-                f"{cond} ? {_address(true_ptr)} : {_address(false_ptr)};")
+                f"{cond} ? {_address(true_ptr)} : {_address(false_ptr)};"
+            )
             self.env[ssa.id] = var_name
             self.env_is_ptr[ssa.id] = (var_name, "0")
             self.env_types[ssa.id] = dtype
@@ -6542,6 +6524,7 @@ class GenericLowerer(
         _TG_MAX = 1024
         if total > _TG_MAX:
             from ._biased_replay import emit_loaded_transpose
+
             if getattr(self, "_source_biased_replay", False) and emit_loaded_transpose(self, ssa):
                 return
             raise MetalNonRecoverableError(
@@ -6716,9 +6699,7 @@ class GenericLowerer(
             {"ttg.convert_layout", "arith.extf", "arith.truncf"},
         )
         if core is not None and core.op == "arith.mulf" and len(core.operand_ids or []) == 2:
-            constants = [
-                oid for oid in core.operand_ids if _constant_float(oid) is not None
-            ]
+            constants = [oid for oid in core.operand_ids if _constant_float(oid) is not None]
             if len(constants) != 1:
                 return None
             cur = next(oid for oid in core.operand_ids if oid != constants[0])
@@ -6740,10 +6721,7 @@ class GenericLowerer(
         for candidate in ops:
             if candidate.op != "tt.reduce" or not candidate.operand_ids:
                 continue
-            if not any(
-                "max" in (nested.op or "")
-                for nested in (candidate.region_ops or [])
-            ):
+            if not any("max" in (nested.op or "") for nested in (candidate.region_ops or [])):
                 continue
             input_core_id, _ = _peel(candidate.operand_ids[0], value_wrappers)
             if input_core_id == score_core_id:
@@ -6751,10 +6729,7 @@ class GenericLowerer(
         max_result_ids = {
             result_id
             for reduction in max_reductions
-            for result_id in (
-                [reduction.id]
-                + list(getattr(reduction, "result_ids", None) or [])
-            )
+            for result_id in ([reduction.id] + list(getattr(reduction, "result_ids", None) or []))
         }
         if not max_result_ids or not _depends_on(core.operand_ids[1], max_result_ids):
             return None
@@ -6836,6 +6811,7 @@ class GenericLowerer(
         the col does not) and any other row-vs-col compare (strict ``>``, reversed, absolute,
         windowed) refuses -> the generic path, never a wrong mask.
         """
+
         def _flat(ops):
             for s in ops:
                 yield s
@@ -6898,8 +6874,10 @@ class GenericLowerer(
         H_arg = None
         for o in ops:
             if o.op in ("arith.divsi", "arith.remsi", "arith.divui", "arith.remui") and o.operand_ids:
-                if any(obid.get(x) is not None and obid.get(x).op in ("tt.get_program_id", "tt.program_id")
-                       for x in o.operand_ids):
+                if any(
+                    obid.get(x) is not None and obid.get(x).op in ("tt.get_program_id", "tt.program_id")
+                    for x in o.operand_ids
+                ):
                     for x in o.operand_ids:
                         a = argid.get(x)
                         if a is not None and not a.is_ptr:
@@ -6920,7 +6898,7 @@ class GenericLowerer(
                 return None
             if o.op == "tt.load":
                 return o
-            for x in (o.operand_ids or []):
+            for x in o.operand_ids or []:
                 r = _find_load(x, seen, d + 1)
                 if r is not None:
                     return r
@@ -6950,9 +6928,11 @@ class GenericLowerer(
         #  * a different Q vs K/V head_dim (asymmetric) mis-sizes the K/V loop.
         # Require BM==BN==32 and a single shared head_dim; otherwise refuse (-> generic).
         import re
+
         def _shape(o):
             mm = re.search(r"tensor<(\d+)x(\d+)x", getattr(o, "type_str", "") or "")
             return (int(mm.group(1)), int(mm.group(2))) if mm else None
+
         qsh, ksh, vsh = _shape(q_load), _shape(k_load), _shape(v_load)
         if qsh is None or ksh is None or vsh is None:
             return None
@@ -6980,8 +6960,7 @@ class GenericLowerer(
 
         _is_mr = lambda o: o.op == "tt.make_range"
         _is_cu_load = lambda o: (
-            o.op == "tt.load"
-            and (lambda p: p is not None and _is_int(getattr(p, "elem_type", None)))(_load_ptr_arg(o))
+            o.op == "tt.load" and (lambda p: p is not None and _is_int(getattr(p, "elem_type", None)))(_load_ptr_arg(o))
         )
         _is_offh = lambda o: o.op in ("arith.remsi", "arith.remui", "arith.divsi", "arith.divui")
 
@@ -6996,7 +6975,7 @@ class GenericLowerer(
                 return acc
             if o.op == "arith.muli":
                 acc.append(o)
-            for x in (o.operand_ids or []):
+            for x in o.operand_ids or []:
                 _muli_terms(x, seen, acc)
             return acc
 
@@ -7045,7 +7024,7 @@ class GenericLowerer(
                     p = _load_ptr_arg(o)
                     if p is not None and _is_int(getattr(p, "elem_type", None)):
                         found.add(p.index)
-                for x in (o.operand_ids or []):
+                for x in o.operand_ids or []:
                     walk(x, seen, d + 1)
 
             walk(load.operand_ids[0])
@@ -7085,21 +7064,22 @@ class GenericLowerer(
         def _peel_core(oid):
             op = obid.get(oid)
             seen = set()
-            while (op is not None and op.id not in seen and op.operand_ids
-                   and op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims",
-                                 "ttg.convert_layout", "tt.reshape")):
+            while (
+                op is not None
+                and op.id not in seen
+                and op.operand_ids
+                and op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.reshape")
+            ):
                 seen.add(op.id)
                 op = obid.get(op.operand_ids[0])
             return op.id if op is not None else None
 
         # Re-review 2026-08-25: the OUTPUT store's head index must ALSO match (a kernel
         # writing O at off_h+1 otherwise routed and the template wrote the WRONG head).
-        qh_i, kh_i, vh_i, oh_i = (_head_index(q_load), _head_index(k_load),
-                                  _head_index(v_load), _head_index(stores[0]))
+        qh_i, kh_i, vh_i, oh_i = (_head_index(q_load), _head_index(k_load), _head_index(v_load), _head_index(stores[0]))
         if qh_i is None or kh_i is None or vh_i is None or oh_i is None:
             return None
-        qh_c, kh_c, vh_c, oh_c = (_peel_core(qh_i), _peel_core(kh_i),
-                                  _peel_core(vh_i), _peel_core(oh_i))
+        qh_c, kh_c, vh_c, oh_c = (_peel_core(qh_i), _peel_core(kh_i), _peel_core(vh_i), _peel_core(oh_i))
         if not (qh_c is not None and qh_c == kh_c == vh_c == oh_c):
             return None
 
@@ -7240,7 +7220,7 @@ class GenericLowerer(
                     p = _load_ptr_arg(o)
                     if p is not None and _is_int(getattr(p, "elem_type", None)):
                         found.add(o.id)
-                for x in (o.operand_ids or []):
+                for x in o.operand_ids or []:
                     walk(x, seen, d + 1)
 
             walk(load.operand_ids[0])
@@ -7307,8 +7287,7 @@ class GenericLowerer(
                 addr = obid.get(ld.operand_ids[0])
                 if addr is None or addr.op != "tt.addptr" or len(addr.operand_ids or []) < 2:
                     continue
-                if _cone_has(addr.operand_ids[1],
-                             lambda o: _div_by_H(o, ("arith.divsi", "arith.divui"))):
+                if _cone_has(addr.operand_ids[1], lambda o: _div_by_H(o, ("arith.divsi", "arith.divui"))):
                     return True
             return False
 
@@ -7329,19 +7308,25 @@ class GenericLowerer(
         _pid0 = lambda o: o.op == "tt.get_program_id" and int(o.attrs.get("axis", 0)) == 0
         _anypid = lambda o: o.op == "tt.get_program_id"
         both_mr = [
-            c for c in ops
-            if c.op == "arith.cmpi" and len(c.operand_ids or []) == 2
-            and _cone_has(c.operand_ids[0], _is_mr) and _cone_has(c.operand_ids[1], _is_mr)
+            c
+            for c in ops
+            if c.op == "arith.cmpi"
+            and len(c.operand_ids or []) == 2
+            and _cone_has(c.operand_ids[0], _is_mr)
+            and _cone_has(c.operand_ids[1], _is_mr)
         ]
         causal = False
         if both_mr:
+
             def _std_causal(c):
                 if c.attrs.get("predicate_name") not in ("sge", "uge"):
                     return False  # only >= (lower-tri incl. diagonal); strict/reversed -> refuse
                 lhs, rhs = c.operand_ids
                 return (
-                    _cone_has(lhs, _pid0) and not _cone_has(lhs, _is_cu_load)
-                    and _cone_has(rhs, _is_mr) and not _cone_has(rhs, _anypid)
+                    _cone_has(lhs, _pid0)
+                    and not _cone_has(lhs, _is_cu_load)
+                    and _cone_has(rhs, _is_mr)
+                    and not _cone_has(rhs, _anypid)
                     and not _cone_has(rhs, _is_cu_load)
                 )
 
@@ -7355,9 +7340,19 @@ class GenericLowerer(
         # dot RESULT before softmax (#6a).  The template bakes their PRODUCT.  Runtime
         # factors, score bias, P-side scaling, and any unrecognized value operation stay
         # outside the detector and are refused by the common FA guard.
-        _LAYOUT = ("ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-                   "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
-                   "arith.truncf", "arith.extf", "tt.fp_to_fp")
+        _LAYOUT = (
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.memdesc_trans",
+            "tt.trans",
+            "tt.reshape",
+            "ttg.convert_layout",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "arith.truncf",
+            "arith.extf",
+            "tt.fp_to_fp",
+        )
 
         def _const_factors(oid):
             """All arith.constant factors multiplied into this dot-operand cone (walked
@@ -7407,12 +7402,28 @@ class GenericLowerer(
         if cuq_idx not in _seqlen_id_of or cuk_idx not in _seqlen_id_of:
             return None
         return {
-            "roles": {"q": q_arg.index, "k": k_arg.index, "v": v_arg.index,
-                      "o": o_arg.index, "cuq": cuq_idx, "cuk": cuk_idx},
-            "H": H_arg.index, "head_dim": head_dim, "out_dtype": _od, "scale": scale,
-            "q_scale": bool(_qf), "score_scale": _score_scale,
-            "max_seqlen": _ms_arg, "causal": causal, "q": q, "k": k, "v": v, "o": o,
-            "seqlen_q_id": _seqlen_id_of[cuq_idx], "seqlen_k_id": _seqlen_id_of[cuk_idx],
+            "roles": {
+                "q": q_arg.index,
+                "k": k_arg.index,
+                "v": v_arg.index,
+                "o": o_arg.index,
+                "cuq": cuq_idx,
+                "cuk": cuk_idx,
+            },
+            "H": H_arg.index,
+            "head_dim": head_dim,
+            "out_dtype": _od,
+            "scale": scale,
+            "q_scale": bool(_qf),
+            "score_scale": _score_scale,
+            "max_seqlen": _ms_arg,
+            "causal": causal,
+            "q": q,
+            "k": k,
+            "v": v,
+            "o": o,
+            "seqlen_q_id": _seqlen_id_of[cuq_idx],
+            "seqlen_k_id": _seqlen_id_of[cuk_idx],
         }
 
     def _lower_varlen_flash_attention(self, info: dict) -> str:
@@ -7432,9 +7443,7 @@ class GenericLowerer(
             )
         for i, a in enumerate(args):
             if i != a.index:
-                raise MetalNonRecoverableError(
-                    "varlen FlashAttention arg list is not densely indexed; refusing."
-                )
+                raise MetalNonRecoverableError("varlen FlashAttention arg list is not densely indexed; refusing.")
         roles = info["roles"]
         # Packet 112: varlen loads are plain or exactly ``pid*32 + range(0,32) < seqlen_q``
         # (Q) / ``iv + range(0,32) < seqlen_k`` (K, V) on the detector's verified seqlen
@@ -7456,8 +7465,12 @@ class GenericLowerer(
             extra_stores=[(roles["o"], "Out", ("Q",), True)],
         )
         role_of_idx = {
-            roles["q"]: "Q", roles["k"]: "K", roles["v"]: "V", roles["o"]: "Out",
-            roles["cuq"]: "CUQ", roles["cuk"]: "CUK",
+            roles["q"]: "Q",
+            roles["k"]: "K",
+            roles["v"]: "V",
+            roles["o"]: "Out",
+            roles["cuq"]: "CUQ",
+            roles["cuk"]: "CUK",
         }
         arg_decls = []
         for a in args:
@@ -7487,12 +7500,26 @@ class GenericLowerer(
 
         q, k, v, o = info["q"], info["k"], info["v"], info["o"]
         bindings = {
-            "Q": "Q", "K": "K", "V": "V", "O": "Out", "CUQ": "CUQ", "CUK": "CUK",
-            "H": _uint_expr(info["H"]), "MAXS": _uint_expr(info["max_seqlen"]),
-            "q_st": _uint_expr(q[0]), "q_sh": _uint_expr(q[1]), "q_sk": _uint_expr(q[2]),
-            "k_st": _uint_expr(k[0]), "k_sh": _uint_expr(k[1]), "k_sk": _uint_expr(k[2]),
-            "v_st": _uint_expr(v[0]), "v_sh": _uint_expr(v[1]), "v_sk": _uint_expr(v[2]),
-            "o_st": _uint_expr(o[0]), "o_sh": _uint_expr(o[1]), "o_sk": _uint_expr(o[2]),
+            "Q": "Q",
+            "K": "K",
+            "V": "V",
+            "O": "Out",
+            "CUQ": "CUQ",
+            "CUK": "CUK",
+            "H": _uint_expr(info["H"]),
+            "MAXS": _uint_expr(info["max_seqlen"]),
+            "q_st": _uint_expr(q[0]),
+            "q_sh": _uint_expr(q[1]),
+            "q_sk": _uint_expr(q[2]),
+            "k_st": _uint_expr(k[0]),
+            "k_sh": _uint_expr(k[1]),
+            "k_sk": _uint_expr(k[2]),
+            "v_st": _uint_expr(v[0]),
+            "v_sh": _uint_expr(v[1]),
+            "v_sk": _uint_expr(v[2]),
+            "o_st": _uint_expr(o[0]),
+            "o_sh": _uint_expr(o[1]),
+            "o_sk": _uint_expr(o[2]),
         }
         # FAST PATH: the register-O simdgroup-MMA varlen kernel (~7.6x the scalar one-thread-
         # per-row template at D=64, ~4x pad+SDPA; ~1.4x pad+SDPA at D=128) when eligible —
@@ -7511,9 +7538,13 @@ class GenericLowerer(
             from triton_msl.codegen._msl_templates import make_varlen_flash_attention_mma
 
             msl = make_varlen_flash_attention_mma(
-                head_dim=D, causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
-                kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
+                head_dim=D,
+                causal=bool(info.get("causal")),
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                scale=info["scale"],
             )
             self.effective_block_size = 128
             self._flash_attention = ("flash_attention", msl, 128)
@@ -7525,9 +7556,13 @@ class GenericLowerer(
                     "rather than failing at Metal pipeline creation. Use head_dim <= 128."
                 )
             msl = make_varlen_flash_attention(
-                head_dim=D, causal=bool(info.get("causal")), out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
-                kernel_name=_sanitize_msl_name(self.graph.func_name), scale=info["scale"],
+                head_dim=D,
+                causal=bool(info.get("causal")),
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
+                kernel_name=_sanitize_msl_name(self.graph.func_name),
+                scale=info["scale"],
             )
             self.effective_block_size = 32
             self._flash_attention = ("flash_attention", msl, 32)
@@ -7898,6 +7933,7 @@ class GenericLowerer(
         # z = zh % Z) otherwise routes with z/h swapped -> silent-wrong (measured err ~0.97
         # at head_dim 128). Verify off_h = remsi(pid, H) and off_z = divsi(pid, H) (same H).
         if not is_mla:
+
             def _bh_offsets_dense(addr_id):
                 """(off_z, off_h) from the 2-level scalar batch/head addptr chain, or
                 (None, None) for the 1-level (H==1, single-head) chain / an unresolved walk."""
@@ -7944,9 +7980,12 @@ class GenericLowerer(
             def _peel_core_dense(oid):
                 seen = set()
                 cur = op_by_id.get(oid)
-                while (cur is not None and cur.id not in seen and cur.operand_ids
-                       and cur.op in ("tt.splat", "tt.broadcast", "tt.expand_dims",
-                                      "ttg.convert_layout", "tt.reshape")):
+                while (
+                    cur is not None
+                    and cur.id not in seen
+                    and cur.operand_ids
+                    and cur.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.reshape")
+                ):
                     seen.add(cur.id)
                     cur = op_by_id.get(cur.operand_ids[0])
                 return cur.id if cur is not None else None
@@ -7990,13 +8029,16 @@ class GenericLowerer(
                 # (off_h=remsi(pid,H), off_z=divsi(pid,H), same H).
                 if _qh is None or _kh is None or _vh is None or _ohh is None:
                     return None  # mixed multi/single head (e.g. MQA H_kv==1) -> refuse
-                _qc, _kc, _vc, _oc = (_peel_core_dense(_qh), _peel_core_dense(_kh),
-                                      _peel_core_dense(_vh), _peel_core_dense(_ohh))
+                _qc, _kc, _vc, _oc = (
+                    _peel_core_dense(_qh),
+                    _peel_core_dense(_kh),
+                    _peel_core_dense(_vh),
+                    _peel_core_dense(_ohh),
+                )
                 if not (_qc is not None and _qc == _kc == _vc == _oc):
                     return None  # GQA/MQA or store-head mismatch -> refuse
                 _zq, _zk, _zv, _zo = (
-                    _peel_core_dense(_off) if _off is not None else None
-                    for _off in (_qz, _kz, _vz, _oz)
+                    _peel_core_dense(_off) if _off is not None else None for _off in (_qz, _kz, _vz, _oz)
                 )
                 if _zq is None or not (_zq == _zk == _zv == _zo):
                     return None  # K/V/store batch offset differs from Q's -> refuse
@@ -8049,7 +8091,9 @@ class GenericLowerer(
         z_arg = scalar_by_name.get("Z")
         h_arg = scalar_by_name.get("H")
         n_ctx_arg = scalar_by_name.get("N_CTX")
-        n_ctx_index = sequence_index if sequence_index is not None else (n_ctx_arg.index if n_ctx_arg is not None else None)
+        n_ctx_index = (
+            sequence_index if sequence_index is not None else (n_ctx_arg.index if n_ctx_arg is not None else None)
+        )
         if n_ctx_index is None:
             # STRUCTURAL fallback (independent of the arg NAME, the trifast-#1
             # name-heuristic class): the bounds masks compare a make_range-derived
@@ -8062,8 +8106,13 @@ class GenericLowerer(
             # index; require EXACTLY one -> that is N_CTX (2+ distinct -> ambiguous
             # -> refuse, never guess).
             _passthru = (
-                "tt.splat", "tt.broadcast", "arith.extsi", "arith.extui",
-                "arith.index_cast", "arith.index_castui", "ttg.convert_layout",
+                "tt.splat",
+                "tt.broadcast",
+                "arith.extsi",
+                "arith.extui",
+                "arith.index_cast",
+                "arith.index_castui",
+                "ttg.convert_layout",
             )
 
             def _is_lt(_s):
@@ -8088,12 +8137,24 @@ class GenericLowerer(
                         continue
                     if _o.op == "tt.make_range":
                         return True
-                    if _o.op in (
-                        "tt.expand_dims", "tt.broadcast", "tt.reshape", "tt.splat",
-                        "ttg.convert_layout", "arith.extsi", "arith.extui",
-                        "arith.trunci", "arith.index_cast", "arith.index_castui",
-                        "arith.muli", "arith.addi",
-                    ) and _o.operand_ids:
+                    if (
+                        _o.op
+                        in (
+                            "tt.expand_dims",
+                            "tt.broadcast",
+                            "tt.reshape",
+                            "tt.splat",
+                            "ttg.convert_layout",
+                            "arith.extsi",
+                            "arith.extui",
+                            "arith.trunci",
+                            "arith.index_cast",
+                            "arith.index_castui",
+                            "arith.muli",
+                            "arith.addi",
+                        )
+                        and _o.operand_ids
+                    ):
                         _stack.extend(_o.operand_ids)
                 return False
 
@@ -8142,11 +8203,23 @@ class GenericLowerer(
                             _bound_args.add(_ba.index)
                             continue
                         _bo = op_by_id.get(_bid)
-                        if _bo is not None and _bo.op in (
-                            "arith.minsi", "arith.minui", "arith.maxsi", "arith.maxui",
-                            "arith.select", "arith.index_cast", "arith.index_castui",
-                            "arith.extsi", "arith.extui", "arith.trunci",
-                        ) and _bo.operand_ids:
+                        if (
+                            _bo is not None
+                            and _bo.op
+                            in (
+                                "arith.minsi",
+                                "arith.minui",
+                                "arith.maxsi",
+                                "arith.maxui",
+                                "arith.select",
+                                "arith.index_cast",
+                                "arith.index_castui",
+                                "arith.extsi",
+                                "arith.extui",
+                                "arith.trunci",
+                            )
+                            and _bo.operand_ids
+                        ):
                             _stack.extend(_bo.operand_ids)
                 if (not _bound_args) or (_cand in _bound_args):
                     n_ctx_index = _cand
@@ -8198,8 +8271,9 @@ class GenericLowerer(
         h_val = None
         for _s in all_ops:
             if _s.op in ("arith.divui", "arith.remui", "arith.divsi", "arith.remsi") and _s.operand_ids:
-                if any(op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id"
-                       for o in _s.operand_ids):
+                if any(
+                    op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in _s.operand_ids
+                ):
                     for o in _s.operand_ids:
                         _a = arg_by_id.get(o)
                         if _a is not None and not _a.is_ptr:
@@ -8391,24 +8465,15 @@ class GenericLowerer(
             lhs_kind = _mask_index_kind(lhs)
             rhs_kind = _mask_index_kind(rhs)
 
-            is_bounds = (
-                pred in ("slt", "ult")
-                and lhs_kind in ("query", "key")
-                and _mask_is_exact_arg(rhs, n_ctx_index)
-            )
-            is_causal = (
-                pred in ("sge", "uge")
-                and lhs_kind == "query"
-                and rhs_kind == "key"
-            )
+            is_bounds = pred in ("slt", "ult") and lhs_kind in ("query", "key") and _mask_is_exact_arg(rhs, n_ctx_index)
+            is_causal = pred in ("sge", "uge") and lhs_kind == "query" and rhs_kind == "key"
             if is_bounds:
                 continue
             if is_causal:
                 causal = True
                 continue
             _refuse(
-                "a score mask equivalent to either the N_CTX boundary or the "
-                "canonical within-sequence lower triangle"
+                "a score mask equivalent to either the N_CTX boundary or the canonical within-sequence lower triangle"
             )
 
         # SPLIT-SCALE GUARD (re-review 2026-08-25): scan every dot-operand cone
@@ -8416,9 +8481,17 @@ class GenericLowerer(
         # may bake one Q-side factor plus a separately proven post-dot chain, but a K-,
         # V-, P-side, or second Q factor would still be silently dropped.
         _SG_LAYOUT = (
-            "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-            "tt.reshape", "ttg.convert_layout", "tt.broadcast", "tt.expand_dims",
-            "arith.truncf", "arith.extf", "tt.fp_to_fp",
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.memdesc_trans",
+            "tt.trans",
+            "tt.reshape",
+            "ttg.convert_layout",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "arith.truncf",
+            "arith.extf",
+            "tt.fp_to_fp",
         )
 
         def _sg_const_factors(oid):
@@ -8451,9 +8524,7 @@ class GenericLowerer(
         # MLA has two chained QK dots and is outside #6a's two-dot score-chain
         # proof. Preserve its already-verified no-result-scale contract unchanged.
         _score_scale = (
-            {"factor": 1.0, "op_ids": ()}
-            if is_mla
-            else self._fa_analyze_constant_score_scale(dot_qk, dot_pv)
+            {"factor": 1.0, "op_ids": ()} if is_mla else self._fa_analyze_constant_score_scale(dot_qk, dot_pv)
         )
         if len(_sg_q) > 1 or _sg_k or _sg_pv or _score_scale is None:
             _refuse(
@@ -8685,10 +8756,20 @@ class GenericLowerer(
                 op = op_by_id.get(sid)
                 if op is None:
                     break
-                if op.op in (
-                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
-                ) and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "ttg.local_load",
+                        "ttg.local_alloc",
+                        "ttg.memdesc_trans",
+                        "tt.trans",
+                        "tt.reshape",
+                        "ttg.convert_layout",
+                        "arith.extf",
+                        "arith.truncf",
+                    )
+                    and op.operand_ids
+                ):
                     sid = op.operand_ids[0]
                     continue
                 if op.op == "tt.load" and op.operand_ids:
@@ -8765,8 +8846,7 @@ class GenericLowerer(
         # Exactly one => resolve it (trifast). More than one => REFUSE, never return None
         # (a bias-in-dot kernel routed to standard FA would silently DROP the bias).
         mask_loads = [
-            s for s in allops
-            if s.op == "tt.load" and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))
+            s for s in allops if s.op == "tt.load" and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))
         ]
         if len(mask_loads) > 1:
             _refuse("at most one boolean mask load (ambiguous biased attention)")
@@ -8796,8 +8876,11 @@ class GenericLowerer(
             if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
                 return None
             inner = op_by_id.get(scal.operand_ids[0])
-            z_muli_id = inner.operand_ids[1] if (inner is not None and inner.op == "tt.addptr"
-                                                 and len(inner.operand_ids) >= 2) else scal.operand_ids[1]
+            z_muli_id = (
+                inner.operand_ids[1]
+                if (inner is not None and inner.op == "tt.addptr" and len(inner.operand_ids) >= 2)
+                else scal.operand_ids[1]
+            )
             z_muli = op_by_id.get(z_muli_id)
             if z_muli is None or z_muli.op != "arith.muli":
                 return None
@@ -8813,8 +8896,9 @@ class GenericLowerer(
             off = op_by_id.get(skip_layout(off_id))
             if off is None or off.op not in ("arith.divui", "arith.divsi"):
                 return None
-            if not any(op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id"
-                       for o in off.operand_ids):
+            if not any(
+                op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in off.operand_ids
+            ):
                 return None
             for o in off.operand_ids:
                 ar = arg_by_id.get(o)
@@ -8840,10 +8924,21 @@ class GenericLowerer(
                 op = op_by_id.get(sid)
                 if op is None:
                     return None
-                if op.op in (
-                    "tt.splat", "arith.truncf", "arith.extf", "arith.fptrunc", "arith.fpext",
-                    "arith.sitofp", "arith.uitofp", "tt.bitcast", "ttg.convert_layout",
-                ) and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "tt.splat",
+                        "arith.truncf",
+                        "arith.extf",
+                        "arith.fptrunc",
+                        "arith.fpext",
+                        "arith.sitofp",
+                        "arith.uitofp",
+                        "tt.bitcast",
+                        "ttg.convert_layout",
+                    )
+                    and op.operand_ids
+                ):
                     sid = skip_layout(op.operand_ids[0])
                     continue
                 return None
@@ -8898,8 +8993,16 @@ class GenericLowerer(
         qk_out = _extract_shape(dot_qk.type_str or "")
         pv_out = _extract_shape(dot_pv.type_str or "")
         k_shape = _extract_shape(self._find_op_type_str(dot_qk.operand_ids[1]))
-        if not (a_shape and len(a_shape) == 2 and qk_out and len(qk_out) == 2
-                and pv_out and len(pv_out) == 2 and k_shape and len(k_shape) == 2):
+        if not (
+            a_shape
+            and len(a_shape) == 2
+            and qk_out
+            and len(qk_out) == 2
+            and pv_out
+            and len(pv_out) == 2
+            and k_shape
+            and len(k_shape) == 2
+        ):
             _refuse("the dot tile shapes")
         block_m, head_dim = a_shape
         block_n = qk_out[1]
@@ -8945,8 +9048,7 @@ class GenericLowerer(
         for s in allops:
             if s.op in ("arith.divui", "arith.remui", "arith.divsi", "arith.remsi") and s.operand_ids:
                 pid_side = any(
-                    (op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id")
-                    for o in s.operand_ids
+                    (op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id") for o in s.operand_ids
                 )
                 if not pid_side:
                     continue
@@ -8995,19 +9097,33 @@ class GenericLowerer(
         return {
             "biased": True,
             "grid_3d": grid_3d,
-            "q": q_res[0], "k": k_res[0], "v": v_res[0], "out": o_res[0],
-            "bias": b_res[0], "mask": (m_res[0] if has_mask else None), "lse": lse_res[0],
+            "q": q_res[0],
+            "k": k_res[0],
+            "v": v_res[0],
+            "out": o_res[0],
+            "bias": b_res[0],
+            "mask": (m_res[0] if has_mask else None),
+            "lse": lse_res[0],
             "has_mask": has_mask,
             # strides in resolver order; the template mapping handles the Kᵀ swap.
-            "q_strides": q_res[1], "k_strides": k_res[1], "v_strides": v_res[1],
-            "o_strides": o_res[1], "b_strides": b_res[1],
-            "m_strides": (m_res[1] if has_mask else None), "lse_strides": lse_res[1],
+            "q_strides": q_res[1],
+            "k_strides": k_res[1],
+            "v_strides": v_res[1],
+            "o_strides": o_res[1],
+            "b_strides": b_res[1],
+            "m_strides": (m_res[1] if has_mask else None),
+            "lse_strides": lse_res[1],
             "scale_arg": scale_arg,
             # In 2-D, H drives z=zh/H. In 3-D, the same resolved divui(pid_h, H) IS
             # the mask cross-head divisor (mask_start_h = pid_h // H_heads).
-            "N_CTX": n_ctx_arg, "H": h_arg, "mask_div": mask_div,
-            "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
-            "out_dtype": out_dtype, "causal": False,
+            "N_CTX": n_ctx_arg,
+            "H": h_arg,
+            "mask_div": mask_div,
+            "block_m": block_m,
+            "block_n": block_n,
+            "head_dim": head_dim,
+            "out_dtype": out_dtype,
+            "causal": False,
             "c_eff": c_eff,  # the constant score scale before the exp (packet 114: sentinel units)
         }
 
@@ -9170,12 +9286,23 @@ class GenericLowerer(
                 op = op_by_id.get(sid)
                 if op is None:
                     break
-                if op.op in (
-                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
-                    # backward also loads lse/delta as [j] then broadcasts to [j,k]:
-                    "tt.broadcast", "tt.expand_dims",
-                ) and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "ttg.local_load",
+                        "ttg.local_alloc",
+                        "ttg.memdesc_trans",
+                        "tt.trans",
+                        "tt.reshape",
+                        "ttg.convert_layout",
+                        "arith.extf",
+                        "arith.truncf",
+                        # backward also loads lse/delta as [j] then broadcasts to [j,k]:
+                        "tt.broadcast",
+                        "tt.expand_dims",
+                    )
+                    and op.operand_ids
+                ):
                     sid = op.operand_ids[0]
                     continue
                 if op.op == "tt.load" and op.operand_ids:
@@ -9209,6 +9336,7 @@ class GenericLowerer(
             kind = "b"
         else:
             return None
+
         def _refuse(field):
             raise MetalNonRecoverableError(
                 f"Biased-FA backward ({kind}) recognized but {field} could not be resolved; "
@@ -9237,8 +9365,11 @@ class GenericLowerer(
             if _e.op != "math.exp2" or not _e.operand_ids:
                 continue
             _inp = op_by_id.get(skip_layout(_e.operand_ids[0]))
-            _subs = list(_inp.operand_ids or []) if (_inp is not None and _inp.op == "arith.mulf") else (
-                [_inp.id] if (_inp is not None and _inp.op == "arith.subf") else [])
+            _subs = (
+                list(_inp.operand_ids or [])
+                if (_inp is not None and _inp.op == "arith.mulf")
+                else ([_inp.id] if (_inp is not None and _inp.op == "arith.subf") else [])
+            )
             for _c in _subs:
                 _cop = op_by_id.get(skip_layout(_c))
                 if _cop is not None and _cop.op == "arith.subf":
@@ -9394,8 +9525,9 @@ class GenericLowerer(
         # mask: exactly one i1/i8 load. A biased-FA backward loads exactly one boolean
         # mask; 0 or 2+ means this is NOT our pattern -> fall through (return None).
         # Present-but-unresolvable IS a broken backward -> refuse.
-        mask_loads = [s for s in allops if s.op == "tt.load"
-                      and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))]
+        mask_loads = [
+            s for s in allops if s.op == "tt.load" and ("i1" in (s.type_str or "") or "i8" in (s.type_str or ""))
+        ]
         if len(mask_loads) != 1:
             return None
         mask_addr = mask_loads[0].operand_ids[0]
@@ -9408,29 +9540,44 @@ class GenericLowerer(
         # order -> subf(., lse) -> mulf(., inv_ln2) -> exp2. The template replays SNT on
         # in-bounds masked cells; it must be ONE SSA scalar (a float arg or a literal).
         _bcast = ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout")
+
         def _peel_ids(vid, allowed):
             seen = set()
             while vid not in seen:
-                seen.add(vid); o = op_by_id.get(vid)
+                seen.add(vid)
+                o = op_by_id.get(vid)
                 if o is None or o.op not in allowed or len(o.operand_ids or []) != 1:
                     return vid
                 vid = o.operand_ids[0]
             return vid
+
         def _const_val(o):
             v = (o.attrs or {}).get("value")
-            if isinstance(v, bool) or v is None: return None
+            if isinstance(v, bool) or v is None:
+                return None
             if isinstance(v, int):
-                if v in (0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000): return float("-inf")
-                if v in (0x7C00, 0x7F80, 0x7F800000, 0x7FF0000000000000): return float("inf")
+                if v in (0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000):
+                    return float("-inf")
+                if v in (0x7C00, 0x7F80, 0x7F800000, 0x7FF0000000000000):
+                    return float("inf")
                 return float(v) if v == 0 else None
             return float(v)
+
         sentinel_ref = None
         # packet 139/140: the N_CTX operand of a boundary compare may peel ONLY value-preserving
         # wrappers — broadcast-family ops and sign-extension (both compare operands are then
         # sign-extended, which preserves slt AND ult). A narrowing (`trunci`), zero-extension
         # or index cast changes the compared value (N=160 -> N.to(int8).to(int32) == -96).
         _IDXW = _bcast + ("arith.extsi",)
-        _VALW = ("arith.extf", "arith.truncf", "ttg.convert_layout", "tt.reshape", "ttg.local_load", "ttg.local_alloc", "tt.fp_to_fp")
+        _VALW = (
+            "arith.extf",
+            "arith.truncf",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "tt.fp_to_fp",
+        )
         # packet 141/144: VALUE identity (not provenance) admits only wrappers that cannot change
         # a single element: layout changes and the shared-memory round trip. A float conversion
         # (`truncf`/`extf`/`fp_to_fp`) is a different value — `scores.to(f16).to(f32)` rounds, and
@@ -9438,9 +9585,10 @@ class GenericLowerer(
         _VALX = ("ttg.convert_layout", "ttg.local_load", "ttg.local_alloc")
 
         def _elem_is_f32(o):
-            t = (getattr(o, "type_str", None) or "")
+            t = getattr(o, "type_str", None) or ""
             # "tensor<32x32xf32, #mma>" / "f32"; NOT "bf16" (and no wider/narrower float)
             return re.search(r"(?<!b)f32(?![0-9])", t) is not None
+
         _ivs = [((s_.attrs or {}).get("block_arg_ids") or [None])[0] for s_ in allops if s_.op == "scf.for"]
         _LOG2E = 1.4426950408889634
 
@@ -9463,42 +9611,77 @@ class GenericLowerer(
         def _leaf_extent(cid, n_ctx_arg, extents):
             """One boundary leaf: cmpi slt|ult(<tile index>, N_CTX). Returns the tile extent."""
             c_ = op_by_id.get(_peel_ids(cid, _bcast))
-            if c_ is None or c_.op != "arith.cmpi" or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult") or len(c_.operand_ids or []) != 2:
+            if (
+                c_ is None
+                or c_.op != "arith.cmpi"
+                or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult")
+                or len(c_.operand_ids or []) != 2
+            ):
                 _refuse("a strict less-than N_CTX boundary leaf in the bounds select")
             lhs, rhs = c_.operand_ids
             if n_ctx_arg is None or _arg_index(rhs) != n_ctx_arg:
                 _refuse("the bounds select comparing the tile index with the kernel's N_CTX argument")
             for iv_ in [None] + [v for v in _ivs if v is not None]:
                 sh = self._index_shape(lhs, op_by_id, arg_by_id, iv_, 1)
-                if sh["bad"] is not None or sh["mod"] is not None or sh["pid_div"] is not None or sh["range"] != 1 or not sh["bounds"]:
+                if (
+                    sh["bad"] is not None
+                    or sh["mod"] is not None
+                    or sh["pid_div"] is not None
+                    or sh["range"] != 1
+                    or not sh["bounds"]
+                ):
                     continue
                 ext = sh["bounds"][1]
                 if sh["bounds"][0] != 0 or ext not in extents:
                     continue
                 singleton_col = n_ctx_arg == C1 and not _ivs and sh["pid"] is None and sh["iv"] == 0
-                if ((sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == ext)
-                        or (sh["pid"] is None and sh["iv"] == 1)
-                        or singleton_col):
+                if (
+                    (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == ext)
+                    or (sh["pid"] is None and sh["iv"] == 1)
+                    or singleton_col
+                ):
                     return ext
             _refuse("a bounds-select index that is exactly one tile of the source's row/col coordinate")
 
         def _leaf_sig(cid, n_ctx_arg, extents):
             """The full coordinate signature of one boundary leaf (structural, remat-proof)."""
             c_ = op_by_id.get(_peel_ids(cid, _bcast))
-            if c_ is None or c_.op != "arith.cmpi" or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult") or len(c_.operand_ids or []) != 2:
+            if (
+                c_ is None
+                or c_.op != "arith.cmpi"
+                or (c_.attrs or {}).get("predicate_name") not in ("slt", "ult")
+                or len(c_.operand_ids or []) != 2
+            ):
                 _refuse("a strict less-than N_CTX boundary leaf")
             lhs, rhs = c_.operand_ids
             if n_ctx_arg is None or _arg_index(rhs) != n_ctx_arg:
                 _refuse("a boundary leaf comparing the tile index with the kernel's N_CTX argument")
             for iv_ in [None] + [v for v in _ivs if v is not None]:
                 sh = self._index_shape(lhs, op_by_id, arg_by_id, iv_, 1)
-                if sh["bad"] is not None or sh["mod"] is not None or sh["range"] != 1 or not sh["bounds"] or sh["bounds"][0] != 0 or sh["bounds"][1] not in extents:
+                if (
+                    sh["bad"] is not None
+                    or sh["mod"] is not None
+                    or sh["range"] != 1
+                    or not sh["bounds"]
+                    or sh["bounds"][0] != 0
+                    or sh["bounds"][1] not in extents
+                ):
                     continue
                 singleton_col = n_ctx_arg == C1 and not _ivs and sh["pid"] is None and sh["iv"] == 0
-                if ((sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == sh["bounds"][1])
-                        or (sh["pid"] is None and sh["iv"] == 1)
-                        or singleton_col):
-                    return (n_ctx_arg, sh["pid"], sh["pid_div"], sh["coef"], sh["bounds"], sh["iv"], iv_ if sh["iv"] else None)
+                if (
+                    (sh["pid"] is not None and sh["iv"] == 0 and sh["coef"] == sh["bounds"][1])
+                    or (sh["pid"] is None and sh["iv"] == 1)
+                    or singleton_col
+                ):
+                    return (
+                        n_ctx_arg,
+                        sh["pid"],
+                        sh["pid_div"],
+                        sh["coef"],
+                        sh["bounds"],
+                        sh["iv"],
+                        iv_ if sh["iv"] else None,
+                    )
             _refuse("a boundary leaf index that is exactly one tile of a row/col coordinate")
 
         _OPW = _VALW + ("tt.trans", "ttg.memdesc_trans")
@@ -9508,25 +9691,32 @@ class GenericLowerer(
             the scale multiply (the constant side is skipped); None if anything else appears."""
             cur, seen = vid, set()
             while cur not in seen and len(seen) < 64:
-                seen.add(cur); o_ = op_by_id.get(cur)
+                seen.add(cur)
+                o_ = op_by_id.get(cur)
                 if o_ is None:
                     return None
                 if o_.op == "tt.load":
                     return o_
                 if o_.op in _OPW and len(o_.operand_ids or []) == 1:
-                    cur = o_.operand_ids[0]; continue
+                    cur = o_.operand_ids[0]
+                    continue
                 if o_.op == "arith.mulf" and len(o_.operand_ids or []) == 2:
+
                     def _is_scalar(x):
-                        pid_ = _peel_ids(x, _bcast); a_ = arg_by_id.get(pid_); c_ = op_by_id.get(pid_)
+                        pid_ = _peel_ids(x, _bcast)
+                        a_ = arg_by_id.get(pid_)
+                        c_ = op_by_id.get(pid_)
                         if c_ is not None and c_.op == "arith.truncf" and len(c_.operand_ids or []) == 1:
                             # packet 174: `tl.full([1], sm_scale, dtype)` = splat(truncf(scalar arg))
                             a2_ = arg_by_id.get(_peel_ids(c_.operand_ids[0], _bcast))
                             return a2_ is not None and not a2_.is_ptr
                         return (a_ is not None and not a_.is_ptr) or (c_ is not None and c_.op == "arith.constant")
+
                     data = [x for x in o_.operand_ids if not _is_scalar(x)]
                     if len(data) != 1:
                         return None
-                    cur = data[0]; continue
+                    cur = data[0]
+                    continue
                 return None
             return None
 
@@ -9560,11 +9750,11 @@ class GenericLowerer(
                     # a kernel argument (scalar) is uniform; anything else unresolved is unknown
                     return (axis if axis is not None else "uniform") if cur in arg_by_id else axis
                 if o.op == "arith.constant":
-                    return axis if axis is not None else "uniform"   # splat or dense constant
+                    return axis if axis is not None else "uniform"  # splat or dense constant
                 if not (o.operand_ids or []):
                     break
                 if o.op in ("tt.broadcast", "ttg.convert_layout", "arith.extui", "arith.extsi", "arith.extf"):
-                    cur = o.operand_ids[0]   # layout / widening: the projection is unchanged
+                    cur = o.operand_ids[0]  # layout / widening: the projection is unchanged
                     continue
                 if o.op == "tt.splat":
                     return axis if axis is not None else "uniform"
@@ -9602,7 +9792,9 @@ class GenericLowerer(
             # the raw fp32 load, so anything between the load and the subtraction refuses.
             _lo = op_by_id.get(_peel_ids(lse_sub_op.operand_ids[1], _bcast))
             if _lo is None or _lo.op != "tt.load" or not _lo.operand_ids or _lo.operand_ids[0] != lse_addr:
-                _refuse("the lse on the right-hand side of the (scores - lse) subtraction being the loaded lse VALUE itself (no conversion or arithmetic between the load and the subtraction)")
+                _refuse(
+                    "the lse on the right-hand side of the (scores - lse) subtraction being the loaded lse VALUE itself (no conversion or arithmetic between the load and the subtraction)"
+                )
             if not _elem_is_f32(_lo):
                 _refuse("an fp32 lse load (the template subtracts the raw fp32 value)")
             if _axis_of(lse_sub_op.operand_ids[1]) != "row":
@@ -9632,11 +9824,21 @@ class GenericLowerer(
                     # keeps the low bit: 2 -> 0) and stays refused.
                     _src = [_peel_ids(x, _bcast + ("arith.extui", "arith.extsi")) for x in _pred.operand_ids]
                     _zero = [op_by_id.get(x) for x in _src if x != mask_loads[0].id]
-                    if mask_loads[0].id not in _src or len(_zero) != 1 or _zero[0] is None or _zero[0].op != "arith.constant" or _const_val(_zero[0]) != 0.0:
+                    if (
+                        mask_loads[0].id not in _src
+                        or len(_zero) != 1
+                        or _zero[0] is None
+                        or _zero[0].op != "arith.constant"
+                        or _const_val(_zero[0]) != 0.0
+                    ):
                         _refuse("the loaded-mask select predicate (must be Mask != literal 0)")
                     if _axis_of(_sel.operand_ids[0]) != "col":
-                        _refuse("the loaded Mask broadcast along the score COLUMNS (Mask[None, :]: one value per key k)")
-                    _kinds.append("mask"); _snts.append(_peel_ids(_sel.operand_ids[1], _bcast)); _cur = _peel_ids(_sel.operand_ids[2], _bcast)
+                        _refuse(
+                            "the loaded Mask broadcast along the score COLUMNS (Mask[None, :]: one value per key k)"
+                        )
+                    _kinds.append("mask")
+                    _snts.append(_peel_ids(_sel.operand_ids[1], _bcast))
+                    _cur = _peel_ids(_sel.operand_ids[2], _bcast)
                 elif _pred is not None and _pred.op == "arith.andi" and len(_pred.operand_ids or []) == 2:
                     _exts = sorted(_leaf_extent(x, n_ctx_arg, {block_j, block_k}) for x in _pred.operand_ids)
                     if _exts != sorted([block_j, block_k]):
@@ -9652,21 +9854,31 @@ class GenericLowerer(
                     # bound, so each leaf is a (signature, axis) pair: the Q-load mask must vary
                     # along the rows and the K-load mask along the columns. Commuting the AND
                     # is harmless and stays admitted.
-                    _qs, _ks = _leaf_sig(_q_mask_leaf(), n_ctx_arg, {block_j, block_k}), _leaf_sig(_k_mask_leaf(), n_ctx_arg, {block_j, block_k})
+                    _qs, _ks = (
+                        _leaf_sig(_q_mask_leaf(), n_ctx_arg, {block_j, block_k}),
+                        _leaf_sig(_k_mask_leaf(), n_ctx_arg, {block_j, block_k}),
+                    )
                     _pairs = {(_leaf_sig(x, n_ctx_arg, {block_j, block_k}), _axis_of(x)) for x in _pred.operand_ids}
                     if _qs == _ks or len(_pred.operand_ids) != 2 or _pairs != {(_qs, "row"), (_ks, "col")}:
-                        _refuse("the bounds select's leaves being exactly the Q-load mask along the score ROWS and the K-load mask along the COLUMNS — a lookalike coordinate or a swapped broadcast axis is not the source's bound")
-                    _kinds.append("bounds"); _snts.append(_peel_ids(_sel.operand_ids[2], _bcast)); _cur = _peel_ids(_sel.operand_ids[1], _bcast)
+                        _refuse(
+                            "the bounds select's leaves being exactly the Q-load mask along the score ROWS and the K-load mask along the COLUMNS — a lookalike coordinate or a swapped broadcast axis is not the source's bound"
+                        )
+                    _kinds.append("bounds")
+                    _snts.append(_peel_ids(_sel.operand_ids[2], _bcast))
+                    _cur = _peel_ids(_sel.operand_ids[1], _bcast)
                 else:
                     _refuse("a recognizable predicate on a score sentinel select")
             if sorted(_kinds) != ["bounds", "mask"] or len(set(_snts)) != 1:
                 _refuse("exactly one loaded-mask select and one bounds select sharing ONE sentinel value")
             _under = _peel_ids(_cur, _VALX)
             if _under != scores_dot.id and _under not in (getattr(scores_dot, "result_ids", None) or []):
-                _refuse("the value under the two selects being exactly the recognised Q@Kᵀ + Bias dot value (a conversion, third select or epilogue is not replayed)")
+                _refuse(
+                    "the value under the two selects being exactly the recognised Q@Kᵀ + Bias dot value (a conversion, third select or epilogue is not replayed)"
+                )
             if not _elem_is_f32(scores_dot):
                 _refuse("an fp32 score dot (the template accumulates Q@Kᵀ + Bias in fp32)")
-            _snt = _snts[0]; _snt_op = op_by_id.get(_snt)
+            _snt = _snts[0]
+            _snt_op = op_by_id.get(_snt)
             if _snt_op is None and _snt in arg_by_id:
                 _a = arg_by_id[_snt]
                 if _a.is_ptr or str(_a.elem_type) not in ("f32", "fp32", "float"):
@@ -9679,8 +9891,20 @@ class GenericLowerer(
                 return ("const", _v)
             _refuse("a sentinel that is a kernel argument or a literal")
 
-        def _prove_downstream(kind, n_ctx_arg, block_j, block_k, head_dim, do_addr, v_addr, dlt_addr,
-                              out_stores, reduce_op=None, scale_arg=None, o_addr=None):
+        def _prove_downstream(
+            kind,
+            n_ctx_arg,
+            block_j,
+            block_k,
+            head_dim,
+            do_addr,
+            v_addr,
+            dlt_addr,
+            out_stores,
+            reduce_op=None,
+            scale_arg=None,
+            o_addr=None,
+        ):
             """Packet 148 (147 HOLD): the WHOLE downstream graph each backward template re-emits,
             proved by ORIENTATION and VALUE, not by pointer role. Every 2-D value gets a pair of
             logical coordinates (row, col) in {j = query row, k = key, d = head dim}; 1-D values
@@ -9746,16 +9970,11 @@ class GenericLowerer(
                     "axis": axis == 1,
                     "metadata-kind": source_meta.kind == result_meta.kind == "result",
                     "producer-identity": (
-                        source_meta.producer_id == product.id
-                        and result_meta.producer_id == reduce.id
+                        source_meta.producer_id == product.id and result_meta.producer_id == reduce.id
                     ),
-                    "known-types": (
-                        source_type.unknown_reason is None
-                        and result_type.unknown_reason is None
-                    ),
+                    "known-types": (source_type.unknown_reason is None and result_type.unknown_reason is None),
                     "element": (
-                        source_type.kind == result_type.kind == "float"
-                        and source_type.elem == result_type.elem == elem
+                        source_type.kind == result_type.kind == "float" and source_type.elem == result_type.elem == elem
                     ),
                     "tensor-shapes": (
                         source_type.is_tensor
@@ -9769,14 +9988,11 @@ class GenericLowerer(
                 failed = [name for name, passed in checks.items() if not passed]
                 detail = ",".join(failed)
                 if "source-layout" in failed or "result-layout" in failed:
-                    detail += (
-                        f"; source={compact(source_type.layout)!r}; "
-                        f"result={compact(result_type.layout)!r}"
-                    )
+                    detail += f"; source={compact(source_type.layout)!r}; result={compact(result_type.layout)!r}"
                 return not failed, detail
 
             def _elem_of(type_str):
-                t = (type_str or "")
+                t = type_str or ""
                 el = t.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in t else t.strip()
                 return el
 
@@ -9789,13 +10005,17 @@ class GenericLowerer(
                 el = _ELEM.get(_elem_of(o.type_str))
                 src = _root(o.operand_ids[0]) if o.operand_ids else None
                 if el is None:
-                    _refuse(f"no conversion to {_elem_of(o.type_str) or '?'} on the backward value path (the templates replay fp16 / bf16 rounding only)")
+                    _refuse(
+                        f"no conversion to {_elem_of(o.type_str) or '?'} on the backward value path (the templates replay fp16 / bf16 rounding only)"
+                    )
                 if src == P_id and kind == "kv":
                     key = "round_p"
                 elif _dS_holder[0] is not None and src == _dS_holder[0].id and kind in ("kv", "q"):
                     key = "round_ds"
                 else:
-                    _refuse("no dtype conversion on the backward value path except the source's own rounding of P before the dV dot (kv) and of dS before the dK / dQ dots (kv, q): the template replays exactly those and computes everything else in fp32")
+                    _refuse(
+                        "no dtype conversion on the backward value path except the source's own rounding of P before the dV dot (kv) and of dS before the dK / dQ dots (kv, q): the template replays exactly those and computes everything else in fp32"
+                    )
                 if _rounding.get(key, el) != el:
                     _refuse(f"one target type per rounding point ({key})")
                 _rounding[key] = el
@@ -9926,9 +10146,9 @@ class GenericLowerer(
                 if o.op == "tt.fp_to_fp":
                     _refuse("no fp8 conversion on the backward value path (P, dP, dS, dK/dV/dQ/dbias)")
                 if o.op == "arith.extf" and o.operand_ids:
-                    return _orient(o.operand_ids[0])   # exact widening (packet 174)
+                    return _orient(o.operand_ids[0])  # exact widening (packet 174)
                 if o.op == "arith.truncf" and o.operand_ids:
-                    _classify_truncf(o)                # a recorded rounding point or a refusal (packet 174)
+                    _classify_truncf(o)  # a recorded rounding point or a refusal (packet 174)
                     return _orient(o.operand_ids[0])
                 if o.op in _LAY and o.operand_ids:
                     return _orient(o.operand_ids[0])
@@ -9953,7 +10173,7 @@ class GenericLowerer(
                 if o.op == "tt.load":
                     shape = _extract_shape(o.type_str or "")
                     if not shape or len(o.operand_ids or []) < 2:
-                        return None   # an unmasked tile load is not oriented
+                        return None  # an unmasked tile load is not oriented
                     if len(shape) == 2:
                         return _mask_orient(o.operand_ids[1], shape)
                     if len(shape) == 1:
@@ -9979,7 +10199,7 @@ class GenericLowerer(
                             if (pp[0] == "row" and pp[1] != r) or (pp[0] == "col" and pp[1] != c):
                                 return None
                         elif isinstance(pp, tuple) and len(pp) == 1:
-                            return None   # an un-projected 1-D operand in a tile op
+                            return None  # an un-projected 1-D operand in a tile op
                     return (r, c)
                 if o.op == "tt.dot" and len(o.operand_ids or []) >= 2:
                     a, b = _orient(o.operand_ids[0]), _orient(o.operand_ids[1])
@@ -10035,7 +10255,9 @@ class GenericLowerer(
             def _raw_load(vid, addr, what):
                 o = op_by_id.get(_root(vid))
                 if o is None or o.op != "tt.load" or load_addr(o.id) != addr:
-                    _refuse(f"{what} being the recognised load VALUE itself (no arithmetic between the load and the dot)")
+                    _refuse(
+                        f"{what} being the recognised load VALUE itself (no arithmetic between the load and the dot)"
+                    )
                 return o
 
             def _scaled_load(vid, addr, what):
@@ -10044,7 +10266,10 @@ class GenericLowerer(
                     _refuse(f"{what} being exactly load * splat(sm_scale)")
                 sides = [(_root(x), _peel_ids(x, _bcast)) for x in m.operand_ids]
                 ld = [op_by_id.get(r) for r, _ in sides]
-                li = next((i for i, o in enumerate(ld) if o is not None and o.op == "tt.load" and load_addr(o.id) == addr), None)
+                li = next(
+                    (i for i, o in enumerate(ld) if o is not None and o.op == "tt.load" and load_addr(o.id) == addr),
+                    None,
+                )
                 if li is None:
                     _refuse(f"{what} being exactly the recognised load * splat(sm_scale)")
                 _mel = _elem_of(m.type_str)
@@ -10083,10 +10308,21 @@ class GenericLowerer(
             if len(scores_dot.operand_ids or []) > 2:
                 bo = op_by_id.get(_peel_ids(scores_dot.operand_ids[2], _LAY + ("arith.extf",)))
                 if bo is None or bo.op != "tt.load" or load_addr(bo.id) != load_addr(scores_dot.operand_ids[2]):
-                    _refuse("the score dot's accumulator being the Bias load VALUE itself (a widening is replayed; arithmetic is not)")
+                    _refuse(
+                        "the score dot's accumulator being the Bias load VALUE itself (a widening is replayed; arithmetic is not)"
+                    )
             k_orient = _orient(k_load.id)
-            dp = next((d for d in dots if d.id != scores_dot.id and len(d.operand_ids or []) >= 2
-                       and load_addr(d.operand_ids[0]) == do_addr and load_addr(d.operand_ids[1]) == v_addr), None)
+            dp = next(
+                (
+                    d
+                    for d in dots
+                    if d.id != scores_dot.id
+                    and len(d.operand_ids or []) >= 2
+                    and load_addr(d.operand_ids[0]) == do_addr
+                    and load_addr(d.operand_ids[1]) == v_addr
+                ),
+                None,
+            )
             if dp is None:
                 _refuse("the dP dot dO @ Vᵀ on the recognised dO and V loads")
             _need(dp.id, ("j", "k"), "the dP dot dO(j,d) @ V(d,k)")
@@ -10105,7 +10341,12 @@ class GenericLowerer(
                 if P_id not in roots:
                     continue
                 other = op_by_id.get(next(r for r in roots if r != P_id)) if len(set(roots)) == 2 else None
-                if other is not None and other.op == "arith.subf" and len(other.operand_ids or []) == 2 and _root(other.operand_ids[0]) == dp.id:
+                if (
+                    other is not None
+                    and other.op == "arith.subf"
+                    and len(other.operand_ids or []) == 2
+                    and _root(other.operand_ids[0]) == dp.id
+                ):
                     dS = s_
                     break
             if dS is None:
@@ -10127,20 +10368,20 @@ class GenericLowerer(
                     _refuse("the delta reduce input being exactly the product O * dO")
                 _pel = _elem_of(rin.type_str)
                 if _pel in _ELEM:
-                    _rounding["round_dprod"] = _ELEM[_pel]   # packet 174: each O*dO product rounded, summed in fp32
+                    _rounding["round_dprod"] = _ELEM[_pel]  # packet 174: each O*dO product rounded, summed in fp32
                 elif _pel not in ("f32", ""):
                     _refuse(f"the delta product computed in {_pel}, which the template cannot replay")
                 _roots = [op_by_id.get(_root(x)) for x in rin.operand_ids]
                 _addrs = sorted(load_addr(r.id) if (r is not None and r.op == "tt.load") else -1 for r in _roots)
                 if o_addr is None or _addrs != sorted([o_addr, do_addr]):
-                    _refuse("the delta reduce input being exactly the recognised O load VALUE times the recognised dO load VALUE (no other arithmetic)")
+                    _refuse(
+                        "the delta reduce input being exactly the recognised O load VALUE times the recognised dO load VALUE (no other arithmetic)"
+                    )
                 if not _plain_sum_reduce(reduce_op):
                     _refuse("the delta reduction combiner being exactly a + b (the template sums)")
                 _rel = _elem_of(reduce_op.type_str)
                 if _rel in _ELEM:
-                    _layout_ok, _layout_failure = _narrow_delta_layout_is_exact(
-                        reduce_op, rin, _rel
-                    )
+                    _layout_ok, _layout_failure = _narrow_delta_layout_is_exact(reduce_op, rin, _rel)
                     if not _layout_ok:
                         _refuse(
                             "the narrow delta reduction having the exact D=32 "
@@ -10172,8 +10413,11 @@ class GenericLowerer(
                 if o is None or o.op != "arith.truncf" or not o.operand_ids:
                     source_el = _ELEM.get(_elem_of(o.type_str)) if o is not None else None
                     pointer_el = _ELEM.get(_pm.group(1)) if _pm else None
-                    if (role == "delta" and _rounding.get("round_delta") is not None
-                            and source_el == pointer_el == _rounding["round_delta"]):
+                    if (
+                        role == "delta"
+                        and _rounding.get("round_delta") is not None
+                        and source_el == pointer_el == _rounding["round_delta"]
+                    ):
                         _output_casts[role] = source_el
                         return v
                     if _pm is None or _pm.group(1) != "f32":
@@ -10183,7 +10427,9 @@ class GenericLowerer(
                 el = _ELEM.get(_elem_of(o.type_str))
                 pel = _ELEM.get(_pm.group(1)) if _pm else None
                 if el is None or pel != el:
-                    _refuse("an output cast to exactly the stored pointer's element type (fp16 / bf16), which the template replays")
+                    _refuse(
+                        "an output cast to exactly the stored pointer's element type (fp16 / bf16), which the template replays"
+                    )
                 _output_casts[role] = el
                 _rounded_truncf[o.id] = "out"
                 return o.operand_ids[0]
@@ -10193,7 +10439,7 @@ class GenericLowerer(
                 _need(val, want, what)
                 # the stored tile's shape: the first typed op on the value's layout chain (the
                 # store itself has no result type; a loop result id is not an op)
-                shape, cur, seen = None, st.operand_ids[1], set()   # the typed chain (incl. an output cast)
+                shape, cur, seen = None, st.operand_ids[1], set()  # the typed chain (incl. an output cast)
                 while cur not in seen and shape is None:
                     seen.add(cur)
                     o_ = op_by_id.get(cur)
@@ -10216,7 +10462,9 @@ class GenericLowerer(
                 if scaled:
                     if o is None or o.op != "arith.mulf" or len(o.operand_ids or []) != 2:
                         _refuse("the scaled output store being mulf(loop result, splat(sm_scale))")
-                    cand = [(_peel_ids(x, _LAY), _peel_ids(y_, _bcast)) for x, y_ in (o.operand_ids, o.operand_ids[::-1])]
+                    cand = [
+                        (_peel_ids(x, _LAY), _peel_ids(y_, _bcast)) for x, y_ in (o.operand_ids, o.operand_ids[::-1])
+                    ]
                     pick = next(((r, sc) for r, sc in cand if r in res_pos), None)
                     if pick is None:
                         _refuse("the scaled output store multiplying the loop result")
@@ -10246,7 +10494,9 @@ class GenericLowerer(
                 if y is None or y.op != "tt.dot" or len(y.operand_ids or []) < 3:
                     _refuse(f"{what} being a dot accumulated into the loop carry")
                 if _root_rd(y.operand_ids[0]) != a_root:
-                    _refuse(f"{what}: the first operand being exactly the proved value (or the source's recorded rounding of it)")
+                    _refuse(
+                        f"{what}: the first operand being exactly the proved value (or the source's recorded rounding of it)"
+                    )
                 if b_root is not None:
                     if _root(y.operand_ids[1]) != b_root:
                         _refuse(f"{what}: the second operand being exactly the scaled K value used by the score dot")
@@ -10255,7 +10505,9 @@ class GenericLowerer(
                 if ba is None and not _is_zero_const(y.operand_ids[2]):
                     _refuse(f"{what} accumulating from literal zero in the proved singleton specialization")
                 if ba is not None and y.operand_ids[2] != ba:
-                    _refuse(f"{what} accumulating into ITS OWN loop carry (C is the block argument of the stored result's position)")
+                    _refuse(
+                        f"{what} accumulating into ITS OWN loop carry (C is the block argument of the stored result's position)"
+                    )
 
             if kind == "kv":
                 dk_st, dv_st = out_stores["dk"], out_stores["dv"]
@@ -10281,8 +10533,11 @@ class GenericLowerer(
                     _refuse("the dbias accumulation being exactly ITS OWN loop carry plus dS")
             if set(_output_casts) != set(out_stores):
                 _refuse("a proved conversion for every output store role")
-            return {"k_orient": k_orient, "v_orient": v_orient,
-                    "rounding": {**_rounding, "output_casts": _output_casts}}
+            return {
+                "k_orient": k_orient,
+                "v_orient": v_orient,
+                "rounding": {**_rounding, "output_casts": _output_casts},
+            }
 
         # ----- N_CTX (loop bound) + H (mask cross-head divisor): shared by q/kv -----
         def _arg_through_casts(sid):
@@ -10320,8 +10575,12 @@ class GenericLowerer(
         def _resolve_h_div():
             h = C1
             for s in allops:
-                if s.op in ("arith.divui", "arith.divsi") and s.operand_ids and any(
-                    op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+                if (
+                    s.op in ("arith.divui", "arith.divsi")
+                    and s.operand_ids
+                    and any(
+                        op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+                    )
                 ):
                     for o in s.operand_ids:
                         a = arg_by_id.get(o)
@@ -10383,8 +10642,18 @@ class GenericLowerer(
                         return False
                     if op.op == "tt.reduce":
                         return True
-                    if op.op in ("arith.truncf", "arith.extf", "ttg.convert_layout",
-                                 "tt.reshape", "ttg.local_load", "ttg.local_alloc") and op.operand_ids:
+                    if (
+                        op.op
+                        in (
+                            "arith.truncf",
+                            "arith.extf",
+                            "ttg.convert_layout",
+                            "tt.reshape",
+                            "ttg.local_load",
+                            "ttg.local_alloc",
+                        )
+                        and op.operand_ids
+                    ):
                         sid = op.operand_ids[0]
                         continue
                     return False
@@ -10445,28 +10714,68 @@ class GenericLowerer(
             block_j, head_dim = a_shape
             qk_out = _extract_shape(scores_dot.type_str or "")
             block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
-            out_dtype = "f16" if str(self.graph.args[dq_res[0]].elem_type) in ("fp16", "f16") else (
-                "bf16" if str(self.graph.args[dq_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+            out_dtype = (
+                "f16"
+                if str(self.graph.args[dq_res[0]].elem_type) in ("fp16", "f16")
+                else ("bf16" if str(self.graph.args[dq_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+            )
 
             sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
-            _ds = _prove_downstream("q", n_ctx_arg, block_j, block_k, head_dim, do_addr, _v_addr_q, None,
-                                    {"dq": _dq_store, "delta": _dlt_store}, reduce_op=reduce_op, scale_arg=scale_arg,
-                                    o_addr=_o_addr_q)
-            roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
-                     dlt_res[0], do_res[0], o_res[0], dq_res[0]]
+            _ds = _prove_downstream(
+                "q",
+                n_ctx_arg,
+                block_j,
+                block_k,
+                head_dim,
+                do_addr,
+                _v_addr_q,
+                None,
+                {"dq": _dq_store, "delta": _dlt_store},
+                reduce_op=reduce_op,
+                scale_arg=scale_arg,
+                o_addr=_o_addr_q,
+            )
+            roles = [
+                q_res[0],
+                k_res[0],
+                v_res[0],
+                b_res[0],
+                m_res[0],
+                lse_res[0],
+                dlt_res[0],
+                do_res[0],
+                o_res[0],
+                dq_res[0],
+            ]
             if len(set(roles)) != 10:
                 _refuse("ten distinct pointer roles")
 
             if not grid_3d:
                 raise MetalNonRecoverableError(_BWD_2D_MSG)
             return {
-                "bwd_kind": "q", "grid_3d": grid_3d,
-                "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
-                "lse": lse_res, "delta": dlt_res, "do": do_res, "o": o_res, "dq": dq_res,
-                "sentinel": sentinel_ref, "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
-                "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
-                "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
-                "rounding": _ds.get("rounding") or {},   # packet 174
+                "bwd_kind": "q",
+                "grid_3d": grid_3d,
+                "q": q_res,
+                "k": k_res,
+                "v": v_res,
+                "bias": b_res,
+                "mask": m_res,
+                "lse": lse_res,
+                "delta": dlt_res,
+                "do": do_res,
+                "o": o_res,
+                "dq": dq_res,
+                "sentinel": sentinel_ref,
+                "scale_arg": scale_arg,
+                "N_CTX": n_ctx_arg,
+                "H": h_arg,
+                "block_j": block_j,
+                "block_k": block_k,
+                "head_dim": head_dim,
+                "out_dtype": out_dtype,
+                "k_orient": _ds["k_orient"],
+                "v_orient": _ds["v_orient"],
+                "rounding": _ds.get("rounding") or {},  # packet 174
             }
 
         # ======================= _bwd_b (dbias) ==============================
@@ -10564,7 +10873,7 @@ class GenericLowerer(
                                 return 1
                         return None
                     nxt = None
-                    for o in (op.operand_ids or []):
+                    for o in op.operand_ids or []:
                         sub = op_by_id.get(skip_layout(o))
                         if sub is not None and sub.op != "tt.splat":
                             nxt = o
@@ -10630,9 +10939,15 @@ class GenericLowerer(
 
             # i-advance strides -> baked into stride-slot [1] (the "i" slot) of each
             # loop-advanced pointer (bias/db keep C1; they don't depend on i).
-            for _res, _addr in ((q_res, q_addr), (k_res, k_addr), (v_res, v_addr),
-                                (do_res, do_addr), (lse_res, lse_addr),
-                                (m_res, mask_addr), (dlt_res, dlt_addr)):
+            for _res, _addr in (
+                (q_res, q_addr),
+                (k_res, k_addr),
+                (v_res, v_addr),
+                (do_res, do_addr),
+                (lse_res, lse_addr),
+                (m_res, mask_addr),
+                (dlt_res, dlt_addr),
+            ):
                 adv = _advance_stride(_addr)
                 if adv is None:
                     _refuse("an i-loop advance stride")
@@ -10649,25 +10964,52 @@ class GenericLowerer(
             block_j, head_dim = a_shape
             qk_out = _extract_shape(scores_dot.type_str or "")
             block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
-            out_dtype = "f16" if str(self.graph.args[db_res[0]].elem_type) in ("fp16", "f16") else (
-                "bf16" if str(self.graph.args[db_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+            out_dtype = (
+                "f16"
+                if str(self.graph.args[db_res[0]].elem_type) in ("fp16", "f16")
+                else ("bf16" if str(self.graph.args[db_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+            )
 
             sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
-            _ds = _prove_downstream("b", n_ctx_arg, block_j, block_k, head_dim, do_addr, v_addr, dlt_addr,
-                                    {"db": stores[0]}, scale_arg=scale_arg)
-            roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
-                     dlt_res[0], do_res[0], db_res[0]]
+            _ds = _prove_downstream(
+                "b",
+                n_ctx_arg,
+                block_j,
+                block_k,
+                head_dim,
+                do_addr,
+                v_addr,
+                dlt_addr,
+                {"db": stores[0]},
+                scale_arg=scale_arg,
+            )
+            roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0], dlt_res[0], do_res[0], db_res[0]]
             if len(set(roles)) != 9:
                 _refuse("nine distinct pointer roles")
 
             return {
-                "bwd_kind": "b", "grid_3d": True,
-                "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
-                "lse": lse_res, "delta": dlt_res, "do": do_res, "db": db_res,
-                "sentinel": sentinel_ref, "scale_arg": scale_arg, "N_CTX": n_ctx_arg, "H": h_arg,
-                "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
-                "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
-                "rounding": _ds.get("rounding") or {},   # packet 174
+                "bwd_kind": "b",
+                "grid_3d": True,
+                "q": q_res,
+                "k": k_res,
+                "v": v_res,
+                "bias": b_res,
+                "mask": m_res,
+                "lse": lse_res,
+                "delta": dlt_res,
+                "do": do_res,
+                "db": db_res,
+                "sentinel": sentinel_ref,
+                "scale_arg": scale_arg,
+                "N_CTX": n_ctx_arg,
+                "H": h_arg,
+                "block_j": block_j,
+                "block_k": block_k,
+                "head_dim": head_dim,
+                "out_dtype": out_dtype,
+                "k_orient": _ds["k_orient"],
+                "v_orient": _ds["v_orient"],
+                "rounding": _ds.get("rounding") or {},  # packet 174
             }
 
         # ========================= _bwd_kv (dK/dV) ===========================
@@ -10681,10 +11023,20 @@ class GenericLowerer(
                     return False
                 if op.op == "math.exp2" or _op_is_exp(op.op):
                     return True
-                if op.op in (
-                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
-                    "tt.reshape", "ttg.convert_layout", "arith.extf", "arith.truncf",
-                ) and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "ttg.local_load",
+                        "ttg.local_alloc",
+                        "ttg.memdesc_trans",
+                        "tt.trans",
+                        "tt.reshape",
+                        "ttg.convert_layout",
+                        "arith.extf",
+                        "arith.truncf",
+                    )
+                    and op.operand_ids
+                ):
                     sid = op.operand_ids[0]
                     continue
                 return False
@@ -10794,8 +11146,12 @@ class GenericLowerer(
 
         h_arg = C1
         for s in allops:
-            if s.op in ("arith.divui", "arith.divsi") and s.operand_ids and any(
-                op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+            if (
+                s.op in ("arith.divui", "arith.divsi")
+                and s.operand_ids
+                and any(
+                    op_by_id.get(o) is not None and op_by_id.get(o).op == "tt.get_program_id" for o in s.operand_ids
+                )
             ):
                 for o in s.operand_ids:
                     a = arg_by_id.get(o)
@@ -10815,27 +11171,66 @@ class GenericLowerer(
         block_j, head_dim = a_shape
         qk_out = _extract_shape(scores_dot.type_str or "")
         block_k = qk_out[1] if (qk_out and len(qk_out) == 2) else block_j
-        out_dtype = "f16" if str(self.graph.args[dk_res[0]].elem_type) in ("fp16", "f16") else (
-            "bf16" if str(self.graph.args[dk_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+        out_dtype = (
+            "f16"
+            if str(self.graph.args[dk_res[0]].elem_type) in ("fp16", "f16")
+            else ("bf16" if str(self.graph.args[dk_res[0]].elem_type) in ("bf16", "bfloat16") else "f32")
+        )
 
         sentinel_ref = _prove(n_ctx_arg, block_j, block_k)  # packet 136 whole-path proof
-        _ds = _prove_downstream("kv", n_ctx_arg, block_j, block_k, head_dim, do_addr, _v_addr_kv, _dlt_addr_kv,
-                                {"dk": _dk_store, "dv": _dv_store}, scale_arg=scale_from_dk)
-        roles = [q_res[0], k_res[0], v_res[0], b_res[0], m_res[0], lse_res[0],
-                 dlt_res[0], do_res[0], dk_res[0], dv_res[0]]
+        _ds = _prove_downstream(
+            "kv",
+            n_ctx_arg,
+            block_j,
+            block_k,
+            head_dim,
+            do_addr,
+            _v_addr_kv,
+            _dlt_addr_kv,
+            {"dk": _dk_store, "dv": _dv_store},
+            scale_arg=scale_from_dk,
+        )
+        roles = [
+            q_res[0],
+            k_res[0],
+            v_res[0],
+            b_res[0],
+            m_res[0],
+            lse_res[0],
+            dlt_res[0],
+            do_res[0],
+            dk_res[0],
+            dv_res[0],
+        ]
         if len(set(roles)) != 10:
             _refuse("ten distinct pointer roles")
 
         if not grid_3d:
             raise MetalNonRecoverableError(_BWD_2D_MSG)
         return {
-            "bwd_kind": "kv", "grid_3d": grid_3d,
-            "q": q_res, "k": k_res, "v": v_res, "bias": b_res, "mask": m_res,
-            "lse": lse_res, "delta": dlt_res, "do": do_res, "dk": dk_res, "dv": dv_res,
-            "sentinel": sentinel_ref, "scale_arg": scale_from_dk, "N_CTX": n_ctx_arg, "H": h_arg,
-            "block_j": block_j, "block_k": block_k, "head_dim": head_dim, "out_dtype": out_dtype,
-            "k_orient": _ds["k_orient"], "v_orient": _ds["v_orient"],
-            "rounding": _ds.get("rounding") or {},   # packet 174
+            "bwd_kind": "kv",
+            "grid_3d": grid_3d,
+            "q": q_res,
+            "k": k_res,
+            "v": v_res,
+            "bias": b_res,
+            "mask": m_res,
+            "lse": lse_res,
+            "delta": dlt_res,
+            "do": do_res,
+            "dk": dk_res,
+            "dv": dv_res,
+            "sentinel": sentinel_ref,
+            "scale_arg": scale_from_dk,
+            "N_CTX": n_ctx_arg,
+            "H": h_arg,
+            "block_j": block_j,
+            "block_k": block_k,
+            "head_dim": head_dim,
+            "out_dtype": out_dtype,
+            "k_orient": _ds["k_orient"],
+            "v_orient": _ds["v_orient"],
+            "rounding": _ds.get("rounding") or {},  # packet 174
         }
 
     def _lower_biased_fa_backward(self, info: dict) -> str:
@@ -10857,9 +11252,12 @@ class GenericLowerer(
         from triton_msl.errors import MetalNonRecoverableError
         from triton_msl.codegen.msl_types import triton_type_to_msl
         from triton_msl.codegen._msl_templates import (
-            make_flash_attention_bwd_kv_kernel, make_flash_attention_bwd_q_kernel,
-            make_flash_attention_bwd_b_kernel, make_flash_attention_bwd_kv_kernel_simd,
-            make_flash_attention_bwd_q_kernel_simd)
+            make_flash_attention_bwd_kv_kernel,
+            make_flash_attention_bwd_q_kernel,
+            make_flash_attention_bwd_b_kernel,
+            make_flash_attention_bwd_kv_kernel_simd,
+            make_flash_attention_bwd_q_kernel_simd,
+        )
 
         kind = info.get("bwd_kind")
         if kind not in ("kv", "q", "b"):
@@ -10882,23 +11280,43 @@ class GenericLowerer(
 
         if kind == "kv":
             role_name = {
-                info["dk"][0]: "DK", info["dv"][0]: "DV", info["q"][0]: "Q", info["k"][0]: "K",
-                info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
-                info["lse"][0]: "Lse", info["delta"][0]: "Delta", info["do"][0]: "dO",
+                info["dk"][0]: "DK",
+                info["dv"][0]: "DV",
+                info["q"][0]: "Q",
+                info["k"][0]: "K",
+                info["v"][0]: "V",
+                info["bias"][0]: "Bias",
+                info["mask"][0]: "Mask",
+                info["lse"][0]: "Lse",
+                info["delta"][0]: "Delta",
+                info["do"][0]: "dO",
             }
             write_roles = ("DK", "DV")
         elif kind == "q":
             role_name = {
-                info["dq"][0]: "DQ", info["delta"][0]: "Delta", info["q"][0]: "Q", info["k"][0]: "K",
-                info["v"][0]: "V", info["bias"][0]: "Bias", info["mask"][0]: "Mask",
-                info["lse"][0]: "Lse", info["o"][0]: "O", info["do"][0]: "dO",
+                info["dq"][0]: "DQ",
+                info["delta"][0]: "Delta",
+                info["q"][0]: "Q",
+                info["k"][0]: "K",
+                info["v"][0]: "V",
+                info["bias"][0]: "Bias",
+                info["mask"][0]: "Mask",
+                info["lse"][0]: "Lse",
+                info["o"][0]: "O",
+                info["do"][0]: "dO",
             }
             write_roles = ("DQ", "Delta")
         else:  # b
             role_name = {
-                info["db"][0]: "DB", info["q"][0]: "Q", info["k"][0]: "K", info["v"][0]: "V",
-                info["bias"][0]: "Bias", info["mask"][0]: "Mask", info["lse"][0]: "Lse",
-                info["delta"][0]: "Delta", info["do"][0]: "dO",
+                info["db"][0]: "DB",
+                info["q"][0]: "Q",
+                info["k"][0]: "K",
+                info["v"][0]: "V",
+                info["bias"][0]: "Bias",
+                info["mask"][0]: "Mask",
+                info["lse"][0]: "Lse",
+                info["delta"][0]: "Delta",
+                info["do"][0]: "dO",
             }
             write_roles = ("DB",)
         n_args = len(args)
@@ -10919,9 +11337,11 @@ class GenericLowerer(
             ptr_ord = j = 0
             for a in args:
                 if a.is_ptr:
-                    arg_decls.append(_ptr_decl(a, ptr_ord)); ptr_ord += 1
+                    arg_decls.append(_ptr_decl(a, ptr_ord))
+                    ptr_ord += 1
                 else:
-                    scalar_pos[a.index] = j; j += 1
+                    scalar_pos[a.index] = j
+                    j += 1
             arg_decls.append(f"    constant uint* _bpk [[buffer({n_ptr})]]")
         else:
             for a in args:
@@ -10965,14 +11385,34 @@ class GenericLowerer(
         mask_batch_div = _u(info["H"]) if (grid_3d and info["H"] != C1) else None
         head_dim, block_j, block_k = info["head_dim"], info["block_j"], info["block_k"]
         common = {
-            "q_sz": _u(qs[0]), "q_sh": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
-            "v_sz": _u(vs[0]), "v_sh": _u(vs[1]), "v_sn": _u(_v_sn), "v_sk": _u(_v_sk),  # from the proven V orientation
-            "b_sz": _u(bs[0]), "b_sh": _u(bs[1]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
-            "mask_sz": _u(ms[0]), "mask_sh": _u(ms[1]), "mask_sn": _u(ms[2]),
-            "lse_sz": _u(ls[0]), "lse_sh": _u(ls[1]), "lse_sm": _u(ls[2]),
-            "dlt_sz": _u(ds[0]), "dlt_sh": _u(ds[1]), "dlt_sm": _u(ds[2]),
-            "do_sz": _u(os_[0]), "do_sh": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
-            "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
+            "q_sz": _u(qs[0]),
+            "q_sh": _u(qs[1]),
+            "q_sm": _u(qs[2]),
+            "q_sk": _u(qs[3]),
+            "v_sz": _u(vs[0]),
+            "v_sh": _u(vs[1]),
+            "v_sn": _u(_v_sn),
+            "v_sk": _u(_v_sk),  # from the proven V orientation
+            "b_sz": _u(bs[0]),
+            "b_sh": _u(bs[1]),
+            "b_sm": _u(bs[2]),
+            "b_sn": _u(bs[3]),
+            "mask_sz": _u(ms[0]),
+            "mask_sh": _u(ms[1]),
+            "mask_sn": _u(ms[2]),
+            "lse_sz": _u(ls[0]),
+            "lse_sh": _u(ls[1]),
+            "lse_sm": _u(ls[2]),
+            "dlt_sz": _u(ds[0]),
+            "dlt_sh": _u(ds[1]),
+            "dlt_sm": _u(ds[2]),
+            "do_sz": _u(os_[0]),
+            "do_sh": _u(os_[1]),
+            "do_sm": _u(os_[2]),
+            "do_sk": _u(os_[3]),
+            "H": _u(info["H"]),
+            "N_CTX": _u(info["N_CTX"]),
+            "scale": _scale(info["scale_arg"]),
         }
         # packet 134: forward the proven score sentinel (natural units in the backward: the
         # source applies it BEFORE the inv_ln2 multiply) — runtime arg or baked literal.
@@ -10986,49 +11426,87 @@ class GenericLowerer(
 
         # simdgroup-MMA fast path (dK/dV, dQ): ~2-2.5x the scalar template at the tile
         # sizes it supports. dbias stays scalar (memory-bound i-loop; MMA lost).
-        simd_ok = (head_dim % 8 == 0 and block_j % 8 == 0 and block_k % 8 == 0
-                   and head_dim <= 32 and block_j <= 32 and block_k <= 32)
+        simd_ok = (
+            head_dim % 8 == 0
+            and block_j % 8 == 0
+            and block_k % 8 == 0
+            and head_dim <= 32
+            and block_j <= 32
+            and block_k <= 32
+        )
         if kind == "kv":
             dks, dvs = info["dk"][1], info["dv"][1]
             bindings = dict(common)
-            bindings.update({
-                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven K orientation
-                "dk_sz": _u(dks[0]), "dk_sh": _u(dks[1]), "dk_sn": _u(dks[2]), "dk_sk": _u(dks[3]),
-                "dv_sz": _u(dvs[0]), "dv_sh": _u(dvs[1]), "dv_sn": _u(dvs[2]), "dv_sk": _u(dvs[3]),
-            })
+            bindings.update(
+                {
+                    "k_sz": _u(ks[0]),
+                    "k_sh": _u(ks[1]),
+                    "k_sn": _u(_k_sn),
+                    "k_sk": _u(_k_sk),  # from the proven K orientation
+                    "dk_sz": _u(dks[0]),
+                    "dk_sh": _u(dks[1]),
+                    "dk_sn": _u(dks[2]),
+                    "dk_sk": _u(dks[3]),
+                    "dv_sz": _u(dvs[0]),
+                    "dv_sh": _u(dvs[1]),
+                    "dv_sn": _u(dvs[2]),
+                    "dv_sk": _u(dvs[3]),
+                }
+            )
             # Error-type parity with the q/b branches: refuse LOUDLY (MetalNonRecoverableError
             # -> CPU fallback) if the scalar path can't tile this head_dim within 32 KB
             # (e.g. head_dim=256), instead of letting the maker raise a bare ValueError.
             if not simd_ok:
                 from triton_msl.codegen._msl_templates import _bwd_kv_subtile_size
+
                 if _bwd_kv_subtile_size(head_dim, block_j, block_k) is None:
                     raise MetalNonRecoverableError(
                         f"Refusing to emit silently-wrong output: backward dK/dV head_dim={head_dim} "
                         f"(BLOCK_J={block_j}, BLOCK_K={block_k}) cannot be k-subtiled within Metal's "
-                        f"1024-thread / 32 KB threadgroup limits.")
+                        f"1024-thread / 32 KB threadgroup limits."
+                    )
             kv_maker = make_flash_attention_bwd_kv_kernel_simd if simd_ok else make_flash_attention_bwd_kv_kernel
             msl = kv_maker(
-                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                head_dim,
+                block_j,
+                block_k,
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div, runtime_neg_inf=True,
-                **(info.get("rounding") or {}))
+                grid_3d=grid_3d,
+                mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True,
+                **(info.get("rounding") or {}),
+            )
             # scalar path k-subtiles so a large head_dim fits: TPG = KS*head_dim (KS==block_k
             # for head_dim<=32 -> unchanged block_k*head_dim). Must match the template's KS.
             if simd_ok:
                 self.effective_block_size = 128
             else:
                 from triton_msl.codegen._msl_templates import _bwd_kv_subtile_size
+
                 _ks = _bwd_kv_subtile_size(head_dim, block_j, block_k)
                 self.effective_block_size = (_ks * head_dim) if _ks is not None else block_k * head_dim
         elif kind == "q":
             oo, dqs = info["o"][1], info["dq"][1]
             bindings = dict(common)
-            bindings.update({
-                "k_sz": _u(ks[0]), "k_sh": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven K orientation
-                "o_sz": _u(oo[0]), "o_sh": _u(oo[1]), "o_sm": _u(oo[2]), "o_sk": _u(oo[3]),
-                "dq_sz": _u(dqs[0]), "dq_sh": _u(dqs[1]), "dq_sm": _u(dqs[2]), "dq_sk": _u(dqs[3]),
-            })
+            bindings.update(
+                {
+                    "k_sz": _u(ks[0]),
+                    "k_sh": _u(ks[1]),
+                    "k_sn": _u(_k_sn),
+                    "k_sk": _u(_k_sk),  # from the proven K orientation
+                    "o_sz": _u(oo[0]),
+                    "o_sh": _u(oo[1]),
+                    "o_sm": _u(oo[2]),
+                    "o_sk": _u(oo[3]),
+                    "dq_sz": _u(dqs[0]),
+                    "dq_sh": _u(dqs[1]),
+                    "dq_sm": _u(dqs[2]),
+                    "dq_sk": _u(dqs[3]),
+                }
+            )
             _q_rounding = info.get("rounding") or {}
             if _q_rounding.get("round_delta") is not None and not simd_ok:
                 raise MetalNonRecoverableError(
@@ -11044,50 +11522,91 @@ class GenericLowerer(
                 self.effective_block_size = 128
             else:
                 from triton_msl.codegen._msl_templates import _bwd_q_subtile_size
+
                 _js = _bwd_q_subtile_size(head_dim, block_j, block_k)
                 if _js is None:
                     raise MetalNonRecoverableError(
                         f"Refusing to emit silently-wrong output: backward dQ head_dim={head_dim} "
                         f"(BLOCK_J={block_j}, BLOCK_K={block_k}) — the J-independent K/V threadgroup "
                         f"staging (2*BLOCK_K*head_dim) exceeds 32 KB at any j-subtile, so dQ has no "
-                        f"correct lowering here (dK/dV still lower via the K-subtiled bwd_kv).")
+                        f"correct lowering here (dK/dV still lower via the K-subtiled bwd_kv)."
+                    )
                 self.effective_block_size = _js * head_dim
             msl = q_maker(
-                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                head_dim,
+                block_j,
+                block_k,
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div, runtime_neg_inf=True,
-                **(info.get("rounding") or {}))
+                grid_3d=grid_3d,
+                mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True,
+                **(info.get("rounding") or {}),
+            )
         else:  # b — triangle-i is a loop; slot [1] of each stride list is the i-stride.
             dbs = info["db"][1]
             bindings = {
-                "q_sh": _u(qs[0]), "q_si": _u(qs[1]), "q_sm": _u(qs[2]), "q_sk": _u(qs[3]),
-                "k_sh": _u(ks[0]), "k_si": _u(ks[1]), "k_sn": _u(_k_sn), "k_sk": _u(_k_sk),  # from the proven orientations
-                "v_sh": _u(vs[0]), "v_si": _u(vs[1]), "v_sn": _u(_v_sn), "v_sk": _u(_v_sk),
-                "b_sh": _u(bs[0]), "b_sm": _u(bs[2]), "b_sn": _u(bs[3]),
-                "mask_sz": _u(ms[0]), "mask_si": _u(ms[1]), "mask_sn": _u(ms[2]),
-                "lse_sh": _u(ls[0]), "lse_si": _u(ls[1]), "lse_sm": _u(ls[2]),
-                "dlt_sh": _u(ds[0]), "dlt_si": _u(ds[1]), "dlt_sm": _u(ds[2]),
-                "do_sh": _u(os_[0]), "do_si": _u(os_[1]), "do_sm": _u(os_[2]), "do_sk": _u(os_[3]),
-                "db_sh": _u(dbs[0]), "db_sm": _u(dbs[2]), "db_sn": _u(dbs[3]),
-                "H": _u(info["H"]), "N_CTX": _u(info["N_CTX"]), "scale": _scale(info["scale_arg"]),
+                "q_sh": _u(qs[0]),
+                "q_si": _u(qs[1]),
+                "q_sm": _u(qs[2]),
+                "q_sk": _u(qs[3]),
+                "k_sh": _u(ks[0]),
+                "k_si": _u(ks[1]),
+                "k_sn": _u(_k_sn),
+                "k_sk": _u(_k_sk),  # from the proven orientations
+                "v_sh": _u(vs[0]),
+                "v_si": _u(vs[1]),
+                "v_sn": _u(_v_sn),
+                "v_sk": _u(_v_sk),
+                "b_sh": _u(bs[0]),
+                "b_sm": _u(bs[2]),
+                "b_sn": _u(bs[3]),
+                "mask_sz": _u(ms[0]),
+                "mask_si": _u(ms[1]),
+                "mask_sn": _u(ms[2]),
+                "lse_sh": _u(ls[0]),
+                "lse_si": _u(ls[1]),
+                "lse_sm": _u(ls[2]),
+                "dlt_sh": _u(ds[0]),
+                "dlt_si": _u(ds[1]),
+                "dlt_sm": _u(ds[2]),
+                "do_sh": _u(os_[0]),
+                "do_si": _u(os_[1]),
+                "do_sm": _u(os_[2]),
+                "do_sk": _u(os_[3]),
+                "db_sh": _u(dbs[0]),
+                "db_sm": _u(dbs[2]),
+                "db_sn": _u(dbs[3]),
+                "H": _u(info["H"]),
+                "N_CTX": _u(info["N_CTX"]),
+                "scale": _scale(info["scale_arg"]),
                 "neg_inf": common["neg_inf"],  # packet 134: the proven score sentinel
             }
             # dbias de-stages Q for a large head_dim; if even that overflows 32 KB
             # (head_dim>=128 at BLOCK_K=32) it has no correct lowering here -> refuse LOUDLY.
             from triton_msl.codegen._msl_templates import _bwd_b_config
+
             _bfits = _bwd_b_config(head_dim, block_j, block_k)[1]
             if not _bfits:
                 raise MetalNonRecoverableError(
                     f"Refusing to emit silently-wrong output: backward dbias head_dim={head_dim} "
                     f"(BLOCK_J={block_j}, BLOCK_K={block_k}) — the J-independent K/V threadgroup "
-                    f"staging exceeds 32 KB even with Q de-staged, so dbias has no correct lowering.")
+                    f"staging exceeds 32 KB even with Q de-staged, so dbias has no correct lowering."
+                )
             msl = make_flash_attention_bwd_b_kernel(
-                head_dim, block_j, block_k, out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                head_dim,
+                block_j,
+                block_k,
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                mask_batch_div=mask_batch_div, runtime_neg_inf=True,
-                **(info.get("rounding") or {}))
+                mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True,
+                **(info.get("rounding") or {}),
+            )
             self.effective_block_size = block_j * block_k
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
         self._used_pid_axes = {0, 1, 2} if grid_3d else {0, 1}
@@ -11166,12 +11685,21 @@ class GenericLowerer(
             extra_stores=[(info["lse"], "Lse", ("Q",), False)],
             # Packet 114: the VALUES — Bias as the dot accumulator, Mask as the select
             # predicate, both selects with ONE sentinel (reported in _bout), the Lse value.
-            biased={"bias": info["bias"], "mask": (info["mask"] if has_mask else None), "lse": info["lse"], "c_eff": info.get("c_eff", 1.0)},
+            biased={
+                "bias": info["bias"],
+                "mask": (info["mask"] if has_mask else None),
+                "lse": info["lse"],
+                "c_eff": info.get("c_eff", 1.0),
+            },
             biased_out=(_bout := {}),
         )
         role_name = {
-            info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out",
-            info["bias"]: "Bias", info["lse"]: "Lse",
+            info["q"]: "Q",
+            info["k"]: "K",
+            info["v"]: "V",
+            info["out"]: "Out",
+            info["bias"]: "Bias",
+            info["lse"]: "Lse",
         }
         if has_mask:
             role_name[info["mask"]] = "Mask"
@@ -11252,9 +11780,7 @@ class GenericLowerer(
                         "refusing rather than reinterpret non-fp32 bits as float."
                     )
                 return f"as_type<float>(_bpk[{scalar_pos[entry]}])" if packed else f"as_type<float>(bsc_{entry})"
-            raise MetalNonRecoverableError(
-                f"biased FlashAttention runtime {role} arg unmapped; refusing."
-            )
+            raise MetalNonRecoverableError(f"biased FlashAttention runtime {role} arg unmapped; refusing.")
 
         qs, ks, vs = info["q_strides"], info["k_strides"], info["v_strides"]
         os_, bs, ls = info["o_strides"], info["b_strides"], info["lse_strides"]
@@ -11263,16 +11789,36 @@ class GenericLowerer(
         ms = info["m_strides"] if has_mask else None
         _msk = (lambda i: _uint_expr(ms[i])) if has_mask else (lambda i: "0u")
         bindings = {
-            "q_sz": _uint_expr(qs[0]), "q_sh": _uint_expr(qs[1]), "q_sm": _uint_expr(qs[2]), "q_sk": _uint_expr(qs[3]),
+            "q_sz": _uint_expr(qs[0]),
+            "q_sh": _uint_expr(qs[1]),
+            "q_sm": _uint_expr(qs[2]),
+            "q_sk": _uint_expr(qs[3]),
             # Kᵀ: resolver row (ks[2]) = head-dim stride -> k_sk; col (ks[3]) = kv stride -> k_sn.
-            "k_sz": _uint_expr(ks[0]), "k_sh": _uint_expr(ks[1]), "k_sn": _uint_expr(ks[3]), "k_sk": _uint_expr(ks[2]),
-            "v_sz": _uint_expr(vs[0]), "v_sh": _uint_expr(vs[1]), "v_sn": _uint_expr(vs[2]), "v_sk": _uint_expr(vs[3]),
-            "o_sz": _uint_expr(os_[0]), "o_sh": _uint_expr(os_[1]), "o_sm": _uint_expr(os_[2]), "o_sk": _uint_expr(os_[3]),
-            "b_sz": _uint_expr(bs[0]), "b_sh": _uint_expr(bs[1]), "b_sm": _uint_expr(bs[2]), "b_sn": _uint_expr(bs[3]),
-            "mask_sz": _msk(0), "mask_sh": _msk(1), "mask_sn": _msk(2),
-            "lse_sz": _uint_expr(ls[0]), "lse_sh": _uint_expr(ls[1]), "lse_sm": _uint_expr(ls[2]),
+            "k_sz": _uint_expr(ks[0]),
+            "k_sh": _uint_expr(ks[1]),
+            "k_sn": _uint_expr(ks[3]),
+            "k_sk": _uint_expr(ks[2]),
+            "v_sz": _uint_expr(vs[0]),
+            "v_sh": _uint_expr(vs[1]),
+            "v_sn": _uint_expr(vs[2]),
+            "v_sk": _uint_expr(vs[3]),
+            "o_sz": _uint_expr(os_[0]),
+            "o_sh": _uint_expr(os_[1]),
+            "o_sm": _uint_expr(os_[2]),
+            "o_sk": _uint_expr(os_[3]),
+            "b_sz": _uint_expr(bs[0]),
+            "b_sh": _uint_expr(bs[1]),
+            "b_sm": _uint_expr(bs[2]),
+            "b_sn": _uint_expr(bs[3]),
+            "mask_sz": _msk(0),
+            "mask_sh": _msk(1),
+            "mask_sn": _msk(2),
+            "lse_sz": _uint_expr(ls[0]),
+            "lse_sh": _uint_expr(ls[1]),
+            "lse_sm": _uint_expr(ls[2]),
             "Z": "1u",  # unused in the tiled template body (z = zh / H computed locally)
-            "H": _uint_expr(info["H"]), "N_CTX": _uint_expr(info["N_CTX"]),
+            "H": _uint_expr(info["H"]),
+            "N_CTX": _uint_expr(info["N_CTX"]),
             "scale": _scale_expr(info["scale_arg"], "scale"),
         }
         # Packet 114: the source's sentinel, forwarded (runtime float arg, reinterpreted
@@ -11316,10 +11862,10 @@ class GenericLowerer(
             and (8 <= head_dim <= 64 or head_dim in (128, 192))
             and info["out_dtype"] != "bf16"  # simd MMA fragments are fp16/fp32; bf16 -> tiled
             and block_m == 32
-            and qs2[3] == C1        # Q head-dim (col) contiguous
-            and ks2[2] == C1        # K head-dim (Kᵀ row) contiguous
-            and vs2[3] == C1        # V head-dim (col) contiguous
-            and os2[3] == C1        # Out head-dim (col) contiguous
+            and qs2[3] == C1  # Q head-dim (col) contiguous
+            and ks2[2] == C1  # K head-dim (Kᵀ row) contiguous
+            and vs2[3] == C1  # V head-dim (col) contiguous
+            and os2[3] == C1  # Out head-dim (col) contiguous
             # packet 164: a source that rounds P to its dtype does so RELATIVE TO ITS OWN kv-block
             # running max; rounding then rescaling differs from rescaling then rounding, so the
             # replay must walk the source's block width. The simd maker is fixed at 64-wide
@@ -11331,27 +11877,50 @@ class GenericLowerer(
             from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup
 
             msl = make_flash_attention_kernel_simdgroup(
-                head_dim, 32, 64,
-                causal=info["causal"], out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                head_dim,
+                32,
+                64,
+                causal=info["causal"],
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                bias=True, mask=has_mask, lse=True, runtime_scale=True,
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div,
-                runtime_neg_inf=True, neg_inf_unit=_ni_unit,
-                round_q=_rq, round_p=_rp, scale_chain=_scale_chain,
+                bias=True,
+                mask=has_mask,
+                lse=True,
+                runtime_scale=True,
+                grid_3d=grid_3d,
+                mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True,
+                neg_inf_unit=_ni_unit,
+                round_q=_rq,
+                round_p=_rp,
+                scale_chain=_scale_chain,
             )
             self.effective_block_size = 256
         else:
             Dc = head_dim if head_dim <= 64 else 64
             msl = make_flash_attention_kernel_tiled(
-                head_dim, block_m, block_n, Dc=Dc,
-                causal=info["causal"], out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                head_dim,
+                block_m,
+                block_n,
+                Dc=Dc,
+                causal=info["causal"],
+                out_dtype=info["out_dtype"],
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
-                bias=True, mask=has_mask, lse=True, runtime_scale=True,
-                grid_3d=grid_3d, mask_batch_div=mask_batch_div,
-                runtime_neg_inf=True, neg_inf_unit=_ni_unit,
-                round_q=_rq, round_p=_rp, scale_chain=_scale_chain,
+                bias=True,
+                mask=has_mask,
+                lse=True,
+                runtime_scale=True,
+                grid_3d=grid_3d,
+                mask_batch_div=mask_batch_div,
+                runtime_neg_inf=True,
+                neg_inf_unit=_ni_unit,
+                round_q=_rq,
+                round_p=_rp,
+                scale_chain=_scale_chain,
             )
             self.effective_block_size = flash_attention_tiled_threads(block_m, block_n)
         self._flash_attention = ("flash_attention", msl, self.effective_block_size)
@@ -11386,7 +11955,16 @@ class GenericLowerer(
         # Packet 109 A: the emitted template declares ONE pointer type for Q, K, V and Out
         # (from out_dtype). Every source role must have exactly that element type; a
         # bf16 role behind an fp16 template (or any mixed ABI) is silently wrong.
-        _norm = {"f16": "f16", "fp16": "f16", "half": "f16", "f32": "f32", "fp32": "f32", "float": "f32", "bf16": "bf16", "bfloat16": "bf16"}
+        _norm = {
+            "f16": "f16",
+            "fp16": "f16",
+            "half": "f16",
+            "f32": "f32",
+            "fp32": "f32",
+            "float": "f32",
+            "bf16": "bf16",
+            "bfloat16": "bf16",
+        }
         _role_types = {
             _norm.get(str(self.graph.args[i].elem_type), str(self.graph.args[i].elem_type))
             for i in (info["q"], info["q_rope"], info["k"], info["k_rope"], info["v"], info["out"])
@@ -11594,25 +12172,78 @@ class GenericLowerer(
         # hole. Membership is necessary, NOT semantic-equivalence proof: the
         # role/value/address and loop checks below still apply independently.
         _effect_vocabulary = {
-            "arith.constant", "arith.addi", "arith.subi", "arith.muli",
-            "arith.divsi", "arith.divui", "arith.remsi", "arith.remui",
-            "arith.minsi", "arith.minui", "arith.maxsi", "arith.maxui",
-            "arith.andi", "arith.ori", "arith.xori", "arith.shli",
-            "arith.shrsi", "arith.shrui", "arith.cmpi", "arith.cmpf",
-            "arith.select", "arith.extsi", "arith.extui", "arith.trunci",
-            "arith.index_cast", "arith.index_castui", "arith.bitcast",
-            "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.negf",
-            "arith.maximumf", "arith.minimumf", "arith.maxnumf", "arith.minnumf",
-            "arith.extf", "arith.truncf", "arith.sitofp", "arith.uitofp",
-            "arith.fptosi", "arith.fptoui",
-            "math.exp", "math.exp2", "math.log", "math.log2", "math.sqrt",
-            "math.rsqrt", "math.absf", "math.fma",
-            "scf.for", "scf.yield",
-            "tt.addptr", "tt.broadcast", "tt.dot", "tt.expand_dims", "tt.exp",
-            "tt.fp_to_fp", "tt.get_program_id", "tt.get_num_programs",
-            "tt.load", "tt.make_range", "tt.reduce", "tt.reduce.return",
-            "tt.reshape", "tt.return", "tt.splat", "tt.store", "tt.trans",
-            "ttg.convert_layout", "ttg.local_alloc", "ttg.local_load",
+            "arith.constant",
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "arith.divsi",
+            "arith.divui",
+            "arith.remsi",
+            "arith.remui",
+            "arith.minsi",
+            "arith.minui",
+            "arith.maxsi",
+            "arith.maxui",
+            "arith.andi",
+            "arith.ori",
+            "arith.xori",
+            "arith.shli",
+            "arith.shrsi",
+            "arith.shrui",
+            "arith.cmpi",
+            "arith.cmpf",
+            "arith.select",
+            "arith.extsi",
+            "arith.extui",
+            "arith.trunci",
+            "arith.index_cast",
+            "arith.index_castui",
+            "arith.bitcast",
+            "arith.addf",
+            "arith.subf",
+            "arith.mulf",
+            "arith.divf",
+            "arith.negf",
+            "arith.maximumf",
+            "arith.minimumf",
+            "arith.maxnumf",
+            "arith.minnumf",
+            "arith.extf",
+            "arith.truncf",
+            "arith.sitofp",
+            "arith.uitofp",
+            "arith.fptosi",
+            "arith.fptoui",
+            "math.exp",
+            "math.exp2",
+            "math.log",
+            "math.log2",
+            "math.sqrt",
+            "math.rsqrt",
+            "math.absf",
+            "math.fma",
+            "scf.for",
+            "scf.yield",
+            "tt.addptr",
+            "tt.broadcast",
+            "tt.dot",
+            "tt.expand_dims",
+            "tt.exp",
+            "tt.fp_to_fp",
+            "tt.get_program_id",
+            "tt.get_num_programs",
+            "tt.load",
+            "tt.make_range",
+            "tt.reduce",
+            "tt.reduce.return",
+            "tt.reshape",
+            "tt.return",
+            "tt.splat",
+            "tt.store",
+            "tt.trans",
+            "ttg.convert_layout",
+            "ttg.local_alloc",
+            "ttg.local_load",
             "ttg.memdesc_trans",
         }
         _foreign_effects = sorted({s.op for s in _all if s.op not in _effect_vocabulary})
@@ -11625,8 +12256,7 @@ class GenericLowerer(
         _dots = [s for s in _all if s.op == "tt.dot"]
         if len(_dots) < 2:
             raise MetalNonRecoverableError(
-                "FlashAttention value path has fewer than two dots; refusing an "
-                "unverifiable specialized route.",
+                "FlashAttention value path has fewer than two dots; refusing an unverifiable specialized route.",
                 op_name="tt.dot",
             )
         _order = {s.id: i for i, s in enumerate(_all)}
@@ -11648,9 +12278,7 @@ class GenericLowerer(
             for _i, _init in enumerate(_inits):
                 if _i + 1 < len(_bids):
                     _loop_sources[_bids[_i + 1]] = [_init] + [
-                        y.operand_ids[_i]
-                        for y in _yields
-                        if _i < len(y.operand_ids or [])
+                        y.operand_ids[_i] for y in _yields if _i < len(y.operand_ids or [])
                     ]
 
         def _depends_on(start_id, targets, limit=256):
@@ -11681,9 +12309,7 @@ class GenericLowerer(
             (
                 d
                 for d in sorted(_dots, key=lambda d: _order[d.id])
-                if d.id not in _dot0_ids
-                and len(d.operand_ids) >= 2
-                and _depends_on_dot0(d.operand_ids[0])
+                if d.id not in _dot0_ids and len(d.operand_ids) >= 2 and _depends_on_dot0(d.operand_ids[0])
             ),
             None,
         )
@@ -11861,6 +12487,7 @@ class GenericLowerer(
             and the explicitly replayed fp32-to-half/bfloat roundings are admitted.
             Record execution order, not the reverse order of this backward walk.
             """
+
             def element(oid):
                 arg = _arg_by_id.get(oid)
                 if arg is not None:
@@ -11878,7 +12505,9 @@ class GenericLowerer(
                 op = _by_id.get(cur)
                 if arg is not None:
                     if arg.is_ptr or element(cur) not in ("f32", "fp32"):
-                        _refuse(role, f"runtime scalar {arg.name} must be fp32 at the root of the scalar conversion chain")
+                        _refuse(
+                            role, f"runtime scalar {arg.name} must be fp32 at the root of the scalar conversion chain"
+                        )
                     break
                 if op is not None and op.op == "arith.constant":
                     if element(cur) not in ("f32", "f16", "bf16"):
@@ -11964,7 +12593,11 @@ class GenericLowerer(
         def _bound_ok(rhs, role):
             if load_mask_policy == "boundary":
                 if detected_query_index is not None and role in _ROW_ROLES:
-                    return _const_value(rhs) == 1 if detected_query_index == "c1" else _scalar_arg_index(rhs) == detected_query_index
+                    return (
+                        _const_value(rhs) == 1
+                        if detected_query_index == "c1"
+                        else _scalar_arg_index(rhs) == detected_query_index
+                    )
                 return detected_n_ctx_index is not None and _scalar_arg_index(rhs) == detected_n_ctx_index
             if load_mask_policy == "varlen":
                 core = _peel_to_core(rhs, _mask_wrappers)
@@ -11978,19 +12611,17 @@ class GenericLowerer(
                 return False
             if role in _ROW_ROLES:
                 return (
-                    sh["bounds"] == (0, _BM) and sh["iv"] == 0 and sh["pid"] == 0
-                    and sh["pid_div"] is None and sh["coef"] == _BM
+                    sh["bounds"] == (0, _BM)
+                    and sh["iv"] == 0
+                    and sh["pid"] == 0
+                    and sh["pid_div"] is None
+                    and sh["coef"] == _BM
                 )
             if detected_n_ctx_index == C1 and _kv_iv is None:
                 # The one-trip KV loop folds to a direct range(0, BN).  It is
                 # still the exact column coordinate because the proved bound is
                 # literal one and there is no surviving loop IV or program axis.
-                return (
-                    sh["bounds"] == (0, _BN)
-                    and sh["iv"] == 0
-                    and sh["pid"] is None
-                    and sh["pid_div"] is None
-                )
+                return sh["bounds"] == (0, _BN) and sh["iv"] == 0 and sh["pid"] is None and sh["pid_div"] is None
             return sh["bounds"] == (0, _BN) and sh["iv"] == 1 and sh["pid"] is None and _kv_iv is not None
 
         def _boundary_leaf(cid, role, allowed_roles):
@@ -12035,7 +12666,9 @@ class GenericLowerer(
                 return
             leaves = _mask_leaf_roles(store.operand_ids[2], role, tuple(leaf_roles))
             if sorted(leaves) != sorted(leaf_roles):
-                _refuse(role, f"the store mask leaves {leaves} are not exactly the template's {list(leaf_roles)} boundary")
+                _refuse(
+                    role, f"the store mask leaves {leaves} are not exactly the template's {list(leaf_roles)} boundary"
+                )
 
         _verified_loads = {}
 
@@ -12070,13 +12703,23 @@ class GenericLowerer(
                 if op.op in _representation and len(op.operand_ids or []) == 1:
                     cur = op.operand_ids[0]
                     continue
-                if (detected_query_index is not None and role == "Q" and op.op == "arith.truncf"
-                        and len(op.operand_ids or []) == 1 and "round_q" not in _rounding):
+                if (
+                    detected_query_index is not None
+                    and role == "Q"
+                    and op.op == "arith.truncf"
+                    and len(op.operand_ids or []) == 1
+                    and "round_q" not in _rounding
+                ):
                     dst = self._native_value_facts(op.id, op_name=op.op)
                     src = self._native_value_facts(op.operand_ids[0], op_name=op.op)
                     producer = _by_id.get(op.operand_ids[0])
-                    if (dst.elem != "f16" or src.elem != "f32" or dst.shape != src.shape
-                            or producer is None or producer.op != "arith.mulf"):
+                    if (
+                        dst.elem != "f16"
+                        or src.elem != "f32"
+                        or dst.shape != src.shape
+                        or producer is None
+                        or producer.op != "arith.mulf"
+                    ):
                         _refuse(role, "decode Q narrowing is not the fp32 scale product rounded to fp16")
                     _rounding["round_q"] = "half"
                     cur = op.operand_ids[0]
@@ -12101,7 +12744,7 @@ class GenericLowerer(
                     # packet 164 (item F-a): the multiply's element type IS a rounding point when it
                     # is narrower than fp32 — the source computes q * full(scale, dtype) in that
                     # dtype (scale rounded, each product rounded). Record it for the makers.
-                    _mt = (op.type_str or "")
+                    _mt = op.type_str or ""
                     _el = _mt.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in _mt else _mt.strip()
                     _round_q = {"f16": "half", "bf16": "bfloat"}.get(_el)
                     if _round_q is not None:
@@ -12121,12 +12764,8 @@ class GenericLowerer(
             scale=q_scale_required,
             transposes=0,
         )
-        _verify_load_path(
-            _dot_qk.operand_ids[1], "K", detected_k_index, transposes=k_transposes
-        )
-        _verify_load_path(
-            _dot_pv.operand_ids[1], "V", detected_v_index, transposes=0
-        )
+        _verify_load_path(_dot_qk.operand_ids[1], "K", detected_k_index, transposes=k_transposes)
+        _verify_load_path(_dot_pv.operand_ids[1], "V", detected_v_index, transposes=0)
         if _dot_rope is not None:
             _qr_scale_value = _verify_load_path(
                 _dot_rope.operand_ids[0], "Q-rope", mla_rope[0], scale=q_scale_required, transposes=0
@@ -12137,7 +12776,10 @@ class GenericLowerer(
                 or _qr_scale_value is None
                 or abs(_q_scale_value - _qr_scale_value) > 1e-7 * max(1.0, abs(_q_scale_value))
             ):
-                _refuse("Q-rope", "the rope scale is not the same single constant as the nope scale (the template bakes ONE Q scale)")
+                _refuse(
+                    "Q-rope",
+                    "the rope scale is not the same single constant as the nope scale (the template bakes ONE Q scale)",
+                )
 
         # P and alpha are one score->probability function.  The template always emits
         # natural exp, but equivalent source spellings may use exp2 with log2e either
@@ -12162,7 +12804,7 @@ class GenericLowerer(
             if _op.op in ("arith.truncf", "tt.fp_to_fp"):
                 # packet 164 (item F-a): P rounded to the input dtype before P @ V is a rounding
                 # point the makers replay; record its target type (one narrowing at most).
-                _pt = (_op.type_str or "")
+                _pt = _op.type_str or ""
                 _pel = _pt.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in _pt else _pt.strip()
                 _round_p = {"f16": "half", "bf16": "bfloat"}.get(_pel)
                 if _round_p is None or "round_p" in _rounding:
@@ -12197,9 +12839,7 @@ class GenericLowerer(
             if core is not None and core.op == "arith.mulf":
                 if len(core.operand_ids or []) != 2:
                     _refuse(role, "the exponential multiplier is not binary")
-                constants = [
-                    (oid, _constant_float(oid)) for oid in core.operand_ids
-                ]
+                constants = [(oid, _constant_float(oid)) for oid in core.operand_ids]
                 constants = [(oid, value) for oid, value in constants if value is not None]
                 if len(constants) != 1:
                     _refuse(
@@ -12232,7 +12872,8 @@ class GenericLowerer(
         if load_mask_policy is not None:
             for _idx, _role, _leaf_roles in extra_loads:
                 _lds = [
-                    o for o in _all
+                    o
+                    for o in _all
                     if o.op == "tt.load" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {_idx}
                 ]
                 if not _lds:
@@ -12241,7 +12882,8 @@ class GenericLowerer(
                     _check_load_mask(_ld, _role, tuple(_leaf_roles), exact_leaves=tuple(_leaf_roles))
             for _idx, _role, _leaf_roles, _req in extra_stores:
                 _sts = [
-                    o for o in _all
+                    o
+                    for o in _all
                     if o.op == "tt.store" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {_idx}
                 ]
                 if len(_sts) != 1:
@@ -12251,7 +12893,15 @@ class GenericLowerer(
         # ---- biased route (packet 114): Bias value, Mask value, both score selects, sentinel ----
         _certified_selects = None
         _biased_S2_id = None
-        _b_wr = {"arith.extf", "arith.truncf", "ttg.convert_layout", "tt.reshape", "ttg.local_load", "ttg.local_alloc", "tt.fp_to_fp"}
+        _b_wr = {
+            "arith.extf",
+            "arith.truncf",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "tt.fp_to_fp",
+        }
         _b_bcast = _b_wr | {"tt.splat", "tt.broadcast", "tt.expand_dims"}
 
         def _peel_id(start, allowed):
@@ -12269,7 +12919,8 @@ class GenericLowerer(
 
             def _unique_load_of(idx, role):
                 lds = [
-                    o for o in _all
+                    o
+                    for o in _all
                     if o.op == "tt.load" and o.operand_ids and _pointer_base_indices(o.operand_ids[0]) == {idx}
                 ]
                 if len(lds) != 1:
@@ -12279,7 +12930,10 @@ class GenericLowerer(
             # (1) Bias value: the accumulator operand IS the Bias load (no arithmetic, no select)
             _bias_ld = _unique_load_of(biased["bias"], "Bias")
             if len(_dot_qk.operand_ids or []) < 3 or _peel_id(_dot_qk.operand_ids[2], _b_wr) != _bias_ld.id:
-                _refuse("Bias", "the QK dot's accumulator is not the Bias load itself (a transform of the bias is not replayed)")
+                _refuse(
+                    "Bias",
+                    "the QK dot's accumulator is not the Bias load itself (a transform of the bias is not replayed)",
+                )
 
             # (2)+(3) the score chain, walked from the softmax input back to the dot
             _S2 = _by_id.get(_peel_id(_p_core.operand_ids[0], _b_wr))
@@ -12287,7 +12941,10 @@ class GenericLowerer(
                 _refuse("Score", "the softmax input is not the tile-boundary select the template replays")
             _leaves = _mask_leaf_roles(_S2.operand_ids[0], "Score", ("Q", "K"))
             if sorted(_leaves) != ["K", "Q"]:
-                _refuse("Score", f"the boundary select's predicate leaves {_leaves} are not exactly the row & col N_CTX boundary")
+                _refuse(
+                    "Score",
+                    f"the boundary select's predicate leaves {_leaves} are not exactly the row & col N_CTX boundary",
+                )
             _sentinel_id = _peel_id(_S2.operand_ids[2], _b_bcast)
             _chain = _peel_id(_S2.operand_ids[1], _b_wr)
             _S1 = None
@@ -12295,23 +12952,39 @@ class GenericLowerer(
                 _mask_ld = _unique_load_of(biased["mask"], "Mask")
                 _S1 = _by_id.get(_chain)
                 if _S1 is None or _S1.op != "arith.select" or len(_S1.operand_ids or []) != 3:
-                    _refuse("Mask", "the loaded-mask select is not where the template replays it (between the scale and the boundary select)")
+                    _refuse(
+                        "Mask",
+                        "the loaded-mask select is not where the template replays it (between the scale and the boundary select)",
+                    )
                 _cmp = _by_id.get(_peel_id(_S1.operand_ids[0], _b_bcast))
-                if _cmp is None or _cmp.op != "arith.cmpi" or (_cmp.attrs or {}).get("predicate_name") != "ne" or len(_cmp.operand_ids or []) != 2:
+                if (
+                    _cmp is None
+                    or _cmp.op != "arith.cmpi"
+                    or (_cmp.attrs or {}).get("predicate_name") != "ne"
+                    or len(_cmp.operand_ids or []) != 2
+                ):
                     _refuse("Mask", "the loaded-mask select's predicate is not `Mask != 0`")
                 _cmp_src = [_peel_id(x, _b_bcast) for x in _cmp.operand_ids]
-                if not ((_cmp_src[0] == _mask_ld.id and _const_value(_cmp.operand_ids[1]) == 0.0)
-                        or (_cmp_src[1] == _mask_ld.id and _const_value(_cmp.operand_ids[0]) == 0.0)):
+                if not (
+                    (_cmp_src[0] == _mask_ld.id and _const_value(_cmp.operand_ids[1]) == 0.0)
+                    or (_cmp_src[1] == _mask_ld.id and _const_value(_cmp.operand_ids[0]) == 0.0)
+                ):
                     _refuse("Mask", "the loaded-mask select's predicate is not the Mask load compared with zero")
                 if _peel_id(_S1.operand_ids[1], _b_bcast) != _sentinel_id:
-                    _refuse("Mask", "the loaded-mask select's masked branch is not the same sentinel value as the boundary select's")
+                    _refuse(
+                        "Mask",
+                        "the loaded-mask select's masked branch is not the same sentinel value as the boundary select's",
+                    )
                 _chain = _peel_id(_S1.operand_ids[2], _b_wr)
             # the constant score scale (c_eff) sits between the dot and the selects
             _c_eff = float(biased.get("c_eff", 1.0))
             _M = _by_id.get(_chain)
             if abs(_c_eff - 1.0) > 1e-9:
                 if _M is None or _M.op != "arith.mulf" or len(_M.operand_ids or []) != 2:
-                    _refuse("Score", "the score scale multiply is not between the dot and the selects (the sentinel units would differ)")
+                    _refuse(
+                        "Score",
+                        "the score scale multiply is not between the dot and the selects (the sentinel units would differ)",
+                    )
                 _cs = [(_const_value(x), x) for x in _M.operand_ids]
                 _consts = [(v, x) for v, x in _cs if v is not None]
                 if len(_consts) != 1 or abs(_consts[0][0] - _c_eff) > 1e-6 * abs(_c_eff):
@@ -12383,8 +13056,7 @@ class GenericLowerer(
             )
             if (
                 _score_scale["op_ids"] != expected_score_scale["op_ids"]
-                or abs(_score_scale["factor"] - expected_score_scale["factor"])
-                > _factor_tol
+                or abs(_score_scale["factor"] - expected_score_scale["factor"]) > _factor_tol
             ):
                 _refuse(
                     "P",
@@ -12433,9 +13105,9 @@ class GenericLowerer(
         if biased is not None:
             _allowed_store_args.add(biased["lse"])
         for _store in (s for s in _all if s.op == "tt.store"):
-            if (not _store.operand_ids or
-                    not any(_pointer_base_indices(_store.operand_ids[0]) == {index}
-                            for index in _allowed_store_args)):
+            if not _store.operand_ids or not any(
+                _pointer_base_indices(_store.operand_ids[0]) == {index} for index in _allowed_store_args
+            ):
                 _refuse("effect", "a store targets memory outside the proved template outputs")
 
         _out_passthrough = _representation | {"arith.truncf", "tt.fp_to_fp"}
@@ -12455,9 +13127,7 @@ class GenericLowerer(
                     _op.operand_ids[1],
                     _representation | {"tt.broadcast", "tt.expand_dims"},
                 )
-                _dot_pv_ids = {_dot_pv.id} | set(
-                    getattr(_dot_pv, "result_ids", None) or []
-                )
+                _dot_pv_ids = {_dot_pv.id} | set(getattr(_dot_pv, "result_ids", None) or [])
                 _singleton_direct = (
                     detected_n_ctx_index == C1
                     and not _fors
@@ -12466,13 +13136,10 @@ class GenericLowerer(
                     and _den is not None
                     and _den.op == "arith.addf"
                 )
-                if not _singleton_direct and (
-                    _num is None or _num.op != "scf.for" or _den is not _num
-                ):
+                if not _singleton_direct and (_num is None or _num.op != "scf.for" or _den is not _num):
                     _refuse(
                         "Out",
-                        "the division is not the canonical accumulator/denominator pair "
-                        "from one attention loop",
+                        "the division is not the canonical accumulator/denominator pair from one attention loop",
                     )
                 if not _singleton_direct and not _depends_on(_num.id, _dot_pv_ids):
                     _refuse("Out", "the attention loop does not yield the verified P@V dot")
@@ -12503,9 +13170,12 @@ class GenericLowerer(
 
             def _int_literal(oid, value):
                 op = _by_id.get(oid)
-                return (op is not None and op.op == "arith.constant"
-                        and (op.type_str or "") in ("i32", "index")
-                        and (op.attrs or {}).get("value") == value)
+                return (
+                    op is not None
+                    and op.op == "arith.constant"
+                    and (op.type_str or "") in ("i32", "index")
+                    and (op.attrs or {}).get("value") == value
+                )
 
             def _length(oid):
                 arg = _arg_by_id.get(oid)
@@ -12524,8 +13194,12 @@ class GenericLowerer(
                         continue
                     for one, pid in (add.operand_ids, add.operand_ids[::-1]):
                         p = _by_id.get(pid)
-                        if (_int_literal(one, 1) and p is not None
-                                and p.op == "tt.get_program_id" and (p.attrs or {}).get("axis") == 0):
+                        if (
+                            _int_literal(one, 1)
+                            and p is not None
+                            and p.op == "tt.get_program_id"
+                            and (p.attrs or {}).get("axis") == 0
+                        ):
                             return True
                 return False
 
@@ -12536,10 +13210,10 @@ class GenericLowerer(
                     _refuse("Tail", "KV loop must start at zero and step by the source BLOCK_N")
                 _upper = _by_id.get(_ub)
                 _causal_stop = (
-                    _upper is not None and _upper.op in ("arith.minsi", "arith.minui")
+                    _upper is not None
+                    and _upper.op in ("arith.minsi", "arith.minui")
                     and len(_upper.operand_ids or []) == 2
-                    and any(_length(a) and _query_stop(b)
-                            for a, b in (_upper.operand_ids, _upper.operand_ids[::-1]))
+                    and any(_length(a) and _query_stop(b) for a, b in (_upper.operand_ids, _upper.operand_ids[::-1]))
                 )
                 if not (_length(_ub) or _causal_stop):
                     _refuse("Tail", "KV loop upper bound is not N_CTX or min(query tile end, N_CTX)")
@@ -12564,11 +13238,14 @@ class GenericLowerer(
                     elif op.op == "arith.cmpi" and len(op.operand_ids) == 2:
                         oid = op.operand_ids[0]
                     elif op.op in ("arith.addi", "arith.muli") and len(op.operand_ids) == 2:
+
                         def uniform(x):
                             c = _peel_to_core(x, {"tt.broadcast", "ttg.convert_layout"})
-                            return c is not None and (c.op == "tt.splat" or
-                                (c.op == "arith.constant" and
-                                 isinstance((c.attrs or {}).get("value"), (int, float))))
+                            return c is not None and (
+                                c.op == "tt.splat"
+                                or (c.op == "arith.constant" and isinstance((c.attrs or {}).get("value"), (int, float)))
+                            )
+
                         varying = [x for x in op.operand_ids if not uniform(x)]
                         if len(varying) != 1:
                             return None
@@ -12593,10 +13270,14 @@ class GenericLowerer(
                 elif _op.op == "arith.select" and len(_op.operand_ids or []) == 3:
                     cond, yes, no = _op.operand_ids
                     _sentinel = _peel_to_core(no, _mask_wrappers)
-                    if (not _depends_on_dot0(yes) or _depends_on_dot0(no)
-                            or _sentinel is None or _sentinel.op != "arith.constant"
-                            or (_sentinel.attrs or {}).get("value") not in
-                            (float("-inf"), 0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000)):
+                    if (
+                        not _depends_on_dot0(yes)
+                        or _depends_on_dot0(no)
+                        or _sentinel is None
+                        or _sentinel.op != "arith.constant"
+                        or (_sentinel.attrs or {}).get("value")
+                        not in (float("-inf"), 0xFC00, 0xFF80, 0xFF800000, 0xFFF0000000000000)
+                    ):
                         _refuse("Tail", "live score select must keep the score or supply negative infinity")
                     cmp = _peel_to_core(cond, _mask_wrappers)
                     if cmp is None or cmp.op != "arith.cmpi" or len(cmp.operand_ids or []) != 2:
@@ -12647,10 +13328,13 @@ class GenericLowerer(
                     return _pid1(oid) if slot == 0 else _int_literal(oid, 0)
                 op = _by_id.get(oid)
                 allowed = ("arith.divsi", "arith.divui") if slot == 0 else ("arith.remsi", "arith.remui")
-                return (op is not None and op.op in allowed and len(op.operand_ids or []) == 2
-                        and _pid1(op.operand_ids[0]) and
-                        (_arg_by_id.get(op.operand_ids[1]) is not None and
-                         _arg_by_id[op.operand_ids[1]].index == h))
+                return (
+                    op is not None
+                    and op.op in allowed
+                    and len(op.operand_ids or []) == 2
+                    and _pid1(op.operand_ids[0])
+                    and (_arg_by_id.get(op.operand_ids[1]) is not None and _arg_by_id[op.operand_ids[1]].index == h)
+                )
 
             for role, load in list(_verified_loads.items()) + [("Out", _out_stores[0])]:
                 if role not in ("Q", "K", "V", "Out"):
@@ -12672,8 +13356,12 @@ class GenericLowerer(
                         ptr = op.operand_ids[0]
                     else:
                         _refuse("Tail", f"{role} address contains unreplayed {op.op}")
-                expected = {"Q": detected_q_index, "K": detected_k_index,
-                            "V": detected_v_index, "Out": detected_out_index}[role]
+                expected = {
+                    "Q": detected_q_index,
+                    "K": detected_k_index,
+                    "V": detected_v_index,
+                    "Out": detected_out_index,
+                }[role]
                 if _arg_by_id[ptr].index != expected:
                     _refuse("Tail", f"{role} address root disagrees with detection")
                 shape = _shape_of(load.operand_ids[0])
@@ -12699,19 +13387,31 @@ class GenericLowerer(
                                 ok = _coord_ok(index, role) and _mask_axis(index) == 0
                             else:
                                 sh = self._index_shape(index, _by_id, _arg_by_id, _kv_iv, 1)
-                                ok = (sh["bad"] is None and sh["mod"] is None and sh["range"] == 1
-                                      and sh["bounds"] == (0, shape[1]) and sh["pid"] is None
-                                      and sh["iv"] == 0 and _mask_axis(index) == 1)
+                                ok = (
+                                    sh["bad"] is None
+                                    and sh["mod"] is None
+                                    and sh["range"] == 1
+                                    and sh["bounds"] == (0, shape[1])
+                                    and sh["pid"] is None
+                                    and sh["iv"] == 0
+                                    and _mask_axis(index) == 1
+                                )
                             if ok:
                                 matches.append(slot)
                     if len(matches) != 1 or matches[0] in found:
-                        _refuse("Tail", f"{role} address term is not an exact, unique source coordinate times its stride")
+                        _refuse(
+                            "Tail", f"{role} address term is not an exact, unique source coordinate times its stride"
+                        )
                     found.add(matches[0])
                 required = {0, 2, 3} if dense_tail_out["H"] == "c1" else {0, 1, 2, 3}
                 if found != required:
                     _refuse("Tail", f"{role} address does not cover exactly the replayed batch/head/row/column terms")
-            dense_tail_out.update(source_kv_block=_BN, mask_tail_scores=not _padding_contributes,
-                                  unmasked_kv=tuple(_plain), source_causal_stop=_causal_stop)
+            dense_tail_out.update(
+                source_kv_block=_BN,
+                mask_tail_scores=not _padding_contributes,
+                unmasked_kv=tuple(_plain),
+                source_causal_stop=_causal_stop,
+            )
 
         # Prove the actual returned recurrence on EVERY forward caller. Belonging
         # to one loop does not prove which result is the numerator/denominator,
@@ -12723,37 +13423,54 @@ class GenericLowerer(
             return _peel_id(sid, _rr_layout)
 
         def _rr_f32(op, shape):
-            return (op is not None and _extract_shape(op.type_str or "") == tuple(shape)
-                    and (op.type_str or "").split(",", 1)[0].rstrip(">").endswith("xf32"))
+            return (
+                op is not None
+                and _extract_shape(op.type_str or "") == tuple(shape)
+                and (op.type_str or "").split(",", 1)[0].rstrip(">").endswith("xf32")
+            )
 
         def _rr_binary(sid, kinds, shape):
             op = _by_id.get(_rr_id(sid))
-            return op if (_rr_f32(op, shape) and op.op in kinds
-                          and len(op.operand_ids or []) == 2) else None
+            return op if (_rr_f32(op, shape) and op.op in kinds and len(op.operand_ids or []) == 2) else None
 
         def _rr_row(sid, target, cols):
             # A row's alpha/max must project across columns, never across rows.
             op = _by_id.get(_rr_id(sid))
             if op is not None and op.op == "tt.broadcast" and _rr_f32(op, (_BM, cols)):
                 op = _by_id.get(_rr_id(op.operand_ids[0])) if len(op.operand_ids or []) == 1 else None
-            return (op is not None and op.op == "tt.expand_dims" and _rr_f32(op, (_BM, 1))
-                    and (op.attrs or {}).get("axis") == 1 and len(op.operand_ids or []) == 1
-                    and _rr_id(op.operand_ids[0]) == target)
+            return (
+                op is not None
+                and op.op == "tt.expand_dims"
+                and _rr_f32(op, (_BM, 1))
+                and (op.attrs or {}).get("axis") == 1
+                and len(op.operand_ids or []) == 1
+                and _rr_id(op.operand_ids[0]) == target
+            )
 
         def _rr_reduce(sid, value, kinds):
             red = _by_id.get(_rr_id(sid))
-            if (red is None or red.op != "tt.reduce" or not _rr_f32(red, (_BM,))
-                    or (red.attrs or {}).get("axis") != 1
-                    or len(red.operand_ids or []) != 1 or _rr_id(red.operand_ids[0]) != value):
+            if (
+                red is None
+                or red.op != "tt.reduce"
+                or not _rr_f32(red, (_BM,))
+                or (red.attrs or {}).get("axis") != 1
+                or len(red.operand_ids or []) != 1
+                or _rr_id(red.operand_ids[0]) != value
+            ):
                 return False
             bids = list((red.attrs or {}).get("block_arg_ids") or [])
             returned = list((red.attrs or {}).get("return_ids") or [])
             body = {o.id: o for o in (red.region_ops or [])}
             combiner = body.get(returned[0]) if len(returned) == 1 else None
-            return (len(bids) == 2 and len(set(bids)) == 2 and combiner is not None
-                    and combiner.op in kinds and combiner.type_str == "f32"
-                    and len(combiner.operand_ids or []) == 2
-                    and set(combiner.operand_ids) == set(bids))
+            return (
+                len(bids) == 2
+                and len(set(bids)) == 2
+                and combiner is not None
+                and combiner.op in kinds
+                and combiner.type_str == "f32"
+                and len(combiner.operand_ids or []) == 2
+                and set(combiner.operand_ids) == set(bids)
+            )
 
         def _rr_constant(sid, value, shape):
             op = _by_id.get(_rr_id(sid))
@@ -12784,13 +13501,10 @@ class GenericLowerer(
                     _rr_max.operand_ids,
                     _rr_max.operand_ids[::-1],
                 ):
-                    if (
-                        _rr_constant(initial, -float("inf"), (_BM,))
-                        and _rr_reduce(
-                            reduced,
-                            _rr_id(_p_core.operand_ids[0]),
-                            {"arith.maxnumf", "arith.maximumf"},
-                        )
+                    if _rr_constant(initial, -float("inf"), (_BM,)) and _rr_reduce(
+                        reduced,
+                        _rr_id(_p_core.operand_ids[0]),
+                        {"arith.maxnumf", "arith.maximumf"},
                     ):
                         _rr_max_ok = True
             if (
@@ -12812,8 +13526,7 @@ class GenericLowerer(
                     if mul is None:
                         continue
                     alpha_and_zero = any(
-                        _rr_id(alpha) == _alpha_exps[0].id
-                        and _rr_constant(zero, 0.0, (_BM,))
+                        _rr_id(alpha) == _alpha_exps[0].id and _rr_constant(zero, 0.0, (_BM,))
                         for alpha, zero in (mul.operand_ids, mul.operand_ids[::-1])
                     )
                     if alpha_and_zero and _rr_reduce(reduced, _p_exp.id, {"arith.addf"}):
@@ -12832,8 +13545,7 @@ class GenericLowerer(
                 or acc.op != "arith.mulf"
                 or len(acc.operand_ids or []) != 2
                 or not any(
-                    _rr_row(alpha, _alpha_exps[0].id, 1)
-                    and _rr_constant(zero, 0.0, (_BM, 1))
+                    _rr_row(alpha, _alpha_exps[0].id, 1) and _rr_constant(zero, 0.0, (_BM, 1))
                     for alpha, zero in (acc.operand_ids, acc.operand_ids[::-1])
                 )
             ):
@@ -12845,11 +13557,15 @@ class GenericLowerer(
         _rr_bids = list((_out_loop.attrs or {}).get("block_arg_ids") or [])
         _rr_inits = list(_out_loop.operand_ids or [])[3:]
         _rr_yields = [o for o in (_out_loop.region_ops or []) if o.op == "scf.yield"]
-        if (len(_rr_yields) != 1 or len(_rr_bids) != len(_rr_rids) + 1
-                or len(_rr_inits) != len(_rr_rids)
-                or len(_rr_yields[0].operand_ids or []) != len(_rr_rids)
-                or _out_num_id not in _rr_rids or _out_den_id not in _rr_rids
-                or _out_num_id == _out_den_id):
+        if (
+            len(_rr_yields) != 1
+            or len(_rr_bids) != len(_rr_rids) + 1
+            or len(_rr_inits) != len(_rr_rids)
+            or len(_rr_yields[0].operand_ids or []) != len(_rr_rids)
+            or _out_num_id not in _rr_rids
+            or _out_den_id not in _rr_rids
+            or _out_num_id == _out_den_id
+        ):
             _refuse("recurrence", "Out does not select two distinct, completely recorded loop results")
         _rr_yids = [_rr_id(x) for x in _rr_yields[0].operand_ids]
         _rr_a, _rr_l = _rr_rids.index(_out_num_id), _rr_rids.index(_out_den_id)
@@ -12857,7 +13573,7 @@ class GenericLowerer(
         if len(_rr_m_candidates) != 1 or _rr_m_candidates[0] in (_rr_a, _rr_l):
             _refuse("recurrence", "the loop does not yield the exact online maximum in its own slot")
         _rr_m = _rr_m_candidates[0]
-        _rr_marg, _rr_larg, _rr_aarg = (_rr_bids[i+1] for i in (_rr_m, _rr_l, _rr_a))
+        _rr_marg, _rr_larg, _rr_aarg = (_rr_bids[i + 1] for i in (_rr_m, _rr_l, _rr_a))
         _rr_initial_values = {}
         for index, value in ((_rr_m, -float("inf")), (_rr_l, 0.0), (_rr_a, 0.0)):
             initial = _by_id.get(_rr_id(_rr_inits[index]))
@@ -12866,11 +13582,18 @@ class GenericLowerer(
             # by the walker; do not decode an arbitrary integer as a float.
             if value == -float("inf") and initial_value == 0xFF800000:
                 initial_value = -float("inf")
-            replay_finite = (index != _rr_m and dense_tail_out is not None
-                             and (type(initial_value) is float or initial_value == 0)
-                             and _math.isfinite(initial_value))
-            if (initial is None or initial.op != "arith.constant"
-                    or initial.elem_type != "f32" or (initial_value != value and not replay_finite)):
+            replay_finite = (
+                index != _rr_m
+                and dense_tail_out is not None
+                and (type(initial_value) is float or initial_value == 0)
+                and _math.isfinite(initial_value)
+            )
+            if (
+                initial is None
+                or initial.op != "arith.constant"
+                or initial.elem_type != "f32"
+                or (initial_value != value and not replay_finite)
+            ):
                 _refuse("recurrence", "the max/denominator/numerator initial values are not the replayed -inf/0/0")
             _rr_initial_values[index] = float(initial_value)
         if dense_tail_out is not None:
@@ -12880,20 +13603,27 @@ class GenericLowerer(
             dense_tail_out["initial_values"] = (_rr_initial_values[_rr_a], _rr_initial_values[_rr_l])
 
         _rr_max = _rr_binary(_p_max.id, {"arith.maxnumf", "arith.maximumf"}, (_BM,))
-        if (_rr_max is None or _rr_id(_alpha_core.operand_ids[0]) != _rr_marg
-                or not _rr_row(_p_core.operand_ids[1], _p_max.id, _BN)):
+        if (
+            _rr_max is None
+            or _rr_id(_alpha_core.operand_ids[0]) != _rr_marg
+            or not _rr_row(_p_core.operand_ids[1], _p_max.id, _BN)
+        ):
             _refuse("recurrence", "the maximum/alpha pair or its row projection is not the carried source value")
-        if not any(_rr_id(a) == _rr_marg and _rr_reduce(b, _rr_id(_p_core.operand_ids[0]),
-                                                    {"arith.maxnumf", "arith.maximumf"})
-                   for a, b in (_rr_max.operand_ids, _rr_max.operand_ids[::-1])):
+        if not any(
+            _rr_id(a) == _rr_marg and _rr_reduce(b, _rr_id(_p_core.operand_ids[0]), {"arith.maxnumf", "arith.maximumf"})
+            for a, b in (_rr_max.operand_ids, _rr_max.operand_ids[::-1])
+        ):
             _refuse("recurrence", "the online maximum is not max(carried max, returned row-max(score))")
         _rr_den = _rr_binary(_rr_yids[_rr_l], {"arith.addf"}, (_BM,))
         _rr_den_ok = False
         if _rr_den is not None:
             for a, b in (_rr_den.operand_ids, _rr_den.operand_ids[::-1]):
                 mul = _rr_binary(a, {"arith.mulf"}, (_BM,))
-                if (mul is not None and {_rr_id(x) for x in mul.operand_ids} == {_rr_larg, _alpha_exps[0].id}
-                        and _rr_reduce(b, _p_exp.id, {"arith.addf"})):
+                if (
+                    mul is not None
+                    and {_rr_id(x) for x in mul.operand_ids} == {_rr_larg, _alpha_exps[0].id}
+                    and _rr_reduce(b, _p_exp.id, {"arith.addf"})
+                ):
                     _rr_den_ok = True
         if not _rr_den_ok:
             _refuse("recurrence", "the denominator is not carried denominator * alpha + returned sum(P)")
@@ -12903,30 +13633,33 @@ class GenericLowerer(
         if len(_rr_pv_shape) != 2 or _rr_pv_shape[0] != _BM:
             _refuse("recurrence", "the numerator has an unproved output shape")
         _rr_acc = _rr_binary(_dot_pv.operand_ids[2], {"arith.mulf"}, _rr_pv_shape)
-        if (_rr_acc is None or not any(_rr_id(a) == _rr_aarg and _rr_row(b, _alpha_exps[0].id, _rr_pv_shape[1])
-                                      for a, b in (_rr_acc.operand_ids, _rr_acc.operand_ids[::-1]))):
+        if _rr_acc is None or not any(
+            _rr_id(a) == _rr_aarg and _rr_row(b, _alpha_exps[0].id, _rr_pv_shape[1])
+            for a, b in (_rr_acc.operand_ids, _rr_acc.operand_ids[::-1])
+        ):
             _refuse("recurrence", "the P@V accumulator is not carried numerator * row-broadcast(alpha)")
 
         # ---- biased route (packet 114): the max reduce reads the certified select; the Lse value ----
         if biased is not None:
             # the row max the softmax subtracts is the max over the SAME boundary-select result
-            _reds = [
-                _by_id.get(_peel_id(x, _b_bcast)) for x in (_p_max.operand_ids or [])
-            ]
+            _reds = [_by_id.get(_peel_id(x, _b_bcast)) for x in (_p_max.operand_ids or [])]
             _reds = [r for r in _reds if r is not None and r.op == "tt.reduce"]
             if len(_reds) != 1 or _peel_id(_reds[0].operand_ids[0], _b_wr) != _biased_S2_id:
                 _refuse("Score", "the online-softmax row max is not reduced from the certified boundary select")
             if _out_loop is None or _out_den_id is None:
                 _refuse("Lse", "the attention loop was not identified by the Out trace")
             _lse_st = [
-                s for s in _all
+                s
+                for s in _all
                 if s.op == "tt.store" and s.operand_ids and _pointer_base_indices(s.operand_ids[0]) == {biased["lse"]}
             ]
             if len(_lse_st) != 1:
                 _refuse("Lse", f"expected exactly one store of arg {biased['lse']}, found {len(_lse_st)}")
             _lv = _by_id.get(_peel_id(_lse_st[0].operand_ids[1], _b_wr))
             if _lv is None or _lv.op != "arith.addf" or len(_lv.operand_ids or []) != 2:
-                _refuse("Lse", "the stored value is not `max * ln(base) + log(denominator)` (an epilogue is not replayed)")
+                _refuse(
+                    "Lse", "the stored value is not `max * ln(base) + log(denominator)` (an epilogue is not replayed)"
+                )
             _parts = [(x, _by_id.get(_peel_id(x, _b_wr))) for x in _lv.operand_ids]
             _logs = [(x, o) for x, o in _parts if o is not None and o.op == "math.log"]
             if len(_logs) != 1 or len(_logs[0][1].operand_ids or []) != 1:
@@ -13656,9 +14389,7 @@ class GenericLowerer(
         # Upstream test_histogram_mask does exactly this over an UNMASKED load, so the
         # two masks are independent and BOTH must be honoured.
         _hist_mask_id = ssa.operand_ids[1] if len(ssa.operand_ids) >= 2 else None
-        _hist_mask_arr = (
-            getattr(self, "env_array", {}).get(_hist_mask_id) if _hist_mask_id is not None else None
-        )
+        _hist_mask_arr = getattr(self, "env_array", {}).get(_hist_mask_id) if _hist_mask_id is not None else None
 
         def _flat_arange_load() -> bool:
             """True when the load's address is exactly ``base + arange(0, M)``, so a
@@ -13715,8 +14446,10 @@ class GenericLowerer(
                 _hm = ""
             self.kb.raw_line(f"    for (uint _ai = 0; _ai < {_arr_n}u; ++_ai) {{")
             self.kb.raw_line(f"        uint _h = lid * {_arr_n}u + _ai;")
-            self.kb.raw_line(f"        if (_h < {M}u{_hm}) atomic_fetch_add_explicit("
-                             f"&{hist_name}[(uint){_arr_name}[_ai]], 1, memory_order_relaxed);")
+            self.kb.raw_line(
+                f"        if (_h < {M}u{_hm}) atomic_fetch_add_explicit("
+                f"&{hist_name}[(uint){_arr_name}[_ai]], 1, memory_order_relaxed);"
+            )
             self.kb.raw_line(f"    }}")
         elif not in_loop:
             # One element per thread: the loaded value IS this thread's element, and the
@@ -13782,9 +14515,7 @@ class GenericLowerer(
             else:
                 self.kb.raw_line(f"        int _hval = static_cast<int>({src_ptr_name}[_h]);")
             _add = f"atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);"
-            self.kb.raw_line(
-                f"        {f'if ({_hist_mask_expr}) ' if _hist_mask_expr else ''}{_add}"
-            )
+            self.kb.raw_line(f"        {f'if ({_hist_mask_expr}) ' if _hist_mask_expr else ''}{_add}")
             self.kb.raw_line(f"    }}")
         else:
             raise MetalNonRecoverableError(
@@ -14879,12 +15610,8 @@ class GenericLowerer(
             cond_shape = self.env_shapes.get(cond_id)
             if cond_shape != () and cond_id not in self._is_splat:
                 _refuse("pointer select condition is not proved kernel-uniform")
-            true_expr = self._rebuild_staged_fill_load(
-                true_id, op_by_id, M, N, axis_dim_hint, depth - 1
-            )
-            false_expr = self._rebuild_staged_fill_load(
-                false_id, op_by_id, M, N, axis_dim_hint, depth - 1
-            )
+            true_expr = self._rebuild_staged_fill_load(true_id, op_by_id, M, N, axis_dim_hint, depth - 1)
+            false_expr = self._rebuild_staged_fill_load(false_id, op_by_id, M, N, axis_dim_hint, depth - 1)
             return f"({self._lookup(cond_id)} ? ({true_expr}) : ({false_expr}))"
 
         ptr_info = self.env_is_ptr.get(ptr_id)
@@ -15115,9 +15842,7 @@ class GenericLowerer(
                     f"than mis-stage.",
                     op_name="ttg.local_alloc",
                 )
-            self.kb.raw_line(
-                f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
-            )
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{")
             self.kb.raw_line(f"        {shared_name}[_sa] = {_src_smem}[_sa];")
             self.kb.raw_line(f"    }}")
         elif total > dispatch_threads and self._is_2d:
@@ -15127,9 +15852,7 @@ class GenericLowerer(
                 # operands).  This returns a complete load expression because
                 # a selected pointer may have a different base in each arm.
                 load_expr = self._rebuild_staged_fill_load(load_addptr_id, op_by_id, M, N)
-                self.kb.raw_line(
-                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
-                )
+                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
                 _emit_staged_fill(load_expr)
@@ -15155,9 +15878,7 @@ class GenericLowerer(
                 # contiguous row-major source; rebuild structurally so a
                 # transposed/strided source stages correctly (or refuses).
                 load_expr = self._rebuild_staged_fill_load(load_addptr_id, op_by_id, M, N)
-                self.kb.raw_line(
-                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
-                )
+                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
                 _emit_staged_fill(load_expr)
@@ -15179,9 +15900,7 @@ class GenericLowerer(
                                 "Refusing (correct-or-refuse).",
                                 op_name="tt.load",
                             )
-                self.kb.raw_line(
-                    f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
-                )
+                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{")
                 self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
                 self.kb.raw_line(f"    }}")
         else:
@@ -15199,9 +15918,7 @@ class GenericLowerer(
                     f"per-thread values across the tile.",
                     op_name="ttg.local_alloc",
                 )
-            self.kb.raw_line(
-                f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{"
-            )
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {dispatch_threads}u) {{")
             self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
             self.kb.raw_line(f"    }}")
 
@@ -15211,8 +15928,7 @@ class GenericLowerer(
         if in_loop:
             total_elems = getattr(self, "_total_elements", self.effective_block_size)
             self.kb.raw_line(
-                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; "
-                f"_loop_e += {dispatch_threads}u) {{"
+                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {dispatch_threads}u) {{"
             )
 
         # Store shared array name for local_load to reference
@@ -15532,9 +16248,7 @@ class GenericLowerer(
             self.kb.declare_threadgroup_array(result_smem, dtype="fp32", size=total)
 
         # Each thread computes one or more elements of C via strided loop
-        self.kb.raw_line(
-            f"    for (uint _de = lid; _de < {total}u; _de += {dispatch_threads}u) {{"
-        )
+        self.kb.raw_line(f"    for (uint _de = lid; _de < {total}u; _de += {dispatch_threads}u) {{")
         self.kb.raw_line(f"        uint _dot_row = _de / {N}u;")
         self.kb.raw_line(f"        uint _dot_col = _de % {N}u;")
         if acc_is_smem:
@@ -15553,8 +16267,7 @@ class GenericLowerer(
         if in_loop:
             total_elems = getattr(self, "_total_elements", self.effective_block_size)
             self.kb.raw_line(
-                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; "
-                f"_loop_e += {dispatch_threads}u) {{"
+                f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {dispatch_threads}u) {{"
             )
 
         # The result for each thread's element comes from the shared result array
@@ -16025,7 +16738,7 @@ class GenericLowerer(
                 continue
             _queue.extend(_op.operand_ids or [])
 
-        reduce_axis, N_reduced = (next(iter(_found)) if len(_found) == 1 else (None, None))
+        reduce_axis, N_reduced = next(iter(_found)) if len(_found) == 1 else (None, None)
 
         def _stage_modular():
             self.kb.raw_line(f"    if (lid < {N}u)")

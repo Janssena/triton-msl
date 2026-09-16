@@ -148,7 +148,4 @@ def test_dense_fa_shifted_k_batch_correct_or_refuse(monkeypatch):
             ref[z, h] = torch.softmax(scores, -1) @ v[z, h].float()
     err = (out - ref).abs().max().item()
     print(f"DENSE_FA_BATCH_PROBE route={route} err={err}")
-    assert err < 1e-3, (
-        "dense FA violated correct-or-refuse for a shifted K batch offset: "
-        f"route={route}, max_err={err}"
-    )
+    assert err < 1e-3, f"dense FA violated correct-or-refuse for a shifted K batch offset: route={route}, max_err={err}"

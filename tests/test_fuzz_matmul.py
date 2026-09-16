@@ -29,6 +29,7 @@ from triton_msl.errors import MetalNonRecoverableError
 HAS = torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")
 requires = pytest.mark.skipif(not HAS, reason="MPS + compile_shader needed")
 
+
 def _tol(dtype):
     if dtype == torch.float32:
         return dict(rtol=2e-3, atol=2e-3)

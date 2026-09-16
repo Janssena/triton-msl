@@ -53,9 +53,8 @@ def _parse(text, path):
 def test_location_payload_cannot_relabel_native_predicates(tmp_path):
     canonical = _ttgir()
     cmp_line = next(line for line in canonical.splitlines() if "arith.cmpi slt" in line)
-    poisoned = (
-        '#pred = loc("%fake = arith.cmpi ugt, %x, %y : i32")\n'
-        + canonical.replace(cmp_line, cmp_line.rsplit(" loc(", 1)[0] + " loc(#pred)", 1)
+    poisoned = '#pred = loc("%fake = arith.cmpi ugt, %x, %y : i32")\n' + canonical.replace(
+        cmp_line, cmp_line.rsplit(" loc(", 1)[0] + " loc(#pred)", 1
     )
     graph, msl = _parse(poisoned, tmp_path / "poison.ttgir")
     comparisons = [op for op in graph.ops if op.op in ("arith.cmpi", "arith.cmpf")]
@@ -68,7 +67,7 @@ def test_location_payload_cannot_relabel_native_predicates(tmp_path):
 
 
 def test_comments_locations_and_private_functions_do_not_create_channel_records():
-    text = r'''
+    text = r"""
 #loc = loc("%x = arith.constant 99.0 : f32; %p = arith.cmpi uge, %x, %y : i32; tt.call @bad()")
 module {
   // %x = arith.constant 88.0 : f32
@@ -83,7 +82,7 @@ module {
     tt.return
   }
 }
-'''
+"""
     index = _ModuleTextIndex(text)
     assert index.constants_by_position == [1.25]
     assert index.predicates == {"p": "olt"}
@@ -105,7 +104,7 @@ def test_channel_count_mismatch_refuses_after_native_walk(tmp_path):
 
 
 def test_strict_indexes_exclude_fake_extern_and_cond_br_payloads():
-    text = r'''
+    text = r"""
 #loc = loc("tt.extern_elementwise %x {symbol = \"bad\", libname = \"bad\"}; cf.cond_br %p, ^bb1, ^bb2")
 module {
   tt.func public @entry() {
@@ -113,7 +112,7 @@ module {
     tt.return loc(#loc)
   }
 }
-'''
+"""
     index = _ModuleTextIndex(text)
     assert index.extern_elementwise_ops == []
     assert index.cond_br_ops == []
@@ -121,7 +120,7 @@ module {
 
 def test_full_walk_and_lowering_bind_quoted_escaped_and_plain_callees(tmp_path):
     assert _mlir_symbol_identity(r'"caf\C3\A9"') == "café"
-    text = r'''
+    text = r"""
 module attributes {"ttg.num-warps"=4:i32, "ttg.threads-per-warp"=32:i32} {
   tt.func private @"quoted\22helper"(%x: i32) -> i32 {
     %one = arith.constant 1 : i32
@@ -141,7 +140,7 @@ module attributes {"ttg.num-warps"=4:i32, "ttg.threads-per-warp"=32:i32} {
     tt.return
   }
 }
-'''
+"""
     graph, msl = _parse(text, tmp_path / "quoted_callees.ttgir")
     assert [callee.name for callee in graph.called_funcs] == ['quoted"helper', "plain_helper"]
     assert [op.attrs["callee"] for op in graph.ops if op.op == "tt.call"] == [
@@ -153,7 +152,7 @@ module attributes {"ttg.num-warps"=4:i32, "ttg.threads-per-warp"=32:i32} {
 
 
 def test_full_walk_and_lowering_bind_quoted_escaped_public_entry_arguments(tmp_path):
-    text = r'''
+    text = r"""
 #loc = loc("quoted_entry.py":1:1)
 module attributes {"ttg.num-warps"=4:i32, "ttg.threads-per-warp"=32:i32} {
   tt.func public @"entry\5Fpoint"(
@@ -163,7 +162,7 @@ module attributes {"ttg.num-warps"=4:i32, "ttg.threads-per-warp"=32:i32} {
     tt.return
   }
 }
-'''
+"""
     graph, msl = _parse(text, tmp_path / "quoted_entry.ttgir")
     assert graph.func_name == "entry_point"
     assert [arg.name for arg in graph.args] == ["Input_0", "Value"]

@@ -222,9 +222,7 @@ def _tolerances(in_dt, out_dt):
 
 @requires_gpu
 @pytest.mark.parametrize(("ep", "in_dt", "out_dt"), _RECOVERY_ROWS)
-def test_s64_upstream_recovery_rows_compute_on_generic_route(
-    monkeypatch, cold_gpu_caches, ep, in_dt, out_dt
-):
+def test_s64_upstream_recovery_rows_compute_on_generic_route(monkeypatch, cold_gpu_caches, ep, in_dt, out_dt):
     hits = []
     original = generic_lowerer.GenericLowerer._lower_dot
 
@@ -252,9 +250,7 @@ def test_s64_upstream_recovery_rows_compute_on_generic_route(
 
 @requires_gpu
 @pytest.mark.parametrize(("in_dt", "out_dt"), _SOFTMAX_ROWS)
-def test_s64_softmax_preserves_specialized_route(
-    monkeypatch, cold_gpu_caches, in_dt, out_dt
-):
+def test_s64_softmax_preserves_specialized_route(monkeypatch, cold_gpu_caches, in_dt, out_dt):
     generic_hits = []
     specialized_hits = []
     original_generic = generic_lowerer.GenericLowerer._lower_dot
@@ -269,18 +265,14 @@ def test_s64_softmax_preserves_specialized_route(
         return original_specialized(self, info)
 
     monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_dot", _generic_spy)
-    monkeypatch.setattr(
-        generic_lowerer.GenericLowerer, "_lower_matmul_softmax_template", _specialized_spy
-    )
+    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_matmul_softmax_template", _specialized_spy)
     # As above, prove routing at lowering rather than through a possibly
     # precompiled runtime executable.
     _direct_lowerer(4, in_dt, out_dt).lower()
     assert generic_hits == []
     assert len(specialized_hits) == 1
     monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_dot", original_generic)
-    monkeypatch.setattr(
-        generic_lowerer.GenericLowerer, "_lower_matmul_softmax_template", original_specialized
-    )
+    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_matmul_softmax_template", original_specialized)
 
     x, y, w, z = _inputs(in_dt, out_dt, seed=64400)
     z0 = z.clone()

@@ -56,8 +56,11 @@ def no_launch(monkeypatch):
 
 # ---------------------------------------------------------------- 1. dispatch descriptors
 
+
 @triton.jit
-def _k_matmul(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _k_matmul(
+    a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rm = pid_m * BM + tl.arange(0, BM)
@@ -92,6 +95,7 @@ def test_descriptor_kernels_refuse_before_launch(cold_caches, no_launch):
     extractor and before any launch. Pre-176: the descriptor was ignored and the arguments bound
     positionally against the template's ABI."""
     import sys
+
     sys.path.insert(0, "tests")
     from test_fa_biased_routing import _biased_tri_fa
 
@@ -106,7 +110,9 @@ def test_matmul_refuses_on_the_read_output_boundary(cold_caches, no_launch):
     lowering path (`output_arg_indices` is None), so the extractor's conservative mode makes every
     pointer an output — and the kernel reads two of them. Refused, not bound blind (pre-176 the
     kernel would have run against fresh, uninitialised copies of A and B)."""
-    a = mx.zeros((64, 64)); b = mx.zeros((64, 64)); c = mx.zeros((64, 64))
+    a = mx.zeros((64, 64))
+    b = mx.zeros((64, 64))
+    c = mx.zeros((64, 64))
     with pytest.raises(MetalNonRecoverableError, match="MLX route"):
         tmlx.triton_call(_k_matmul, a, b, c, 64, 64, 64, 64, 1, 64, 1, 64, 1, grid=(1, 1), BM=64, BN=64, BK=32)
 
@@ -116,7 +122,9 @@ class _Meta:
         self.__dict__.update(kw)
 
 
-@pytest.mark.parametrize("name", ["flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds", "device_assert"])
+@pytest.mark.parametrize(
+    "name", ["flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds", "device_assert"]
+)
 def test_each_unsupported_descriptor_is_named(monkeypatch, cold_caches, no_launch, name):
     """Each descriptor the table names refuses, with the descriptor in the message (the compile is
     stubbed to return metadata carrying just that descriptor)."""
@@ -161,16 +169,22 @@ def test_argument_count_mismatch_refuses():
     """The Triton signature says 4 runtime arguments; the parsed MSL has 2 pointers + 1 scalar."""
     with pytest.raises(MetalNonRecoverableError, match="3 scalar|1 scalar"):
         extract_msl_for_mlx(_ONE, output_arg_indices=[1], expected_args=4)
-    ext = extract_msl_for_mlx(_ONE, output_arg_indices=[1], expected_args=3)   # control
+    ext = extract_msl_for_mlx(_ONE, output_arg_indices=[1], expected_args=3)  # control
     assert ext.output_names == ["o"] and ext.input_names == ["x"]
 
 
-@pytest.mark.parametrize("body,what", [
-    ("    o[tid] = o[tid] + x[tid];", "accumulating store"),
-    ("    device atomic_uint* p = (device atomic_uint*)(o + tid); atomic_fetch_add_explicit(p, 1u, memory_order_relaxed);", "atomic on the output"),
-    ("    float prev = o[tid];\n    o[tid] = prev * x[tid];", "in-place read then store"),
-    ("    if (o[tid] > 0.0f) { o[tid] = x[tid]; }", "output read in a condition"),
-])
+@pytest.mark.parametrize(
+    "body,what",
+    [
+        ("    o[tid] = o[tid] + x[tid];", "accumulating store"),
+        (
+            "    device atomic_uint* p = (device atomic_uint*)(o + tid); atomic_fetch_add_explicit(p, 1u, memory_order_relaxed);",
+            "atomic on the output",
+        ),
+        ("    float prev = o[tid];\n    o[tid] = prev * x[tid];", "in-place read then store"),
+        ("    if (o[tid] > 0.0f) { o[tid] = x[tid]; }", "output read in a condition"),
+    ],
+)
 def test_output_that_is_read_refuses(body, what):
     msl = _ONE.replace("    if (tid < n) { o[tid] = x[tid]; }", body)
     with pytest.raises(MetalNonRecoverableError, match="reads .* output pointer 'o'"):
@@ -180,20 +194,29 @@ def test_output_that_is_read_refuses(body, what):
 def test_vectorized_store_through_an_alias_is_accepted():
     """Control: the softmax template stores through `device float4* o4 = (device float4*)(o + base);`
     — an alias used only for stores is a store (the first cut of the rule refused it)."""
-    msl = _ONE.replace("    if (tid < n) { o[tid] = x[tid]; }", "    device float4* o4 = (device float4*)(o + tid * 4u);\n    o4[0] = float4(x[tid]);\n    o[tid] = x[tid];")
+    msl = _ONE.replace(
+        "    if (tid < n) { o[tid] = x[tid]; }",
+        "    device float4* o4 = (device float4*)(o + tid * 4u);\n    o4[0] = float4(x[tid]);\n    o[tid] = x[tid];",
+    )
     ext = extract_msl_for_mlx(msl, output_arg_indices=[1])
     assert ext.output_names == ["o"]
 
 
 def test_read_through_an_alias_refuses():
-    msl = _ONE.replace("    if (tid < n) { o[tid] = x[tid]; }", "    device float* p = o + tid;\n    float prev = p[0];\n    p[0] = prev + x[tid];")
+    msl = _ONE.replace(
+        "    if (tid < n) { o[tid] = x[tid]; }",
+        "    device float* p = o + tid;\n    float prev = p[0];\n    p[0] = prev + x[tid];",
+    )
     with pytest.raises(MetalNonRecoverableError, match="reads .* output pointer 'o'"):
         extract_msl_for_mlx(msl, output_arg_indices=[1])
 
 
 def test_plain_store_output_is_accepted():
     """Control: `o[...] = ...` stores only (several, masked, in a comment mentioning o) pass."""
-    msl = _ONE.replace("    if (tid < n) { o[tid] = x[tid]; }", "    // o is the output\n    if (tid < n) { o[tid] = x[tid]; }\n    if (tid == 0u) { o[0] = 1.0f; }")
+    msl = _ONE.replace(
+        "    if (tid < n) { o[tid] = x[tid]; }",
+        "    // o is the output\n    if (tid < n) { o[tid] = x[tid]; }\n    if (tid == 0u) { o[0] = 1.0f; }",
+    )
     ext = extract_msl_for_mlx(msl, output_arg_indices=[1])
     assert ext.output_names == ["o"]
 
@@ -207,6 +230,7 @@ def test_conservative_mode_refuses_when_any_pointer_is_read():
 
 # ---------------------------------------------------------------- 5–6. the signature map
 
+
 @pytest.mark.parametrize("dtype", [mx.int64, mx.uint64, mx.complex64])
 def test_unknown_dtypes_refuse(dtype):
     with pytest.raises(MetalNonRecoverableError, match="no Triton signature mapping"):
@@ -217,17 +241,22 @@ def test_known_dtypes_map():
     assert tmlx._mlx_dtype_to_triton_sig(mx.bfloat16) == "*bf16" and tmlx._mlx_dtype_to_triton_sig(mx.uint8) == "*u8"
 
 
-@pytest.mark.parametrize("val", [2 ** 31, -(2 ** 31) - 1, 10 ** 12])
+@pytest.mark.parametrize("val", [2**31, -(2**31) - 1, 10**12])
 def test_ints_beyond_int32_refuse(val):
     with pytest.raises(MetalNonRecoverableError, match="does not fit int32"):
         tmlx._scalar_to_triton_sig(val)
 
 
 def test_ints_within_int32_map():
-    assert tmlx._scalar_to_triton_sig(2 ** 31 - 1) == "i32" and tmlx._scalar_to_triton_sig(-(2 ** 31)) == "i32" and tmlx._scalar_to_triton_sig(True) == "i1"
+    assert (
+        tmlx._scalar_to_triton_sig(2**31 - 1) == "i32"
+        and tmlx._scalar_to_triton_sig(-(2**31)) == "i32"
+        and tmlx._scalar_to_triton_sig(True) == "i1"
+    )
 
 
 # ---------------------------------------------------------------- the route still works
+
 
 @triton.jit
 def _k_add(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
@@ -240,7 +269,9 @@ def _k_add(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
 @pytest.mark.skipif(not tmlx.mlx_available(), reason="MLX metal_kernel needed")
 def test_plain_kernel_still_launches(cold_caches):
     """Control: a kernel with no descriptor, one kernel, matching arguments, write-only output."""
-    x = mx.arange(1024, dtype=mx.float32); y = mx.ones((1024,)); out = mx.zeros((1024,))
+    x = mx.arange(1024, dtype=mx.float32)
+    y = mx.ones((1024,))
+    out = mx.zeros((1024,))
     (r,) = tmlx.triton_call(_k_add, x, y, out, 1024, grid=(4,), BLOCK=256)
     mx.eval(r)
     assert mx.allclose(r, x + 1.0).item()

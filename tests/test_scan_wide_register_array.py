@@ -33,8 +33,7 @@ def cold_gpu_caches(tmp_path, monkeypatch):
 
 
 @triton.jit
-def _cumsum_2d(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr,
-                AXIS: tl.constexpr, REVERSE: tl.constexpr):
+def _cumsum_2d(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, AXIS: tl.constexpr, REVERSE: tl.constexpr):
     row = tl.arange(0, M)[:, None]
     col = tl.arange(0, N)[None, :]
     offset = row * N + col
@@ -83,8 +82,7 @@ def _get_first(left, right):
 
 
 @triton.jit
-def _first_2d(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr,
-              REVERSE: tl.constexpr):
+def _first_2d(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, REVERSE: tl.constexpr):
     row = tl.arange(0, M)[:, None]
     col = tl.arange(0, N)[None, :]
     offset = row * N + col
@@ -103,8 +101,13 @@ def _two_cumsums_1d(x_ptr, out_a_ptr, out_b_ptr, N: tl.constexpr):
 
 @triton.jit
 def _masked_strided_cumsum_2d(
-    x_ptr, out_ptr, valid_n, row_stride, col_stride,
-    M: tl.constexpr, N: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    valid_n,
+    row_stride,
+    col_stride,
+    M: tl.constexpr,
+    N: tl.constexpr,
 ):
     row = tl.arange(0, M)[:, None]
     col = tl.arange(0, N)[None, :]
@@ -125,9 +128,7 @@ def _scan_lowerer(fn=_cumsum_2d):
     from tests.test_fa_bwd_routing import _build_lowerer
 
     if expected_root := os.environ.get("TRITON_MSL_EXPECTED_ROOT"):
-        assert Path(triton_msl.__file__).resolve().is_relative_to(
-            Path(expected_root).resolve()
-        )
+        assert Path(triton_msl.__file__).resolve().is_relative_to(Path(expected_root).resolve())
     if fn is _cummax_2d:
         signature = {"x_ptr": "*fp32", "out_ptr": "*fp32", "index_ptr": "*i64"}
         constants = {"M": 2, "N": 1024}
@@ -174,9 +175,7 @@ def test_wide_scan_refuses_missing_or_contradictory_native_metadata():
         else:
             value_id = return_op.operand_ids[1]
             meta = lowerer.graph.result_meta[value_id]
-            lowerer.graph.result_meta[value_id] = replace(
-                meta, type=replace(meta.type, width=32)
-            )
+            lowerer.graph.result_meta[value_id] = replace(meta, type=replace(meta.type, width=32))
 
         with pytest.raises(MetalNonRecoverableError, match="native per-result metadata"):
             lowerer.lower()
@@ -192,9 +191,7 @@ def test_wide_scan_refuses_missing_or_contradictory_native_metadata():
     ],
     ids=["row-fp32-w4", "column-reverse-i32-w16", "row-reverse-bf16-w4"],
 )
-def test_wide_cumsum_projects_flat_ownership(
-    cold_gpu_caches, shape, axis, reverse, dtype, num_warps
-):
+def test_wide_cumsum_projects_flat_ownership(cold_gpu_caches, shape, axis, reverse, dtype, num_warps):
     torch.manual_seed(325)
     if dtype == torch.int32:
         x = torch.randint(-3, 4, shape, device="mps", dtype=dtype)
@@ -202,7 +199,12 @@ def test_wide_cumsum_projects_flat_ownership(
         x = torch.randn(shape, device="mps", dtype=dtype)
     out = torch.empty_like(x)
     _cumsum_2d[(1,)](
-        x, out, M=shape[0], N=shape[1], AXIS=axis, REVERSE=reverse,
+        x,
+        out,
+        M=shape[0],
+        N=shape[1],
+        AXIS=axis,
+        REVERSE=reverse,
         num_warps=num_warps,
     )
     torch.mps.synchronize()
@@ -275,16 +277,19 @@ def test_wide_scan_proves_runtime_strides_and_tail_masks(cold_gpu_caches):
     addresses = rows * row_stride + cols * col_stride
     x[addresses] = logical
     _masked_strided_cumsum_2d[(1,)](
-        x, out, valid_n, row_stride, col_stride, M=m, N=n, num_warps=4,
+        x,
+        out,
+        valid_n,
+        row_stride,
+        col_stride,
+        M=m,
+        N=n,
+        num_warps=4,
     )
     torch.mps.synchronize()
-    assert torch.allclose(
-        out[addresses].cpu(), torch.cumsum(logical.cpu(), 1), rtol=1e-4, atol=8e-4
-    )
+    assert torch.allclose(out[addresses].cpu(), torch.cumsum(logical.cpu(), 1), rtol=1e-4, atol=8e-4)
     tail_addresses = rows * row_stride + torch.arange(valid_n, n, device="mps")[None, :] * col_stride
-    assert torch.equal(
-        out[tail_addresses].cpu(), torch.full((m, n - valid_n), -123.0)
-    )
+    assert torch.equal(out[tail_addresses].cpu(), torch.full((m, n - valid_n), -123.0))
 
 
 @requires_mps

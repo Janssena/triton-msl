@@ -166,7 +166,9 @@ class _DetectionMixin:
         if o is None or o.op not in ("arith.muli", "arith.mul") or len(o.operand_ids or []) != 2:
             return False
         x, y = (self._strip_wrappers(v, op_by_id, self._IDX_CASTS) for v in o.operand_ids)
-        return (x == iv and self._const_int(y, op_by_id) == iv_scale) or (y == iv and self._const_int(x, op_by_id) == iv_scale)
+        return (x == iv and self._const_int(y, op_by_id) == iv_scale) or (
+            y == iv and self._const_int(x, op_by_id) == iv_scale
+        )
 
     def _grouped_pid_expr(self, vid, op_by_id):
         """Recognize the exact grouped tutorial DAG, not arbitrary scalar arithmetic.
@@ -174,10 +176,12 @@ class _DetectionMixin:
         Return an axis and a shared structural key. The caller must ALSO prove the
         two cdiv extents match its actual M/N tiles before any template is admitted.
         """
+
         def binary(v, name):
             op = op_by_id.get(v)
             if op is not None and op.op == name and len(op.operand_ids or []) == 2:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 try:
                     facts = self._native_value_facts(v, op_name="tt.dot")
                 except MetalNonRecoverableError:
@@ -275,7 +279,17 @@ class _DetectionMixin:
         "pid", "bad"}``: counts of make_range / K-offset addends, the program_id axis
         (None if absent, -1 if mixed) and the first un-replayed construct (a runtime
         scalar offset, a constant addend, a scaled index, ...) or None."""
-        res = {"range": 0, "iv": 0, "pid": None, "bad": None, "mod": None, "pid_div": None, "coef": None, "bounds": None, "index_casts": []}
+        res = {
+            "range": 0,
+            "iv": 0,
+            "pid": None,
+            "bad": None,
+            "mod": None,
+            "pid_div": None,
+            "coef": None,
+            "bounds": None,
+            "index_casts": [],
+        }
 
         def note_pid(axis, div, coef=1):
             # packet 106: the pid's tile COEFFICIENT (``pid * BLOCK``) and the make_range
@@ -327,7 +341,9 @@ class _DetectionMixin:
                     b = None
                 res["bounds"] = b if res["range"] == 1 else None
                 return
-            if (o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") or o.op in self._IDX_CASTS) and o.operand_ids:
+            if (
+                o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") or o.op in self._IDX_CASTS
+            ) and o.operand_ids:
                 if o.op in self._IDX_CASTS:
                     res["index_casts"].append(v)
                 walk(o.operand_ids[0], depth + 1)
@@ -340,7 +356,11 @@ class _DetectionMixin:
                 # only ``<pid expr> * BLOCK`` (either order) is a replayed product
                 sides = [op_by_id.get(x) for x in o.operand_ids]
                 ci = next((i for i, s in enumerate(sides) if s is not None and s.op == "arith.constant"), None)
-                pe = self._pid_expr(o.operand_ids[1 - ci], op_by_id, allow_grouped=allow_grouped) if ci is not None else None
+                pe = (
+                    self._pid_expr(o.operand_ids[1 - ci], op_by_id, allow_grouped=allow_grouped)
+                    if ci is not None
+                    else None
+                )
                 if pe is None:
                     res["bad"] = "scaled index"
                     return
@@ -383,7 +403,9 @@ class _DetectionMixin:
     def _is_k_extent(self, vid, k_extent, op_by_id, arg_by_id):
         """True iff ``vid`` is the K extent the template clips with (the arg by name,
         or its constexpr value)."""
-        vid = self._strip_wrappers(vid, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") + tuple(self._IDX_CASTS))
+        vid = self._strip_wrappers(
+            vid, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims") + tuple(self._IDX_CASTS)
+        )
         if isinstance(k_extent, str):
             a = arg_by_id.get(vid)
             return a is not None and a.name == k_extent
@@ -392,12 +414,16 @@ class _DetectionMixin:
     def _is_k_remaining(self, bound_id, k_for, k_extent, op_by_id, arg_by_id, iv_scale=1):
         """True iff ``bound_id`` is ``K - <K offset>``: an ``arith.subi`` of the loop's K
         extent and the loop's K offset in elements (``_is_k_offset``)."""
-        vid = self._strip_wrappers(bound_id, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims"))
+        vid = self._strip_wrappers(
+            bound_id, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims")
+        )
         o = op_by_id.get(vid)
         if o is None or o.op not in ("arith.subi", "arith.sub") or len(o.operand_ids or []) != 2:
             return False
         iv = ((k_for.attrs or {}).get("block_arg_ids") or [None])[0]
-        return self._is_k_offset(o.operand_ids[1], op_by_id, iv, iv_scale) and self._is_k_extent(o.operand_ids[0], k_extent, op_by_id, arg_by_id)
+        return self._is_k_offset(o.operand_ids[1], op_by_id, iv, iv_scale) and self._is_k_extent(
+            o.operand_ids[0], k_extent, op_by_id, arg_by_id
+        )
 
     def _advance_matches(self, vid, block_k, stride, op_by_id, arg_by_id):
         """True iff the per-iteration pointer advance ``vid`` is exactly
@@ -430,7 +456,9 @@ class _DetectionMixin:
         x, y = o.operand_ids
         return (_const(x) == block_k and _arg_name(y) == stride) or (_const(y) == block_k and _arg_name(x) == stride)
 
-    def _kloop_load_mask_reason(self, load, role, k_for, k_extent, index_ids, mn_names, op_by_id, arg_by_id, iv_scale=1):
+    def _kloop_load_mask_reason(
+        self, load, role, k_for, k_extent, index_ids, mn_names, op_by_id, arg_by_id, iv_scale=1
+    ):
         """Reason a K-loop operand load mask is NOT the template's own boundary clip,
         else None. The K-loop template zero-pads exactly ``row < M && k + kk < K`` (A)
         / ``k + kk < K && col < N`` (B) and ignores the IR mask, so the mask must be an
@@ -517,9 +545,15 @@ class _DetectionMixin:
                             f"clips with ({want or 'the single-tile extent'})"
                         )
                 else:
-                    c = op_by_id.get(self._strip_wrappers(r, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout")))
+                    c = op_by_id.get(
+                        self._strip_wrappers(r, op_by_id, ("tt.splat", "tt.broadcast", "ttg.convert_layout"))
+                    )
                     try:
-                        cval = int(str(c.attrs.get("value", "")).split(":")[0].strip()) if c is not None and c.op == "arith.constant" else None
+                        cval = (
+                            int(str(c.attrs.get("value", "")).split(":")[0].strip())
+                            if c is not None and c.op == "arith.constant"
+                            else None
+                        )
                     except (TypeError, ValueError):
                         cval = None
                     if cval is None or li[0] is None or cval < li[0]:
@@ -593,7 +627,11 @@ class _DetectionMixin:
                 opnd_shape = _extract_shape(opnd.type_str or "")
             loads[role] = load
         if a_arg.elem_type != b_arg.elem_type:
-            return (f"A ({a_arg.elem_type}) and B ({b_arg.elem_type}) buffers differ in element type", loads, opnd_shape)
+            return (
+                f"A ({a_arg.elem_type}) and B ({b_arg.elem_type}) buffers differ in element type",
+                loads,
+                opnd_shape,
+            )
         return (None, loads, opnd_shape)
 
     def _dot_template_value_paths(self):
@@ -708,7 +746,9 @@ class _DetectionMixin:
 
         iv = ((k_for.attrs or {}).get("block_arg_ids") or [None])[0] if k_for is not None else None
         ptr_wrap = ("ttg.convert_layout",)
-        block_k_hint = _extract_shape(op_by_id[dot.operand_ids[0]].type_str or "") if dot.operand_ids[0] in op_by_id else None
+        block_k_hint = (
+            _extract_shape(op_by_id[dot.operand_ids[0]].type_str or "") if dot.operand_ids[0] in op_by_id else None
+        )
         block_k_hint = block_k_hint[-1] if block_k_hint and len(block_k_hint) >= 2 else None
         # The loop's K offset in elements: ``iv`` for ``range(0, K, BLOCK_K)`` (step ==
         # BLOCK_K), ``iv * BLOCK_K`` for ``range(0, cdiv(K, BLOCK_K))`` (step == 1).
@@ -769,11 +809,20 @@ class _DetectionMixin:
         # axis without a program_id is replayed as tile 0 in every program, never tiled).
         # GPU on the P0 tree: no pid / ``pid * 2BM`` / ``range(BN, 2BN)`` / ``range(BK,
         # 2BK)`` all stored the template's tiled result.
-        _b_shape = _extract_shape(op_by_id[dot.operand_ids[1]].type_str or "") if dot.operand_ids[1] in op_by_id else None
+        _b_shape = (
+            _extract_shape(op_by_id[dot.operand_ids[1]].type_str or "") if dot.operand_ids[1] in op_by_id else None
+        )
         _blk = {}
         if opnd_shape and len(opnd_shape) >= 2 and _b_shape and len(_b_shape) >= 2:
             _bm_t, _bk_t, _bn_t = opnd_shape[-2], opnd_shape[-1], _b_shape[-1]
-            _blk = {("A", 0): _bm_t, ("A", 1): _bk_t, ("B", 0): _bk_t, ("B", 1): _bn_t, ("C", 0): _bm_t, ("C", 1): _bn_t}
+            _blk = {
+                ("A", 0): _bm_t,
+                ("A", 1): _bk_t,
+                ("B", 0): _bk_t,
+                ("B", 1): _bn_t,
+                ("C", 0): _bm_t,
+                ("C", 1): _bn_t,
+            }
 
         # N-fastest flat grids are a DOT-role proof, not a changed meaning for
         # the shared _pid_expr/_index_shape helpers (quantized callers use them).
@@ -787,6 +836,7 @@ class _DetectionMixin:
                     continue
                 seen.add(v)
                 from triton_msl.errors import MetalNonRecoverableError
+
                 try:
                     facts = self._native_value_facts(v, op_name="tt.dot")
                 except MetalNonRecoverableError:
@@ -807,19 +857,32 @@ class _DetectionMixin:
         if all(v is not None for v in c_indices):
             c_shapes = [self._index_shape(v, op_by_id, arg_by_id, iv, iv_scale, allow_grouped=True) for v in c_indices]
             d = c_shapes[0]["pid_div"]
-            if (c_shapes[0]["pid"] == 1 and c_shapes[1]["pid"] == 0
-                    and d is not None and not isinstance(d, tuple) and c_shapes[1]["pid_div"] == d):
+            if (
+                c_shapes[0]["pid"] == 1
+                and c_shapes[1]["pid"] == 0
+                and d is not None
+                and not isinstance(d, tuple)
+                and c_shapes[1]["pid_div"] == d
+            ):
                 div = op_by_id.get(d)
                 bn = _blk.get(("C", 1))
                 if div is not None and div.op == "arith.divsi" and len(div.operand_ids or []) == 2 and bn:
                     numerator, denominator = div.operand_ids
                     add = op_by_id.get(numerator)
-                    if (self._const_int(denominator, op_by_id) == bn
-                            and add is not None and add.op == "arith.addi" and len(add.operand_ids or []) == 2):
+                    if (
+                        self._const_int(denominator, op_by_id) == bn
+                        and add is not None
+                        and add.op == "arith.addi"
+                        and len(add.operand_ids or []) == 2
+                    ):
                         x, y = add.operand_ids
-                        if (any(v in arg_by_id and not arg_by_id[v].is_ptr
-                                and arg_by_id[v].name == mn_names[1] and self._const_int(c, op_by_id) == bn - 1
-                                for v, c in ((x, y), (y, x))) and i32_index_dag(d)):
+                        if any(
+                            v in arg_by_id
+                            and not arg_by_id[v].is_ptr
+                            and arg_by_id[v].name == mn_names[1]
+                            and self._const_int(c, op_by_id) == bn - 1
+                            for v, c in ((x, y), (y, x))
+                        ) and i32_index_dag(d):
                             flat_n_divisor = d
 
         def dot_index_shape(value):
@@ -835,7 +898,12 @@ class _DetectionMixin:
         _has_pid = {}
         k_form = {}
         for role, ax, want_pid, is_k in (
-            ("A", 0, 0, False), ("A", 1, None, True), ("B", 0, None, True), ("B", 1, 1, False), ("C", 0, 0, False), ("C", 1, 1, False),
+            ("A", 0, 0, False),
+            ("A", 1, None, True),
+            ("B", 0, None, True),
+            ("B", 1, 1, False),
+            ("C", 0, 0, False),
+            ("C", 1, 1, False),
         ):
             axis_name = "row" if ax == 0 else "col"
             vid = index_ids.get(role, (None, None))[ax]
@@ -851,7 +919,12 @@ class _DetectionMixin:
             if isinstance(sh["pid_div"], tuple) and sh["index_casts"]:
                 return (f"{role} grouped tile index contains an unreplayed width cast", set(), None, None)
             if sh["bad"]:
-                return (f"{role} {axis_name} index contains {sh['bad']}, which the template does not replay", set(), None, None)
+                return (
+                    f"{role} {axis_name} index contains {sh['bad']}, which the template does not replay",
+                    set(),
+                    None,
+                    None,
+                )
             if sh["range"] != 1:
                 return (f"{role} {axis_name} index is not a single tile range", set(), None, None)
             _want_blk = _blk.get((role, ax))
@@ -873,7 +946,9 @@ class _DetectionMixin:
                 _has_pid[(role, ax)] = sh["pid"] is not None
             if sh["mod"] is not None:
                 want = mn_names[0] if (role, ax) == ("A", 0) else (mn_names[1] if (role, ax) == ("B", 1) else None)
-                mod_arg = arg_by_id.get(self._strip_wrappers(sh["mod"], op_by_id, ("tt.splat",) + tuple(self._IDX_CASTS)))
+                mod_arg = arg_by_id.get(
+                    self._strip_wrappers(sh["mod"], op_by_id, ("tt.splat",) + tuple(self._IDX_CASTS))
+                )
                 if want is None or k_for is None or mod_arg is None or mod_arg.name != want:
                     return (
                         f"{role} {axis_name} index wraps with a modulo the template does not replay "
@@ -901,7 +976,12 @@ class _DetectionMixin:
         # pid PRESENCE per axis must agree between the operand and the output (the template
         # tiles both from ONE pid_m / pid_n); recorded for the templates and the dispatchers.
         if _has_pid.get(("A", 0)) != _has_pid.get(("C", 0)) or _has_pid.get(("B", 1)) != _has_pid.get(("C", 1)):
-            return ("the operand and output tile indices disagree on which axes are program_id-tiled", set(), None, None)
+            return (
+                "the operand and output tile indices disagree on which axes are program_id-tiled",
+                set(),
+                None,
+                None,
+            )
         pid_axes = (bool(_has_pid.get(("C", 0))), bool(_has_pid.get(("C", 1))))
 
         # ---- grid mapping: 2-D (program_id(0)/program_id(1)) or the tutorial's 1-D
@@ -924,6 +1004,7 @@ class _DetectionMixin:
         if isinstance(grouped, tuple) and grouped[0] == "flat_n":
             pid_map = ("flat_n", _blk[("C", 1)])
         elif isinstance(grouped, tuple) and grouped[0] == "grouped":
+
             def cdiv_extent(value, extent, block):
                 op = op_by_id.get(value)
                 if op is None or not block or len(op.operand_ids or []) != 2:
@@ -938,13 +1019,17 @@ class _DetectionMixin:
                 if op.op != "arith.divsi" or add is None or add.op != "arith.addi" or len(add.operand_ids or []) != 2:
                     return False
                 x, y = add.operand_ids
-                return any(self._const_int(c, op_by_id) == block - 1 and
-                           v in arg_by_id and not arg_by_id[v].is_ptr and arg_by_id[v].name == extent
-                           for v, c in ((x, y), (y, x)))
+                return any(
+                    self._const_int(c, op_by_id) == block - 1
+                    and v in arg_by_id
+                    and not arg_by_id[v].is_ptr
+                    and arg_by_id[v].name == extent
+                    for v, c in ((x, y), (y, x))
+                )
+
             _, group, npm, npn = grouped
             bm, bn = _blk.get(("C", 0)), _blk.get(("C", 1))
-            if (None in mn_names or not cdiv_extent(npm, mn_names[0], bm)
-                    or not cdiv_extent(npn, mn_names[1], bn)):
+            if None in mn_names or not cdiv_extent(npm, mn_names[0], bm) or not cdiv_extent(npn, mn_names[1], bn):
                 return ("grouped grid extents do not match the source M/N tiles", set(), None, None)
             pid_map = ("grouped", group, bn)
         elif divs and divs != {None}:
@@ -954,13 +1039,23 @@ class _DetectionMixin:
             ok = False
             if dop is not None and block_m:
                 if dop.op == "arith.ceildivsi" and len(dop.operand_ids or []) == 2:
-                    ok = self._const_int(dop.operand_ids[1], op_by_id) == block_m and self._is_k_extent(dop.operand_ids[0], mn_names[0], op_by_id, arg_by_id)
-                elif dop.op == "arith.divsi" and len(dop.operand_ids or []) == 2 and self._const_int(dop.operand_ids[1], op_by_id) == block_m:
+                    ok = self._const_int(dop.operand_ids[1], op_by_id) == block_m and self._is_k_extent(
+                        dop.operand_ids[0], mn_names[0], op_by_id, arg_by_id
+                    )
+                elif (
+                    dop.op == "arith.divsi"
+                    and len(dop.operand_ids or []) == 2
+                    and self._const_int(dop.operand_ids[1], op_by_id) == block_m
+                ):
                     num = op_by_id.get(self._strip_wrappers(dop.operand_ids[0], op_by_id, self._IDX_CASTS))
                     if num is not None and num.op in ("arith.addi", "arith.add") and len(num.operand_ids or []) == 2:
                         x, y = num.operand_ids
-                        ok = (self._const_int(y, op_by_id) == block_m - 1 and self._is_k_extent(x, mn_names[0], op_by_id, arg_by_id)) or (
-                            self._const_int(x, op_by_id) == block_m - 1 and self._is_k_extent(y, mn_names[0], op_by_id, arg_by_id)
+                        ok = (
+                            self._const_int(y, op_by_id) == block_m - 1
+                            and self._is_k_extent(x, mn_names[0], op_by_id, arg_by_id)
+                        ) or (
+                            self._const_int(x, op_by_id) == block_m - 1
+                            and self._is_k_extent(y, mn_names[0], op_by_id, arg_by_id)
                         )
             if not ok or mn_names[0] is None:
                 return (
@@ -978,7 +1073,12 @@ class _DetectionMixin:
             inits = list(k_for.operand_ids[3:]) if len(k_for.operand_ids or []) > 3 else []
             body = k_for.region_ops or []
             ylds = [o for o in body if o.op == "scf.yield"]
-            if not bargs or len(bargs) != len(inits) + 1 or len(ylds) != 1 or len(ylds[0].operand_ids or []) != len(inits):
+            if (
+                not bargs
+                or len(bargs) != len(inits) + 1
+                or len(ylds) != 1
+                or len(ylds[0].operand_ids or []) != len(inits)
+            ):
                 return ("K-loop iter-args, inits and yield could not be aligned", set(), None, None)
             yld = ylds[0]
             kind, x = _layout_walk(dot.operand_ids[2], set())
@@ -1009,9 +1109,18 @@ class _DetectionMixin:
                     continue
                 y = op_by_id.get(yld.operand_ids[i])
                 if y is None or y.op != "tt.addptr" or len(y.operand_ids or []) < 2 or y.operand_ids[0] != ba:
-                    return (f"loop-carried value #{i} is not a pointer advanced from its own iter-arg", set(), None, None)
+                    return (
+                        f"loop-carried value #{i} is not a pointer advanced from its own iter-arg",
+                        set(),
+                        None,
+                        None,
+                    )
                 src = self._trace_ptr_source(init, op_by_id, iter_inits=iter_inits)
-                role = "A" if (src is not None and src.name == a_arg.name) else ("B" if (src is not None and src.name == b_arg.name) else None)
+                role = (
+                    "A"
+                    if (src is not None and src.name == a_arg.name)
+                    else ("B" if (src is not None and src.name == b_arg.name) else None)
+                )
                 if role is None or role in carried:
                     return (f"loop-carried pointer #{i} is not the A or B stream", set(), None, None)
                 if init != addr_ids[role]:
@@ -1036,9 +1145,19 @@ class _DetectionMixin:
                 if role in carried:
                     ba, y = carried[role]
                     if ptr != ba:
-                        return (f"the {role} load inside the K-loop does not read its loop-carried pointer directly", set(), None, None)
+                        return (
+                            f"the {role} load inside the K-loop does not read its loop-carried pointer directly",
+                            set(),
+                            None,
+                            None,
+                        )
                     if k_form[role] != "carried":
-                        return (f"the {role} address mixes a loop-carried pointer with the induction variable", set(), None, None)
+                        return (
+                            f"the {role} address mixes a loop-carried pointer with the induction variable",
+                            set(),
+                            None,
+                            None,
+                        )
                     kstride = strides[role][1] if role == "A" else strides[role][0]
                     if not self._advance_matches(y.operand_ids[1], block_k, kstride, op_by_id, arg_by_id):
                         return (
@@ -1059,8 +1178,15 @@ class _DetectionMixin:
                         )
                 if len(load.operand_ids or []) >= 2:
                     checked = self._kloop_load_mask_reason(
-                        load, role, k_for, k_extent, index_ids, mn_names,
-                        op_by_id, arg_by_id, iv_scale,
+                        load,
+                        role,
+                        k_for,
+                        k_extent,
+                        index_ids,
+                        mn_names,
+                        op_by_id,
+                        arg_by_id,
+                        iv_scale,
                     )
                     if not isinstance(checked, tuple):
                         return (checked, set(), None, None)
@@ -1071,7 +1197,9 @@ class _DetectionMixin:
                 return (
                     "A and B must either both zero-mask the K tail or both load the source's full final block; "
                     "one-sided masking is not equivalent for nonfinite values",
-                    set(), None, None,
+                    set(),
+                    None,
+                    None,
                 )
             k_tail_mode = "masked_zero" if k_tail_clips["A"] else "full_blocks"
         else:
@@ -1094,7 +1222,12 @@ class _DetectionMixin:
             seen.add(vid)
             o = op_by_id.get(vid)
             if o is None:
-                return ("the stored value is not the dot result (it reaches a loop-carried or argument value)", set(), None, None)
+                return (
+                    "the stored value is not the dot result (it reaches a loop-carried or argument value)",
+                    set(),
+                    None,
+                    None,
+                )
             if o.op == "ttg.convert_layout" and o.operand_ids:
                 vid = o.operand_ids[0]
                 continue
@@ -1118,7 +1251,9 @@ class _DetectionMixin:
                 )
         else:
             _cast_in = op_by_id.get(casts[0].operand_ids[0]) if casts and casts[0].operand_ids else None
-            _in_elem = src_elem if (casts and casts[0].operand_ids[0] == term_id) else getattr(_cast_in, "elem_type", None)
+            _in_elem = (
+                src_elem if (casts and casts[0].operand_ids[0] == term_id) else getattr(_cast_in, "elem_type", None)
+            )
             if len(casts) != 1 or casts[0].elem_type != c_arg.elem_type or _in_elem != src_elem:
                 return (
                     f"the store path must carry exactly one cast {src_elem} -> {c_arg.elem_type} "
@@ -1130,7 +1265,12 @@ class _DetectionMixin:
             proven.add(casts[0].id)
         sv = op_by_id.get(store.operand_ids[1])
         if sv is not None and sv.elem_type != c_arg.elem_type:
-            return (f"the stored value type {sv.elem_type} differs from C's element type {c_arg.elem_type}", set(), None, None)
+            return (
+                f"the stored value type {sv.elem_type} differs from C's element type {c_arg.elem_type}",
+                set(),
+                None,
+                None,
+            )
         # Sole-observation census (packets 081/083): every consumer of the dot result
         # must be a layout op, the PROVEN output cast, the single store or the K-loop's
         # yield — and so on transitively. Any other observation is not replayed (this
@@ -1149,7 +1289,12 @@ class _DetectionMixin:
                 if _c.op == "ttg.convert_layout" or _c.id in proven:
                     _pending.append(_c.id)
                     continue
-                return (f"the dot result is observed by '{_c.op}', which the template does not replay", set(), None, None)
+                return (
+                    f"the dot result is observed by '{_c.op}', which the template does not replay",
+                    set(),
+                    None,
+                    None,
+                )
         if (pid_map == "1d" or isinstance(pid_map, tuple)) and pid_axes != (True, True):
             return ("a 1-D grid split needs program_id on both tile axes", set(), None, None)
         return (None, proven, (a_arg, b_arg, c_arg), pid_map, pid_axes, k_tail_mode)
@@ -1216,8 +1361,15 @@ class _DetectionMixin:
             return None
 
         _TRANSPARENT = {
-            "ttg.convert_layout", "tt.reshape", "tt.broadcast", "tt.expand_dims",
-            "tt.splat", "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans", "tt.trans",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "tt.splat",
+            "ttg.local_load",
+            "ttg.local_alloc",
+            "ttg.memdesc_trans",
+            "tt.trans",
         }
 
         def _direct(vid, depth=0):
@@ -1379,9 +1531,7 @@ class _DetectionMixin:
             # Narrowing and integer-to-float conversion change addresses. A
             # stride-only template cannot replay them as transparent wrappers.
             seen_ids = set()
-            while o is not None and o.op in (
-                "tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.extsi"
-            ):
+            while o is not None and o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.extsi"):
                 if o.id in seen_ids:
                     return None
                 seen_ids.add(o.id)
@@ -1466,7 +1616,11 @@ class _DetectionMixin:
                 return None
             parts = [_skip(op_by_id.get(x)) for x in o.operand_ids]
             eds = [p for p in parts if p is not None and p.op == "tt.expand_dims"]
-            ivs = [p for p in parts if p is not None and p.op == "tt.splat" and p.operand_ids and p.operand_ids[0] in _iv_ids]
+            ivs = [
+                p
+                for p in parts
+                if p is not None and p.op == "tt.splat" and p.operand_ids and p.operand_ids[0] in _iv_ids
+            ]
             return eds[0] if (len(eds) == 1 and len(ivs) == 1) else None
 
         def _flatten_addi(o, acc):
@@ -1554,7 +1708,11 @@ class _DetectionMixin:
                 index_id = term.id
                 term = _iv_addi(term)
             if term.op == "tt.expand_dims":
-                return (term.attrs.get("axis"), stride, index_id if index_id is not None else (term.operand_ids or [None])[0])
+                return (
+                    term.attrs.get("axis"),
+                    stride,
+                    index_id if index_id is not None else (term.operand_ids or [None])[0],
+                )
             return (None, None, None)
 
         index_ids = {}
@@ -1645,9 +1803,14 @@ class _DetectionMixin:
         for role in ("A", "B", "C"):
             for index in indices[role]:
                 shape = self._index_shape(index, by_id, args, None)
-                if (shape["bad"] is not None or shape["range"] != 1 or shape["iv"] != 0
-                        or shape["mod"] is not None
-                        or not shape["bounds"] or shape["bounds"][0] != 0):
+                if (
+                    shape["bad"] is not None
+                    or shape["range"] != 1
+                    or shape["iv"] != 0
+                    or shape["mod"] is not None
+                    or not shape["bounds"]
+                    or shape["bounds"][0] != 0
+                ):
                     # The local shape check deliberately understands only the
                     # simple fused-maker envelope. Bare matmul's whole-value
                     # proof additionally validates grouped/flat PID mappings
@@ -1726,8 +1889,9 @@ class _DetectionMixin:
                 if leaving:
                     active.discard(vid)
                     facts = [_pid_memo.get(oid) for oid in (op.operand_ids or [])]
-                    _pid_memo[vid] = (True if any(f is True for f in facts)
-                                      else None if any(f is None for f in facts) else False)
+                    _pid_memo[vid] = (
+                        True if any(f is True for f in facts) else None if any(f is None for f in facts) else False
+                    )
                     continue
                 if vid in active:
                     return None
@@ -1750,9 +1914,7 @@ class _DetectionMixin:
         def _skip_wrap(o):
             # Keep value-changing arithmetic visible to the address proof.
             seen_ids = set()
-            while o is not None and o.op in (
-                "tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.extsi"
-            ):
+            while o is not None and o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.extsi"):
                 if o.id in seen_ids:
                     return None
                 seen_ids.add(o.id)
@@ -2944,8 +3106,7 @@ class _DetectionMixin:
             order = src.attrs.get("order")
             if not isinstance(order, (list, tuple)) or sorted(order) != list(range(len(order))):
                 raise MetalNonRecoverableError(
-                    "non-looped matmul requires a proven operation-owned "
-                    "ttg.memdesc_trans permutation",
+                    "non-looped matmul requires a proven operation-owned ttg.memdesc_trans permutation",
                     op_name="ttg.memdesc_trans",
                 )
             order = list(order)
@@ -2957,8 +3118,7 @@ class _DetectionMixin:
             if order == inner_swap:
                 return not incoming
             raise MetalNonRecoverableError(
-                "non-looped matmul does not reproduce non-inner "
-                f"ttg.memdesc_trans permutation {order!r}",
+                f"non-looped matmul does not reproduce non-inner ttg.memdesc_trans permutation {order!r}",
                 op_name="ttg.memdesc_trans",
             )
 
@@ -3141,9 +3301,7 @@ class _DetectionMixin:
         from triton_msl.errors import MetalNonRecoverableError
 
         by_id = {op.id: op for op in self.graph.ops}
-        if len(dot_ssa.operand_ids) != 3 or not self._acc_init_is_literal_zero(
-            dot_ssa.operand_ids[2], by_id
-        ):
+        if len(dot_ssa.operand_ids) != 3 or not self._acc_init_is_literal_zero(dot_ssa.operand_ids[2], by_id):
             raise MetalNonRecoverableError(
                 "fused matmul+softmax requires a proven zero dot accumulator; "
                 "the template cannot discard a bias or unknown accumulator.",
@@ -3197,7 +3355,9 @@ class _DetectionMixin:
                     _collect_all(_s.else_ops)
 
         _collect_all(self.graph.ops)
-        _ab_reason = self._dot_operand_paths_reason(dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False)[0]
+        _ab_reason = self._dot_operand_paths_reason(
+            dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False
+        )[0]
         if _ab_reason:
             if self._dot_generic_eligible():
                 return None
@@ -3506,7 +3666,9 @@ class _DetectionMixin:
                     _collect_all(_s.else_ops)
 
         _collect_all(self.graph.ops)
-        _ab_reason = self._dot_operand_paths_reason(dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False)[0]
+        _ab_reason = self._dot_operand_paths_reason(
+            dot_ssa, a_ptr, b_ptr, _by_all, allow_masked=False, allow_trans=False
+        )[0]
         if _ab_reason:
             if self._dot_generic_eligible():
                 return None
@@ -3886,15 +4048,40 @@ class _DetectionMixin:
         # atomic/assert/call/barrier must not disappear merely because its result
         # is dead. Value/address proofs below remain independently required.
         effect_vocabulary = {
-            "arith.constant", "arith.addi", "arith.subi", "arith.muli",
-            "arith.divsi", "arith.divui", "arith.remsi", "arith.remui",
-            "arith.andi", "arith.ori", "arith.xori", "arith.shli",
-            "arith.shrsi", "arith.shrui", "arith.cmpi", "arith.select",
-            "arith.extsi", "arith.extui", "arith.trunci",
-            "arith.index_cast", "arith.index_castui", "arith.bitcast",
-            "tt.addptr", "tt.bitcast", "tt.broadcast", "tt.expand_dims", "tt.load",
-            "tt.make_range", "tt.reduce", "tt.reshape", "tt.return",
-            "tt.splat", "tt.store", "ttg.convert_layout",
+            "arith.constant",
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "arith.divsi",
+            "arith.divui",
+            "arith.remsi",
+            "arith.remui",
+            "arith.andi",
+            "arith.ori",
+            "arith.xori",
+            "arith.shli",
+            "arith.shrsi",
+            "arith.shrui",
+            "arith.cmpi",
+            "arith.select",
+            "arith.extsi",
+            "arith.extui",
+            "arith.trunci",
+            "arith.index_cast",
+            "arith.index_castui",
+            "arith.bitcast",
+            "tt.addptr",
+            "tt.bitcast",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "tt.load",
+            "tt.make_range",
+            "tt.reduce",
+            "tt.reshape",
+            "tt.return",
+            "tt.splat",
+            "tt.store",
+            "ttg.convert_layout",
         }
 
         def _all(ops):
@@ -3941,8 +4128,11 @@ class _DetectionMixin:
             return None
         # The direct maker has no load/store predicate, ``other`` value, or
         # volatile access. Do not erase those source semantics.
-        if (len(load_ssa.operand_ids or []) != 1 or len(store_ssa.operand_ids or []) != 2
-                or bool((load_ssa.attrs or {}).get("isVolatile", False))):
+        if (
+            len(load_ssa.operand_ids or []) != 1
+            or len(store_ssa.operand_ids or []) != 2
+            or bool((load_ssa.attrs or {}).get("isVolatile", False))
+        ):
             return None
         # Must have at least one xori reduce. Reshapes appear in pairs when the
         # flip dim has size > 2; when size == 2, Triton skips them.
@@ -3961,9 +4151,12 @@ class _DetectionMixin:
             if len(block_args) != 2 or len(returned) != 1 or len(body) != 1:
                 return None
             combine = body[0]
-            if (combine.op != "arith.xori" or combine.id != returned[0]
-                    or len(combine.operand_ids or []) != 2
-                    or set(combine.operand_ids) != set(block_args)):
+            if (
+                combine.op != "arith.xori"
+                or combine.id != returned[0]
+                or len(combine.operand_ids or []) != 2
+                or set(combine.operand_ids) != set(block_args)
+            ):
                 return None
 
         # Input shape from load: tensor<MxNxK>
@@ -4043,18 +4236,23 @@ class _DetectionMixin:
         for red, expected_axis in zip(reduce_ops, expected_axes):
             if red.operand_ids != [current] or red.attrs.get("axis") != expected_axis:
                 return None
-            expands = [o for o in self.graph.ops
-                       if o.op == "tt.expand_dims" and o.operand_ids == [red.id]
-                       and o.attrs.get("axis") == expected_axis]
+            expands = [
+                o
+                for o in self.graph.ops
+                if o.op == "tt.expand_dims" and o.operand_ids == [red.id] and o.attrs.get("axis") == expected_axis
+            ]
             if len(expands) != 1:
                 return None
-            broadcasts = [o for o in self.graph.ops
-                          if o.op == "tt.broadcast" and o.operand_ids == [expands[0].id]]
+            broadcasts = [o for o in self.graph.ops if o.op == "tt.broadcast" and o.operand_ids == [expands[0].id]]
             if len(broadcasts) != 1:
                 return None
-            combines = [o for o in self.graph.ops
-                        if o.op == "arith.xori" and len(o.operand_ids or []) == 2
-                        and set(o.operand_ids) == {current, broadcasts[0].id}]
+            combines = [
+                o
+                for o in self.graph.ops
+                if o.op == "arith.xori"
+                and len(o.operand_ids or []) == 2
+                and set(o.operand_ids) == {current, broadcasts[0].id}
+            ]
             if len(combines) != 1:
                 return None
             current = combines[0].id
@@ -4074,18 +4272,29 @@ class _DetectionMixin:
         # three 0-based ranges with row-major coefficients (N*K, K, 1).
         load_ptr = by_id.get(load_ssa.operand_ids[0]) if load_ssa.operand_ids else None
         store_ptr = by_id.get(store_ssa.operand_ids[0]) if store_ssa.operand_ids else None
-        if (load_ptr is None or store_ptr is None or load_ptr.op != "tt.addptr"
-                or store_ptr.op != "tt.addptr" or len(load_ptr.operand_ids or []) != 2
-                or len(store_ptr.operand_ids or []) != 2
-                or load_ptr.operand_ids[1] != store_ptr.operand_ids[1]):
+        if (
+            load_ptr is None
+            or store_ptr is None
+            or load_ptr.op != "tt.addptr"
+            or store_ptr.op != "tt.addptr"
+            or len(load_ptr.operand_ids or []) != 2
+            or len(store_ptr.operand_ids or []) != 2
+            or load_ptr.operand_ids[1] != store_ptr.operand_ids[1]
+        ):
             return None
         arg_ids = {a.id for a in self.graph.args if a.is_ptr}
         load_base = by_id.get(load_ptr.operand_ids[0])
         store_base = by_id.get(store_ptr.operand_ids[0])
-        if (load_base is None or store_base is None
-                or load_base.op != "tt.splat" or store_base.op != "tt.splat"
-                or len(load_base.operand_ids or []) != 1 or len(store_base.operand_ids or []) != 1
-                or load_base.operand_ids[0] not in arg_ids or store_base.operand_ids[0] not in arg_ids):
+        if (
+            load_base is None
+            or store_base is None
+            or load_base.op != "tt.splat"
+            or store_base.op != "tt.splat"
+            or len(load_base.operand_ids or []) != 1
+            or len(store_base.operand_ids or []) != 1
+            or load_base.operand_ids[0] not in arg_ids
+            or store_base.operand_ids[0] not in arg_ids
+        ):
             return None
 
         import re
@@ -4118,8 +4327,7 @@ class _DetectionMixin:
                 # expand_dims inserts a singleton coordinate before/after it;
                 # carry that ownership through later broadcasts rather than
                 # inferring an axis from equal extents or sorted coefficients.
-                return [(axis + (inserted <= axis), start, end, coef)
-                        for axis, start, end, coef in terms]
+                return [(axis + (inserted <= axis), start, end, coef) for axis, start, end, coef in terms]
             if op.op == "tt.make_range":
                 try:
                     start, end = int(op.attrs.get("start")), int(op.attrs.get("end"))
@@ -4130,13 +4338,11 @@ class _DetectionMixin:
                 left, right = (_affine(x, depth + 1) for x in op.operand_ids)
                 return None if left is None or right is None else left + right
             if op.op == "arith.muli" and len(op.operand_ids or []) == 2:
-                for value, other in ((op.operand_ids[0], op.operand_ids[1]),
-                                     (op.operand_ids[1], op.operand_ids[0])):
+                for value, other in ((op.operand_ids[0], op.operand_ids[1]), (op.operand_ids[1], op.operand_ids[0])):
                     factor = _literal(value)
                     terms = _affine(other, depth + 1)
                     if factor is not None and terms is not None:
-                        return [(axis, start, end, coef * factor)
-                                for axis, start, end, coef in terms]
+                        return [(axis, start, end, coef * factor) for axis, start, end, coef in terms]
             return None
 
         terms = _affine(load_ptr.operand_ids[1])
@@ -4235,7 +4441,7 @@ class _DetectionMixin:
                 cur = o.operand_ids[0]
                 continue
             if o.op == "arith.truncf" and o.operand_ids and casts == 0:
-                t = (o.type_str or "")
+                t = o.type_str or ""
                 el = t.rsplit("x", 1)[-1].split(",")[0].split(">")[0].strip() if "x" in t else t.strip()
                 norm = {"f16": ("f16", "fp16", "half"), "bf16": ("bf16", "bfloat16"), "f32": ("f32", "fp32", "float")}
                 ok = ptr_elem is not None and any(el in v and ptr_elem in v for v in norm.values())
@@ -4317,7 +4523,12 @@ class _DetectionMixin:
             if o.op != "arith.divf" or len(o.operand_ids or []) != 2:
                 return False
             a, b = (by_id.get(x) for x in o.operand_ids)
-            return a is not None and a.op in ("math.exp", "math.exp2") and b is not None and b.op in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat")
+            return (
+                a is not None
+                and a.op in ("math.exp", "math.exp2")
+                and b is not None
+                and b.op in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat")
+            )
 
         if self._stored_value_roots_at(store_ssa, _is_softmax_div, "softmax") is None:
             return None
@@ -4449,7 +4660,11 @@ class _DetectionMixin:
             while x not in seen:
                 seen.add(x)
                 o = by_id.get(x)
-                if o is None or o.op not in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat") or not o.operand_ids:
+                if (
+                    o is None
+                    or o.op not in ("tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.splat")
+                    or not o.operand_ids
+                ):
                     return o
                 x = o.operand_ids[0]
             return None
@@ -4501,7 +4716,10 @@ class _DetectionMixin:
                     return float(str(o.attrs.get("value", "")).split(":")[0].strip())
                 except (TypeError, ValueError):
                     return None
-            if o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "arith.extf", "arith.truncf") and o.operand_ids:
+            if (
+                o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "arith.extf", "arith.truncf")
+                and o.operand_ids
+            ):
                 return _const_float(o.operand_ids[0], depth + 1)
             return None
 
@@ -4988,7 +5206,11 @@ class _DetectionMixin:
                             _mr_root = o.operand_ids[mr_side]
                             for _ in range(6):
                                 _w = _obid.get(_mr_root)
-                                if _w is not None and _w.op in ("tt.expand_dims", "tt.broadcast", "ttg.convert_layout") and _w.operand_ids:
+                                if (
+                                    _w is not None
+                                    and _w.op in ("tt.expand_dims", "tt.broadcast", "ttg.convert_layout")
+                                    and _w.operand_ids
+                                ):
                                     _mr_root = _w.operand_ids[0]
                                     continue
                                 break
@@ -5013,7 +5235,10 @@ class _DetectionMixin:
                                     if isinstance(v, int):
                                         consts.add(v)
                                     break
-                                if c_op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "arith.extsi") and c_op.operand_ids:
+                                if (
+                                    c_op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "arith.extsi")
+                                    and c_op.operand_ids
+                                ):
                                     c_id = c_op.operand_ids[0]
                                     continue
                                 break

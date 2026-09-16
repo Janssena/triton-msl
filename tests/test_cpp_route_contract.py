@@ -3,6 +3,7 @@
 Stage-control spies only: neither mocked LLVM nor GPU numerics earn correctness
 credit for the experimental C++ implementation.
 """
+
 from types import SimpleNamespace
 import warnings
 
@@ -35,18 +36,22 @@ def stage(monkeypatch):
     monkeypatch.setattr(compiler, "_cpp_warning_emitted", False, raising=False)
     backend = compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32))
     monkeypatch.setattr(backend, "_has_cpp_passes", lambda: True)
+
     def msl(src, metadata, options):
         metadata["block_size"] = 32
         events.append("msl-source")
         return "controlled MSL"
+
     def llvm(src, metadata, options):
         metadata["block_size"] = 64
         events.append("cpp-lowering")
         return "controlled LLVM"
+
     monkeypatch.setattr(compiler.MetalBackend, "make_msl", staticmethod(msl))
     monkeypatch.setattr(compiler.MetalBackend, "make_llir", staticmethod(llvm))
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib_from_llir", staticmethod(lambda *args: b"cpp-binary"))
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib", staticmethod(lambda *args: b"msl-binary"))
+
     def run(text=_SIMPLE):
         stages = {}
         backend.add_stages(stages, SimpleNamespace(num_warps=4))
@@ -54,6 +59,7 @@ def stage(monkeypatch):
         msl_source = stages["msl"](text, metadata)
         binary = stages["metallib"](msl_source, metadata)
         return binary, metadata
+
     return run, events, backend
 
 
@@ -80,8 +86,10 @@ def test_experimental_binary_warning_is_once_per_process(stage):
 
 def test_cpp_failure_is_visible_and_preserves_msl_metadata(stage, monkeypatch):
     run, _, _ = stage
+
     def fail(*args):
         raise RuntimeError("forced-cpp-probe-failure")
+
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib_from_llir", staticmethod(fail))
     with pytest.warns(UserWarning, match=r"C\+\+.*forced-cpp-probe-failure.*MSL"):
         binary, metadata = run()
@@ -101,8 +109,9 @@ def test_force_python_never_claims_a_cpp_binary(stage, monkeypatch):
     assert not any("unaudited" in str(item.message) for item in caught)
 
 
-@pytest.mark.parametrize("dot", ["%d = tt.dot %a, %b, %c : tensor<32x32xf32>",
-                                  '%d = "tt.dot"(%a, %b, %c) : () -> tensor<32x32xf32>'])
+@pytest.mark.parametrize(
+    "dot", ["%d = tt.dot %a, %b, %c : tensor<32x32xf32>", '%d = "tt.dot"(%a, %b, %c) : () -> tensor<32x32xf32>']
+)
 def test_known_unsafe_dot_is_explicitly_derouted_not_compiled(stage, dot):
     run, events, _ = stage
     source = _SIMPLE.replace("    tt.return", "    " + dot + "\n    tt.return")
@@ -127,9 +136,12 @@ def test_missing_optional_extension_has_an_explicit_msl_disposition(stage, monke
 def test_direct_cpp_entry_refuses_dot_before_lowering(monkeypatch, dot):
     import sys
     from triton_msl.errors import MetalNonRecoverableError
+
     monkeypatch.setitem(sys.modules, "triton_msl._triton_msl_cpp", SimpleNamespace())
+
     def forbidden(*args):
         raise AssertionError("unsafe dot reached annotation stripping before a C++ refusal")
+
     monkeypatch.setattr(compiler.MetalBackend, "_strip_ttg_annotations", staticmethod(forbidden))
     with pytest.raises(MetalNonRecoverableError, match=r"C\+\+.*dot"):
         compiler.MetalBackend.make_llir(f"%d = {dot} %a, %b, %c", {"name": "k"}, SimpleNamespace())
@@ -160,19 +172,24 @@ def test_actual_metallib_route_and_numeric_control(monkeypatch, tmp_path, use_cp
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     cpp_calls, launches = [], []
     original = compiler.MetalBackend.make_metallib_from_llir
+
     def compile_cpp(*args, **kwargs):
         result = original(*args, **kwargs)
         cpp_calls.append(result)
         return result
+
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib_from_llir", staticmethod(compile_cpp))
     utils = driver._get_utils()
     launch = utils.launch
+
     def launch_binary(*args, **kwargs):
         launches.append(True)
         return launch(*args, **kwargs)
+
     monkeypatch.setattr(utils, "launch", launch_binary)
-    src = ASTSource(fn=_unmasked_add, signature={"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32"},
-                    constexprs={"BLOCK": 128})
+    src = ASTSource(
+        fn=_unmasked_add, signature={"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32"}, constexprs={"BLOCK": 128}
+    )
     kernel = triton.compile(src, target=GPUTarget("metal", "apple-m4", 32))
     assert kernel.metadata.binary_route == ("cpp" if use_cpp else "msl")
     assert len(cpp_calls) == int(use_cpp)
@@ -204,8 +221,7 @@ def _multi_program_dot_runtime(a, b, c, M, N):
     lhs = tl.load(a + rows[:, None] * 32 + inner[None, :], rows[:, None] < M, other=0.0)
     rhs = tl.load(b + inner[:, None] * N + cols[None, :], cols[None, :] < N, other=0.0)
     result = tl.dot(lhs, rhs)
-    tl.store(c + rows[:, None] * N + cols[None, :], result,
-             (rows[:, None] < M) & (cols[None, :] < N))
+    tl.store(c + rows[:, None] * N + cols[None, :], result, (rows[:, None] < M) & (cols[None, :] < N))
 
 
 def test_constexpr_multi_program_dot_remains_refused(monkeypatch, tmp_path):
@@ -216,17 +232,20 @@ def test_constexpr_multi_program_dot_remains_refused(monkeypatch, tmp_path):
     """
     from triton.compiler.compiler import ASTSource
     from triton_msl.errors import MetalNonRecoverableError
+
     monkeypatch.setenv("TRITON_MSL_USE_CPP", "1")
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
+
     def forbidden(*args, **kwargs):
         raise AssertionError("refused source reached binary production")
+
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib_from_llir", staticmethod(forbidden))
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib", staticmethod(forbidden))
-    src = ASTSource(fn=_multi_program_dot,
-                    signature={"a": "*fp16", "b": "*fp16", "c": "*fp32"},
-                    constexprs={"K": 32, "N": 64})
+    src = ASTSource(
+        fn=_multi_program_dot, signature={"a": "*fp16", "b": "*fp16", "c": "*fp32"}, constexprs={"K": 32, "N": 64}
+    )
     with pytest.raises(MetalNonRecoverableError, match="M/N are baked as constexpr"):
         triton.compile(src, target=GPUTarget("metal", "apple-m4", 32))
 
@@ -249,28 +268,42 @@ def test_multi_program_dot_deroutes_and_writes_every_output(monkeypatch, tmp_pat
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     cpp_calls, launches = [], []
     original_cpp = compiler.MetalBackend.make_metallib_from_llir
+
     def cpp_binary(*args, **kwargs):
         result = original_cpp(*args, **kwargs)
         cpp_calls.append(True)
         return result
+
     monkeypatch.setattr(compiler.MetalBackend, "make_metallib_from_llir", staticmethod(cpp_binary))
     utils = driver._get_utils()
     original_launch = utils.launch
+
     def launch_binary(*args, **kwargs):
         launches.append(True)
         return original_launch(*args, **kwargs)
+
     monkeypatch.setattr(utils, "launch", launch_binary)
-    src = ASTSource(fn=_multi_program_dot_runtime,
-                    signature={"a": "*fp16", "b": "*fp16", "c": "*fp32", "M": "i32", "N": "i32"},
-                    constexprs={})
+    src = ASTSource(
+        fn=_multi_program_dot_runtime,
+        signature={"a": "*fp16", "b": "*fp16", "c": "*fp32", "M": "i32", "N": "i32"},
+        constexprs={},
+    )
     compiled = triton.compile(src, target=GPUTarget("metal", "apple-m4", 32))
     generator = torch.Generator().manual_seed(245247)
     a = torch.randn(64, 32, generator=generator).half()
     b = torch.randn(32, 64, generator=generator).half()
     c = torch.full((64, 64), float("nan"), dtype=torch.float32)
     compiled[(2, 2, 1)](a, b, c, 64, 64)
-    print("DOT_GRID", "cpp_binaries", len(cpp_calls), "metallib_launches", len(launches),
-          "unwritten", torch.isnan(c).sum().item(), flush=True)
+    print(
+        "DOT_GRID",
+        "cpp_binaries",
+        len(cpp_calls),
+        "metallib_launches",
+        len(launches),
+        "unwritten",
+        torch.isnan(c).sum().item(),
+        flush=True,
+    )
     assert launches == [True]
     assert torch.isfinite(c).all()
     torch.testing.assert_close(c, a.float() @ b.float(), rtol=1e-3, atol=1e-3)

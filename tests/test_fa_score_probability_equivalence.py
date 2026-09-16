@@ -60,13 +60,7 @@ def _fa_score_probability(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    q_ptrs = (
-        Q
-        + off_z * sqz
-        + off_h * sqh
-        + offs_m[:, None] * sqm
-        + offs_d[None, :] * sqk
-    )
+    q_ptrs = Q + off_z * sqz + off_h * sqh + offs_m[:, None] * sqm + offs_d[None, :] * sqk
     q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
     qk_scale = 1.0 / tl.sqrt(float(HEAD_DIM))
     if VARIANT == 3 or VARIANT == 4 or VARIANT == 8 or VARIANT == 9:
@@ -79,13 +73,7 @@ def _fa_score_probability(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for start_n in range(0, N_CTX, BLOCK_N):
         kn = start_n + offs_n
-        k_ptrs = (
-            K
-            + off_z * skz
-            + off_h * skh
-            + kn[:, None] * skn
-            + offs_d[None, :] * skk
-        )
+        k_ptrs = K + off_z * skz + off_h * skh + kn[:, None] * skn + offs_d[None, :] * skk
         k = tl.load(k_ptrs, mask=kn[:, None] < N_CTX, other=0.0)
         qk = tl.dot(q, tl.trans(k).to(q.dtype))
         if VARIANT == 7 or VARIANT == 8:
@@ -121,25 +109,13 @@ def _fa_score_probability(
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
 
-        v_ptrs = (
-            V
-            + off_z * svz
-            + off_h * svh
-            + kn[:, None] * svn
-            + offs_d[None, :] * svk
-        )
+        v_ptrs = V + off_z * svz + off_h * svh + kn[:, None] * svn + offs_d[None, :] * svk
         v = tl.load(v_ptrs, mask=kn[:, None] < N_CTX, other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
     acc = acc / l_i[:, None]
-    o_ptrs = (
-        Out
-        + off_z * soz
-        + off_h * soh
-        + offs_m[:, None] * som
-        + offs_d[None, :] * sok
-    )
+    o_ptrs = Out + off_z * soz + off_h * soh + offs_m[:, None] * som + offs_d[None, :] * sok
     if VARIANT == 5:
         tl.store(
             o_ptrs,
@@ -185,9 +161,7 @@ def _reference(q, k, v, variant):
             acc = acc * alpha[..., None] + p @ vf[..., start_n : start_n + 32, :]
             m_i = m_new
         return acc / l_i[..., None]
-    return torch.nn.functional.scaled_dot_product_attention(
-        q.float(), k.float(), v.float(), scale=scale
-    )
+    return torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float(), scale=scale)
 
 
 def _run(variant, monkeypatch):
@@ -245,9 +219,7 @@ def _run(variant, monkeypatch):
     ],
 )
 @requires_mps
-def test_equivalent_score_probability_spelling_routes_and_computes(
-    variant, label, monkeypatch
-):
+def test_equivalent_score_probability_spelling_routes_and_computes(variant, label, monkeypatch):
     q, k, v, out, hits = _run(variant, monkeypatch)
     assert hits == [64], f"{label} did not reach the specialized dense FA template"
     err = (out.float() - _reference(q, k, v, variant)).abs().max().item()
@@ -264,9 +236,7 @@ def test_equivalent_score_probability_spelling_routes_and_computes(
     ],
 )
 @requires_mps
-def test_non_equivalent_score_probability_path_is_correct_or_refuses(
-    variant, label, monkeypatch
-):
+def test_non_equivalent_score_probability_path_is_correct_or_refuses(variant, label, monkeypatch):
     try:
         q, k, v, out, _hits = _run(variant, monkeypatch)
     except MetalNonRecoverableError as exc:

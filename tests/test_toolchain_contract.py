@@ -1,4 +1,5 @@
 """Dependency identity tests; no GPU and no real SDK needed by these fixtures."""
+
 import os
 from pathlib import Path
 
@@ -72,9 +73,11 @@ def test_untracked_search_paths_refuse_even_after_a_cached_snapshot(inputs, monk
 def test_repeated_snapshot_does_not_rehash_gigabytes(inputs, monkeypatch):
     calls = []
     real = tc._tree_manifest
+
     def read(root):
         calls.append(root)
         return real(root)
+
     monkeypatch.setattr(tc, "_tree_manifest", read)
     first = tc.toolchain_identity()
     assert tc.toolchain_identity() == first
@@ -130,9 +133,11 @@ def test_incomplete_inventory_cannot_become_unknown_identity(inputs, monkeypatch
 
 def test_selection_change_during_hashing_does_not_publish_a_snapshot(inputs, monkeypatch):
     real = tc._tree_manifest
+
     def changing(root):
         monkeypatch.setenv("DEVELOPER_DIR", "/changed/during/hash")
         return real(root)
+
     monkeypatch.setattr(tc, "_tree_manifest", changing)
     with pytest.raises(MetalNonRecoverableError, match="selection changed during"):
         tc.toolchain_identity()
@@ -174,11 +179,13 @@ def test_resolver_proves_actual_compiler_is_in_the_inventory(tmp_path, monkeypat
         ("--show-sdk-path",): str(sdk),
         ("--show-sdk-build-version",): "SDK-build1",
     }
+
     def query(command, **kwargs):
         if command == ["/usr/sbin/sysctl", "-n", "kern.osversion"]:
             return "OS-build1\n"
         assert command[:3] == [str(resolver), "-sdk", "macosx"]
         return results[tuple(command[3:])]
+
     monkeypatch.setattr(tc.subprocess, "check_output", query)
     if spelling != "valid":
         with pytest.raises(RuntimeError, match="InstalledDir|outside"):

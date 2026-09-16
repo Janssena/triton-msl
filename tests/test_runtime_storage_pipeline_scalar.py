@@ -1,4 +1,5 @@
 """CPU-only runtime regression witnesses with recording buffers and pipelines."""
+
 import struct
 import sys
 import weakref
@@ -154,9 +155,11 @@ def pipeline_loader(monkeypatch):
     monkeypatch.setitem(sys.modules, "Foundation", SimpleNamespace(NSURL=SimpleNamespace(fileURLWithPath_=lambda p: p)))
     monkeypatch.setattr(driver, "_MM_DIRECT_PIPELINES", {})
     loader = driver.MetalUtils.__new__(driver.MetalUtils)
+
     def load(name, mode="success"):
         loader._device = _Device(name, mode)
         return loader.load_binary("kernel", "record-only.metallib", 0, 0)[1]
+
     return load
 
 
@@ -189,9 +192,16 @@ def test_colliding_foreign_pipeline_keeps_staged_fallback(monkeypatch, recording
     assert recording_host.calls[-1][0].name == "A direct"
 
 
-@pytest.mark.parametrize("dims,split,direct", [((32, 32, 8), True, True), ((31, 32, 8), True, False),
-                                               ((32, 31, 8), True, False), ((32, 32, 7), True, False),
-                                               ((32, 32, 8), False, False)])
+@pytest.mark.parametrize(
+    "dims,split,direct",
+    [
+        ((32, 32, 8), True, True),
+        ((31, 32, 8), True, False),
+        ((32, 31, 8), True, False),
+        ((32, 32, 7), True, False),
+        ((32, 32, 8), False, False),
+    ],
+)
 def test_matching_pipeline_keeps_alignment_and_metadata_checks(recording_host, pipeline_loader, dims, split, direct):
     primary = pipeline_loader("A")
     _invoke_matrix(primary, dims, split)
@@ -202,8 +212,10 @@ def test_matching_pipeline_keeps_alignment_and_metadata_checks(recording_host, p
 
 
 @pytest.mark.parametrize("checked", [False, True])
-@pytest.mark.parametrize("value,eligible", [(0, True), ((1 << 63) - 1, True), (1 << 63, False),
-                                           ((1 << 63) + 3, False), ((1 << 64) - 1, False)])
+@pytest.mark.parametrize(
+    "value,eligible",
+    [(0, True), ((1 << 63) - 1, True), (1 << 63, False), ((1 << 63) + 3, False), ((1 << 64) - 1, False)],
+)
 def test_u64_bridge_range_precedes_cached_packing(checked, value, eligible):
     pointer = torch.empty(1, device="cpu")
     launcher = _launcher(["p", "v"], dict(p="*fp32", v="u64"))
@@ -213,9 +225,18 @@ def test_u64_bridge_range_precedes_cached_packing(checked, value, eligible):
     assert driver._compile_shader_scalars_ok(launcher, args, checked=bound if checked else None) is eligible
 
 
-@pytest.mark.parametrize("declared,value", [("i64", -(1 << 63)), ("i64", (1 << 63) - 1),
-                                            ("u32", (1 << 32) - 1), ("i8", -128), ("u8", 255),
-                                            ("i1", True), ("i1", False)])
+@pytest.mark.parametrize(
+    "declared,value",
+    [
+        ("i64", -(1 << 63)),
+        ("i64", (1 << 63) - 1),
+        ("u32", (1 << 32) - 1),
+        ("i8", -128),
+        ("u8", 255),
+        ("i1", True),
+        ("i1", False),
+    ],
+)
 def test_signed_bridge_and_small_scalar_boundaries_still_admit(declared, value):
     launcher = _launcher(["v"], dict(v=declared))
     assert driver._compile_shader_scalars_ok(launcher, [value])
@@ -223,10 +244,13 @@ def test_signed_bridge_and_small_scalar_boundaries_still_admit(declared, value):
 
 def test_high_u64_reaches_host_with_full_unsigned_bytes(monkeypatch, recording_host):
     events = []
-    runtime = SimpleNamespace(available=lambda: True, is_unsupported=lambda _: False,
-                              get_library=lambda _: pytest.fail("high u64 entered compile_shader"),
-                              dispatch=lambda *a, **k: pytest.fail("high u64 dispatched"),
-                              mark_unsupported=lambda _: events.append("blacklist"))
+    runtime = SimpleNamespace(
+        available=lambda: True,
+        is_unsupported=lambda _: False,
+        get_library=lambda _: pytest.fail("high u64 entered compile_shader"),
+        dispatch=lambda *a, **k: pytest.fail("high u64 dispatched"),
+        mark_unsupported=lambda _: events.append("blacklist"),
+    )
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1")
     monkeypatch.setattr(driver, "_get_compile_shader_runtime", lambda: runtime)
     # All-scalar launch satisfies all_mps; the scalar gate must select the host.

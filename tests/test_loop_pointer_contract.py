@@ -4,6 +4,7 @@ Each row checks freshly lowered native IR and a GPU result against exact CPU
 indexing. The small spelling table covers distinct representations/phi edges,
 not a Cartesian shape sweep; a refusal is not success for these supported rows.
 """
+
 import re
 
 import pytest
@@ -151,23 +152,25 @@ def _conditional_caller(A, B, O, SCF: tl.constexpr):
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
-@pytest.mark.parametrize("scalar,mode,block,dtype", [
-    (False, 1, 32, torch.float32),  # P0: base A -> B, not just an offset update
-    (True, 0, 32, torch.float16),   # bare scalar argument must not become float
-    (True, 1, 32, torch.int32),     # bare argument also appears on the yield side
-    (False, 2, 32, torch.float32),  # simultaneous pointer exchange
-    (False, 2, 256, torch.float32), # per-thread offset arrays + simultaneous exchange
-    (False, 3, 32, torch.float32),  # single-result scf.for exit mapping
-    (True, 3, 32, torch.bfloat16),
-])
+@pytest.mark.parametrize(
+    "scalar,mode,block,dtype",
+    [
+        (False, 1, 32, torch.float32),  # P0: base A -> B, not just an offset update
+        (True, 0, 32, torch.float16),  # bare scalar argument must not become float
+        (True, 1, 32, torch.int32),  # bare argument also appears on the yield side
+        (False, 2, 32, torch.float32),  # simultaneous pointer exchange
+        (False, 2, 256, torch.float32),  # per-thread offset arrays + simultaneous exchange
+        (False, 3, 32, torch.float32),  # single-result scf.for exit mapping
+        (True, 3, 32, torch.bfloat16),
+    ],
+)
 def test_loop_pointer_preserves_address(scalar, mode, block, dtype, monkeypatch, tmp_path):
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "metal"))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     fn = _pointer_only if mode == 3 else _pointer_flow
     fn.device_caches.clear()
-    dtype_name = {torch.float32: "fp32", torch.float16: "fp16",
-                  torch.bfloat16: "bf16", torch.int32: "i32"}[dtype]
+    dtype_name = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16", torch.int32: "i32"}[dtype]
     # Small exact values keep the reference independent of rounding/reassociation.
     indices = torch.arange(3 * block)
     a = (indices % 32 + 1 + (indices // block) * 16).to(dtype)
@@ -187,6 +190,7 @@ def test_loop_pointer_preserves_address(scalar, mode, block, dtype, monkeypatch,
     from triton_msl.backend.compiler import MetalBackend
     from triton_msl.codegen.mlir_walker import walk_ttgir
     from triton_msl.codegen.generic_lowerer import GenericLowerer
+
     target = GPUTarget("metal", "apple-m4", 32)
     backend = MetalBackend(target)
     options = backend.parse_options({"num_warps": 4})
@@ -203,20 +207,23 @@ def test_loop_pointer_preserves_address(scalar, mode, block, dtype, monkeypatch,
     if block == 256:
         assert lowerer.env_ptr_array, "must exercise the per-thread pointer-array representation"
     from triton_msl.backend.driver import _get_compile_shader_runtime
+
     runtime = _get_compile_shader_runtime()
     calls = []
     real = runtime.dispatch
+
     def dispatch(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
+
     monkeypatch.setattr(runtime, "dispatch", dispatch)
     if mode == 3:
         compiled = fn[(1,)](a.to("mps"), actual, 2, **cex)
-        expected = a[2 * block:3 * block]
+        expected = a[2 * block : 3 * block]
     else:
         compiled = fn[(1,)](a.to("mps"), b.to("mps"), actual, 2, **cex)
-        last = b[:block] if mode == 1 else a[2 * block:3 * block] if mode == 0 else a[:block]
-        second = a[block:2 * block] if mode == 0 else b[block:2 * block] if mode == 2 else b[:block]
+        last = b[:block] if mode == 1 else a[2 * block : 3 * block] if mode == 0 else a[:block]
+        second = a[block : 2 * block] if mode == 0 else b[block : 2 * block] if mode == 2 else b[:block]
         expected = torch.cat(((a[:block].float() + second.float()).to(dtype), last))
     torch.mps.synchronize()
     assert calls == [1], "must observe the actual dispatched kernel"
@@ -235,6 +242,7 @@ def test_loop_pointer_preserves_negative_runtime_offset(monkeypatch, tmp_path):
     storage = torch.tensor([1.0, 2.0, 4.0, 8.0], device="mps")
     output = torch.full((1,), -99.0, device="mps")
     from triton_msl.backend.driver import _get_compile_shader_runtime
+
     runtime = _get_compile_shader_runtime()
     calls, real = [], runtime.dispatch
 
@@ -260,12 +268,11 @@ def test_loop_pointer_tensor_preserves_negative_runtime_offset(monkeypatch, tmp_
     block = 256
     storage = torch.arange(block + 3, dtype=torch.float32)
     output = torch.full((block,), -99.0, device="mps")
-    compiled = _signed_offset_pointer_tensor[(1,)](
-        storage.to("mps")[2:], output, -2, BLOCK=block)
+    compiled = _signed_offset_pointer_tensor[(1,)](storage.to("mps")[2:], output, -2, BLOCK=block)
     torch.mps.synchronize()
     assert "uint off_" not in compiled.asm["msl"]
     assert re.search(r"A \+ \(int\(start\) \+ int\(lid\)\)", compiled.asm["msl"])
-    assert torch.equal(output.cpu(), storage[:block] + storage[1:block + 1])
+    assert torch.equal(output.cpu(), storage[:block] + storage[1 : block + 1])
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
@@ -279,6 +286,7 @@ def test_loop_pointer_mept_preserves_negative_runtime_offset(monkeypatch, tmp_pa
     storage = torch.arange(block + 2, dtype=torch.float32)
     output = torch.full((block,), -99.0, device="mps")
     from triton_msl.backend.driver import _get_compile_shader_runtime
+
     runtime = _get_compile_shader_runtime()
     calls, real = [], runtime.dispatch
 
@@ -287,8 +295,7 @@ def test_loop_pointer_mept_preserves_negative_runtime_offset(monkeypatch, tmp_pa
         return real(*args, **kwargs)
 
     monkeypatch.setattr(runtime, "dispatch", dispatch)
-    compiled = _signed_offset_pointer_mept[(1,)](
-        storage.to("mps")[2:], output, -2, BLOCK=block)
+    compiled = _signed_offset_pointer_mept[(1,)](storage.to("mps")[2:], output, -2, BLOCK=block)
     torch.mps.synchronize()
     assert calls == [1]
     assert re.search(r"long off_\d+\[2\]", compiled.asm["msl"])
@@ -305,8 +312,7 @@ def test_while_pointer_preserves_negative_runtime_offset(monkeypatch, tmp_path):
     block = 32
     storage = torch.arange(block + 2, dtype=torch.float32)
     output = torch.full((block,), -99.0, device="mps")
-    compiled = _signed_offset_pointer_while[(1,)](
-        storage.to("mps")[2:], output, -1, 2, BLOCK=block)
+    compiled = _signed_offset_pointer_while[(1,)](storage.to("mps")[2:], output, -1, 2, BLOCK=block)
     torch.mps.synchronize()
     assert "for (;;)" in compiled.asm["msl"]
     assert re.search(r"auto wh_ptr_\d+ = .*A", compiled.asm["msl"])
@@ -327,17 +333,19 @@ def test_while_pointer_preserves_address(scalar, monkeypatch, tmp_path):
     b = a + 64
     out = torch.full((2 * block,), -99.0, device="mps")
     from triton_msl.backend.driver import _get_compile_shader_runtime
+
     runtime = _get_compile_shader_runtime()
     calls, real = [], runtime.dispatch
+
     def dispatch(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
+
     monkeypatch.setattr(runtime, "dispatch", dispatch)
-    compiled = _while_pointer[(1,)](
-        a.to("mps"), b.to("mps"), out, 2, BLOCK=block, SCALAR=scalar)
+    compiled = _while_pointer[(1,)](a.to("mps"), b.to("mps"), out, 2, BLOCK=block, SCALAR=scalar)
     torch.mps.synchronize()
-    final = b[block:2 * block] if scalar else a[:block]
-    expected = torch.cat((a[:block] + b[block:2 * block], final))
+    final = b[block : 2 * block] if scalar else a[:block]
+    expected = torch.cat((a[:block] + b[block : 2 * block], final))
     assert calls == [1]
     assert "UNKNOWN_" not in compiled.asm["msl"]
     assert torch.equal(out.cpu(), expected)
@@ -359,8 +367,7 @@ def test_noinline_callee_loop_preserves_pointer_arguments(monkeypatch, tmp_path)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Metal GPU required")
-@pytest.mark.parametrize("callee", [0, 1, 2],
-                         ids=["kernel-if", "noinline-select", "noinline-scf-if"])
+@pytest.mark.parametrize("callee", [0, 1, 2], ids=["kernel-if", "noinline-select", "noinline-scf-if"])
 def test_conditional_pointer_preserves_address(callee, monkeypatch, tmp_path):
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "metal"))
@@ -370,8 +377,7 @@ def test_conditional_pointer_preserves_address(callee, monkeypatch, tmp_path):
     if callee:
         _conditional_caller.device_caches.clear()
         out = torch.full((32,), -99.0, device="mps")
-        compiled = _conditional_caller[(32,)](
-            a.to("mps"), b.to("mps"), out, SCF=callee == 2)
+        compiled = _conditional_caller[(32,)](a.to("mps"), b.to("mps"), out, SCF=callee == 2)
         expected = torch.where(torch.arange(32) % 2 == 0, a, b)
     else:
         _conditional_pointer.device_caches.clear()
@@ -400,8 +406,8 @@ def test_noinline_mixed_if_uses_each_native_result_type():
     then = SSAValue(20, "", "scf.yield", [4, 1], {}, "", "", False)
     other = SSAValue(21, "", "scf.yield", [4, 2], {}, "", "", False)
     branch = SSAValue(
-        10, "", "scf.if", [3], {}, "f32", "f32", False,
-        region_ops=[then], else_ops=[other], result_ids=[10, 11])
+        10, "", "scf.if", [3], {}, "f32", "f32", False, region_ops=[then], else_ops=[other], result_ids=[10, 11]
+    )
     metadata = {
         10: ResultMeta(10, parse_type_facts("f32"), "result", 10, 0),
         11: ResultMeta(11, parse_type_facts("!tt.ptr<f32>"), "result", 10, 1),

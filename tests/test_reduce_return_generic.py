@@ -22,7 +22,7 @@ from triton_msl.codegen.generic_lowerer import GenericLowerer
 from triton_msl.codegen.mlir_walker import walk_ttgir
 from triton_msl.errors import MetalNonRecoverableError
 
-_HEADER = '''#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+_HEADER = """#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @entry(%p: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
     %r = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32, #blocked>
@@ -38,7 +38,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
-'''
+"""
 
 
 def _lower(text, tmp_path):

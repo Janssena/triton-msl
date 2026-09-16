@@ -5,6 +5,7 @@ strings. System framework build identity is separately in the Metal toolchain
 contract. This inventory does not purport to authenticate arbitrary injected
 libraries or a foreign pipeline; those are separate boundaries.
 """
+
 import hashlib
 import importlib.util
 import json
@@ -23,8 +24,11 @@ _owned_selection = None
 _native_guard = None
 _lock = threading.RLock()
 _RUNTIME_SELECTION_ENV = ("PYTORCH_MPS_FAST_MATH", "PYTORCH_MPS_PREFER_METAL", "PYTORCH_ENABLE_MPS_FALLBACK")
-_REQUIRED_NAMES = ("triton",) + (("objc", "Metal", "Foundation", "CoreFoundation", "AppKit", "MetalPerformanceShaders")
-                                 if sys.platform == "darwin" else ())
+_REQUIRED_NAMES = ("triton",) + (
+    ("objc", "Metal", "Foundation", "CoreFoundation", "AppKit", "MetalPerformanceShaders")
+    if sys.platform == "darwin"
+    else ()
+)
 # Editable finders may resolve an optional native CHILD from a different
 # installation even when the top-level package came from this worktree.
 # Bind its actual selected spec/bytes; never infer it from __init__.__file__.
@@ -59,6 +63,7 @@ def _python_roots():
 
 def _native_entrypoints(roots):
     from ._native_dependencies import is_native
+
     seeds, visited = [], set()
     # torch/__init__.py:_load_global_deps performs this explicit ctypes load;
     # it need not be an LC_LOAD_DYLIB edge of torch._C. No directory search.
@@ -109,10 +114,8 @@ def _native_dependencies(roots):
     # imported native extensions outside these named frameworks BEFORE our
     # first snapshot (e.g. a model tokenizer). Those are real cache inputs, not
     # a reason to reject every subsequent compilation or a basename exemption.
-    loaded_paths = tuple(Path(os.fsdecode(raw)).resolve(strict=True)
-                         for raw in loaded if not _system(os.fsdecode(raw)))
-    rows, providers = dependency_graph(seeds, cpu_type=cpu, executable=executable,
-                                      loaded_paths=loaded_paths)
+    loaded_paths = tuple(Path(os.fsdecode(raw)).resolve(strict=True) for raw in loaded if not _system(os.fsdecode(raw)))
+    rows, providers = dependency_graph(seeds, cpu_type=cpu, executable=executable, loaded_paths=loaded_paths)
     ambient = []
     order = []
     for raw in loaded:
@@ -130,8 +133,9 @@ def _native_dependencies(roots):
     if ambient:
         # Use the existing closed resolver, including its RPATH/ambiguity and
         # malformed-image refusals. Never auto-certify a directory or all .so's.
-        rows, providers = dependency_graph([*seeds, *ambient], cpu_type=cpu, executable=executable,
-                                          loaded_paths=loaded_paths)
+        rows, providers = dependency_graph(
+            [*seeds, *ambient], cpu_type=cpu, executable=executable, loaded_paths=loaded_paths
+        )
     guard = _LoadedNativeGuard(providers)
     guard.verify()
     if _loaded_native_images() != loaded:
@@ -143,6 +147,7 @@ def _native_dependencies(roots):
 def _loaded_native_images():
     """Read actual dyld selection in order, without importing optional packages."""
     import ctypes
+
     loader = ctypes.CDLL(None)
     count = loader._dyld_image_count
     count.restype = ctypes.c_uint32
@@ -165,6 +170,7 @@ class _LoadedNativeGuard:
 
     def __init__(self, providers):
         import ctypes
+
         loader = ctypes.CDLL(None)
         self.count = loader._dyld_image_count
         self.count.restype = ctypes.c_uint32
@@ -176,11 +182,13 @@ class _LoadedNativeGuard:
         self.approved_names = set()
         self.checked_names = None
         from ._native_generation import create_generation_reader
+
         self._generation_reader = create_generation_reader()
         self._generation_checked = None
 
     def verify(self, *, allow_scan=True):
         from ._native_dependencies import _system
+
         reader = getattr(self, "_generation_reader", None)
         generation = reader() if reader is not None else None
         if generation is not None and generation == getattr(self, "_generation_checked", None):
@@ -204,7 +212,9 @@ class _LoadedNativeGuard:
                 continue
             name = os.fsdecode(raw)
             if not _system(name) and Path(name).resolve(strict=True) not in self.providers:
-                raise _NativeSelectionChanged(f"loaded native provider is outside the proved runtime graph: {name}; a new native inventory is required")
+                raise _NativeSelectionChanged(
+                    f"loaded native provider is outside the proved runtime graph: {name}; a new native inventory is required"
+                )
         if self.count() != count:
             raise RuntimeError("native image selection changed during inspection")
         if reader is not None and reader() != generation:
@@ -231,12 +241,27 @@ def _discover_selection():
     for name in names:
         module = sys.modules.get(name)
         spec = getattr(module, "__spec__", None)
-        module_tokens.append((name, id(module), id(spec), getattr(spec, "origin", None),
-                              tuple(getattr(spec, "submodule_search_locations", ()) or ())))
+        module_tokens.append(
+            (
+                name,
+                id(module),
+                id(spec),
+                getattr(spec, "origin", None),
+                tuple(getattr(spec, "submodule_search_locations", ()) or ()),
+            )
+        )
     runtime_env = tuple((key, os.environ.get(key)) for key in _RUNTIME_SELECTION_ENV)
-    token = (tuple(sys.path), tuple(map(id, sys.meta_path)), tuple(map(id, sys.path_hooks)),
-             tuple(module_tokens), id(importlib.util.find_spec), sys.version,
-             sys.implementation.cache_tag, sys.byteorder, runtime_env)
+    token = (
+        tuple(sys.path),
+        tuple(map(id, sys.meta_path)),
+        tuple(map(id, sys.path_hooks)),
+        tuple(module_tokens),
+        id(importlib.util.find_spec),
+        sys.version,
+        sys.implementation.cache_tag,
+        sys.byteorder,
+        runtime_env,
+    )
     if _discovery_snapshot is not None and _discovery_snapshot[0] == token:
         return _discovery_snapshot[1:]
     roots = {}
@@ -257,18 +282,23 @@ def _discover_selection():
         else:
             raise RuntimeError(f"unproved framework package layout for {name}")
     roots.update(_python_roots())
-    metadata = {"python_abi": sys.implementation.cache_tag,
-                "python_version": sys.version, "byteorder": sys.byteorder,
-                "runtime_environment": runtime_env}
+    metadata = {
+        "python_abi": sys.implementation.cache_tag,
+        "python_version": sys.version,
+        "byteorder": sys.byteorder,
+        "runtime_environment": runtime_env,
+    }
     # These dictionaries are private construction products, not caller-owned
     # proxies. Freeze their entire normal value graph before reusing its text.
     # Foreign/nonstandard metadata keeps the original live serialization path.
-    if (all(type(metadata[key]) is str for key in ("python_abi", "python_version", "byteorder"))
-            and all(type(key) is str and (value is None or type(value) is str)
-                    for key, value in runtime_env)
-            and all(type(name) is str and type(paths) is tuple
-                    and all(type(path) is type(Path()) for path in paths)
-                    for name, paths in roots.items())):
+    if (
+        all(type(metadata[key]) is str for key in ("python_abi", "python_version", "byteorder"))
+        and all(type(key) is str and (value is None or type(value) is str) for key, value in runtime_env)
+        and all(
+            type(name) is str and type(paths) is tuple and all(type(path) is type(Path()) for path in paths)
+            for name, paths in roots.items()
+        )
+    ):
         selection = _format_selection(roots, metadata)
         roots = MappingProxyType(roots)
         metadata = MappingProxyType(metadata)
@@ -278,8 +308,10 @@ def _discover_selection():
 
 
 def _format_selection(roots, metadata):
-    return (tuple((name, tuple(map(str, paths))) for name, paths in sorted(roots.items())),
-            json.dumps(metadata, sort_keys=True))
+    return (
+        tuple((name, tuple(map(str, paths))) for name, paths in sorted(roots.items())),
+        json.dumps(metadata, sort_keys=True),
+    )
 
 
 def _selection_identity(roots, metadata):
@@ -310,7 +342,9 @@ def framework_identity():
             selection = _selection_identity(roots, metadata)
             if _snapshot is not None:
                 if _snapshot[0] != selection:
-                    raise MetalNonRecoverableError("framework selection changed in this process; restart before compiling")
+                    raise MetalNonRecoverableError(
+                        "framework selection changed in this process; restart before compiling"
+                    )
                 if _native_guard is None:
                     return _snapshot[1]
                 try:
@@ -327,7 +361,9 @@ def framework_identity():
             for name, paths in sorted(roots.items()):
                 parts = []
                 for path in paths:
-                    excludes = ("site-packages", "dist-packages") if name in ("python-stdlib", "python-platstdlib") else ()
+                    excludes = (
+                        ("site-packages", "dist-packages") if name in ("python-stdlib", "python-platstdlib") else ()
+                    )
                     # A venv's platstdlib may contain only site-packages;
                     # its real stdlib/dynload provider is inventoried through
                     # python-stdlib. Record the empty supplemental inventory,
@@ -336,7 +372,9 @@ def framework_identity():
                     physical_key = path, excludes, allow_empty
                     if physical_key not in physical:
                         physical[physical_key] = _tree_manifest(
-                            path, ignore_bytecode=True, exclude_root_names=excludes,
+                            path,
+                            ignore_bytecode=True,
+                            exclude_root_names=excludes,
                             allow_empty=allow_empty,
                         )
                     parts.append(physical[physical_key])
@@ -345,8 +383,11 @@ def framework_identity():
             again, again_metadata = _discover_selection()
             if again != roots or again_metadata != metadata:
                 raise RuntimeError("framework selection changed during content inventory")
-            payload = json.dumps({"schema": 5, "metadata": _json_metadata(metadata), "packages": manifests, "native": native},
-                                 sort_keys=True, separators=(",", ":"))
+            payload = json.dumps(
+                {"schema": 5, "metadata": _json_metadata(metadata), "packages": manifests, "native": native},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             digest = hashlib.sha256(payload.encode()).hexdigest()
             _snapshot = selection, digest
             return digest
@@ -355,6 +396,8 @@ def framework_identity():
             # selection/payload checks. Roll back BOTH pieces even on an
             # interrupt; an old digest + a newer guard would certify stale code.
             _snapshot, _native_guard = previous_snapshot, previous_guard
-            if isinstance(exc, (OSError, ValueError, RuntimeError, TypeError)) and not isinstance(exc, MetalNonRecoverableError):
+            if isinstance(exc, (OSError, ValueError, RuntimeError, TypeError)) and not isinstance(
+                exc, MetalNonRecoverableError
+            ):
                 raise MetalNonRecoverableError(f"cannot establish framework package identity: {exc}") from exc
             raise

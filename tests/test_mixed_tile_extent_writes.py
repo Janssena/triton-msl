@@ -83,7 +83,7 @@ def test_masked_histogram_honours_mask_and_other(N, n_real, nw):
     torch.mps.synchronize()
     exp = [0] * 8
     exp[0] = N - n_real  # other=0
-    exp[3] = n_real      # the real values
+    exp[3] = n_real  # the real values
     assert o.cpu().tolist() == exp, f"masked histogram wrong for N={N} n_real={n_real} nw={nw}"
 
 
@@ -101,8 +101,7 @@ def test_histogram_honours_the_load_offset(N, nw):
     # as 64 counts in the wrong bin. Values before OFF differ from those after, so a
     # dropped offset is visible in the bins.
     OFF, B = N, 8
-    a = torch.cat([torch.full((OFF,), 1, dtype=torch.int32),
-                   torch.full((N,), 5, dtype=torch.int32)]).to("mps")
+    a = torch.cat([torch.full((OFF,), 1, dtype=torch.int32), torch.full((N,), 5, dtype=torch.int32)]).to("mps")
     o = torch.zeros(B, device="mps", dtype=torch.int32)
     _hist_offset[(1,)](a, o, OFF=OFF, N=N, B=B, num_warps=nw)
     torch.mps.synchronize()
@@ -119,10 +118,12 @@ def test_wide_histogram_with_load_offset_refuses_not_miscomputes():
     # their already-loaded per-thread values; this wider case must refuse until the
     # complete chained address can be reconstructed.
     N, B, OFF = 2048, 8, 2048
-    a = torch.cat([
-        torch.full((OFF,), 1, dtype=torch.int32),
-        torch.full((N,), 5, dtype=torch.int32),
-    ]).to("mps")
+    a = torch.cat(
+        [
+            torch.full((OFF,), 1, dtype=torch.int32),
+            torch.full((N,), 5, dtype=torch.int32),
+        ]
+    ).to("mps")
     o = torch.zeros(B, device="mps", dtype=torch.int32)
     with pytest.raises(MetalNonRecoverableError, match="not a plain"):
         _hist_offset[(1,)](a, o, OFF=OFF, N=N, B=B, num_warps=4)
@@ -164,14 +165,12 @@ def _big_in_small_out(a, o, N: tl.constexpr, B: tl.constexpr):
 @pytest.mark.parametrize("N,B", [(512, 8), (256, 8), (1024, 32)])
 def test_small_store_beside_big_tile_stays_in_bounds(N, B, nw):
     out, pack, saved = _canary(B)
-    _big_in_small_out[(1,)](a := torch.ones(N, device="mps", dtype=torch.float32),
-                            out, N=N, B=B, num_warps=nw)
+    _big_in_small_out[(1,)](a := torch.ones(N, device="mps", dtype=torch.float32), out, N=N, B=B, num_warps=nw)
     torch.mps.synchronize()
     assert a is not None
     got = out.cpu().tolist()
     assert all(abs(g - N) < 1e-3 for g in got), f"wrong sum for N={N} B={B} nw={nw}: {got[0]}"
-    assert _overrun(pack, B, saved) == 0, (
-        f"store overran its {B}-element output for N={N} nw={nw}")
+    assert _overrun(pack, B, saved) == 0, f"store overran its {B}-element output for N={N} nw={nw}"
 
 
 # ------------------------------------------------------------- 3. mixed tile widths
@@ -191,8 +190,7 @@ def test_wide_tile_beside_narrow_store_computes_not_truncates(N, B, nw):
     _big_in_small_out[(1,)](a, out, N=N, B=B, num_warps=nw)
     torch.mps.synchronize()
     got = out.cpu().tolist()
-    assert all(abs(g - N) < 1e-3 for g in got), (
-        f"wide tile truncated: N={N} B={B} nw={nw} gave {got[0]}, expected {N}")
+    assert all(abs(g - N) < 1e-3 for g in got), f"wide tile truncated: N={N} B={B} nw={nw} gave {got[0]}, expected {N}"
     assert _overrun(pack, B, saved) == 0, f"store overran its output (N={N} B={B} nw={nw})"
 
 

@@ -1,4 +1,5 @@
 """Large template records preserve the JSON boundary and per-call ownership."""
+
 import json
 
 import pytest
@@ -8,19 +9,26 @@ from triton_msl.errors import MetalNonRecoverableError
 
 
 def _record(value):
-    return [4, 1, 0, 128, [1], False, None, None, None,
-            ["template", "shader text\n" * 128, value], None, None]
+    return [4, 1, 0, 128, [1], False, None, None, None, ["template", "shader text\n" * 128, value], None, None]
 
 
 def _encode(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-@pytest.mark.parametrize("wanted,changed", [
-    (1, True), (1, 1.0), (0.0, -0.0), (-0.0, 0.0),
-    (0.0, float("nan")), (0.0, float("inf")),
-    ({"size": [16]}, {"size": [17]}), ("same-size-a", "same-size-b"),
-])
+@pytest.mark.parametrize(
+    "wanted,changed",
+    [
+        (1, True),
+        (1, 1.0),
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (0.0, float("nan")),
+        (0.0, float("inf")),
+        ({"size": [16]}, {"size": [17]}),
+        ("same-size-a", "same-size-b"),
+    ],
+)
 def test_large_record_rejects_json_distinct_aliases(wanted, changed):
     packed = _record(wanted)
     expected = _encode(packed)

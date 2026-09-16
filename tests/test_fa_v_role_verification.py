@@ -51,13 +51,30 @@ sys.path.insert(0, "tests")
 
 @triton.jit
 def _varlen_fwd_private(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     """Private clone of test_varlen_fa_routing._varlen_fwd. Deliberately a COPY, not an
     import: the catch test below monkeypatches the varlen LOWERING, which only runs on
@@ -107,13 +124,31 @@ def _varlen_fwd_private(
 
 @triton.jit
 def _varlen_v_transform(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr, MODE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    MODE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     """Adversarial varlen FA: P@V consumes transformed V, not raw V."""
     start_m = tl.program_id(0)
@@ -180,9 +215,23 @@ def _run_v_transform(mode, lens, H, D, scale):
     max_seqlen = max(lens)
     grid = (triton.cdiv(max_seqlen, block_m), len(lens) * H)
     _varlen_v_transform[grid](
-        q, k, v, out, cu, cu,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        H, max_seqlen, scale, mode, block_m, block_n, D,
+        q,
+        k,
+        v,
+        out,
+        cu,
+        cu,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        H,
+        max_seqlen,
+        scale,
+        mode,
+        block_m,
+        block_n,
+        D,
     )
     torch.mps.synchronize()
     return q, k, v, out, cu
@@ -198,10 +247,21 @@ def _launch(D, causal=False):
     v = torch.randn(Z, H, N, D, device="mps", dtype=torch.float32)
     out = torch.empty_like(q)
     _flash_attn_fwd[(N // 32, Z * H)](
-        q, k, v, out,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        Z, H, N,
-        BLOCK_M=32, BLOCK_N=32, HEAD_DIM=D, IS_CAUSAL=causal,
+        q,
+        k,
+        v,
+        out,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        Z,
+        H,
+        N,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        HEAD_DIM=D,
+        IS_CAUSAL=causal,
     )
     return q, k, v, out
 
@@ -212,9 +272,7 @@ def test_fa_computes_with_v_verification_live():
     # verification does not over-refuse the canonical kernel.
     q, k, v, out = _launch(128)
     torch.mps.synchronize()
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, scale=1.0 / math.sqrt(128)
-    )
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(128))
     err = (out - ref).abs().max().item()
     assert err == err and err < 2e-3, f"FA wrong with V verification live: err {err}"
 
@@ -246,8 +304,7 @@ def test_fa_v_role_disagreement_refuses(monkeypatch):
 
     monkeypatch.setattr(gl.GenericLowerer, "_lower_varlen_flash_attention", evil)
     with pytest.raises(MetalNonRecoverableError, match="V pointer role disagrees"):
-        _run_varlen(_varlen_fwd_private, [64, 32], [64, 32], H=2, D=64,
-                    dtype=torch.float32, scale=1.0 / math.sqrt(64))
+        _run_varlen(_varlen_fwd_private, [64, 32], [64, 32], H=2, D=64, dtype=torch.float32, scale=1.0 / math.sqrt(64))
 
 
 @requires_mps

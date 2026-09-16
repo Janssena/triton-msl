@@ -101,6 +101,7 @@ def test_kda_decode_step_matches_recurrent(monkeypatch):
     """Autoregressive decode (state threaded across steps in place) matches the recurrent form."""
     from tests.cache_helpers import patch_live_singleton_method
     import triton_msl.kda as op
+
     kda_decode_step = op.kda_decode_step
 
     ZH, D, T = 8, 64, 48
@@ -147,7 +148,7 @@ def test_kda_decode_step_matches_recurrent(monkeypatch):
     assert hits == ["kda_decode"] * (2 * T)
     assert torch.equal(poisoned_out[:, :poison_at], out[:, :poison_at])
     assert torch.equal(poisoned_out[1:], out[1:])
-    assert torch.equal(poisoned_out[0, poison_at + 1:], out[0, poison_at + 1:])
+    assert torch.equal(poisoned_out[0, poison_at + 1 :], out[0, poison_at + 1 :])
     assert torch.isnan(poisoned_out[0, poison_at]).all()
     rel = (out - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-4, f"kda_decode_step rel err {rel:.2e}"
@@ -176,11 +177,17 @@ def test_kda_attention_fp16():
 
 
 @requires
-@pytest.mark.parametrize("case,dtype", [
-    ("query_inf", torch.float32), ("query_inf", torch.float16),
-    ("future_value_nan", torch.float32), ("gate_underflow", torch.float32),
-    ("chunk_dot_overflow", torch.float32), ("key_quotient_overflow", torch.float32),
-])
+@pytest.mark.parametrize(
+    "case,dtype",
+    [
+        ("query_inf", torch.float32),
+        ("query_inf", torch.float16),
+        ("future_value_nan", torch.float32),
+        ("gate_underflow", torch.float32),
+        ("chunk_dot_overflow", torch.float32),
+        ("key_quotient_overflow", torch.float32),
+    ],
+)
 def test_kda_prefill_preserves_exceptional_recurrence(case, dtype, monkeypatch):
     """Chunk algebra must not invent Inf*0 or read a future poisoned token."""
     from tests.cache_helpers import patch_live_singleton_method
@@ -196,7 +203,7 @@ def test_kda_prefill_preserves_exceptional_recurrence(case, dtype, monkeypatch):
     elif case == "future_value_nan":
         v[0, 7, 0] = float("nan")
     elif case == "gate_underflow":
-        a[0] = 2 ** -20  # Valid (0,1) gates; the eight-term product underflows.
+        a[0] = 2**-20  # Valid (0,1) gates; the eight-term product underflows.
     else:
         k[0] = 1e20 if case == "chunk_dot_overflow" else 1e38
         v[0] = 0  # State stays exactly zero; no source k*k or k/B exists.

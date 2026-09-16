@@ -20,26 +20,24 @@ class _Tensor:
 
 def test_fixed_abi_helper_checks_shape_dtype_and_device():
     expected = _Tensor((2, 8, 64))
-    kda._require_tensor_abi("k", expected, shape=(2, 8, 64),
-                            dtype=torch.float32, device=torch.device("mps:0"))
-    for tensor, match in ((_Tensor((1, 8, 64)), "shape"),
-                          (_Tensor((2, 8, 64), torch.float16), "dtype"),
-                          (_Tensor((2, 8, 64), device="cpu"), "must be on")):
+    kda._require_tensor_abi("k", expected, shape=(2, 8, 64), dtype=torch.float32, device=torch.device("mps:0"))
+    for tensor, match in (
+        (_Tensor((1, 8, 64)), "shape"),
+        (_Tensor((2, 8, 64), torch.float16), "dtype"),
+        (_Tensor((2, 8, 64), device="cpu"), "must be on"),
+    ):
         with pytest.raises(ValueError, match=match):
-            kda._require_tensor_abi("k", tensor, shape=(2, 8, 64),
-                                    dtype=torch.float32, device=torch.device("mps:0"))
+            kda._require_tensor_abi("k", tensor, shape=(2, 8, 64), dtype=torch.float32, device=torch.device("mps:0"))
 
 
-@pytest.mark.parametrize("peer,shape", [("k", (1, 8, 64)), ("v", (2, 7, 64)),
-                                         ("a", (2, 8, 32)), ("beta", (1, 8))])
+@pytest.mark.parametrize("peer,shape", [("k", (1, 8, 64)), ("v", (2, 7, 64)), ("a", (2, 8, 32)), ("beta", (1, 8))])
 def test_prefill_peer_shape_refuses_before_compilation(monkeypatch, peer, shape):
     tensors = {name: _Tensor((2, 8, 64)) for name in ("q", "k", "v", "a")}
     tensors["beta"] = _Tensor((2, 8))
     tensors[peer] = _Tensor(shape)
     monkeypatch.setattr(kda, "_kernel", lambda **kw: pytest.fail("compiled before validation"))
     with pytest.raises(ValueError, match=peer):
-        kda.kda_attention(tensors["q"], tensors["k"], tensors["v"],
-                          tensors["a"], tensors["beta"])
+        kda.kda_attention(tensors["q"], tensors["k"], tensors["v"], tensors["a"], tensors["beta"])
 
 
 def test_prefill_peer_dtype_and_q_device_refuse_before_compilation(monkeypatch):
@@ -69,8 +67,7 @@ def test_decode_q_dtype_and_peer_abi_refuse_before_compilation(monkeypatch):
     monkeypatch.setattr(kda, "_decode_kernel", lambda: pytest.fail("compiled before validation"))
     half = _Tensor((2, 64), torch.float16)
     with pytest.raises(ValueError, match="supports float32"):
-        kda.kda_decode_step(half, half, half, half, _Tensor((2,), torch.float16),
-                            _Tensor((2, 64, 64), torch.float16))
+        kda.kda_decode_step(half, half, half, half, _Tensor((2,), torch.float16), _Tensor((2, 64, 64), torch.float16))
 
     q = _Tensor((2, 64))
     with pytest.raises(ValueError, match="S must have shape"):

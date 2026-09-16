@@ -58,6 +58,7 @@ def _spy(monkeypatch):
     from triton_msl.backend.driver import _get_compile_shader_runtime
 
     seen = []
+
     def observe(_runtime, original):
         def spy(lib, kernel_name, args, **kw):
             seen.append(kernel_name)
@@ -65,9 +66,7 @@ def _spy(monkeypatch):
 
         return spy
 
-    patch_live_singleton_method(
-        monkeypatch, _get_compile_shader_runtime, "dispatch", observe
-    )
+    patch_live_singleton_method(monkeypatch, _get_compile_shader_runtime, "dispatch", observe)
     return seen
 
 
@@ -140,6 +139,7 @@ def test_flag_off_skips_cached_descriptor(monkeypatch):
     from triton_msl.backend.driver import _get_compile_shader_runtime
 
     seen2 = []
+
     def observe2(_runtime, original):
         def spy2(lib, kernel_name, args, **kw):
             seen2.append(kernel_name)
@@ -147,9 +147,7 @@ def test_flag_off_skips_cached_descriptor(monkeypatch):
 
         return spy2
 
-    patch_live_singleton_method(
-        monkeypatch, _get_compile_shader_runtime, "dispatch", observe2
-    )
+    patch_live_singleton_method(monkeypatch, _get_compile_shader_runtime, "dispatch", observe2)
 
     A, B, C = _launch(256, 256, 256)
     torch.mps.synchronize()

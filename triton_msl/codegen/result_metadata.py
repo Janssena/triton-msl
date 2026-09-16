@@ -3,6 +3,7 @@
 Stage 1a is additive. Unknown facts stay unknown; no emitter consumes these
 records yet and the legacy type parser's defaults are not imported here.
 """
+
 from dataclasses import dataclass
 import re
 from typing import Mapping
@@ -58,13 +59,14 @@ def _resolve_layout(text, aliases, seen=frozenset()):
         token = match.group()
         # An inline dialect attribute is not an alias. Its nested aliases are
         # visited separately by this same substitution.
-        if text[match.end():].lstrip().startswith("<"):
+        if text[match.end() :].lstrip().startswith("<"):
             return token
         if token in seen:
             raise ValueError(f"cyclic layout alias {token}")
         if token not in aliases:
             raise ValueError(f"unresolved layout alias {token}")
         return _resolve_layout(aliases[token], aliases, seen | {token})
+
     return re.sub(r"#[A-Za-z_][\w.]*", replace, text)
 
 
@@ -96,7 +98,7 @@ def parse_type_facts(raw: str, aliases: Mapping[str, str] | None = None) -> Type
             dims = []
             while (match := re.match(r"(\d+|\?)x", text)) is not None:
                 dims.append(None if match.group(1) == "?" else int(match.group(1)))
-                text = text[match.end():]
+                text = text[match.end() :]
             shape = tuple(dims)
             if len(parts) == 2:
                 try:
@@ -113,11 +115,28 @@ def parse_type_facts(raw: str, aliases: Mapping[str, str] | None = None) -> Type
             space = 1 if len(parts) == 1 else int(parts[1])
             if space < 0:
                 raise ValueError("negative pointer address space")
-            return TypeFacts(raw, "pointer", shape=shape, is_tensor=is_tensor,
-                             layout=layout, pointee=pointee, address_space=space, unknown_reason=reason)
-        float_widths = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64,
-                        "f8E4M3FN": 8, "f8E4M3FNUZ": 8, "f8E5M2": 8, "f8E5M2FNUZ": 8,
-                        "f8E4M3B11FNUZ": 8, "f8E8M0FNU": 8}
+            return TypeFacts(
+                raw,
+                "pointer",
+                shape=shape,
+                is_tensor=is_tensor,
+                layout=layout,
+                pointee=pointee,
+                address_space=space,
+                unknown_reason=reason,
+            )
+        float_widths = {
+            "f16": 16,
+            "bf16": 16,
+            "f32": 32,
+            "f64": 64,
+            "f8E4M3FN": 8,
+            "f8E4M3FNUZ": 8,
+            "f8E5M2": 8,
+            "f8E5M2FNUZ": 8,
+            "f8E4M3B11FNUZ": 8,
+            "f8E8M0FNU": 8,
+        }
         signed = None
         if text in float_widths:
             kind, width = "float", float_widths[text]

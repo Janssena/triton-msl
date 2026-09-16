@@ -16,6 +16,7 @@ Two kinds of pin here:
   * a lowering-boundary (emission) pin that proves the corrected per-range stride map
     directly from GenericLowerer on CPU, per collaboration protocol 9 (not GPU-only).
 """
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -32,7 +33,7 @@ requires_mps = pytest.mark.skipif(not _HAS_MPS, reason="Metal GPU required")
 @triton.jit
 def _two_broadcasts(OFLIP, OOTHER):
     a = tl.arange(0, 2)[None, :, None]
-    flip = tl.reshape(tl.broadcast_to(a, [1, 2, 4]), [8])   # middle stride 4 -> [0,0,0,0,1,1,1,1]
+    flip = tl.reshape(tl.broadcast_to(a, [1, 2, 4]), [8])  # middle stride 4 -> [0,0,0,0,1,1,1,1]
     b = tl.arange(0, 2)[None, :, None]
     other = tl.reshape(tl.broadcast_to(b, [4, 2, 1]), [8])  # middle stride 1 -> [0,1,0,1,0,1,0,1]
     idx = tl.arange(0, 8)
@@ -53,7 +54,7 @@ def test_two_broadcasts_same_source_different_targets_each_correct():
 
 @triton.jit
 def _one_source_two_broadcasts(OFLIP, OOTHER):
-    a = tl.arange(0, 2)[None, :, None]        # ONE make_range spelling feeding two broadcasts
+    a = tl.arange(0, 2)[None, :, None]  # ONE make_range spelling feeding two broadcasts
     flip = tl.reshape(tl.broadcast_to(a, [1, 2, 4]), [8])
     other = tl.reshape(tl.broadcast_to(a, [4, 2, 1]), [8])
     idx = tl.arange(0, 8)
@@ -138,8 +139,7 @@ def _lower(kernel):
     src = ASTSource(kernel, signature={"OA": "*i32", "OB": "*i32"}, constexprs={})
     ctx = ir.context()
     ir.load_dialects(ctx)
-    mod = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                      backend.get_module_map(), ctx)
+    mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
     meta = {}
     mod = backend.make_ttir(mod, meta, options)
     mod = backend.make_ttgir(mod, meta, options)
@@ -149,8 +149,7 @@ def _lower(kernel):
     return msl, lower
 
 
-@pytest.mark.parametrize("kernel", [_cmp_derived_broadcasts, _select_derived_broadcasts],
-                         ids=["comparison", "select"])
+@pytest.mark.parametrize("kernel", [_cmp_derived_broadcasts, _select_derived_broadcasts], ids=["comparison", "select"])
 def test_coordinate_preserving_broadcast_targets_emit_distinct_strides(kernel):
     """The corrected per-range map must record exactly two distinct broadcast targets
     with strides {1, 4}, and the emitted MSL must carry both index expressions — proving

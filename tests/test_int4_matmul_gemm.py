@@ -6,6 +6,7 @@ tt.dot contracts the activation over the same k). A non-standard packing (high-n
 -first `(k+1)%2` single-swap, or `(k+1)//2 + (k+1)%2` double-swap) REFUSES instead of
 silently dequantizing the wrong nibble.
 """
+
 import pytest
 import torch
 import triton
@@ -21,12 +22,34 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _int4_gemm(
-    a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K,
-    sam, sak, wbk, wsn, scm, scn, ssg, ssn, zsg, zsn,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    s_ptr,
+    z_ptr,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    wbk,
+    wsn,
+    scm,
+    scn,
+    ssg,
+    ssn,
+    zsg,
+    zsn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
 ):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    rm = pid_m * BM + tl.arange(0, BM); rn = pid_n * BN + tl.arange(0, BN); ok = tl.arange(0, BK)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         kk = k + ok
@@ -42,18 +65,40 @@ def _int4_gemm(
 
 @triton.jit
 def _int4_gemm_highfirst(
-    a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K,
-    sam, sak, wbk, wsn, scm, scn, ssg, ssn, zsg, zsn,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    s_ptr,
+    z_ptr,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    wbk,
+    wsn,
+    scm,
+    scn,
+    ssg,
+    ssn,
+    zsg,
+    zsn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
 ):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    rm = pid_m * BM + tl.arange(0, BM); rn = pid_n * BN + tl.arange(0, BN); ok = tl.arange(0, BK)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         kk = k + ok
         a = tl.load(a_ptr + rm[:, None] * sam + kk[None, :] * sak)
         packed = tl.load(w_ptr + (kk // 2)[:, None] * wbk + rn[None, :] * wsn)
-        w4 = (packed >> (((kk + 1) % 2) * 4)[:, None]) & 0xF   # HIGH nibble for even k
+        w4 = (packed >> (((kk + 1) % 2) * 4)[:, None]) & 0xF  # HIGH nibble for even k
         g = k // G
         s = tl.load(s_ptr + g * ssg + rn * ssn)
         z = tl.load(z_ptr + g * zsg + rn * zsn)
@@ -63,16 +108,38 @@ def _int4_gemm_highfirst(
 
 @triton.jit
 def _int4_gemm_doubleswap(
-    a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K,
-    sam, sak, wbk, wsn, scm, scn, ssg, ssn, zsg, zsn,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr,
+    a_ptr,
+    w_ptr,
+    c_ptr,
+    s_ptr,
+    z_ptr,
+    M,
+    N,
+    K,
+    sam,
+    sak,
+    wbk,
+    wsn,
+    scm,
+    scn,
+    ssg,
+    ssn,
+    zsg,
+    zsn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    G: tl.constexpr,
 ):
-    pid_m = tl.program_id(0); pid_n = tl.program_id(1)
-    rm = pid_m * BM + tl.arange(0, BM); rn = pid_n * BN + tl.arange(0, BN); ok = tl.arange(0, BK)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rm = pid_m * BM + tl.arange(0, BM)
+    rn = pid_n * BN + tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):
         kk = k + ok
-        kk2 = kk + 1                                           # byte AND nibble shifted
+        kk2 = kk + 1  # byte AND nibble shifted
         a = tl.load(a_ptr + rm[:, None] * sam + kk[None, :] * sak)
         packed = tl.load(w_ptr + (kk2 // 2)[:, None] * wbk + rn[None, :] * wsn)
         w4 = (packed >> ((kk2 % 2) * 4)[:, None]) & 0xF
@@ -84,15 +151,19 @@ def _int4_gemm_doubleswap(
 
 
 def _setup(M, N, K, G, wlayout, slayout):
-    dev = "mps"; torch.manual_seed(0); ng = K // G
+    dev = "mps"
+    torch.manual_seed(0)
+    ng = K // G
     a = torch.randn(M, K, device=dev)
     w4 = torch.randint(0, 16, (K, N), device=dev, dtype=torch.int32)
     packed_kn = (w4[0::2, :] | (w4[1::2, :] << 4)).to(torch.uint8).contiguous()
     if wlayout == "kn":
-        weight = packed_kn; wbk, wsn = weight.stride(0), weight.stride(1)
+        weight = packed_kn
+        wbk, wsn = weight.stride(0), weight.stride(1)
     else:
-        weight = packed_kn.t().contiguous(); wbk, wsn = weight.stride(1), weight.stride(0)
-    scale = (torch.rand(ng, N, device=dev) * 0.02 + 0.005)
+        weight = packed_kn.t().contiguous()
+        wbk, wsn = weight.stride(1), weight.stride(0)
+    scale = torch.rand(ng, N, device=dev) * 0.02 + 0.005
     zero = torch.randint(0, 16, (ng, N), device=dev).float()
     if slayout == "gn":
         s_t, z_t = scale.contiguous(), zero.contiguous()
@@ -103,8 +174,26 @@ def _setup(M, N, K, G, wlayout, slayout):
     c = torch.zeros(M, N, device=dev)
     gi = torch.arange(K, device=dev) // G
     ref = a @ ((w4.float() - zero[gi, :]) * scale[gi, :])
-    args = (a, weight, c, s_t, z_t, M, N, K, a.stride(0), a.stride(1), wbk, wsn,
-            c.stride(0), c.stride(1), ssg, ssn, zsg, zsn)
+    args = (
+        a,
+        weight,
+        c,
+        s_t,
+        z_t,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        wbk,
+        wsn,
+        c.stride(0),
+        c.stride(1),
+        ssg,
+        ssn,
+        zsg,
+        zsn,
+    )
     return args, c, ref
 
 

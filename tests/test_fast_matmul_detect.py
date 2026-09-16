@@ -86,10 +86,14 @@ def _clear_jit_caches():
             if store is None:
                 continue
             try:
-                if hasattr(store, "values") and store and all(hasattr(v, "clear") or isinstance(v, (list, tuple, dict)) for v in store.values()):
+                if (
+                    hasattr(store, "values")
+                    and store
+                    and all(hasattr(v, "clear") or isinstance(v, (list, tuple, dict)) for v in store.values())
+                ):
                     for v in store.values():
                         # device_caches maps device -> (kernel_cache_dict, ...)
-                        for part in (v if isinstance(v, (list, tuple)) else (v,)):
+                        for part in v if isinstance(v, (list, tuple)) else (v,):
                             if hasattr(part, "clear"):
                                 part.clear()
                 store.clear()

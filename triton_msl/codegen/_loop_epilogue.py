@@ -179,8 +179,9 @@ def eligible(lowerer):
         op = replacements.get(vid, by.get(vid))
         if op is not None:
             pending.extend(op.operand_ids)
-    projected = replace(graph, ops=[projected_store if o is store else replacements.get(o.id, o)
-                                   for o in graph.ops if o.id in keep])
+    projected = replace(
+        graph, ops=[projected_store if o is store else replacements.get(o.id, o) for o in graph.ops if o.id in keep]
+    )
     proof = type(lowerer)(projected, lowerer.options)._dot_template_value_paths()
     return proof[0] is None
 
@@ -192,7 +193,7 @@ def deferred_wide_ops(lowerer):
     must not run before the per-element replay, which needs the raw loop result.
     Pointer/mask computation and the source bias load still emit normally.
     """
-    by = {o.id:o for o in lowerer.graph.ops}
+    by = {o.id: o for o in lowerer.graph.ops}
     store = next(o for o in lowerer.graph.ops if o.op == "tt.store")
     shape = lowerer._native_shape(store.operand_ids[0], op_name="tt.store")
     if shape[0] * shape[1] <= 1024:
@@ -236,11 +237,12 @@ def emit_store(lowerer, store):
     desc = getattr(lowerer, "_shared_mem_descs", {}).get(root)
     if wide and (desc is None or desc[1] != shape or desc[2] != "fp32"):
         raise MetalNonRecoverableError("wide epilogue lacks its exact carried accumulator storage")
-    by = {o.id:o for o in lowerer.graph.ops}
+    by = {o.id: o for o in lowerer.graph.ops}
     all_by = dict(by)
-    all_by.update({o.id:o for o in loop.region_ops})
-    memo = {root:f"{desc[0]}[_st]"} if wide else {}
+    all_by.update({o.id: o for o in loop.region_ops})
+    memo = {root: f"{desc[0]}[_st]"} if wide else {}
     declarations = []
+
     def value(vid):
         if vid in memo:
             return memo[vid]
@@ -253,7 +255,7 @@ def emit_store(lowerer, store):
         if op.op in ("tt.splat", "tt.expand_dims", "tt.broadcast", "ttg.convert_layout"):
             return value(op.operand_ids[0])
         if op.op in ("arith.extf", "arith.truncf"):
-            dtype = {"f16":"half", "bf16":"bfloat", "f32":"float"}[op.elem_type]
+            dtype = {"f16": "half", "bf16": "bfloat", "f32": "float"}[op.elem_type]
             expression = f"float(static_cast<{dtype}>({value(op.operand_ids[0])}))"
         elif op.op in ("arith.addf", "arith.mulf"):
             symbol = "+" if op.op == "arith.addf" else "*"
@@ -264,9 +266,11 @@ def emit_store(lowerer, store):
         declarations.append(f"        float {name} = {expression};")
         memo[vid] = name
         return name
+
     result = value(store.operand_ids[1]) if wide else lowerer._lookup(store.operand_ids[1])
     base, _ = lowerer.env_is_ptr[store.operand_ids[0]]
     offset = lowerer._rebuild_staged_fill_offset(store.operand_ids[0], all_by, base, bm, bn)
+
     def replay_mask(vid):
         op = all_by.get(vid)
         if op is not None and op.op in ("tt.broadcast", "ttg.convert_layout"):
@@ -274,6 +278,7 @@ def emit_store(lowerer, store):
         if op is not None and op.op == "arith.andi" and len(op.operand_ids) == 2:
             return f"({replay_mask(op.operand_ids[0])} && {replay_mask(op.operand_ids[1])})"
         return lowerer._rebuild_staged_fill_mask(vid, all_by, bm, bn)
+
     mask = replay_mask(store.operand_ids[2]) if len(store.operand_ids) > 2 else None
     storage = triton_type_to_msl(lowerer._trace_ptr_dtype(store.operand_ids[0]))
     lowerer.kb.raw_line(f"    for (uint _st = lid; _st < {bm * bn}u; _st += {width}u) {{")

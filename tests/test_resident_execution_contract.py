@@ -2,6 +2,7 @@
 
 Controlled CPU launcher witnesses, not a GPU warm-upgrade or packed-ABI proof.
 """
+
 import json
 from types import SimpleNamespace
 
@@ -15,21 +16,32 @@ from triton_msl.errors import MetalNonRecoverableError
 
 def _stamp():
     # Independent literal schema oracle also works before the producer exists.
-    return json.dumps({"schema": 1, "source": contract.source_contract(),
-                       "toolchain": contract.toolchain_identity()}, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        {"schema": 1, "source": contract.source_contract(), "toolchain": contract.toolchain_identity()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def test_stamp_text_reuse_never_reuses_live_validation(monkeypatch):
-    source = {"schema": 3, "implementation": "implementation", "frameworks": "framework",
-              "label": "label", "policy": {key: False for key in contract._STAMP_FLAGS}}
+    source = {
+        "schema": 3,
+        "implementation": "implementation",
+        "frameworks": "framework",
+        "label": "label",
+        "policy": {key: False for key in contract._STAMP_FLAGS},
+    }
     source["policy"]["CPP_SKIP"] = ""
     calls = []
+
     def current():
         calls.append("source")
         return source
+
     def toolchain():
         calls.append("toolchain")
         return "toolchain"
+
     monkeypatch.setattr(contract, "source_contract", current)
     monkeypatch.setattr(contract, "toolchain_identity", toolchain)
     contract._encode_known_stamp.cache_clear()
@@ -38,8 +50,12 @@ def test_stamp_text_reuse_never_reuses_live_validation(monkeypatch):
     assert calls == ["source", "toolchain", "source", "toolchain"]
     assert contract._encode_known_stamp.cache_info().hits == 1
     # Same dict, changed primitive or schema, and Python-equal JSON type aliases.
-    for key, value in [*((key, True) for key in contract._STAMP_FLAGS),
-                       ("CPP_SKIP", "changed"), ("FA_FAST", 0), ("FA_FAST", 1.0)]:
+    for key, value in [
+        *((key, True) for key in contract._STAMP_FLAGS),
+        ("CPP_SKIP", "changed"),
+        ("FA_FAST", 0),
+        ("FA_FAST", 1.0),
+    ]:
         prior = source["policy"][key]
         source["policy"][key] = value
         assert contract.execution_contract() == _stamp()
@@ -53,8 +69,10 @@ def test_stamp_text_reuse_never_reuses_live_validation(monkeypatch):
     source["extra"][0] = "changed"
     assert contract.execution_contract() != before
     assert contract.execution_contract() == _stamp()
+
     def failed_check():
         raise MetalNonRecoverableError("current native identity failed")
+
     monkeypatch.setattr(contract, "toolchain_identity", failed_check)
     with pytest.raises(MetalNonRecoverableError, match="current native identity failed"):
         contract.execution_contract()
@@ -67,17 +85,47 @@ def controlled_dependencies(monkeypatch, tmp_path):
 
 
 def _metadata(stamp):
-    data = dict(name="execution_contract", num_warps=4, num_ctas=1,
-                shared=0, block_size=128, execution_contract=stamp,
-                output_arg_indices=None, needs_2d_grid=False, mm_two_kernel=None,
-                fast_matmul=None, quant_matmul=None, flash_attention=None, batched_dot_bounds=None, device_assert=None)
-    fields = ("num_warps", "num_ctas", "shared", "block_size", "output_arg_indices",
-              "needs_2d_grid", "mm_two_kernel", "fast_matmul", "quant_matmul",
-              "flash_attention", "batched_dot_bounds", "device_assert")
+    data = dict(
+        name="execution_contract",
+        num_warps=4,
+        num_ctas=1,
+        shared=0,
+        block_size=128,
+        execution_contract=stamp,
+        output_arg_indices=None,
+        needs_2d_grid=False,
+        mm_two_kernel=None,
+        fast_matmul=None,
+        quant_matmul=None,
+        flash_attention=None,
+        batched_dot_bounds=None,
+        device_assert=None,
+    )
+    fields = (
+        "num_warps",
+        "num_ctas",
+        "shared",
+        "block_size",
+        "output_arg_indices",
+        "needs_2d_grid",
+        "mm_two_kernel",
+        "fast_matmul",
+        "quant_matmul",
+        "flash_attention",
+        "batched_dot_bounds",
+        "device_assert",
+    )
     data["launch_contract"] = json.dumps(
-        {"schema": 2, "kind": "metal-packed-launch", "name": data["name"],
-         "execution_contract": stamp, "fields": {f: data[f] for f in fields}},
-        sort_keys=True, separators=(",", ":"))
+        {
+            "schema": 2,
+            "kind": "metal-packed-launch",
+            "name": data["name"],
+            "execution_contract": stamp,
+            "fields": {f: data[f] for f in fields},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return SimpleNamespace(**data)
 
 
@@ -90,27 +138,38 @@ def _launcher(stamp):
 def test_unbound_restored_launcher_refuses_before_stash(value, monkeypatch):
     def forbidden(*args):
         pytest.fail("unbound launcher reached a cache lookup")
+
     monkeypatch.setattr(compiler, "_load_stashed_msl", forbidden)
     with pytest.raises(MetalNonRecoverableError, match="execution contract"):
         _launcher(value)
 
 
-@pytest.mark.parametrize("name,a,b", [
-    ("MEPT", "1", "0"), ("QUANT_MATMUL", "1", "0"),
-    ("FAST_MATMUL", "1", "0"), ("COMPILE_SHADER", "1", "0"),
-    ("FA_FAST", "1", "0"), ("INFER_LAYOUT", "1", "0"),
-    ("LEGACY", "1", "0"), ("USE_CPP", "0", "1"),
-    ("FORCE_PYTHON", "0", "1"), ("FA_HALF_ACCUM", "0", "1"),
-    ("CPP_SKIP", "", "reduce"),
-])
+@pytest.mark.parametrize(
+    "name,a,b",
+    [
+        ("MEPT", "1", "0"),
+        ("QUANT_MATMUL", "1", "0"),
+        ("FAST_MATMUL", "1", "0"),
+        ("COMPILE_SHADER", "1", "0"),
+        ("FA_FAST", "1", "0"),
+        ("INFER_LAYOUT", "1", "0"),
+        ("LEGACY", "1", "0"),
+        ("USE_CPP", "0", "1"),
+        ("FORCE_PYTHON", "0", "1"),
+        ("FA_HALF_ACCUM", "0", "1"),
+        ("CPP_SKIP", "", "reduce"),
+    ],
+)
 def test_resident_policy_change_refuses_before_hooks_or_runtime(monkeypatch, name, a, b):
     monkeypatch.setenv("TRITON_MSL_" + name, a)
     launcher = _launcher(_stamp())
     monkeypatch.setenv("TRITON_MSL_" + name, b)
     events = []
+
     def runtime():
         events.append("runtime")
         pytest.fail("stale launcher reached the runtime")
+
     monkeypatch.setattr(driver, "_get_utils", runtime)
     with pytest.raises(MetalNonRecoverableError, match="execution contract"):
         launcher(1, 1, 1, None, None, None, None, lambda _: events.append("enter"), None)
@@ -131,11 +190,15 @@ def test_current_handle_reaches_existing_launch_boundary(monkeypatch):
     # is genuinely stale and must not be accepted just to reach this sentinel.
     backend = compiler.MetalBackend(GPUTarget("metal", "apple-m4", 32))
     launcher = _launcher(_stamp())
+
     class ReachedRuntime(Exception):
         pass
+
     events = []
+
     def runtime():
         raise ReachedRuntime
+
     monkeypatch.setattr(driver, "_get_utils", runtime)
     with pytest.raises(ReachedRuntime):
         packed = backend.pack_metadata(_metadata(_stamp()))
@@ -160,6 +223,7 @@ def test_only_successful_unchanged_compile_produces_execution_stamp(monkeypatch,
     if change.startswith("native-"):
         monkeypatch.setattr(contract, "framework_identity", lambda: native[0])
     calls = []
+
     def produce(source, metadata, options):
         calls.append("compile")
         if change == "during":
@@ -167,6 +231,7 @@ def test_only_successful_unchanged_compile_produces_execution_stamp(monkeypatch,
         if change == "native-during":
             native[0] = "original-loaded-order-plus-interposed-provider"
         return b"controlled fresh binary"
+
     monkeypatch.setattr(backend, "make_metallib", produce)
     stages = {}
     backend.add_stages(stages, compiler.MetalOptions())
@@ -221,10 +286,11 @@ def test_per_jit_guard_preserves_user_hooks_and_only_clears_its_owner(monkeypatc
 def test_guard_does_not_keep_a_jit_function_alive():
     import gc
     import weakref
+
     owner = _HookableJit()
     ref = weakref.ref(owner)
     assert contract.install_jit_policy_guard(owner, _stamp())
-    guard, = owner.pre_run_hooks
+    (guard,) = owner.pre_run_hooks
     del owner
     gc.collect()
     assert ref() is None

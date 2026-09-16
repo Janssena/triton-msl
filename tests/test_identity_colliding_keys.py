@@ -1,4 +1,5 @@
 """Foreign colliding keys force the complete evaluator without a fast hit."""
+
 import os
 import sys
 from types import ModuleType
@@ -67,12 +68,20 @@ def _outcome(scenario, mode, api, name, baseline):
     hits = fast._stats["hits"]
     try:
         try:
-            value = (cache.execution_contract() if api == "execution_contract"
-                     else cache.validate_execution_contract(baseline))
+            value = (
+                cache.execution_contract()
+                if api == "execution_contract"
+                else cache.validate_execution_contract(baseline)
+            )
             result = ("value", value == baseline, None, None, None)
         except BaseException as exc:
-            result = ("exception", None, type(exc), str(exc),
-                      (type(exc.__cause__), str(exc.__cause__)) if exc.__cause__ else None)
+            result = (
+                "exception",
+                None,
+                type(exc),
+                str(exc),
+                (type(exc.__cause__), str(exc.__cause__)) if exc.__cause__ else None,
+            )
         return result, len(calls), fast._stats["hits"] - hits
     finally:
         sys.modules.pop(key, None)

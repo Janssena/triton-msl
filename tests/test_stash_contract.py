@@ -1,4 +1,5 @@
 """Memory and disk source stashes must validate the same semantic product."""
+
 import json
 
 import pytest
@@ -31,6 +32,7 @@ def test_stash_policy_transition_misses_in_memory_and_on_disk(disk, monkeypatch)
 @pytest.mark.parametrize("disk", [False, True])
 def test_stash_implementation_transition_misses(disk, monkeypatch):
     from triton_msl.backend import _cache_contract
+
     compiler._stash_msl(SOURCE, KEY, 64)
     if disk:
         compiler._MSL_BY_KEY.clear()
@@ -92,12 +94,14 @@ def test_identical_source_different_keys_stay_independent():
 
 def test_stash_envelope_cannot_impersonate_source_product(isolated_stash):
     from triton_msl.backend._cache_contract import read_metadata
+
     compiler._stash_msl(SOURCE, KEY, 64)
     assert read_metadata(SOURCE, isolated_stash / f"{KEY}.mslstash", KEY) is None
 
 
 def test_source_product_cannot_impersonate_stash(isolated_stash):
     from triton_msl.backend._cache_contract import metadata_record
+
     record = json.loads(metadata_record(SOURCE, {"block_size": 64}, KEY))
     record["msl"] = SOURCE
     (isolated_stash / f"{KEY}.mslstash").write_text(json.dumps(record))
@@ -108,6 +112,7 @@ def test_source_product_cannot_impersonate_stash(isolated_stash):
 def test_invalid_stash_key_cannot_reach_disk_lookup(key, monkeypatch):
     def forbidden():
         pytest.fail("invalid cache identity reached the filesystem")
+
     monkeypatch.setattr(compiler, "_get_cache_dir", forbidden)
     compiler._stash_msl(SOURCE, key, 64)
     assert compiler._load_stashed_msl(key) is None
@@ -120,10 +125,12 @@ def test_same_process_concurrent_stash_writers_use_distinct_temporary_files(isol
     real = compiler.os.replace
     barrier = threading.Barrier(2)
     names = []
+
     def replace(src, dst):
         names.append(src)
         barrier.wait(timeout=5)
         real(src, dst)
+
     monkeypatch.setattr(compiler.os, "replace", replace)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(compiler._stash_msl, SOURCE, KEY, 64) for _ in range(2)]

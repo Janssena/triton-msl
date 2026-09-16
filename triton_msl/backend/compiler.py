@@ -36,14 +36,16 @@ def _warn_cpp_unaudited():
     warnings.warn(
         "C++ lowering is an unaudited development route; its binaries are not covered "
         "by the Python/MSL correctness proofs. binary_route records compilation, not GPU dispatch.",
-        UserWarning, stacklevel=3,
+        UserWarning,
+        stacklevel=3,
     )
 
 
 def _warn_cpp_fallback(metadata, reason):
     warnings.warn(
         f"C++ route for {metadata.get('name', 'kernel')}: {reason}; using MSL instead.",
-        UserWarning, stacklevel=3,
+        UserWarning,
+        stacklevel=3,
     )
 
 
@@ -82,8 +84,13 @@ def _stash_msl(msl_src, key, block_size=None):
     so it must use this size — using the clobbered metadata size silently
     mis-launches MEPT kernels (MSL sizePerThread>1 uses fewer threads).
     """
-    if (not _valid_stash_key(key) or not isinstance(msl_src, str) or not msl_src
-            or type(block_size) is not int or not 1 <= block_size <= 1024):
+    if (
+        not _valid_stash_key(key)
+        or not isinstance(msl_src, str)
+        or not msl_src
+        or type(block_size) is not int
+        or not 1 <= block_size <= 1024
+    ):
         return
     import json
     from triton_msl.backend._cache_contract import metadata_record
@@ -100,8 +107,9 @@ def _stash_msl(msl_src, key, block_size=None):
         path = os.path.join(directory, f"{key}.mslstash")
         # Unique per writer, including threads in the same process. Always
         # replace a stale/corrupt old product when a legitimate compile finishes.
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
-                                         prefix=f"{key}.", suffix=".tmp", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, prefix=f"{key}.", suffix=".tmp", delete=False
+        ) as f:
             tmp = f.name
             f.write(payload)
         os.replace(tmp, path)
@@ -459,8 +467,8 @@ class MetalBackend(BaseBackend):
                 from triton_msl.backend.cpp_families import cpp_refusal_reason
 
                 reason = cpp_refusal_reason(ttgir_text) if ttgir_text else "saved TTGIR unavailable"
-                if metadata.get('device_assert') is not None:
-                    reason = 'retained assertions require the checked MSL launch ABI'
+                if metadata.get("device_assert") is not None:
+                    reason = "retained assertions require the checked MSL launch ABI"
                 if reason is None and MetalBackend._has_complex_ops(ttgir_text):
                     reason = "operations, dtype or layout outside the experimental C++ envelope"
                 if reason is None:
@@ -517,6 +525,7 @@ class MetalBackend(BaseBackend):
             stages["msl"] = _msl_with_cpp
             stages["metallib"] = _metallib_via_cpp
         else:
+
             def _metallib_msl(src, metadata):
                 reason = "optional extension unavailable" if use_cpp else None
                 if reason:
@@ -525,6 +534,7 @@ class MetalBackend(BaseBackend):
                 metadata["binary_route"] = "msl"
                 metadata["cpp_fallback_reason"] = reason
                 return result
+
             stages["metallib"] = _metallib_msl
 
         # Only a successful compile under an unchanged policy may stamp a
@@ -1474,9 +1484,11 @@ class MetalBackend(BaseBackend):
         Python/MSL path.
         """
         from triton_msl.backend.cpp_families import cpp_refusal_reason
+
         reason = cpp_refusal_reason(str(mod))
         if reason is not None:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(f"C++ route: {reason}; use the independently generated MSL path")
         import triton_msl._triton_msl_cpp as cpp
         from triton_msl.debug import _debug_level, _dump_dir
@@ -2493,8 +2505,7 @@ class MetalBackend(BaseBackend):
 
         with _compilation_runtime_lock:
             _get_utils().device
-            if (os.environ.get("TRITON_MSL_USE_CPP") == "1"
-                    and os.environ.get("TRITON_MSL_FORCE_PYTHON") != "1"):
+            if os.environ.get("TRITON_MSL_USE_CPP") == "1" and os.environ.get("TRITON_MSL_FORCE_PYTHON") != "1":
                 self._has_cpp_passes()
 
     def hash(self):
@@ -2504,17 +2515,20 @@ class MetalBackend(BaseBackend):
         # launcher validation is a separate required boundary.
         self._initialize_compilation_runtime()
         from triton_msl.backend._cache_contract import _digest, source_contract, toolchain_identity
+
         # Actual package content (including native artifacts), source schema,
         # and CURRENT effective policy supplement the human version label.
         # Both persistent Triton and inner binary caches bind the selected actual
         # compiler bundle/SDK bytes. No shared "unknown" toolchain identity.
-        return "metal-" + _digest({
-            "kind": "triton-backend-source-contract",
-            "contract": source_contract(),
-            "target": {
-                "backend": self.target.backend,
-                "arch": self.target.arch,
-                "warp_size": self.target.warp_size,
-            },
-            "toolchain": toolchain_identity(),
-        })
+        return "metal-" + _digest(
+            {
+                "kind": "triton-backend-source-contract",
+                "contract": source_contract(),
+                "target": {
+                    "backend": self.target.backend,
+                    "arch": self.target.arch,
+                    "warp_size": self.target.warp_size,
+                },
+                "toolchain": toolchain_identity(),
+            }
+        )

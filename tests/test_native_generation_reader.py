@@ -1,4 +1,5 @@
 """Own-process ABI, fail-closed states, and real same-count dlclose/dlopen."""
+
 import ctypes as C
 import json
 import os
@@ -11,6 +12,7 @@ import pytest
 
 def _info():
     from triton_msl.backend._native_generation import _ImageInfosPrefix
+
     info = _ImageInfosPrefix()
     info.version = 17
     info.infoArray = 4096
@@ -20,11 +22,20 @@ def _info():
     return info
 
 
-@pytest.mark.parametrize("field,value", [("version", 99), ("dyldAllImageInfosAddress", 1),
-                                        ("infoArray", 0), ("infoArrayCount", 0),
-                                        ("infoArrayCount", 1_000_001), ("infoArrayChangeTimestamp", 0)])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("version", 99),
+        ("dyldAllImageInfosAddress", 1),
+        ("infoArray", 0),
+        ("infoArrayCount", 0),
+        ("infoArrayCount", 1_000_001),
+        ("infoArrayChangeTimestamp", 0),
+    ],
+)
 def test_invalid_generation_state_cannot_be_read_as_stable(field, value):
     from triton_msl.backend._native_generation import _GenerationReader
+
     info = _info()
     reader = _GenerationReader(info, C.addressof(info))
     setattr(info, field, value)
@@ -35,6 +46,7 @@ def test_invalid_generation_state_cannot_be_read_as_stable(field, value):
 @pytest.mark.parametrize("version", [0, 1, 14, 19, 2**32 - 1])
 def test_unknown_prefix_version_is_not_certified(version):
     from triton_msl.backend._native_generation import _GenerationReader
+
     info = _info()
     info.version = version
     with pytest.raises(RuntimeError, match="version"):
@@ -43,6 +55,7 @@ def test_unknown_prefix_version_is_not_certified(version):
 
 def test_generation_token_tracks_timestamp_pointer_and_count():
     from triton_msl.backend._native_generation import _GenerationReader
+
     info = _info()
     reader = _GenerationReader(info, C.addressof(info))
     assert reader() == (100, 4096, 2)
@@ -53,10 +66,12 @@ def test_generation_token_tracks_timestamp_pointer_and_count():
     assert reader() == (101, 8192, 3)
 
 
-@pytest.mark.parametrize("result", [(0, 368, 1), (-8, 368, 1), (1 << 64, 368, 1),
-                                   (4097, 368, 1), (4096, 191, 1), (4096, 368, 0)])
+@pytest.mark.parametrize(
+    "result", [(0, 368, 1), (-8, 368, 1), (1 << 64, 368, 1), (4097, 368, 1), (4096, 191, 1), (4096, 368, 0)]
+)
 def test_unproved_task_info_retains_full_scan(monkeypatch, result):
     from triton_msl.backend import _native_generation as module
+
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(module, "_task_image_info", lambda: result)
@@ -65,10 +80,13 @@ def test_unproved_task_info_retains_full_scan(monkeypatch, result):
 
 def test_unavailable_task_info_retains_full_scan(monkeypatch):
     from triton_msl.backend import _native_generation as module
+
     monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.setattr(module.platform, "machine", lambda: "arm64")
+
     def unavailable():
         raise RuntimeError("unavailable own-process query")
+
     monkeypatch.setattr(module, "_task_image_info", unavailable)
     assert module.create_generation_reader() is None
 
@@ -76,8 +94,9 @@ def test_unavailable_task_info_retains_full_scan(monkeypatch):
 @pytest.mark.skipif(sys.platform != "darwin" or platform.machine() != "arm64", reason="Apple arm64 ABI")
 def test_prefix_offsets_match_the_selected_sdk(tmp_path):
     from triton_msl.backend._native_generation import _ImageInfosPrefix
+
     source, executable = tmp_path / "offsets.c", tmp_path / "offsets"
-    source.write_text('''#include <stdbool.h>
+    source.write_text("""#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <mach/task_info.h>
@@ -89,23 +108,28 @@ int main(void) {
   offsetof(struct dyld_all_image_infos, infoArrayChangeTimestamp));
  return 0;
 }
-''')
+""")
     subprocess.run(["xcrun", "clang", str(source), "-o", str(executable)], check=True, capture_output=True)
     result = json.loads(subprocess.check_output([str(executable)], text=True))
-    assert result == {"task_size": 20, "task_count": 5,
-                      "self": _ImageInfosPrefix.dyldAllImageInfosAddress.offset,
-                      "timestamp": _ImageInfosPrefix.infoArrayChangeTimestamp.offset}
+    assert result == {
+        "task_size": 20,
+        "task_count": 5,
+        "self": _ImageInfosPrefix.dyldAllImageInfosAddress.offset,
+        "timestamp": _ImageInfosPrefix.infoArrayChangeTimestamp.offset,
+    }
 
 
 @pytest.mark.skipif(sys.platform != "darwin" or platform.machine() != "arm64", reason="Apple arm64 dyld")
 def test_real_same_count_library_replacement_changes_generation(tmp_path):
     from triton_msl.backend._native_generation import create_generation_reader
+
     libraries = []
     for value in (1, 2):
         source, library = tmp_path / f"image{value}.c", tmp_path / f"image{value}.dylib"
         source.write_text(f"int generation_probe(void) {{ return {value}; }}\n")
-        subprocess.run(["xcrun", "clang", "-dynamiclib", str(source), "-o", str(library)],
-                       check=True, capture_output=True)
+        subprocess.run(
+            ["xcrun", "clang", "-dynamiclib", str(source), "-o", str(library)], check=True, capture_output=True
+        )
         libraries.append(library)
     reader = create_generation_reader()
     assert reader is not None, "the supported host must prove the fast reader, not silently fall back"

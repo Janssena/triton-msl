@@ -35,10 +35,33 @@ requires_mps = pytest.mark.skipif(
 
 
 @triton.jit
-def _varlen_overhang(Q, K, V, Out, cu_q, cu_k,
-                     sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
-                     H, GROUP, max_seqlen, SCALE: tl.constexpr,
-                     BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
+def _varlen_overhang(
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    sqt,
+    sqh,
+    sqd,
+    skt,
+    skh,
+    skd,
+    svt,
+    svh,
+    svd,
+    sot,
+    soh,
+    sod,
+    H,
+    GROUP,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
     """Varlen FA on a GQA head so it lowers generically. With ragged lengths the final
     K/V block of the SHORTER sequence begins past the end of the packed tensor — the
     tile that the staged fill used to read unguarded."""
@@ -54,33 +77,33 @@ def _varlen_overhang(Q, K, V, Out, cu_q, cu_k,
     om = sm * BM + tl.arange(0, BM)
     on = tl.arange(0, BN)
     od = tl.arange(0, D)
-    q = tl.load(Q + (qs + om)[:, None] * sqt + h * sqh + od[None, :] * sqd,
-                mask=om[:, None] < slq, other=0.) * SCALE
+    q = tl.load(Q + (qs + om)[:, None] * sqt + h * sqh + od[None, :] * sqd, mask=om[:, None] < slq, other=0.0) * SCALE
     mi = tl.full([BM], float("-inf"), tl.float32)
     li = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
     for sn in range(0, max_seqlen, BN):
         kn = sn + on
-        k = tl.load(K + (ks + kn)[:, None] * skt + hkv * skh + od[None, :] * skd,
-                    mask=kn[:, None] < slk, other=0.)
+        k = tl.load(K + (ks + kn)[:, None] * skt + hkv * skh + od[None, :] * skd, mask=kn[:, None] < slk, other=0.0)
         qk = tl.where(kn[None, :] < slk, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
         m2 = tl.maximum(mi, tl.max(qk, 1))
         a = tl.exp(mi - m2)
         p = tl.exp(qk - m2[:, None])
         li = li * a + tl.sum(p, 1)
         acc = acc * a[:, None]
-        vv = tl.load(V + (ks + kn)[:, None] * svt + hkv * svh + od[None, :] * svd,
-                     mask=kn[:, None] < slk, other=0.)
+        vv = tl.load(V + (ks + kn)[:, None] * svt + hkv * svh + od[None, :] * svd, mask=kn[:, None] < slk, other=0.0)
         acc += tl.dot(p.to(tl.float32), vv.to(tl.float32))
         mi = m2
-    tl.store(Out + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod,
-             (acc / li[:, None]).to(Out.dtype.element_ty), mask=om[:, None] < slq)
+    tl.store(
+        Out + (qs + om)[:, None] * sot + h * soh + od[None, :] * sod,
+        (acc / li[:, None]).to(Out.dtype.element_ty),
+        mask=om[:, None] < slq,
+    )
 
 
 @triton.jit
-def _primer_matmul(a_ptr, b_ptr, c_ptr, M, N, K,
-                   sam, sak, sbk, sbn, scm, scn,
-                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _primer_matmul(
+    a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
     """An unrelated fp32 matmul, run only for its side effect on the allocator."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -118,7 +141,8 @@ def _prime_allocator():
     bt = torch.randn(K, N, device=dev, dtype=torch.float32)
     ct = torch.zeros(M, N, device=dev, dtype=torch.float32)
     _primer_matmul[(triton.cdiv(M, 32), triton.cdiv(N, 32))](
-        at, bt, ct, M, N, K, *at.stride(), *bt.stride(), *ct.stride(), BM=32, BN=32, BK=32)
+        at, bt, ct, M, N, K, *at.stride(), *bt.stride(), *ct.stride(), BM=32, BN=32, BK=32
+    )
     torch.mps.synchronize()
     del at, bt, ct
 
@@ -144,8 +168,25 @@ def _run(dtype, lens, D=64, nw=4, H=4, Hkv=2, prime=True):
     scale = 1.0 / math.sqrt(D)
     mx = max(lens)
     _varlen_overhang[(triton.cdiv(mx, 32), len(lens) * H)](
-        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        H, group, mx, scale, 32, 32, D, num_warps=nw)
+        q,
+        k,
+        v,
+        o,
+        cu,
+        cu,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *o.stride(),
+        H,
+        group,
+        mx,
+        scale,
+        32,
+        32,
+        D,
+        num_warps=nw,
+    )
     torch.mps.synchronize()
 
     ref = torch.zeros_like(o)
@@ -201,19 +242,39 @@ def _emitted_msl(dtype):
     element = {torch.float16: "fp16", torch.float32: "fp32"}[dtype]
     signature = {name: "*" + element for name in ("Q", "K", "V", "Out")}
     signature.update({name: "*i32" for name in ("cu_q", "cu_k")})
-    signature.update({name: "i32" for name in (
-        "sqt", "sqh", "sqd", "skt", "skh", "skd", "svt", "svh", "svd",
-        "sot", "soh", "sod", "H", "GROUP", "max_seqlen",
-    )})
-    source = ASTSource(_varlen_overhang, signature=signature,
-                       constexprs={"SCALE": 1 / math.sqrt(64), "BM": 32, "BN": 32, "D": 64})
+    signature.update(
+        {
+            name: "i32"
+            for name in (
+                "sqt",
+                "sqh",
+                "sqd",
+                "skt",
+                "skh",
+                "skd",
+                "svt",
+                "svh",
+                "svd",
+                "sot",
+                "soh",
+                "sod",
+                "H",
+                "GROUP",
+                "max_seqlen",
+            )
+        }
+    )
+    source = ASTSource(
+        _varlen_overhang, signature=signature, constexprs={"SCALE": 1 / math.sqrt(64), "BM": 32, "BN": 32, "D": 64}
+    )
     target = GPUTarget("metal", "apple-m4", 32)
     backend = MetalBackend(target)
     options = backend.parse_options({"num_warps": 4})
     context = ir.context()
     ir.load_dialects(context)
-    module = source.make_ir(target, options, backend.get_codegen_implementation(options),
-                            backend.get_module_map(), context)
+    module = source.make_ir(
+        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     metadata = {}
     module = backend.make_ttir(module, metadata, options)
     module = backend.make_ttgir(module, metadata, options)
@@ -244,7 +305,6 @@ def test_emitted_msl_guards_every_staged_fill(dtype):
     rebuilt = [(n, e) for n, e in fills if "_fill_row" in e or "_fill_col" in e]
     assert rebuilt, "expected address-rebuilding staged fills for this kernel"
     unguarded = [(n, e) for n, e in rebuilt if "?" not in e]
-    assert not unguarded, (
-        "staged fill re-reads a masked load without a guard (out-of-bounds read): "
-        + "; ".join(f"{n}[_sa] = {e}" for n, e in unguarded)
+    assert not unguarded, "staged fill re-reads a masked load without a guard (out-of-bounds read): " + "; ".join(
+        f"{n}[_sa] = {e}" for n, e in unguarded
     )

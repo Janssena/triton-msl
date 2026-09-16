@@ -1,4 +1,5 @@
 """Real AST/TTGIR compiler-to-metadata boundary; deliberately no GPU dispatch."""
+
 import pytest
 import triton
 import triton.language as tl
@@ -29,17 +30,20 @@ def test_actual_ttgir_source_product_preserves_native_context(tmp_path, monkeypa
     source = ASTSource(_contract_copy, {"X": "*fp32", "Y": "*fp32"}, {"BLOCK": 32})
     context = ir.context()
     ir.load_dialects(context)
-    module = source.make_ir(target, options, backend.get_codegen_implementation(options),
-                            backend.get_module_map(), context)
+    module = source.make_ir(
+        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     metadata = {"hash": "test-outer-hash", "target": target, **vars(options)}
     module = backend.make_ttir(module, metadata, options)
     module = backend.make_ttgir(module, metadata, options)
     initial = dict(metadata)
     calls = []
     original = emitter.emit_msl
+
     def emit(*args, **kwargs):
         calls.append(True)
         return original(*args, **kwargs)
+
     monkeypatch.setattr(emitter, "emit_msl", emit)
     first = backend.make_msl(module, metadata, options)
     records = list(tmp_path.glob("*.meta.json"))
@@ -50,7 +54,9 @@ def test_actual_ttgir_source_product_preserves_native_context(tmp_path, monkeypa
     assert calls == [True]
     assert type(second_metadata["target"]) is GPUTarget
     assert second_metadata["target"] == target
-    assert json.dumps(second_metadata, default=vars, sort_keys=True) == json.dumps(metadata, default=vars, sort_keys=True)
+    assert json.dumps(second_metadata, default=vars, sort_keys=True) == json.dumps(
+        metadata, default=vars, sort_keys=True
+    )
 
 
 @requires_metal_compiler
@@ -76,6 +82,7 @@ def test_actual_compile_stamps_and_restores_without_loading_a_pipeline(tmp_path,
 
     def forbidden(*args, **kwargs):
         pytest.fail("unchanged valid product missed the outer persistent cache")
+
     monkeypatch.setattr(MetalBackend, "add_stages", forbidden)
     restored = triton.compile(source, target=target, options=options)
     assert restored.metadata.execution_contract == _stamp()
@@ -99,7 +106,8 @@ def test_cold_direct_compile_and_outer_restore_initialize_before_identity(tmp_pa
         pytest.skip("optional C++ extension unavailable")
     root = Path(triton_msl.__file__).resolve().parent.parent
     worker = tmp_path / "cold_direct.py"
-    worker.write_text(textwrap.dedent('''\
+    worker.write_text(
+        textwrap.dedent("""\
         import os
         from pathlib import Path
         import sys
@@ -137,21 +145,33 @@ def test_cold_direct_compile_and_outer_restore_initialize_before_identity(tmp_pa
         restored[(1, 1, 1)](x, output)
         assert torch.equal(output, x + 1)
         print("COMPUTED_EXACT; COLD_DIRECT_AND_OUTER_HIT_VERIFIED; ROUTE=" + expected, flush=True)
-    '''))
+    """)
+    )
     env = dict(os.environ)
     for key in tuple(env):
         if key.startswith("TRITON_MSL_"):
             env.pop(key)
-    env.update(TRITON_DEFAULT_BACKEND="metal", TRITON_ALWAYS_COMPILE="0",
-               TRITON_MSL_USE_CPP="1" if use_cpp else "0", TRITON_MSL_COMPILE_SHADER="0",
-               PYTHONPATH=str(root))
-    for key in ("TRITON_CACHE_DIR", "TRITON_MSL_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
-                "TORCH_EXTENSIONS_DIR", "CLANG_MODULE_CACHE_PATH", "TMPDIR"):
+    env.update(
+        TRITON_DEFAULT_BACKEND="metal",
+        TRITON_ALWAYS_COMPILE="0",
+        TRITON_MSL_USE_CPP="1" if use_cpp else "0",
+        TRITON_MSL_COMPILE_SHADER="0",
+        PYTHONPATH=str(root),
+    )
+    for key in (
+        "TRITON_CACHE_DIR",
+        "TRITON_MSL_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TORCH_EXTENSIONS_DIR",
+        "CLANG_MODULE_CACHE_PATH",
+        "TMPDIR",
+    ):
         directory = tmp_path / key
         directory.mkdir()
         env[key] = str(directory)
-    result = subprocess.run([sys.executable, str(worker), str(root)], env=env,
-                            capture_output=True, text=True, timeout=180)
+    result = subprocess.run(
+        [sys.executable, str(worker), str(root)], env=env, capture_output=True, text=True, timeout=180
+    )
     (tmp_path / "raw.txt").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "COMPUTED_EXACT; COLD_DIRECT_AND_OUTER_HIT_VERIFIED; ROUTE=" in result.stdout
@@ -161,18 +181,23 @@ def test_cold_direct_compile_and_outer_restore_initialize_before_identity(tmp_pa
 def test_runtime_initialization_precedes_key_and_producer_capture(monkeypatch, boundary):
     """Controlled CPU ordering witness for both public and stage-only callers."""
     from triton_msl.backend import _cache_contract as contract, driver
+
     events = []
+
     class Runtime:
         @property
         def device(self):
             events.append("initialize")
             return object()
+
     monkeypatch.setattr(driver, "_get_utils", lambda: Runtime())
     monkeypatch.setenv("TRITON_MSL_USE_CPP", "0")
+
     def source():
         assert events and events[0] == "initialize", events
         events.append("identity")
         return {"controlled": "initialized"}
+
     monkeypatch.setattr(contract, "source_contract", source)
     monkeypatch.setattr(contract, "toolchain_identity", lambda: "controlled-toolchain")
     backend = MetalBackend(GPUTarget("metal", "apple-m4", 32))

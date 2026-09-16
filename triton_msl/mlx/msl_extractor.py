@@ -43,9 +43,7 @@ def _reads_output(body: str, name: str) -> bool:
     text = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", body)
     pending, seen = [name], set()
     safe_uses = set()
-    declarations = list(re.finditer(
-        r"(?:volatile\s+)?device\s+\w+\s*\*\s+(\w+)\s*=\s*([^;]+);", text
-    ))
+    declarations = list(re.finditer(r"(?:volatile\s+)?device\s+\w+\s*\*\s+(\w+)\s*=\s*([^;]+);", text))
     while pending:
         n = pending.pop()
         if n in seen:
@@ -81,7 +79,7 @@ def _reads_output(body: str, name: str) -> bool:
                     i += 1
                 while i < len(text) and text[i].isspace():
                     i += 1
-                if depth == 0 and text[i:i + 1] == "=" and text[i:i + 2] != "==":
+                if depth == 0 and text[i : i + 1] == "=" and text[i : i + 2] != "==":
                     safe_uses.add(use.start())
                     continue
             return True  # load, atomic, escaping address, or unknown syntax
@@ -158,7 +156,9 @@ def extract_msl_for_mlx(
 
     n_buffers = len(re.findall(r"\[\[\s*buffer\s*\(", sig_text))
     if n_buffers != len(arg_positions) or sorted(arg_positions) != list(range(n_buffers)):
-        raise MetalNonRecoverableError("MLX route: kernel buffer bindings are not a complete unique runtime-argument map.")
+        raise MetalNonRecoverableError(
+            "MLX route: kernel buffer bindings are not a complete unique runtime-argument map."
+        )
     if expected_signature is not None:
         from triton_msl.codegen.msl_emitter import _sanitize_msl_name, triton_type_to_msl
 
@@ -175,7 +175,7 @@ def extract_msl_for_mlx(
                     f"({source_type}); emitted '{name}' is {'pointer' if is_ptr else 'scalar'} {dtype}. Refusing."
                 )
     if output_arg_indices is not None:
-        ptr_positions = set(arg_positions[:len(ptr_args)])
+        ptr_positions = set(arg_positions[: len(ptr_args)])
         if any(type(i) is not int or i not in ptr_positions for i in output_arg_indices):
             raise MetalNonRecoverableError("MLX route: an output argument index does not identify a source pointer.")
 

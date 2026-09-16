@@ -33,13 +33,32 @@ _LOG2E = tl.constexpr(1.4426950408889634)
 
 @triton.jit
 def _varlen_fa_value_path(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, RUNTIME_SCALE, SCALE: tl.constexpr, MODE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    RUNTIME_SCALE,
+    SCALE: tl.constexpr,
+    MODE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_bh = tl.program_id(1)
@@ -53,12 +72,7 @@ def _varlen_fa_value_path(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    q_ptrs = (
-        Q
-        + (q_start + offs_m)[:, None] * stride_qt
-        + off_h * stride_qh
-        + offs_d[None, :] * stride_qd
-    )
+    q_ptrs = Q + (q_start + offs_m)[:, None] * stride_qt + off_h * stride_qh + offs_d[None, :] * stride_qd
     q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
     if MODE == 0:
         q = tl.trans(q) * SCALE
@@ -79,12 +93,7 @@ def _varlen_fa_value_path(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for start_n in range(0, max_seqlen, BLOCK_N):
         kn = start_n + offs_n
-        k_ptrs = (
-            K
-            + (k_start + kn)[:, None] * stride_kt
-            + off_h * stride_kh
-            + offs_d[None, :] * stride_kd
-        )
+        k_ptrs = K + (k_start + kn)[:, None] * stride_kt + off_h * stride_kh + offs_d[None, :] * stride_kd
         k = tl.load(k_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         if MODE == 2:
             # This cancels the canonical transpose below in square test tiles.
@@ -115,12 +124,7 @@ def _varlen_fa_value_path(
             p = tl.exp(p)
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
-        v_ptrs = (
-            V
-            + (k_start + kn)[:, None] * stride_vt
-            + off_h * stride_vh
-            + offs_d[None, :] * stride_vd
-        )
+        v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
         m_i = m_new
@@ -129,12 +133,7 @@ def _varlen_fa_value_path(
         acc = acc * 2.0 + 0.25
     elif MODE == 5:
         acc = acc / 2.0
-    o_ptrs = (
-        Out
-        + (q_start + offs_m)[:, None] * stride_ot
-        + off_h * stride_oh
-        + offs_d[None, :] * stride_od
-    )
+    o_ptrs = Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh + offs_d[None, :] * stride_od
     tl.store(
         o_ptrs,
         acc.to(Out.dtype.element_ty),
@@ -192,9 +191,24 @@ def _run(mode, monkeypatch):
     v = torch.randn_like(q)
     out = torch.zeros_like(q)
     _varlen_fa_value_path[(1, H)](
-        q, k, v, out, cu, cu,
-        *q.stride(), *k.stride(), *v.stride(), *out.stride(),
-        H, length, scale, scale, mode, 32, 32, D,
+        q,
+        k,
+        v,
+        out,
+        cu,
+        cu,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        H,
+        length,
+        scale,
+        scale,
+        mode,
+        32,
+        32,
+        D,
     )
     torch.mps.synchronize()
     return q, k, v, out, hits, scale

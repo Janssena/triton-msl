@@ -43,7 +43,14 @@ _compile_cache = {}
 # does NOT — a route-only template ABI (packed scalar buffer, template-ordered arguments), a
 # two-kernel split, a runtime-dispatch matmul descriptor, host-side address-bounds checks. Binding
 # the Triton arguments positionally against such a kernel is silently wrong, so the route refuses.
-_UNSUPPORTED_DESCRIPTORS = ("flash_attention", "mm_two_kernel", "fast_matmul", "quant_matmul", "batched_dot_bounds", "device_assert")
+_UNSUPPORTED_DESCRIPTORS = (
+    "flash_attention",
+    "mm_two_kernel",
+    "fast_matmul",
+    "quant_matmul",
+    "batched_dot_bounds",
+    "device_assert",
+)
 
 
 def mlx_available():
@@ -90,7 +97,7 @@ def _scalar_to_triton_sig(val):
     if isinstance(val, bool):
         return "i1"
     elif isinstance(val, int):
-        if not (-(2 ** 31) <= val < 2 ** 31):
+        if not (-(2**31) <= val < 2**31):
             # packet 176: the launcher passes Python ints as int32 scalars; a stride / element count
             # beyond int32 was truncated silently.
             from triton_msl.errors import MetalNonRecoverableError
@@ -217,7 +224,9 @@ def triton_call(kernel_fn, *args, grid, num_warps=4, **constexpr_kwargs):
         # arguments — a packed or reordered ABI would otherwise be bound positionally.
         n_runtime = sum(1 for v in signature.values() if v != "constexpr")
         extraction = extract_msl_for_mlx(
-            msl_source, output_arg_indices, expected_args=n_runtime,
+            msl_source,
+            output_arg_indices,
+            expected_args=n_runtime,
             expected_signature=[(name, ty) for name, ty in signature.items() if ty != "constexpr"],
         )
         _compile_cache[key] = (extraction, block_size, needs_2d_grid)

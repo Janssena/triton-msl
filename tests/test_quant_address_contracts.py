@@ -46,8 +46,31 @@ SENTINEL = 98765.0
 if HAS:
 
     @triton.jit
-    def _pg(a_ptr, w_ptr, c_ptr, scale_ptr, zero_ptr, M, N, K, sam, sak, swk, swn, ssg, ssn, zsg, zsn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr, MODE: tl.constexpr):
+    def _pg(
+        a_ptr,
+        w_ptr,
+        c_ptr,
+        scale_ptr,
+        zero_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        swk,
+        swn,
+        ssg,
+        ssn,
+        zsg,
+        zsn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        G: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         rm = tl.arange(0, BM)
@@ -112,8 +135,25 @@ if HAS:
             tl.store(c_ptr + om[:, None] * scm + on[None, :] * scn, acc)
 
     @triton.jit
-    def _sym(a_ptr, w_ptr, c_ptr, s_ptr, M, N, K, sam, sak, swk, swn, scm, scn,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
+    def _sym(
+        a_ptr,
+        w_ptr,
+        c_ptr,
+        s_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        swk,
+        swn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         rm = tl.arange(0, BM)
@@ -176,7 +216,9 @@ if HAS:
             tl.store(c_ptr + om[:, None] * scm + on[None, :] * scn, acc)
 
     @triton.jit
-    def _g8(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
+    def _g8(
+        x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr
+    ):
         pid = tl.program_id(0)
         rn = tl.arange(0, BN)
         on_out = pid * BN + rn
@@ -229,7 +271,22 @@ if HAS:
             tl.store(o_ptr + on_out, acc * scale)
 
     @triton.jit
-    def _g4(x_ptr, w_ptr, o_ptr, s_ptr, z_ptr, N, K, ng, swn, ssn, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr, MODE: tl.constexpr):
+    def _g4(
+        x_ptr,
+        w_ptr,
+        o_ptr,
+        s_ptr,
+        z_ptr,
+        N,
+        K,
+        ng,
+        swn,
+        ssn,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        G: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         pid = tl.program_id(0)
         rn = tl.arange(0, BN)
         on_out = pid * BN + rn
@@ -296,7 +353,9 @@ if HAS:
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
         context = ir.context()
         ir.load_dialects(context)
-        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+        mod = src.make_ir(
+            target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+        )
         metadata = {}
         mod = backend.make_ttir(mod, metadata, options)
         mod = backend.make_ttgir(mod, metadata, options)
@@ -503,7 +562,28 @@ def _pg_case(mode):
     z = torch.randint(-3, 4, (K // G + 1, 2 * N), device=D).float().contiguous()
     c = torch.full((4 * M, N), float("nan"), device=D)
     st = lambda t: t.stride()
-    launch = lambda: _pg[(M // BM, N // BN)](a0, w, c, s, z, M, N, K, *st(a0), *st(w), s.stride(0), s.stride(1), z.stride(0), z.stride(1), *st(c), BM=BM, BN=BN, BK=BK, G=G, MODE=mode)
+    launch = lambda: _pg[(M // BM, N // BN)](
+        a0,
+        w,
+        c,
+        s,
+        z,
+        M,
+        N,
+        K,
+        *st(a0),
+        *st(w),
+        s.stride(0),
+        s.stride(1),
+        z.stride(0),
+        z.stride(1),
+        *st(c),
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        G=G,
+        MODE=mode,
+    )
     # simulate on the FULL backing buffer (same base, same strides): the shifted modes read
     # past the launched view into its slack rows exactly as the kernel does
     raw = _sim_gemm(0, a, w, c.shape, M, N, K, BM, BN, BK, G, s=s, z=z)
@@ -519,7 +599,25 @@ def _sym_case(mode):
     w = torch.randint(-127, 127, (K + BK, N), device=D, dtype=torch.int8).contiguous()
     sc = torch.rand(4 * N, device=D) * 0.05 + 0.01
     c = torch.full((4 * M, N), float("nan"), device=D)
-    launch = lambda: _sym[(M // BM, N // BN)](a0, w, c, sc, M, N, K, a0.stride(0), a0.stride(1), w.stride(0), w.stride(1), c.stride(0), c.stride(1), BM, BN, BK, MODE=mode)
+    launch = lambda: _sym[(M // BM, N // BN)](
+        a0,
+        w,
+        c,
+        sc,
+        M,
+        N,
+        K,
+        a0.stride(0),
+        a0.stride(1),
+        w.stride(0),
+        w.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM,
+        BN,
+        BK,
+        MODE=mode,
+    )
     raw = _sim_gemm(0, a, w, c.shape, M, N, K, BM, BN, BK, 1, sc=sc)  # full backing buffer, see _pg_case
     intended = _sim_gemm(mode, a, w, c.shape, M, N, K, BM, BN, BK, 1, sc=sc)
     return launch, c, raw, intended
@@ -547,8 +645,15 @@ def _g4_case(mode):
     s = (torch.rand(4 * N, ng, device=D) * 0.02 + 0.005).contiguous()
     z = torch.randint(0, 16, (4 * N, ng), device=D).float().contiguous()
     o = torch.full((N + 8,), float("nan"), device=D)
-    launch = lambda: _g4[(N // BN,)](x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0), BN=BN, BK=BK, G=G, MODE=mode)
-    return launch, o, _sim_gemv4(0, x, packed, s, z, N, K, ng, BN, BK, G), _sim_gemv4(mode, x, packed, s, z, N, K, ng, BN, BK, G)
+    launch = lambda: _g4[(N // BN,)](
+        x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0), BN=BN, BK=BK, G=G, MODE=mode
+    )
+    return (
+        launch,
+        o,
+        _sim_gemv4(0, x, packed, s, z, N, K, ng, BN, BK, G),
+        _sim_gemv4(mode, x, packed, s, z, N, K, ng, BN, BK, G),
+    )
 
 
 def _witness(launch, out, raw, intended, hits):
@@ -565,7 +670,9 @@ def _witness(launch, out, raw, intended, hits):
         return "refused"
     err = _cmp(out, intended)
     err_raw = _cmp(out, raw)
-    assert err <= sep / 10, f"stored the template's raw result / something else (err vs intended {err}, vs raw {err_raw}, sep {sep}; quant dispatch {hits})"
+    assert err <= sep / 10, (
+        f"stored the template's raw result / something else (err vs intended {err}, vs raw {err_raw}, sep {sep}; quant dispatch {hits})"
+    )
     assert hits != [True] or err_raw > sep / 10, "the specialized quant dispatcher produced the raw result"
     return "computed"
 
@@ -599,7 +706,9 @@ def test_int4_gemv_address_contract_never_raw(cold_gpu_caches, quant_dispatch_sp
 
 
 @requires_gpu
-@pytest.mark.parametrize("case", [_pg_case, _sym_case, _g8_case, _g4_case], ids=["pergroup", "symmetric", "gemv-int8", "gemv-int4"])
+@pytest.mark.parametrize(
+    "case", [_pg_case, _sym_case, _g8_case, _g4_case], ids=["pergroup", "symmetric", "gemv-int8", "gemv-int4"]
+)
 def test_native_forms_route_and_compute(cold_gpu_caches, quant_dispatch_spy, case):
     """Positives: mode 0 routes to the specialized template and matches its own simulation."""
     launch, out, raw, _ = case(0)
@@ -610,14 +719,67 @@ def test_native_forms_route_and_compute(cold_gpu_caches, quant_dispatch_spy, cas
 
 
 # ---------------------------------------------------------------------------- lowering boundary
-_SIG_PG = {"a_ptr": "*fp32", "w_ptr": "*i8", "c_ptr": "*fp32", "scale_ptr": "*fp32", "zero_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32",
-           "sam": "i32", "sak": "constexpr", "swk": "i32", "swn": "constexpr", "ssg": "i32", "ssn": "constexpr", "zsg": "i32", "zsn": "constexpr", "scm": "i32", "scn": "constexpr"}
+_SIG_PG = {
+    "a_ptr": "*fp32",
+    "w_ptr": "*i8",
+    "c_ptr": "*fp32",
+    "scale_ptr": "*fp32",
+    "zero_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "sam": "i32",
+    "sak": "constexpr",
+    "swk": "i32",
+    "swn": "constexpr",
+    "ssg": "i32",
+    "ssn": "constexpr",
+    "zsg": "i32",
+    "zsn": "constexpr",
+    "scm": "i32",
+    "scn": "constexpr",
+}
 _CEX_PG = {"BM": 32, "BN": 32, "BK": 32, "G": 32, "sak": 1, "swn": 1, "ssn": 1, "zsn": 1, "scn": 1}
-_SIG_SYM = {"a_ptr": "*fp32", "w_ptr": "*i8", "c_ptr": "*fp32", "s_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32", "sam": "i32", "sak": "constexpr", "swk": "i32", "swn": "constexpr", "scm": "i32", "scn": "constexpr"}
+_SIG_SYM = {
+    "a_ptr": "*fp32",
+    "w_ptr": "*i8",
+    "c_ptr": "*fp32",
+    "s_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "sam": "i32",
+    "sak": "constexpr",
+    "swk": "i32",
+    "swn": "constexpr",
+    "scm": "i32",
+    "scn": "constexpr",
+}
 _CEX_SYM = {"BM": 32, "BN": 32, "BK": 32, "sak": 1, "swn": 1, "scn": 1}
-_SIG_G8 = {"x_ptr": "*fp32", "w_ptr": "*i8", "o_ptr": "*fp32", "scale_ptr": "*fp32", "zero_ptr": "*fp32", "N": "i32", "K": "i32", "swn": "i32", "swk": "constexpr"}
+_SIG_G8 = {
+    "x_ptr": "*fp32",
+    "w_ptr": "*i8",
+    "o_ptr": "*fp32",
+    "scale_ptr": "*fp32",
+    "zero_ptr": "*fp32",
+    "N": "i32",
+    "K": "i32",
+    "swn": "i32",
+    "swk": "constexpr",
+}
 _CEX_G8 = {"BN": 32, "BK": 32, "swk": 1}
-_SIG_G4 = {"x_ptr": "*fp32", "w_ptr": "*u8", "o_ptr": "*fp32", "s_ptr": "*fp32", "z_ptr": "*fp32", "N": "i32", "K": "i32", "ng": "i32", "swn": "i32", "ssn": "i32"}
+_SIG_G4 = {
+    "x_ptr": "*fp32",
+    "w_ptr": "*u8",
+    "o_ptr": "*fp32",
+    "s_ptr": "*fp32",
+    "z_ptr": "*fp32",
+    "N": "i32",
+    "K": "i32",
+    "ng": "i32",
+    "swn": "i32",
+    "ssn": "i32",
+}
 _CEX_G4 = {"BN": 32, "BK": 32, "G": 128}
 
 _REFUSING = (
@@ -647,12 +809,15 @@ def test_lowering_boundary_int4_gemv_declines(mode):
 
 
 @requires
-@pytest.mark.parametrize("fn,sig,cex", [
-    pytest.param(_pg, _SIG_PG, _CEX_PG, id="pergroup"),
-    pytest.param(_sym, _SIG_SYM, _CEX_SYM, id="symmetric"),
-    pytest.param(_g8, _SIG_G8, _CEX_G8, id="gemv-int8"),
-    pytest.param(_g4, _SIG_G4, _CEX_G4, id="gemv-int4"),
-])
+@pytest.mark.parametrize(
+    "fn,sig,cex",
+    [
+        pytest.param(_pg, _SIG_PG, _CEX_PG, id="pergroup"),
+        pytest.param(_sym, _SIG_SYM, _CEX_SYM, id="symmetric"),
+        pytest.param(_g8, _SIG_G8, _CEX_G8, id="gemv-int8"),
+        pytest.param(_g4, _SIG_G4, _CEX_G4, id="gemv-int4"),
+    ],
+)
 def test_lowering_boundary_native_routes(fn, sig, cex):
     msl, md = _emit_for(fn, sig, {**cex, "MODE": 0})
     assert "UNSUPPORTED" not in msl

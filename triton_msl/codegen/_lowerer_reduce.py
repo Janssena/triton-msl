@@ -239,15 +239,11 @@ class _ReduceScanMixin:
             or len(return_ids) != n_values
         ):
             raise MetalNonRecoverableError(
-                "tt.reduce native contract requires exact operand, result, "
-                "block-argument, and return arity",
+                "tt.reduce native contract requires exact operand, result, block-argument, and return arity",
                 op_name="tt.reduce",
             )
 
-        operand_types = [
-            self._native_value_facts(value_id, op_name="tt.reduce")
-            for value_id in operand_ids
-        ]
+        operand_types = [self._native_value_facts(value_id, op_name="tt.reduce") for value_id in operand_ids]
         shape = operand_types[0].shape
         layout = operand_types[0].layout
         allowed_kinds = {"float", "integer"}
@@ -272,8 +268,7 @@ class _ReduceScanMixin:
                 or facts.width <= 0
             ):
                 raise MetalNonRecoverableError(
-                    f"tt.reduce native metadata does not prove tensor slot {slot}'s "
-                    "shape, layout, and representation",
+                    f"tt.reduce native metadata does not prove tensor slot {slot}'s shape, layout, and representation",
                     op_name="tt.reduce",
                 )
 
@@ -285,33 +280,22 @@ class _ReduceScanMixin:
             )
         output_shape = tuple((*shape[:axis], *shape[axis + 1 :]))
 
-        result_types = [
-            self._native_value_facts(value_id, op_name="tt.reduce")
-            for value_id in result_ids
-        ]
+        result_types = [self._native_value_facts(value_id, op_name="tt.reduce") for value_id in result_ids]
         result_layout = result_types[0].layout
         for slot, (source, result) in enumerate(zip(operand_types, result_types)):
             if (
                 result.shape != output_shape
                 or result.is_tensor != bool(output_shape)
                 or result.layout != result_layout
-                or self._native_element_signature(result)
-                != self._native_element_signature(source)
+                or self._native_element_signature(result) != self._native_element_signature(source)
             ):
                 raise MetalNonRecoverableError(
-                    f"tt.reduce result {slot} does not preserve its native slot "
-                    "type and reduced shape",
+                    f"tt.reduce result {slot} does not preserve its native slot type and reduced shape",
                     op_name="tt.reduce",
                 )
 
-        block_types = [
-            self._native_value_facts(value_id, op_name="tt.reduce")
-            for value_id in block_arg_ids
-        ]
-        return_types = [
-            self._native_value_facts(value_id, op_name="tt.reduce")
-            for value_id in return_ids
-        ]
+        block_types = [self._native_value_facts(value_id, op_name="tt.reduce") for value_id in block_arg_ids]
+        return_types = [self._native_value_facts(value_id, op_name="tt.reduce") for value_id in return_ids]
         for slot, source in enumerate(operand_types):
             signature = self._native_element_signature(source)
             for facts in (
@@ -319,14 +303,9 @@ class _ReduceScanMixin:
                 block_types[n_values + slot],
                 return_types[slot],
             ):
-                if (
-                    facts.is_tensor
-                    or facts.shape != ()
-                    or self._native_element_signature(facts) != signature
-                ):
+                if facts.is_tensor or facts.shape != () or self._native_element_signature(facts) != signature:
                     raise MetalNonRecoverableError(
-                        f"tt.reduce combine region does not preserve scalar "
-                        f"slot {slot}'s native representation",
+                        f"tt.reduce combine region does not preserve scalar slot {slot}'s native representation",
                         op_name="tt.reduce",
                     )
 
@@ -338,8 +317,7 @@ class _ReduceScanMixin:
                 facts = self._native_value_facts(value_id, op_name="tt.reduce")
                 if facts.kind not in allowed_kinds or facts.elem is None or facts.width is None:
                     raise MetalNonRecoverableError(
-                        "tt.reduce combine body has an unproved native result "
-                        "representation",
+                        "tt.reduce combine body has an unproved native result representation",
                         op_name="tt.reduce",
                     )
 
@@ -349,12 +327,8 @@ class _ReduceScanMixin:
             "axis": axis,
             "slot_facts": operand_types,
             "result_facts": result_types,
-            "slot_dtypes": [
-                _mlir_to_triton_dtype(facts.elem) for facts in operand_types
-            ],
-            "result_dtypes": [
-                _mlir_to_triton_dtype(facts.elem) for facts in result_types
-            ],
+            "slot_dtypes": [_mlir_to_triton_dtype(facts.elem) for facts in operand_types],
+            "result_dtypes": [_mlir_to_triton_dtype(facts.elem) for facts in result_types],
         }
 
     def _register_bcast_layout_by_native(self, facts, shape, layout_expr):
@@ -419,9 +393,7 @@ class _ReduceScanMixin:
             if op is None or op.op != op_name or len(op.operand_ids or []) != 2:
                 return False
             operands = tuple(op.operand_ids)
-            return operands == (left, right) or (
-                commutative and operands == (right, left)
-            )
+            return operands == (left, right) or (commutative and operands == (right, left))
 
         def unique_binary(op_name, left, right, *, commutative=False):
             matches = [
@@ -437,9 +409,7 @@ class _ReduceScanMixin:
             ]
             return matches[0] if len(matches) == 1 else None
 
-        if not exact_binary(
-            weight_out, "arith.addf", weight_a, weight_b
-        ):
+        if not exact_binary(weight_out, "arith.addf", weight_a, weight_b):
             return None
         delta = unique_binary("arith.subf", mean_b, mean_a)
         raw_ratio = unique_binary("arith.divf", weight_b, weight_out)
@@ -489,28 +459,14 @@ class _ReduceScanMixin:
             ratio = raw_ratio
 
         mean_correction = unique_binary("arith.mulf", delta, ratio)
-        if mean_correction is None or not exact_binary(
-            mean_out, "arith.addf", mean_a, mean_correction
-        ):
+        if mean_correction is None or not exact_binary(mean_out, "arith.addf", mean_a, mean_correction):
             return None
 
         m2_base = unique_binary("arith.addf", m2_a, m2_b)
         delta_squared = unique_binary("arith.mulf", delta, delta)
-        weighted_delta = (
-            unique_binary("arith.mulf", delta_squared, weight_a)
-            if delta_squared is not None
-            else None
-        )
-        m2_correction = (
-            unique_binary("arith.mulf", weighted_delta, ratio)
-            if weighted_delta is not None
-            else None
-        )
-        if (
-            m2_base is None
-            or m2_correction is None
-            or not exact_binary(m2_out, "arith.addf", m2_base, m2_correction)
-        ):
+        weighted_delta = unique_binary("arith.mulf", delta_squared, weight_a) if delta_squared is not None else None
+        m2_correction = unique_binary("arith.mulf", weighted_delta, ratio) if weighted_delta is not None else None
+        if m2_base is None or m2_correction is None or not exact_binary(m2_out, "arith.addf", m2_base, m2_correction):
             return None
         return ratio_mode
 
@@ -558,7 +514,9 @@ class _ReduceScanMixin:
             return None
         condition_children = [producers.get(value_id) for value_id in condition.operand_ids]
         tie = next((op for op in condition_children if op is not None and op.op == "arith.andi"), None)
-        winner = next((op for op in condition_children if op is not None and op.op in ("arith.cmpf", "arith.cmpi")), None)
+        winner = next(
+            (op for op in condition_children if op is not None and op.op in ("arith.cmpf", "arith.cmpi")), None
+        )
         if tie is None or winner is None or len(tie.operand_ids or []) != 2:
             return None
 
@@ -566,19 +524,11 @@ class _ReduceScanMixin:
         if any(op is None for op in tie_children):
             return None
         value_eq = next(
-            (
-                op
-                for op in tie_children
-                if tuple(op.operand_ids or []) in ((value_a, value_b), (value_b, value_a))
-            ),
+            (op for op in tie_children if tuple(op.operand_ids or []) in ((value_a, value_b), (value_b, value_a))),
             None,
         )
         index_lt = next(
-            (
-                op
-                for op in tie_children
-                if tuple(op.operand_ids or []) == (index_a, index_b)
-            ),
+            (op for op in tie_children if tuple(op.operand_ids or []) == (index_a, index_b)),
             None,
         )
         expected_value_op = "arith.cmpf" if value_kind == "float" else "arith.cmpi"
@@ -1159,22 +1109,25 @@ class _ReduceScanMixin:
         the proof. Pointer/mask/other dependencies must themselves be scalar and
         available outside the loops. This is not general load speculation.
         """
-        available = {
-            arg.id for arg in self.graph.args
-            if self._native_shape(arg.id, op_name="tt.load") == ()
-        }
+        available = {arg.id for arg in self.graph.args if self._native_shape(arg.id, op_name="tt.load") == ()}
         pure_tt = {
-            "tt.make_range", "tt.get_program_id", "tt.get_num_programs",
-            "tt.splat", "tt.broadcast", "tt.expand_dims", "tt.reshape",
-            "tt.trans", "tt.addptr", "ttg.convert_layout",
+            "tt.make_range",
+            "tt.get_program_id",
+            "tt.get_num_programs",
+            "tt.splat",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "tt.reshape",
+            "tt.trans",
+            "tt.addptr",
+            "ttg.convert_layout",
         }
 
         def pure(op):
             if op.op == "tt.load":
                 return op.attrs.get("isVolatile") is False
             if op.op == "tt.reduce":
-                return all(child.op == "tt.reduce.return" or pure(child)
-                           for child in op.region_ops or [])
+                return all(child.op == "tt.reduce.return" or pure(child) for child in op.region_ops or [])
             if op.region_ops or op.else_ops:
                 return False
             return op.op.startswith(("arith.", "math.")) or op.op in pure_tt
@@ -1184,9 +1137,11 @@ class _ReduceScanMixin:
             if not pure(op):
                 break
             ids = self._native_result_ids_for_op(op)
-            if (len(ids) != 1 or
-                    self._native_shape(ids[0], op_name=op.op) != () or
-                    not all(dep in available for dep in op.operand_ids)):
+            if (
+                len(ids) != 1
+                or self._native_shape(ids[0], op_name=op.op) != ()
+                or not all(dep in available for dep in op.operand_ids)
+            ):
                 continue
             if op.op == "tt.load":
                 loads.add(op.id)
@@ -1248,11 +1203,7 @@ class _ReduceScanMixin:
             next_reduce = None
             if phase_idx + 1 < len(phases) and phases[phase_idx + 1][1]:
                 next_reduce = phases[phase_idx + 1][0][0]
-            next_reduce_native = (
-                self._prove_reduce_native_contract(next_reduce)
-                if next_reduce is not None
-                else None
-            )
+            next_reduce_native = self._prove_reduce_native_contract(next_reduce) if next_reduce is not None else None
 
             # Separate scalar ops (hoist before loop) from tensor ops (inside loop)
             scalar_ops = [op for op in phase_ops if is_scalar_op(op)]
@@ -1394,9 +1345,7 @@ class _ReduceScanMixin:
                         )
                     ordered_stage = f"shared_ordered_multipass_{self._shared_counter}"
                     self._shared_counter += 1
-                    self.kb.declare_threadgroup_array(
-                        ordered_stage, dtype="fp32", size=total
-                    )
+                    self.kb.declare_threadgroup_array(ordered_stage, dtype="fp32", size=total)
                 # bitwise (and/or/xor) identities are width-independent: and = all-ones,
                 # or/xor = 0; product identity = 1.
                 _bitwise_ident = {"and": "(~0)", "or": "0", "xor": "0", "prod": "1"}
@@ -1462,9 +1411,7 @@ class _ReduceScanMixin:
                 # Cast input to accumulator type to avoid Metal ambiguity
                 cast_input = f"({acc_msl_type}){input_var}"
                 if ordered_multipass:
-                    self.kb.raw_line(
-                        f"        {ordered_stage}[_loop_e] = {cast_input};"
-                    )
+                    self.kb.raw_line(f"        {ordered_stage}[_loop_e] = {cast_input};")
                 elif combine_op == "sum":
                     self.kb.raw_line(f"        {acc_var} += {cast_input};")
                 elif combine_op == "prod":
@@ -1501,13 +1448,8 @@ class _ReduceScanMixin:
                 _span = 1
                 while _span < total:
                     _pairs = total // (2 * _span)
-                    self.kb.raw_line(
-                        f"    for (uint _ord_mp = lid; _ord_mp < {_pairs}u; "
-                        f"_ord_mp += {block_size}u) {{"
-                    )
-                    self.kb.raw_line(
-                        f"        uint _ord_left = _ord_mp * {2 * _span}u;"
-                    )
+                    self.kb.raw_line(f"    for (uint _ord_mp = lid; _ord_mp < {_pairs}u; _ord_mp += {block_size}u) {{")
+                    self.kb.raw_line(f"        uint _ord_left = _ord_mp * {2 * _span}u;")
                     self.kb.raw_line(
                         f"        {ordered_stage}[_ord_left] = "
                         + self.kb.ordered_combine_expr(
@@ -1520,9 +1462,7 @@ class _ReduceScanMixin:
                     self.kb.raw_line("    }")
                     self.kb.barrier("threadgroup")
                     _span *= 2
-                self.kb.raw_line(
-                    f"    {acc_msl_type} {acc_var} = {ordered_stage}[0];"
-                )
+                self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {ordered_stage}[0];")
 
             # Emit any scalar terminal write (atomic/store of a reduce result)
             # ONCE, AFTER the per-element loop — never inside it (B3 over-count fix).
@@ -1747,15 +1687,12 @@ class _ReduceScanMixin:
         # multipass full reduction arrives already folded in logical source order;
         # array-fold, nested, tail-padded, or other N-D forms still refuse.
         if ordered_cmp:
-            _ordered_multipass = ssa.operand_ids[0] in getattr(
-                self, "_ordered_multipass_inputs", set()
-            )
+            _ordered_multipass = ssa.operand_ids[0] in getattr(self, "_ordered_multipass_inputs", set())
             _rn = input_shape[0] if input_shape and len(input_shape) == 1 else None
             _rank2 = bool(input_shape and len(input_shape) == 2 and self._is_2d)
             _total2 = input_shape[0] * input_shape[1] if _rank2 else None
-            _exact_1d = (
-                _rn == self.kb.block_size
-                and (self.kb.block_size == 16 or (self.kb.block_size >= 32 and self.kb.block_size % 32 == 0))
+            _exact_1d = _rn == self.kb.block_size and (
+                self.kb.block_size == 16 or (self.kb.block_size >= 32 and self.kb.block_size % 32 == 0)
             )
             _staged_2d = _rank2 and _total2 <= self.kb.block_size
             if (
@@ -2093,10 +2030,7 @@ class _ReduceScanMixin:
 
         # Dispatch Welford (3-value) vs argmax/argmin (2-value)
         if n_values == 3:
-            if any(
-                facts.kind != "float" or facts.elem != "f32" or facts.width != 32
-                for facts in native["slot_facts"]
-            ):
+            if any(facts.kind != "float" or facts.elem != "f32" or facts.width != 32 for facts in native["slot_facts"]):
                 raise MetalNonRecoverableError(
                     "the Welford tuple lowering requires three native fp32 slots; a narrower "
                     "or mixed representation would be silently widened by its float temporaries",
@@ -2116,9 +2050,7 @@ class _ReduceScanMixin:
                     "argmax/argmin 2-tuples are handled.",
                     op_name="tt.reduce",
                 )
-            self._lower_reduce_welford(
-                ssa, native, guarded_ratio=welford_ratio_mode == "guarded"
-            )
+            self._lower_reduce_welford(ssa, native, guarded_ratio=welford_ratio_mode == "guarded")
             return
 
         value_facts, index_facts = native["slot_facts"]
@@ -2152,9 +2084,7 @@ class _ReduceScanMixin:
             # Skip 2D dispatch when first dim is 1 and axis is 1
             # (really a 1D reduction, same logic as _lower_reduce)
             if not (input_shape[0] == 1 and axis == 1):
-                self._lower_reduce_2d_argminmax(
-                    ssa, axis, input_shape, native, argminmax
-                )
+                self._lower_reduce_2d_argminmax(ssa, axis, input_shape, native, argminmax)
                 return
 
         self._lower_reduce_argminmax(ssa, native, argminmax)
@@ -2371,9 +2301,7 @@ class _ReduceScanMixin:
         for _rid in ssa.result_ids or []:
             self._register_1d_layout(_rid, "direct")
 
-    def _lower_reduce_2d_argminmax(
-        self, ssa, axis, input_shape, native, argminmax
-    ):
+    def _lower_reduce_2d_argminmax(self, ssa, axis, input_shape, native, argminmax):
         """Lower 2D argmin/argmax: find min/max value and index along axis.
 
         For axis=1 on (M, N): each row finds min/max among N values → (M,) values + indices.
@@ -2754,9 +2682,7 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"        for (uint j = {_start}u; j < {N}u; j++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[lid * {N}u + j];")
             if ordered_cmp:
-                self.kb.raw_line(
-                    f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};"
-                )
+                self.kb.raw_line(f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};")
             else:
                 self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
@@ -2787,9 +2713,7 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"        for (uint i = {_start}u; i < {M}u; i++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[i * {N}u + lid];")
             if ordered_cmp:
-                self.kb.raw_line(
-                    f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};"
-                )
+                self.kb.raw_line(f"            acc = {self.kb.ordered_combine_expr(combine_op, 'acc', 'val')};")
             else:
                 self.kb.raw_line(f"            acc = {combine_expr};")
             self.kb.raw_line(f"        }}")
@@ -2968,9 +2892,7 @@ class _ReduceScanMixin:
         # Downstream reduces/stores use this to re-stage data correctly when
         # the logical mapping is not lid → lid.
         self._bcast_layout[ssa.id] = f"({read_idx})"
-        self._register_bcast_layout_by_native(
-            result_facts, tuple(result_dims), f"({read_idx})"
-        )
+        self._register_bcast_layout_by_native(result_facts, tuple(result_dims), f"({read_idx})")
 
     def _lower_reduce_nd(
         self,
@@ -3175,9 +3097,7 @@ class _ReduceScanMixin:
         # store, make_range rewrite) use this to re-stage data correctly.
         if result_read_idx is not None and nr >= 2:
             self._bcast_layout[ssa.id] = f"({result_read_idx})"
-            self._register_bcast_layout_by_native(
-                result_facts, tuple(result_shape), f"({result_read_idx})"
-            )
+            self._register_bcast_layout_by_native(result_facts, tuple(result_shape), f"({result_read_idx})")
 
     def _lower_scan(self, ssa: SSAValue):
         """tt.scan → prefix scan via shared memory.
@@ -3235,9 +3155,7 @@ class _ReduceScanMixin:
             else [None] * n_values
         )
         if any(a is not None for a in _arrays):
-            self._lower_scan_array(
-                ssa, input_shape, axis, reverse, n_values, _arrays, native_contract
-            )
+            self._lower_scan_array(ssa, input_shape, axis, reverse, n_values, _arrays, native_contract)
             return
 
         # The scan stages every element through threadgroup memory with one thread
@@ -3422,9 +3340,7 @@ class _ReduceScanMixin:
             self.env_types[ssa.id] = slot_shared[0]
             self.env_shapes[ssa.id] = input_shape
 
-    def _lower_scan_array(
-        self, ssa, input_shape, axis, reverse, n_values, arrays, native_contract
-    ):
+    def _lower_scan_array(self, ssa, input_shape, axis, reverse, n_values, arrays, native_contract):
         """Lower a proved wide scan over contiguous flat register ownership.
 
         Each physical thread owns ``width`` adjacent flattened elements.
@@ -3457,8 +3373,7 @@ class _ReduceScanMixin:
         )
         if not shape_matches:
             raise MetalNonRecoverableError(
-                "tt.scan: the operand shape differs from the shape whose flat "
-                "ownership was proved; refusing.",
+                "tt.scan: the operand shape differs from the shape whose flat ownership was proved; refusing.",
                 op_name="tt.scan",
             )
         if axis not in (0, 1):
@@ -3472,14 +3387,12 @@ class _ReduceScanMixin:
         for operand, array in zip(ssa.operand_ids, arrays):
             if array is not None and array[1] != width:
                 raise MetalNonRecoverableError(
-                    "tt.scan: operand register arrays disagree on the proved "
-                    "per-thread width; refusing.",
+                    "tt.scan: operand register arrays disagree on the proved per-thread width; refusing.",
                     op_name="tt.scan",
                 )
             if array is None and operand not in self._is_splat:
                 raise MetalNonRecoverableError(
-                    "tt.scan: a non-array operand is not proven uniform across "
-                    "the tile; refusing.",
+                    "tt.scan: a non-array operand is not proven uniform across the tile; refusing.",
                     op_name="tt.scan",
                 )
 
@@ -3498,9 +3411,23 @@ class _ReduceScanMixin:
             )
 
         known_dtypes = {
-            "fp16", "bf16", "fp32", "fp64",
-            "i1", "i8", "u8", "ui8", "i16", "u16", "ui16",
-            "i32", "u32", "ui32", "i64", "u64", "ui64",
+            "fp16",
+            "bf16",
+            "fp32",
+            "fp64",
+            "i1",
+            "i8",
+            "u8",
+            "ui8",
+            "i16",
+            "u16",
+            "ui16",
+            "i32",
+            "u32",
+            "ui32",
+            "i64",
+            "u64",
+            "ui64",
         }
         slot_dtypes = []
         slot_msl = []
@@ -3521,14 +3448,34 @@ class _ReduceScanMixin:
         # padding; equality is refused because the 32 KiB limit leaves no
         # margin for an unmodelled compiler allocation.
         type_layout = {
-            "bool": (1, 1), "char": (1, 1), "uchar": (1, 1),
-            "i1": (1, 1), "i8": (1, 1), "u8": (1, 1), "ui8": (1, 1),
-            "half": (2, 2), "short": (2, 2), "ushort": (2, 2),
-            "fp16": (2, 2), "i16": (2, 2), "u16": (2, 2), "ui16": (2, 2),
-            "float": (4, 4), "int": (4, 4), "uint": (4, 4),
-            "fp32": (4, 4), "i32": (4, 4), "u32": (4, 4), "ui32": (4, 4),
-            "long": (8, 8), "ulong": (8, 8), "double": (8, 8),
-            "fp64": (8, 8), "i64": (8, 8), "u64": (8, 8), "ui64": (8, 8),
+            "bool": (1, 1),
+            "char": (1, 1),
+            "uchar": (1, 1),
+            "i1": (1, 1),
+            "i8": (1, 1),
+            "u8": (1, 1),
+            "ui8": (1, 1),
+            "half": (2, 2),
+            "short": (2, 2),
+            "ushort": (2, 2),
+            "fp16": (2, 2),
+            "i16": (2, 2),
+            "u16": (2, 2),
+            "ui16": (2, 2),
+            "float": (4, 4),
+            "int": (4, 4),
+            "uint": (4, 4),
+            "fp32": (4, 4),
+            "i32": (4, 4),
+            "u32": (4, 4),
+            "ui32": (4, 4),
+            "long": (8, 8),
+            "ulong": (8, 8),
+            "double": (8, 8),
+            "fp64": (8, 8),
+            "i64": (8, 8),
+            "u64": (8, 8),
+            "ui64": (8, 8),
         }
 
         def _allocation_bytes(entries):
@@ -3568,9 +3515,7 @@ class _ReduceScanMixin:
             source = array[0] if array is not None else self._lookup(ssa.operand_ids[i])
             for k in range(width):
                 value = f"{source}[{k}]" if array is not None else source
-                self.kb.raw_line(
-                    f"    {shared_names[i]}[lid * {width}u + {k}u] = {cast}{value};"
-                )
+                self.kb.raw_line(f"    {shared_names[i]}[lid * {width}u + {k}u] = {cast}{value};")
         self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         if axis == 1:
@@ -3599,9 +3544,7 @@ class _ReduceScanMixin:
         for i in range(n_values):
             current = self._next_var("scan_cur")
             neighbour = self._next_var("scan_neighbour")
-            self.kb.raw_line(
-                f"            {slot_msl[i]} {current} = ({slot_msl[i]}){shared_names[i]}[scan_idx];"
-            )
+            self.kb.raw_line(f"            {slot_msl[i]} {current} = ({slot_msl[i]}){shared_names[i]}[scan_idx];")
             self.kb.raw_line(
                 f"            {slot_msl[i]} {neighbour} = scan_has ? "
                 f"({slot_msl[i]}){shared_names[i]}[scan_src] : {current};"
@@ -3624,9 +3567,7 @@ class _ReduceScanMixin:
             if body_op.op != "tt.scan.return":
                 self._lower_op(body_op)
         for i, return_id in enumerate(return_ids):
-            self.kb.raw_line(
-                f"                {temporary[i]}[scan_k] = {self._lookup(return_id)};"
-            )
+            self.kb.raw_line(f"                {temporary[i]}[scan_k] = {self._lookup(return_id)};")
         self.kb.raw_line("            }")
         self.kb.raw_line("        }")
         self.kb.raw_line("        threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -3640,10 +3581,7 @@ class _ReduceScanMixin:
 
         outputs = []
         for i in range(n_values):
-            expressions = [
-                f"({slot_msl[i]}){shared_names[i]}[lid * {width}u + {k}u]"
-                for k in range(width)
-            ]
+            expressions = [f"({slot_msl[i]}){shared_names[i]}[lid * {width}u + {k}u]" for k in range(width)]
             outputs.append(self._var_array("scan_res", expressions, slot_msl[i]))
         self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 

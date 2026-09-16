@@ -1,4 +1,5 @@
 """Hardware supporting evidence, not a proof of ordering or scheduler progress."""
+
 import pytest
 import torch
 import triton
@@ -29,12 +30,15 @@ def test_bounded_release_acquire_message_passing(repetition, tmp_path, monkeypat
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     from triton_msl.codegen.generic_lowerer import GenericLowerer
+
     calls = []
     real = GenericLowerer._atomic_ordering_fences
+
     def spy(self, ssa):
         result = real(self, ssa)
         calls.append((ssa.attrs["sem"], ssa.attrs["scope"], result))
         return result
+
     monkeypatch.setattr(GenericLowerer, "_atomic_ordering_fences", spy)
     count = 128
     data = torch.zeros(count, dtype=torch.int32, device="mps")

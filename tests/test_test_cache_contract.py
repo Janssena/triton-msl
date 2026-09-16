@@ -1,4 +1,5 @@
 """Cache ownership, standalone entrypoints and original-input fuzzer failures."""
+
 from pathlib import Path
 
 import pytest
@@ -37,8 +38,13 @@ def test_benchmark_owns_distinct_cache_children(monkeypatch, tmp_path):
     import os
 
     module, deletion_attempts = _benchmark_module(monkeypatch, tmp_path)
-    keys = ("TRITON_CACHE_DIR", "TRITON_MSL_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
-            "TORCH_EXTENSIONS_DIR", "CLANG_MODULE_CACHE_PATH")
+    keys = (
+        "TRITON_CACHE_DIR",
+        "TRITON_MSL_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TORCH_EXTENSIONS_DIR",
+        "CLANG_MODULE_CACHE_PATH",
+    )
     parents = {}
     for key in keys:
         parent = tmp_path / key
@@ -69,8 +75,8 @@ def test_benchmark_owns_distinct_cache_children(monkeypatch, tmp_path):
         sessions.append(json.loads(marker.read_text()))
     assert not deletion_attempts
     assert all(sessions[0][k] != sessions[1][k] for k in keys)
-    assert all((Path(root)/"session-marker").read_text() == "retain" for s in sessions for root in s.values())
-    assert all((Path(p)/"canary").read_text() == "retain" and os.environ[k] == p for k,p in parents.items())
+    assert all((Path(root) / "session-marker").read_text() == "retain" for s in sessions for root in s.values())
+    assert all((Path(p) / "canary").read_text() == "retain" and os.environ[k] == p for k, p in parents.items())
 
 
 def test_benchmark_retains_success_failure_and_timeout_output(monkeypatch, tmp_path, capsys):
@@ -101,8 +107,8 @@ def test_benchmark_retains_success_failure_and_timeout_output(monkeypatch, tmp_p
     assert "invalid-stdout" in output.out and "invalid-stderr" in output.err
 
     def timeout(command, **kwargs):
-        kwargs['stdout'].write('timeout-stdout\n')
-        kwargs['stderr'].write('timeout-stderr\n')
+        kwargs["stdout"].write("timeout-stdout\n")
+        kwargs["stderr"].write("timeout-stderr\n")
         raise subprocess.TimeoutExpired(command, 300)
 
     monkeypatch.setattr(module.subprocess, "run", timeout)
@@ -110,10 +116,14 @@ def test_benchmark_retains_success_failure_and_timeout_output(monkeypatch, tmp_p
         module.run_one_flag("1")
     output = capsys.readouterr()
     assert "timeout-stdout" in output.out and "timeout-stderr" in output.err
-    receipts = [json.loads(p.read_text()) for p in tmp_path.glob('compile-shader-*/exit.json')]
-    assert {r['classification'] for r in receipts} == {
-        'UNQUALIFIED_TIMING_WITH_STDERR', 'PROCESS_FAILED', 'INVALID_RESULT', 'TIMEOUT'}
-    assert all(r['release_claim_qualified'] is False for r in receipts)
+    receipts = [json.loads(p.read_text()) for p in tmp_path.glob("compile-shader-*/exit.json")]
+    assert {r["classification"] for r in receipts} == {
+        "UNQUALIFIED_TIMING_WITH_STDERR",
+        "PROCESS_FAILED",
+        "INVALID_RESULT",
+        "TIMEOUT",
+    }
+    assert all(r["release_claim_qualified"] is False for r in receipts)
 
 
 def test_shared_cache_allocator_preserves_input_and_refuses_bad_parent(tmp_path):
@@ -125,12 +135,12 @@ def test_shared_cache_allocator_preserves_input_and_refuses_bad_parent(tmp_path)
     env = {"TORCHINDUCTOR_CACHE_DIR": str(parent), "KEEP": "unchanged"}
     a = fresh_cache_environment(env, keys=("TORCHINDUCTOR_CACHE_DIR",))
     b = fresh_cache_environment(env, keys=("TORCHINDUCTOR_CACHE_DIR",))
-    assert a != b and a['KEEP'] == b['KEEP'] == 'unchanged'
-    assert all(Path(x['TORCHINDUCTOR_CACHE_DIR']).parent == parent for x in (a,b))
+    assert a != b and a["KEEP"] == b["KEEP"] == "unchanged"
+    assert all(Path(x["TORCHINDUCTOR_CACHE_DIR"]).parent == parent for x in (a, b))
     assert env == {"TORCHINDUCTOR_CACHE_DIR": str(parent), "KEEP": "unchanged"}
     assert (parent / "canary").read_text() == "retain"
     with pytest.raises(FileExistsError):
-        fresh_cache_environment({"TRITON_CACHE_DIR": str(parent / 'canary')}, keys=("TRITON_CACHE_DIR",))
+        fresh_cache_environment({"TRITON_CACHE_DIR": str(parent / "canary")}, keys=("TRITON_CACHE_DIR",))
 
 
 @triton.jit
@@ -152,8 +162,9 @@ def test_cold_cache_rotation_preserves_existing_directories(monkeypatch, tmp_pat
         monkeypatch.setenv(key, str(directory))
         original[key] = directory
     mkdtemp = tempfile.mkdtemp
-    monkeypatch.setattr("triton_msl.profiling.cache_session.tempfile.mkdtemp",
-                        lambda **kwargs: mkdtemp(dir=tmp_path, **kwargs))
+    monkeypatch.setattr(
+        "triton_msl.profiling.cache_session.tempfile.mkdtemp", lambda **kwargs: mkdtemp(dir=tmp_path, **kwargs)
+    )
     roots = []
     for _ in range(2):
         _unused_kernel.device_caches[999] = "stale executable"
@@ -168,8 +179,14 @@ def test_cold_cache_rotation_preserves_existing_directories(monkeypatch, tmp_pat
     # The shared helper must also load from the documented direct-script entry.
     # Zero seeds exercise imports/CLI only, not an additional GPU fuzz sweep.
     env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-    run = subprocess.run([sys.executable, str(Path(__file__).with_name("test_fuzz_reduce.py")), "0"],
-                         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    run = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("test_fuzz_reduce.py")), "0"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert run.returncode == 0, run.stdout + run.stderr
     assert "reduce fuzz: {} over 0 seed(s)" in run.stdout
 
@@ -189,8 +206,11 @@ def test_fuzzer_missing_file_keeps_original_seed_and_failure(monkeypatch):
     monkeypatch.setattr(torch, "manual_seed", seed)
     cases = [
         (mm, "_k_simple", lambda: mm._run_cell("simple", 16, 16, 16, torch.float32, 277)),
-        (mm, "_k_single_strided", lambda: mm._run_strided_cell(
-            "single", 16, 16, 16, torch.float32, "rowmaj", "rowmaj", "rowmaj", 277)),
+        (
+            mm,
+            "_k_single_strided",
+            lambda: mm._run_strided_cell("single", 16, 16, 16, torch.float32, "rowmaj", "rowmaj", "rowmaj", 277),
+        ),
         (mm, "_k_batched", lambda: mm._run_batched_cell(2, 16, 16, 16, torch.float32, 277)),
         (red, "_r1d_sum", lambda: red._run_cell("1d_sum", (16,), torch.float32, 277)),
     ]
@@ -210,7 +230,11 @@ def test_fuzzer_missing_file_keeps_original_seed_and_failure(monkeypatch):
             patch.setattr(getattr(module, name), "run", fail)
             seed_calls.clear()
             result = run()
-            if result != ("crash:FileNotFoundError", "original missing cache artifact") or calls != [1] or seed_calls != [277]:
+            if (
+                result != ("crash:FileNotFoundError", "original missing cache artifact")
+                or calls != [1]
+                or seed_calls != [277]
+            ):
                 failures.append((name, result, list(calls), list(seed_calls)))
     assert not failures, failures
 
@@ -250,8 +274,11 @@ def test_pytest_sessions_own_cold_inductor_caches(tmp_path):
     (parent / "canary").write_text("retain")
     roots = []
     for index, inherited in enumerate((False, True, True)):
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("TORCHINDUCTOR_CACHE_DIR", "PYTHONPATH", "PYTEST_ADDOPTS", "EXPECTED_PARENT")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("TORCHINDUCTOR_CACHE_DIR", "PYTHONPATH", "PYTEST_ADDOPTS", "EXPECTED_PARENT")
+        }
         env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         # The copied conftest's shared helper must come from this exact candidate,
         # not an unrelated globally installed package. Assert it inside collection.
@@ -263,9 +290,14 @@ def test_pytest_sessions_own_cold_inductor_caches(tmp_path):
         if inherited:
             env["TORCHINDUCTOR_CACHE_DIR"] = str(parent)
             env["EXPECTED_PARENT"] = str(parent)
-        run = subprocess.run([sys.executable, "-m", "pytest", "-q", "--confcutdir", str(project),
-                              str(project / "test_probe.py")],
-                             cwd=project, env=env, text=True, capture_output=True, timeout=60)
+        run = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--confcutdir", str(project), str(project / "test_probe.py")],
+            cwd=project,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
         assert run.returncode == 0, run.stdout + run.stderr
         roots.append(Path(json.loads(receipt.read_text())))
     assert len(set(roots)) == 3

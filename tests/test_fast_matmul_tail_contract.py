@@ -22,8 +22,7 @@ def _unmasked(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.const
         acc += tl.dot(tl.load(ap), tl.load(bp))
         ap += BK
         bp += BK * N
-    tl.store(C + rm[:, None] * N + rn[None, :], acc,
-             (rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(C + rm[:, None] * N + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N))
 
 
 @triton.jit
@@ -40,8 +39,7 @@ def _masked(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constex
         acc += tl.dot(av, bv)
         ap += BK
         bp += BK * N
-    tl.store(C + rm[:, None] * N + rn[None, :], acc,
-             (rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(C + rm[:, None] * N + rn[None, :], acc, (rm[:, None] < M) & (rn[None, :] < N))
 
 
 def _descriptor(kernel):
@@ -50,10 +48,20 @@ def _descriptor(kernel):
     options = backend.parse_options({"num_warps": 4})
     ctx = ir.context()
     ir.load_dialects(ctx)
-    sig = {"A": "*fp32", "B": "*fp32", "C": "*fp32", "M": "i32", "N": "i32", "K": "i32",
-           "BM": "constexpr", "BN": "constexpr", "BK": "constexpr"}
+    sig = {
+        "A": "*fp32",
+        "B": "*fp32",
+        "C": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr",
+        "BK": "constexpr",
+    }
     module = ASTSource(kernel, sig, {"BM": 32, "BN": 32, "BK": 32}).make_ir(
-        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
+        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx
+    )
     module = backend.make_ttir(module, {}, options)
     module = backend.make_ttgir(module, {}, options)
     lowerer = GenericLowerer(walk_ttgir(module, options), options)
@@ -82,7 +90,10 @@ class _Runtime:
 def _dispatch(desc, k):
     rt = _Runtime()
     accepted = dispatch_fast_matmul(
-        rt, desc, [object(), object(), object(), 32, 32, k], grid=(1, 1, 1),
+        rt,
+        desc,
+        [object(), object(), object(), 32, 32, k],
+        grid=(1, 1, 1),
     )
     return accepted, rt.calls
 

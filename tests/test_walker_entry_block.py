@@ -59,6 +59,7 @@ def cold_gpu_caches(tmp_path, monkeypatch):
 
 # --------------------------------------------------------------------------- Python-reachable shapes
 
+
 @triton.jit
 def _k_while_carried(out_ptr, x, y):
     # first statement owns a region; its condition reads only carried values, no literal anywhere
@@ -157,12 +158,15 @@ def test_walker_files_while_first_callee_under_the_callee():
 
 
 @requires_gpu
-@pytest.mark.parametrize("kernel,dtype,cases", [
-    (_k_while_carried, torch.float32, [(1.0, 100.0), (3.0, 5.0), (0.5, 0.25), (7.0, 7.0)]),
-    # no integer argument equal to 1: Triton's JIT specializes it as a constexpr and its own
-    # frontend then rejects the loop ("carried variable changed type") on every backend
-    (_k_while_carried_i, torch.int32, [(2, 100), (3, 5), (9, 4), (7, 7)]),
-])
+@pytest.mark.parametrize(
+    "kernel,dtype,cases",
+    [
+        (_k_while_carried, torch.float32, [(1.0, 100.0), (3.0, 5.0), (0.5, 0.25), (7.0, 7.0)]),
+        # no integer argument equal to 1: Triton's JIT specializes it as a constexpr and its own
+        # frontend then rejects the loop ("carried variable changed type") on every backend
+        (_k_while_carried_i, torch.int32, [(2, 100), (3, 5), (9, 4), (7, 7)]),
+    ],
+)
 def test_while_first_kernel_computes(cold_gpu_caches, kernel, dtype, cases):
     """Two-arm, correct-or-refuse: the kernel whose first statement is a `while` over carried values
     must write the Python loop's result. Pre-166 the lowered kernel compiled with no store (its
@@ -221,11 +225,13 @@ def test_while_against_literal_unaffected(cold_gpu_caches):
 
 # --------------------------------------------------------------------------- direct TTGIR (155 witness)
 
-_HEADER = '''#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+_HEADER = """#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-'''
+"""
 
-_CALLEES = _HEADER + '''  tt.func public @entry(%p: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
+_CALLEES = (
+    _HEADER
+    + """  tt.func public @entry(%p: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
     %r = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32, #blocked>
     %ps = tt.splat %p : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>, #blocked>
     %addr = tt.addptr %ps, %r : tensor<32x!tt.ptr<f32>, #blocked>, tensor<32xi32, #blocked>
@@ -253,9 +259,12 @@ _CALLEES = _HEADER + '''  tt.func public @entry(%p: !tt.ptr<f32>, %out: !tt.ptr<
     tt.return %r : f32
   }
 }
-'''
+"""
+)
 
-_ENTRY_FIRST = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>) {
+_ENTRY_FIRST = (
+    _HEADER
+    + """  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>) {
     %r = "tt.reduce"(%x) <{axis = 0 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %s = arith.addf %a, %b : f32
@@ -265,7 +274,8 @@ _ENTRY_FIRST = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #blocked>
     tt.return
   }
 }
-'''
+"""
+)
 
 
 def _parse(text, tmp_path, name="m.ttgir"):
@@ -319,12 +329,16 @@ def test_ttgir_reduction_first_entry_function(tmp_path):
     g = _parse(_ENTRY_FIRST, tmp_path)
     # entry args are named positionally and carry the expanded layout: compare shape / kind
     assert [(a.is_ptr, a.elem_type, a.type_str.split(",")[0]) for a in g.args] == [
-        (False, "f32", "tensor<32xf32"), (True, "f32", "!tt.ptr<f32>")], g.args
+        (False, "f32", "tensor<32xf32"),
+        (True, "f32", "!tt.ptr<f32>"),
+    ], g.args
     _check_reduce(g.ops, True)
     assert g.called_funcs is None
 
 
-_FOR_REDUCE_FIRST = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>, %lb: index, %ub: index, %st: index, %init: f32) {
+_FOR_REDUCE_FIRST = (
+    _HEADER
+    + """  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>, %lb: index, %ub: index, %st: index, %init: f32) {
     %acc = scf.for %i = %lb to %ub step %st iter_args(%a0 = %init) -> (f32) {
       %r = "tt.reduce"(%x) <{axis = 0 : i32}> ({
       ^bb0(%a: f32, %b: f32):
@@ -338,9 +352,12 @@ _FOR_REDUCE_FIRST = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #blo
     tt.return
   }
 }
-'''
+"""
+)
 
-_IF_FIRST_CALLEE = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %c: i1, %v: f32) {
+_IF_FIRST_CALLEE = (
+    _HEADER
+    + """  tt.func public @entry(%out: !tt.ptr<f32>, %c: i1, %v: f32) {
     %r = tt.call @pick(%c, %v) : (i1, f32) -> f32
     tt.store %out, %r : !tt.ptr<f32>
     tt.return
@@ -355,7 +372,8 @@ _IF_FIRST_CALLEE = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %c: 
     tt.return %r : f32
   }
 }
-'''
+"""
+)
 
 
 def _walk_all(ops):
@@ -371,13 +389,28 @@ def test_ttgir_two_regions_deep_first_op_entry(tmp_path):
     nested under the loop. Pre-166: two f32 arguments off the reduce body, ops == [arith.addf]."""
     g = _parse(_FOR_REDUCE_FIRST, tmp_path)
     assert [(a.is_ptr, a.elem_type) for a in g.args] == [
-        (False, "f32"), (True, "f32"), (False, "index"), (False, "index"), (False, "index"), (False, "f32")], g.args
+        (False, "f32"),
+        (True, "f32"),
+        (False, "index"),
+        (False, "index"),
+        (False, "index"),
+        (False, "f32"),
+    ], g.args
     assert [o.op for o in g.ops] == ["scf.for", "tt.store", "tt.return"]
     assert [o.op for o in _walk_all(g.ops)] == [
-        "scf.for", "tt.reduce", "arith.addf", "arith.addf", "scf.yield", "tt.store", "tt.return"]
+        "scf.for",
+        "tt.reduce",
+        "arith.addf",
+        "arith.addf",
+        "scf.yield",
+        "tt.store",
+        "tt.return",
+    ]
 
 
-_WHILE_IF_CALLEE = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %x: f32, %lim: f32, %c: i1) {
+_WHILE_IF_CALLEE = (
+    _HEADER
+    + """  tt.func public @entry(%out: !tt.ptr<f32>, %x: f32, %lim: f32, %c: i1) {
     %r = tt.call @grow(%x, %lim, %c) : (f32, f32, i1) -> f32
     tt.store %out, %r : !tt.ptr<f32>
     tt.return
@@ -400,9 +433,12 @@ _WHILE_IF_CALLEE = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %x: 
     tt.return %r : f32
   }
 }
-'''
+"""
+)
 
-_PRIVATE_FIRST = _HEADER + '''  tt.func private @twice(%v: f32) -> f32 {
+_PRIVATE_FIRST = (
+    _HEADER
+    + """  tt.func private @twice(%v: f32) -> f32 {
     %d = arith.addf %v, %v : f32
     tt.return %d : f32
   }
@@ -412,9 +448,12 @@ _PRIVATE_FIRST = _HEADER + '''  tt.func private @twice(%v: f32) -> f32 {
     tt.return
   }
 }
-'''
+"""
+)
 
-_TWO_PUBLIC = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32) {
+_TWO_PUBLIC = (
+    _HEADER
+    + """  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32) {
     tt.store %out, %v : !tt.ptr<f32>
     tt.return
   }
@@ -423,7 +462,8 @@ _TWO_PUBLIC = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32) 
     tt.return
   }
 }
-'''
+"""
+)
 
 
 def test_ttgir_while_first_callee_with_nested_condition(tmp_path):
@@ -435,8 +475,17 @@ def test_ttgir_while_first_callee_with_nested_condition(tmp_path):
     assert [a.type_str for a in f.args] == ["f32", "f32", "i1"], f.args
     assert [o.op for o in f.ops] == ["scf.while", "tt.return"]
     assert [o.op for o in _walk_all(f.ops)] == [
-        "scf.while", "scf.if", "arith.cmpf", "scf.yield", "arith.constant", "scf.yield",
-        "scf.condition", "arith.addf", "scf.yield", "tt.return"]
+        "scf.while",
+        "scf.if",
+        "arith.cmpf",
+        "scf.yield",
+        "arith.constant",
+        "scf.yield",
+        "scf.condition",
+        "arith.addf",
+        "scf.yield",
+        "tt.return",
+    ]
 
 
 def test_ttgir_private_function_before_the_public_one(tmp_path):
@@ -454,7 +503,9 @@ def test_ttgir_private_function_before_the_public_one(tmp_path):
     assert [o.op for o in f.ops] == ["arith.addf", "tt.return"]
 
 
-_MULTI_BLOCK = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32) {
+_MULTI_BLOCK = (
+    _HEADER
+    + """  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32) {
     %d = arith.addf %v, %v : f32
     cf.br ^bb1(%d : f32)
   ^bb1(%a: f32):
@@ -462,7 +513,8 @@ _MULTI_BLOCK = _HEADER + '''  tt.func public @entry(%out: !tt.ptr<f32>, %v: f32)
     tt.return
   }
 }
-'''
+"""
+)
 
 
 def test_ttgir_multi_block_body_refuses(tmp_path):
@@ -474,7 +526,9 @@ def test_ttgir_multi_block_body_refuses(tmp_path):
         _parse(_MULTI_BLOCK, tmp_path)
 
 
-_IF_THEN_REDUCE = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>, %c: i1) {
+_IF_THEN_REDUCE = (
+    _HEADER
+    + """  tt.func public @entry(%x: tensor<32xf32, #blocked>, %out: !tt.ptr<f32>, %c: i1) {
     %t = scf.if %c -> (tensor<32xf32, #blocked>) {
       %d = arith.addf %x, %x : tensor<32xf32, #blocked>
       scf.yield %d : tensor<32xf32, #blocked>
@@ -490,7 +544,8 @@ _IF_THEN_REDUCE = _HEADER + '''  tt.func public @entry(%x: tensor<32xf32, #block
     tt.return
   }
 }
-'''
+"""
+)
 
 
 def test_ttgir_region_op_feeding_a_region_op_first(tmp_path):
@@ -501,7 +556,15 @@ def test_ttgir_region_op_feeding_a_region_op_first(tmp_path):
     assert [(a.is_ptr, a.elem_type) for a in g.args] == [(False, "f32"), (True, "f32"), (False, "i1")], g.args
     assert [o.op for o in g.ops] == ["scf.if", "tt.reduce", "tt.store", "tt.return"]
     assert [o.op for o in _walk_all(g.ops)] == [
-        "scf.if", "arith.addf", "scf.yield", "scf.yield", "tt.reduce", "arith.addf", "tt.store", "tt.return"]
+        "scf.if",
+        "arith.addf",
+        "scf.yield",
+        "scf.yield",
+        "tt.reduce",
+        "arith.addf",
+        "tt.store",
+        "tt.return",
+    ]
 
 
 def test_ttgir_two_public_functions_refuse(tmp_path):

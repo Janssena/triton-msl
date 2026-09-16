@@ -152,7 +152,9 @@ def _compile_msl(fn, signature, constexprs, tmp_path, monkeypatch):
     source = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
     context = ir.context()
     ir.load_dialects(context)
-    mod = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+    mod = source.make_ir(
+        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     metadata = {}
     mod = backend.make_ttir(mod, metadata, options)
     mod = backend.make_ttgir(mod, metadata, options)
@@ -313,11 +315,11 @@ def test_ordered_reduce_sub16_stays_refused(tmp_path, monkeypatch):
     [
         (_reduce_quiet_2d, "for (uint j = 1u; j < 32u", "[lid * 32u]"),
         (_reduce_quiet_2d_axis0, "for (uint i = 1u; i < 2u", "[lid]"),
-    ] if HAS else [],
+    ]
+    if HAS
+    else [],
 )
-def test_ordered_reduce_rank2_seeds_first_value_and_folds_in_axis_order(
-    kernel, axis_loop, seed, tmp_path, monkeypatch
-):
+def test_ordered_reduce_rank2_seeds_first_value_and_folds_in_axis_order(kernel, axis_loop, seed, tmp_path, monkeypatch):
     msl = _compile_msl(
         kernel,
         {"x": "*fp32", "z": "*fp32", "m": "constexpr", "n": "constexpr"},
@@ -402,13 +404,17 @@ def _fold_bits(bits, kind):
 
 
 _GPU_CASES = (
-    ("quiet_max", _reduce_quiet),
-    ("prop_max", _reduce_prop),
-    ("quiet_min", _reduce_quiet_min),
-    ("prop_min", _reduce_prop_min),
-    ("plain_ge", _reduce_plain_ge),
-    ("plain_le", _reduce_plain_le),
-) if HAS else ()
+    (
+        ("quiet_max", _reduce_quiet),
+        ("prop_max", _reduce_prop),
+        ("quiet_min", _reduce_quiet_min),
+        ("prop_min", _reduce_prop_min),
+        ("plain_ge", _reduce_plain_ge),
+        ("plain_le", _reduce_plain_le),
+    )
+    if HAS
+    else ()
+)
 
 
 @requires_gpu
@@ -424,14 +430,27 @@ def test_ordered_reduce_gpu_bits_canaries_and_live_source(kind, kernel, n, execu
         words = [0x7FC00001 + i for i in range(n)]
     elif n == 64:
         words = [0x80000000 if i % 2 else 0x00000000 for i in range(n)]
-        for i, word in ((0, 0x7FC00011), (15, 0x7FC00012), (31, 0x7FC00013),
-                        (32, 0x7FC00014), (47, 0x7FC00015), (63, 0x7FC00016)):
+        for i, word in (
+            (0, 0x7FC00011),
+            (15, 0x7FC00012),
+            (31, 0x7FC00013),
+            (32, 0x7FC00014),
+            (47, 0x7FC00015),
+            (63, 0x7FC00016),
+        ):
             words[i] = word
     else:
         words = [0x3F000000 + (i % 7) for i in range(n)]
-        for i, word in ((0, 0x7FC00021), (31, 0xFF800000), (32, 0x7F800000),
-                        (63, 0x7FC00022), (64, 0x7F800000), (95, 0xFF800000),
-                        (96, 0x7FC00023), (127, 0x7FC00024)):
+        for i, word in (
+            (0, 0x7FC00021),
+            (31, 0xFF800000),
+            (32, 0x7F800000),
+            (63, 0x7FC00022),
+            (64, 0x7F800000),
+            (95, 0xFF800000),
+            (96, 0x7FC00023),
+            (127, 0x7FC00024),
+        ):
             words[i] = word
     input_canary = 0x4A123456
     output_canary = 0x4B654321
@@ -491,11 +510,15 @@ def test_ordered_reduce_gpu_partial_simd_n16(kind, kernel, executed):
 
 
 _RANK2_GPU_CASES = (
-    ("quiet_max", _reduce_quiet_2d, _reduce_quiet_2d_axis0),
-    ("prop_max", _reduce_prop_2d, _reduce_prop_2d_axis0),
-    ("quiet_min", _reduce_quiet_min_2d, _reduce_quiet_min_2d_axis0),
-    ("prop_min", _reduce_prop_min_2d, _reduce_prop_min_2d_axis0),
-) if HAS else ()
+    (
+        ("quiet_max", _reduce_quiet_2d, _reduce_quiet_2d_axis0),
+        ("prop_max", _reduce_prop_2d, _reduce_prop_2d_axis0),
+        ("quiet_min", _reduce_quiet_min_2d, _reduce_quiet_min_2d_axis0),
+        ("prop_min", _reduce_prop_min_2d, _reduce_prop_min_2d_axis0),
+    )
+    if HAS
+    else ()
+)
 
 
 @requires_gpu
@@ -504,8 +527,14 @@ _RANK2_GPU_CASES = (
 def test_ordered_reduce_gpu_rank2_axis_source_order(kind, axis1_kernel, axis0_kernel, axis, executed):
     m, n = 2, 16
     words = [0x80000000 if i % 2 else 0x00000000 for i in range(m * n)]
-    for i, word in ((0, 0x7FC00201), (7, 0x7FC00202), (15, 0x7FC00203),
-                    (16, 0x7FC00211), (23, 0x7FC00212), (31, 0x7FC00213)):
+    for i, word in (
+        (0, 0x7FC00201),
+        (7, 0x7FC00202),
+        (15, 0x7FC00203),
+        (16, 0x7FC00211),
+        (23, 0x7FC00212),
+        (31, 0x7FC00213),
+    ):
         words[i] = word
     canary = 0x4A56789A
     signed = lambda word: word if word < 0x80000000 else word - 0x100000000

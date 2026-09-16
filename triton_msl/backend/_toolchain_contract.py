@@ -6,6 +6,7 @@ silently combined with cached device/AIR probes. No persistent stat-only memo is
 trusted. The first lookup reads actual bytes; subsequent lookups reuse that
 process snapshot. Whole-tree inventory is intentionally conservative.
 """
+
 import hashlib
 import json
 import os
@@ -17,11 +18,23 @@ import threading
 
 
 _SELECTION = ("PATH", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS")
-_EXTERNAL_SEARCH = ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH",
-                    "COMPILER_PATH", "GCC_EXEC_PREFIX", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-                    "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
-                    "DYLD_ROOT_PATH", "DYLD_IMAGE_SUFFIX", "DYLD_VERSIONED_LIBRARY_PATH",
-                    "DYLD_VERSIONED_FRAMEWORK_PATH")
+_EXTERNAL_SEARCH = (
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "LIBRARY_PATH",
+    "COMPILER_PATH",
+    "GCC_EXEC_PREFIX",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_ROOT_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+)
 _lock = threading.RLock()
 _snapshot = None
 _environment_inputs = None
@@ -53,7 +66,9 @@ def _tree_manifest(root, *, ignore_bytecode=False, exclude_root_names=(), allow_
                 digest = hasher.hexdigest()
             after = path.stat()
             if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                after.st_size, after.st_mtime_ns, after.st_ctime_ns
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
             ):
                 raise RuntimeError(f"toolchain input changed while hashing: {path}")
             records.append((rel, before.st_size, digest, "file"))
@@ -87,13 +102,13 @@ def _toolchain_native_dependencies(roots, entries):
                 continue
             visited.add(inode)
             if stat.S_ISDIR(status.st_mode):
-                pending.extend((child, f"{rel}/{child.name}" if rel else child.name)
-                               for child in reversed(sorted(path.iterdir())))
+                pending.extend(
+                    (child, f"{rel}/{child.name}" if rel else child.name) for child in reversed(sorted(path.iterdir()))
+                )
             elif stat.S_ISREG(status.st_mode) and path.suffix != ".a" and is_native(path):
                 if parse_image(path, cpu).file_type == 2:  # MH_EXECUTE, not standalone dylib
                     entries[f"{role}-helper:{rel}"] = path
-    return {role: dependency_manifest([path], cpu_type=cpu, executable=path)
-            for role, path in sorted(entries.items())}
+    return {role: dependency_manifest([path], cpu_type=cpu, executable=path) for role, path in sorted(entries.items())}
 
 
 def _resolve_toolchain():
@@ -102,8 +117,7 @@ def _resolve_toolchain():
         raise RuntimeError("xcrun is unavailable; install/select the Metal toolchain")
 
     def query(*args):
-        value = subprocess.check_output([resolver, "-sdk", "macosx", *args],
-                                        text=True, stderr=subprocess.PIPE).strip()
+        value = subprocess.check_output([resolver, "-sdk", "macosx", *args], text=True, stderr=subprocess.PIPE).strip()
         if not value:
             raise RuntimeError(f"empty toolchain query: {args}")
         return value
@@ -117,8 +131,11 @@ def _resolve_toolchain():
         roots[name] = bundle
         entries[name + "-selector"] = selector
     version = query("metal", "--version")
-    installed = [line.removeprefix("InstalledDir: ").strip() for line in version.splitlines()
-                 if line.startswith("InstalledDir: ")]
+    installed = [
+        line.removeprefix("InstalledDir: ").strip()
+        for line in version.splitlines()
+        if line.startswith("InstalledDir: ")
+    ]
     if len(installed) != 1:
         raise RuntimeError("Metal compiler does not identify its actual InstalledDir")
     actual = (Path(installed[0]) / "metal").resolve(strict=True)
@@ -144,6 +161,7 @@ def _resolve_toolchain():
 def toolchain_identity():
     """Fail closed on incomplete identity or live selector changes, never 'unknown'."""
     from ._environment_snapshot import environment_snapshot
+
     return _identity_for_environment(environment_snapshot())
 
 
@@ -154,24 +172,28 @@ def _identity_for_environment(environment):
     from ._environment_snapshot import is_snapshot
 
     cached = _environment_inputs
-    if (cached is not None and cached[0] is environment
-            and cached[1:3] == (_SELECTION, _EXTERNAL_SEARCH)):
+    if cached is not None and cached[0] is environment and cached[1:3] == (_SELECTION, _EXTERNAL_SEARCH):
         selection, external = cached[3:]
     else:
         selection = tuple(environment.get(key) for key in _SELECTION)
-        external = sorted({key for key in _EXTERNAL_SEARCH if environment.get(key)}
-                          | {key for key in environment if key.startswith("DYLD_") and environment.get(key)})
+        external = sorted(
+            {key for key in _EXTERNAL_SEARCH if environment.get(key)}
+            | {key for key in environment if key.startswith("DYLD_") and environment.get(key)}
+        )
         if is_snapshot(environment):
             _environment_inputs = environment, _SELECTION, _EXTERNAL_SEARCH, selection, external
     if external:
         raise MetalNonRecoverableError(
-            "untracked compiler search/injection environment: " + ", ".join(external)
+            "untracked compiler search/injection environment: "
+            + ", ".join(external)
             + "; clear it before compiling with the Metal cache contract"
         )
     with _lock:
         if _snapshot is not None:
             if _snapshot[0] != selection:
-                raise MetalNonRecoverableError("Metal toolchain selection changed in this process; restart before compiling")
+                raise MetalNonRecoverableError(
+                    "Metal toolchain selection changed in this process; restart before compiling"
+                )
             return _snapshot[1]
         try:
             roots, metadata = _resolve_toolchain()

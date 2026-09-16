@@ -35,8 +35,24 @@ requires_gpu = pytest.mark.skipif(not HAS_GPU, reason="Metal GPU needed")
 if HAS:
 
     @triton.jit
-    def _kloop(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
+    def _kloop(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        sbk,
+        sbn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -87,7 +103,9 @@ if HAS:
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
         context = ir.context()
         ir.load_dialects(context)
-        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+        mod = src.make_ir(
+            target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+        )
         metadata = {}
         mod = backend.make_ttir(mod, metadata, options)
         mod = backend.make_ttgir(mod, metadata, options)
@@ -107,7 +125,7 @@ def _tile_trans(a, bm, bk):
     t = torch.empty_like(a)
     for m0 in range(0, a.shape[0], bm):
         for k0 in range(0, a.shape[1], bk):
-            t[m0:m0 + bm, k0:k0 + bk] = a[m0:m0 + bm, k0:k0 + bk].T
+            t[m0 : m0 + bm, k0 : k0 + bk] = a[m0 : m0 + bm, k0 : k0 + bk].T
     return t
 
 
@@ -121,7 +139,9 @@ def _witness(launch, c, raw, intended):
         assert bool(c.isnan().all()), "a refused kernel must touch nothing"
         return "refused"
     err = (c - intended).abs().max().item()
-    assert err == err and err <= sep / 10, f"computed the raw product, not the transposed one (err {err}, separation {sep})"
+    assert err == err and err <= sep / 10, (
+        f"computed the raw product, not the transposed one (err {err}, separation {sep})"
+    )
     return "computed"
 
 
@@ -134,7 +154,24 @@ def _kloop_case(mode):
     raw = a @ b
     intended = _tile_trans(a, BM, BK) @ b if mode == 1 else (a @ _tile_trans(b, BK, BN) if mode == 2 else raw)
     c = torch.full((M, N), float("nan"), device="mps")
-    launch = lambda: _kloop[(M // BM, N // BN)](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM, BN, BK, MODE=mode)
+    launch = lambda: _kloop[(M // BM, N // BN)](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM,
+        BN,
+        BK,
+        MODE=mode,
+    )
     return launch, c, raw, intended
 
 
@@ -158,8 +195,11 @@ def test_kloop_native_spellings_compute(cold_gpu_caches, mode):
 
 
 @requires_gpu
-@pytest.mark.parametrize("mode,M,N,K", [(1, 32, 64, 32), (2, 64, 32, 32), (4, 64, 32, 32)],
-                         ids=["single-transA-square", "single-transB-square", "single-Y[N,K]-canonical"])
+@pytest.mark.parametrize(
+    "mode,M,N,K",
+    [(1, 32, 64, 32), (2, 64, 32, 32), (4, 64, 32, 32)],
+    ids=["single-transA-square", "single-transB-square", "single-Y[N,K]-canonical"],
+)
 def test_single_tile_transposes_replayed(cold_gpu_caches, mode, M, N, K):
     """Positives (probe-proven): the single-tile template replays in-tile and canonical
     transposes exactly (outside the generic envelope: M != N)."""
@@ -173,8 +213,20 @@ def test_single_tile_transposes_replayed(cold_gpu_caches, mode, M, N, K):
     torch.testing.assert_close(c, ref, rtol=1e-4, atol=1e-4)
 
 
-_SIG_K = {"a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32",
-          "sam": "i32", "sak": "constexpr", "sbk": "i32", "sbn": "constexpr", "scm": "i32", "scn": "constexpr"}
+_SIG_K = {
+    "a_ptr": "*fp32",
+    "b_ptr": "*fp32",
+    "c_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "sam": "i32",
+    "sak": "constexpr",
+    "sbk": "i32",
+    "sbn": "constexpr",
+    "scm": "i32",
+    "scn": "constexpr",
+}
 _CEX_K = {"BM": 32, "BN": 32, "BK": 32, "sak": 1, "sbn": 1, "scn": 1}
 
 

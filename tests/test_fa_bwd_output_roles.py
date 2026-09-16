@@ -3,6 +3,7 @@
 All inputs are fp32 so only output storage differs. Direct-lowering pins inspect the
 contract before executable caching; GPU rows use source-faithful independent math.
 """
+
 import itertools
 import re
 
@@ -13,8 +14,16 @@ import triton
 import triton_msl.codegen._msl_templates as makers
 from triton_msl.errors import MetalNonRecoverableError
 from test_fa_bwd_rounding_replay import (
-    NEG, _bwd_b, _bwd_kv, _bwd_q, _build_lowerer,
-    _oracle_b, _oracle_kv, _oracle_q, _problem, _sig,
+    NEG,
+    _bwd_b,
+    _bwd_kv,
+    _bwd_q,
+    _build_lowerer,
+    _oracle_b,
+    _oracle_kv,
+    _oracle_q,
+    _problem,
+    _sig,
 )
 
 
@@ -65,7 +74,7 @@ def test_lowering_replays_each_output_role(kind, dim, widths):
 def test_bias_output_role_is_independent_of_input_width(dim, width):
     fn, sig, cex = _signature("b", (width,), dim)
     msl = _build_lowerer(fn, sig, cex).lower()
-    rhs, = re.findall(r"\bDB\[.*?\] = ([^;]+);", msl)
+    (rhs,) = re.findall(r"\bDB\[.*?\] = ([^;]+);", msl)
     expected = "db_acc[i]" if width == "fp32" else CASTS[width] + "(db_acc[i])"
     assert rhs == expected
 
@@ -147,9 +156,11 @@ def test_gpu_outputs_match_each_source_storage_type(kind, dim, widths, cold, mon
     name = "make_flash_attention_bwd_" + kind + "_kernel" + ("_simd" if dim == 32 else "")
     real = getattr(makers, name)
     calls = []
+
     def spy(*args, **kw):
         calls.append(kw)
         return real(*args, **kw)
+
     monkeypatch.setattr(makers, name, spy)
     args = []
     delta = p["delta"] if kind == "kv" else second
@@ -177,9 +188,11 @@ def test_gpu_bias_output_matches_source_storage(dim, width, cold, monkeypatch):
     out = torch.zeros(hc, n, n, dtype=DTYPES[width], device="mps")
     real = makers.make_flash_attention_bwd_b_kernel
     calls = []
+
     def spy(*args, **kw):
         calls.append(kw)
         return real(*args, **kw)
+
     monkeypatch.setattr(makers, "make_flash_attention_bwd_b_kernel", spy)
     args = []
     for tensor in [p[k] for k in ("delta", "q", "k", "v", "bias", "lse", "mask", "do")] + [out]:
@@ -201,9 +214,11 @@ def test_random_dv_float32_is_not_rounded_to_dk_width(width, cold, monkeypatch):
     dv = torch.zeros(hc, i, n, dim, device="mps", dtype=torch.float32)
     real = makers.make_flash_attention_bwd_kv_kernel_simd
     calls = []
+
     def spy(*args, **kw):
         calls.append(kw)
         return real(*args, **kw)
+
     monkeypatch.setattr(makers, "make_flash_attention_bwd_kv_kernel_simd", spy)
     args = []
     for tensor in [p[k] for k in ("delta", "q", "k", "v", "bias", "lse", "mask", "do")] + [dk, dv]:

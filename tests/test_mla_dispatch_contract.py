@@ -232,15 +232,39 @@ class _FakeRT:
 
 def _desc(**over):
     base = dict(
-        idx=(0, 1, 2, 3, 4, 5), z=30, h=31, n=32, bm=32, dims=(DN, DR, DV),
+        idx=(0, 1, 2, 3, 4, 5),
+        z=30,
+        h=31,
+        n=32,
+        bm=32,
+        dims=(DN, DR, DV),
         # kargs layout (see _kargs): 6 tensors at 0..5, then FOUR stride args per tensor
         # (z, h, row, inner) at 6..29, then Z, H, N at 30..32; the inner stride is folded ("c1").
-        strides={"q": (6, 7, 8, "c1"), "q_rope": (10, 11, 12, "c1"), "k": (14, 15, 16, "c1"),
-                 "k_rope": (18, 19, 20, "c1"), "v": (22, 23, 24, "c1"), "out": (26, 27, 28, "c1")},
+        strides={
+            "q": (6, 7, 8, "c1"),
+            "q_rope": (10, 11, 12, "c1"),
+            "k": (14, 15, 16, "c1"),
+            "k_rope": (18, 19, 20, "c1"),
+            "v": (22, 23, 24, "c1"),
+            "out": (26, 27, 28, "c1"),
+        },
         elems=("f16",) * 6,
     )
     base.update(over)
-    return ("mla", "#include <metal_stdlib>\n// mla", "mla_kernel", 256, *base["idx"], base["z"], base["h"], base["n"], base["bm"], base["dims"], base["strides"], base["elems"])
+    return (
+        "mla",
+        "#include <metal_stdlib>\n// mla",
+        "mla_kernel",
+        256,
+        *base["idx"],
+        base["z"],
+        base["h"],
+        base["n"],
+        base["bm"],
+        base["dims"],
+        base["strides"],
+        base["elems"],
+    )
 
 
 def _kargs(dtype=torch.float16, over=None):
@@ -267,7 +291,20 @@ def test_descriptor_contract_dispatches_full_grid_from_refs():
 
 
 @requires_gpu
-@pytest.mark.parametrize("case", ["bm16", "partial-grid", "no-grid", "legacy-descriptor", "z-ref-is-a-tensor", "n-ref-out-of-range", "dtype-mismatch", "stride-out-of-storage", "negative-stride"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "bm16",
+        "partial-grid",
+        "no-grid",
+        "legacy-descriptor",
+        "z-ref-is-a-tensor",
+        "n-ref-out-of-range",
+        "dtype-mismatch",
+        "stride-out-of-storage",
+        "negative-stride",
+    ],
+)
 def test_descriptor_contract_refuses(case):
     rt = _FakeRT()
     desc, kargs, grid = _desc(), _kargs(), (2, Z * H, 1)

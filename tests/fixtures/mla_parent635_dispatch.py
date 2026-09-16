@@ -6,6 +6,7 @@ Loaded by the CPU test harness with the real SubmissionState class.
 
 from triton_msl.autotuning._submission import SubmissionState
 
+
 def _launch_grid_ok(grid, expected):
     """Packet 105 B: a replacement template computes the FULL output from its descriptor;
     it may stand in for the compiled kernel only when the caller launched EXACTLY the
@@ -20,7 +21,9 @@ def _launch_grid_ok(grid, expected):
     return len(g) == 3 and len(e) == 3 and g == e
 
 
-def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_mla(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """MLA (nope/rope) dispatch: concat the split QK tensors and run the qk=head_dim /
     v=v_head_dim kernel. descriptor = ('mla', msl, name, tg, q_nope, q_rope, k_nope,
     k_rope, v, out, Z, H, N) with the last 9 being indices into kargs. FAIL-CLOSED in the
@@ -70,15 +73,34 @@ def _dispatch_mla(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, la
         # Packet 109 A: the template declares ONE pointer type for Q/K/V/Out — all six roles
         # must share it (f16 or f32; the template has no bf16 variant), and each host
         # tensor must carry exactly that dtype.
-        _dt = {"f16": torch.float16, "fp16": torch.float16, "half": torch.float16, "f32": torch.float32, "fp32": torch.float32, "float": torch.float32}
+        _dt = {
+            "f16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "f32": torch.float32,
+            "fp32": torch.float32,
+            "float": torch.float32,
+        }
         if len(elems) != 6 or len({_dt.get(str(e)) for e in elems}) != 1 or _dt.get(str(elems[0])) is None:
             return False
-        roles = (("q", qn_i, DN), ("q_rope", qr_i, DR), ("k", kn_i, DN), ("k_rope", kr_i, DR), ("v", v_i, DV), ("out", o_i, DV))
+        roles = (
+            ("q", qn_i, DN),
+            ("q_rope", qr_i, DR),
+            ("k", kn_i, DN),
+            ("k_rope", kr_i, DR),
+            ("v", v_i, DV),
+            ("out", o_i, DV),
+        )
         views = {}
         for (role, idx, last), elem in zip(roles, elems):
             t = kargs[idx] if 0 <= int(idx) < len(kargs) else None
             want = _dt.get(str(elem))
-            if t is None or want is None or not hasattr(t, "data_ptr") or not str(getattr(t, "device", "")).startswith("mps"):
+            if (
+                t is None
+                or want is None
+                or not hasattr(t, "data_ptr")
+                or not str(getattr(t, "device", "")).startswith("mps")
+            ):
                 return False
             if t.dtype != want:
                 return False

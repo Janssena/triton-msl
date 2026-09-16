@@ -1,4 +1,5 @@
 """GPU controls for packed records: refuse before writes; snapshot before hooks."""
+
 import pytest
 import torch
 import triton
@@ -38,8 +39,7 @@ def test_changed_live_packed_record_refuses_without_hook_or_write(compiled, fiel
     packed[field] = value
     events = []
     with pytest.raises(MetalNonRecoverableError, match="packed launch contract"):
-        kernel.run(1, 1, 1, None, kernel.function, packed, None,
-                   lambda _: events.append("hook"), None, x, y, 32)
+        kernel.run(1, 1, 1, None, kernel.function, packed, None, lambda _: events.append("hook"), None, x, y, 32)
     torch.mps.synchronize()
     assert events == []
     torch.testing.assert_close(y, torch.full_like(y, -99), atol=0, rtol=0)
@@ -49,9 +49,11 @@ def test_hook_cannot_change_the_already_checked_dispatch(compiled):
     kernel, x, y = compiled
     packed = list(kernel.packed_metadata)
     events = []
+
     def hook(_):
         events.append("hook")
         packed[9] = ["mla"]  # malformed route would refuse if read after the hook
+
     kernel.run(1, 1, 1, None, kernel.function, packed, None, hook, None, x, y, 32)
     torch.mps.synchronize()
     assert events == ["hook"] and packed[9] == ["mla"]

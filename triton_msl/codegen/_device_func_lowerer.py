@@ -330,20 +330,30 @@ class _DeviceFuncLowerer:
                 a = self._pointer_expr(ids[1])
                 b = self._pointer_expr(ids[2])
                 meta = self.cfunc.result_meta.get(ssa.id)
-                if (a is None or b is None or meta is None or meta.schema_version != 1
-                        or meta.value_id != ssa.id or meta.kind != "result"
-                        or meta.producer_id != ssa.id or meta.result_index != 0
-                        or meta.type.kind != "pointer" or meta.type.address_space != 1
-                        or meta.type.pointee is None or meta.type.pointee.unknown_reason
-                        or meta.type.pointee.elem is None):
+                if (
+                    a is None
+                    or b is None
+                    or meta is None
+                    or meta.schema_version != 1
+                    or meta.value_id != ssa.id
+                    or meta.kind != "result"
+                    or meta.producer_id != ssa.id
+                    or meta.result_index != 0
+                    or meta.type.kind != "pointer"
+                    or meta.type.address_space != 1
+                    or meta.type.pointee is None
+                    or meta.type.pointee.unknown_reason
+                    or meta.type.pointee.elem is None
+                ):
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         "device-function pointer select lacks two addresses or native result metadata",
-                        op_name="arith.select")
+                        op_name="arith.select",
+                    )
                 dtype = _mlir_to_triton_dtype(meta.type.pointee.elem)
                 var = self._next_var("ptr")
-                self._emit(
-                    f"volatile device {triton_type_to_msl(dtype)}* {var} = {cond} ? {a} : {b};")
+                self._emit(f"volatile device {triton_type_to_msl(dtype)}* {var} = {cond} ? {a} : {b};")
                 self.env[ssa.id] = var
                 self.env_types[ssa.id] = dtype
                 self.env_is_ptr[ssa.id] = (var, None)
@@ -547,9 +557,11 @@ class _DeviceFuncLowerer:
                             pointer = self._pointer_expr(yield_id)
                             if pointer is None:
                                 from triton_msl.errors import MetalNonRecoverableError
+
                                 raise MetalNonRecoverableError(
                                     "device-function loop pointer yield has no address representation",
-                                    op_name="scf.for")
+                                    op_name="scf.for",
+                                )
                             next_var = self._next_var("next_ptr")
                             self._emit(f"    auto {next_var} = {pointer};")
                             pointer_next[i] = next_var
@@ -603,20 +615,29 @@ class _DeviceFuncLowerer:
             meta = self.cfunc.result_meta.get(rid)
             if meta is not None and meta.type.kind == "pointer":
                 pointee = meta.type.pointee
-                if (meta.schema_version != 1 or meta.value_id != rid
-                        or meta.kind != "result" or meta.producer_id != ssa.id
-                        or meta.result_index != i or meta.type.address_space != 1
-                        or pointee is None or pointee.unknown_reason or pointee.elem is None):
+                if (
+                    meta.schema_version != 1
+                    or meta.value_id != rid
+                    or meta.kind != "result"
+                    or meta.producer_id != ssa.id
+                    or meta.result_index != i
+                    or meta.type.address_space != 1
+                    or pointee is None
+                    or pointee.unknown_reason
+                    or pointee.elem is None
+                ):
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
-                        "device-function scf.if pointer result has incomplete native metadata",
-                        op_name="scf.if")
+                        "device-function scf.if pointer result has incomplete native metadata", op_name="scf.if"
+                    )
                 pointer_results[i] = _mlir_to_triton_dtype(pointee.elem)
         if "!tt.ptr" in (ssa.type_str or "") and not pointer_results:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
-                "device-function scf.if pointer result lacks native per-result metadata",
-                op_name="scf.if")
+                "device-function scf.if pointer result lacks native per-result metadata", op_name="scf.if"
+            )
         if rids:
             for i, rid in enumerate(rids):
                 var = self._next_var("if_res")
@@ -644,9 +665,11 @@ class _DeviceFuncLowerer:
                             val = self._pointer_expr(yid) if i in pointer_results else self._lookup(yid)
                             if val is None:
                                 from triton_msl.errors import MetalNonRecoverableError
+
                                 raise MetalNonRecoverableError(
                                     "device-function scf.if pointer branch has no address representation",
-                                    op_name="scf.if")
+                                    op_name="scf.if",
+                                )
                             self._emit(f"    {var} = {val};")
                 else:
                     self._lower_op(sub_op)
@@ -661,9 +684,11 @@ class _DeviceFuncLowerer:
                             val = self._pointer_expr(yid) if i in pointer_results else self._lookup(yid)
                             if val is None:
                                 from triton_msl.errors import MetalNonRecoverableError
+
                                 raise MetalNonRecoverableError(
                                     "device-function scf.if pointer branch has no address representation",
-                                    op_name="scf.if")
+                                    op_name="scf.if",
+                                )
                             self._emit(f"    {var} = {val};")
                 else:
                     self._lower_op(sub_op)

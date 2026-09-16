@@ -21,8 +21,9 @@ def _emit(fn, signature, constants):
     context = ir.context()
     ir.load_dialects(context)
     source = ASTSource(fn=fn, signature=signature, constexprs=constants)
-    module = source.make_ir(backend.target, options, backend.get_codegen_implementation(options),
-                            backend.get_module_map(), context)
+    module = source.make_ir(
+        backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     metadata = {}
     module = backend.make_ttir(module, metadata, options)
     module = backend.make_ttgir(module, metadata, options)
@@ -30,8 +31,7 @@ def _emit(fn, signature, constants):
 
 
 @triton.jit
-def _fused(A, B, Bias, C, M, N, K, MODE: tl.constexpr,
-           PID_AXIS: tl.constexpr, LOAD_MASK: tl.constexpr):
+def _fused(A, B, Bias, C, M, N, K, MODE: tl.constexpr, PID_AXIS: tl.constexpr, LOAD_MASK: tl.constexpr):
     rm = tl.arange(0, 32)
     rn = tl.arange(0, 32)
     rk = tl.arange(0, 32)
@@ -61,8 +61,7 @@ def _fused(A, B, Bias, C, M, N, K, MODE: tl.constexpr,
     else:
         y = e / s[:, None]
     if PID_AXIS >= 0:
-        tl.store(C + rm[:, None] * N + rn[None, :], y,
-                 (rm[:, None] < M) & (rn[None, :] < N))
+        tl.store(C + rm[:, None] * N + rn[None, :], y, (rm[:, None] < M) & (rn[None, :] < N))
     else:
         tl.store(C + rm[:, None] * N + rn[None, :], y)
 
@@ -81,9 +80,10 @@ def test_fused_softmax_canonical_still_emits():
     assert "exp(" in msl
 
 
-@pytest.mark.parametrize("mode,reason", [(1, "zero dot accumulator"),
-                                         (2, "reversed operands"), (3, "reversed operands"),
-                                         (4, "reversed operands")])
+@pytest.mark.parametrize(
+    "mode,reason",
+    [(1, "zero dot accumulator"), (2, "reversed operands"), (3, "reversed operands"), (4, "reversed operands")],
+)
 def test_fused_softmax_does_not_replace_source_arithmetic(mode, reason):
     with pytest.raises(MetalNonRecoverableError, match=reason):
         _fused_msl(mode=mode)
@@ -99,7 +99,7 @@ def test_masked_load_generic_recovery_is_not_removed():
     msl = _fused_msl(axis=0, load_mask=True)
     # This was already a computing generic route, unlike the unmasked-load
     # counterexample. The template-specific guard must not remove it.
-    body = msl[msl.index("{", msl.index("kernel void")):]
+    body = msl[msl.index("{", msl.index("kernel void")) :]
     assert "pid" in body
     assert "M" in body
 
@@ -143,8 +143,11 @@ def _reduce3(X, Z, AXIS: tl.constexpr, KIND: tl.constexpr):
 
 
 def _reduce_msl(kind, axis, dtype):
-    return _emit(_reduce3, dict(X="*" + dtype, Z="*i32" if kind >= 5 else "*" + dtype,
-                               AXIS="constexpr", KIND="constexpr"), dict(AXIS=axis, KIND=kind))
+    return _emit(
+        _reduce3,
+        dict(X="*" + dtype, Z="*i32" if kind >= 5 else "*" + dtype, AXIS="constexpr", KIND="constexpr"),
+        dict(AXIS=axis, KIND=kind),
+    )
 
 
 @pytest.mark.parametrize("kind", [3, 4])

@@ -1,4 +1,5 @@
 """Toolchain subprocess providers are inputs too; no fixture binary is executed."""
+
 import struct
 
 import pytest
@@ -23,21 +24,31 @@ def selection(tmp_path, monkeypatch):
     for path in (selectors, actual, sdk):
         path.mkdir(parents=True)
     (sdk / "header.h").write_text("header\n")
-    entries = {"selector": selectors / "metal", "linker": selectors / "metallib",
-               "compiler": actual / "metal", "resolver": tmp_path / "xcrun", "helper": actual / "helper"}
+    entries = {
+        "selector": selectors / "metal",
+        "linker": selectors / "metallib",
+        "compiler": actual / "metal",
+        "resolver": tmp_path / "xcrun",
+        "helper": actual / "helper",
+    }
     for path in entries.values():
         path.write_bytes(_image())
     external = tmp_path / "outside-bundle.dylib"
     external.write_bytes(_image() + b"first implementation")
-    replies = {("--find", "metal"): str(entries["selector"]),
-               ("--find", "metallib"): str(entries["linker"]),
-               ("metal", "--version"): f"same Metal version\nInstalledDir: {actual}",
-               ("--show-sdk-path",): str(sdk), ("--show-sdk-build-version",): "same-sdk-build"}
+    replies = {
+        ("--find", "metal"): str(entries["selector"]),
+        ("--find", "metallib"): str(entries["linker"]),
+        ("metal", "--version"): f"same Metal version\nInstalledDir: {actual}",
+        ("--show-sdk-path",): str(sdk),
+        ("--show-sdk-build-version",): "same-sdk-build",
+    }
+
     def query(command, **kwargs):
         if command == ["/usr/sbin/sysctl", "-n", "kern.osversion"]:
             return "same-os-build"
         assert command[:3] == [str(entries["resolver"]), "-sdk", "macosx"]
         return replies[tuple(command[3:])]
+
     monkeypatch.setattr(tc.shutil, "which", lambda name: str(entries["resolver"]))
     monkeypatch.setattr(tc.subprocess, "check_output", query)
     monkeypatch.setattr(tc, "_snapshot", None)

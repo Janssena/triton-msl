@@ -15,6 +15,7 @@ This kernel is copied verbatim from trifast/src/trifast/triton.py (`_bwd_kv`), t
 same source the external user (Janssena) is porting. The reference lse/delta inputs
 are produced directly in torch so the test is self-contained (no forward kernel).
 """
+
 import math
 import pytest
 import torch
@@ -40,9 +41,9 @@ def _build_lowerer(fn, sig, cex):
     backend = MetalBackend(target)
     options = backend.parse_options({})
     s = ASTSource(fn=fn, signature=sig, constexprs=cex)
-    ctx = ir.context(); ir.load_dialects(ctx)
-    mod = s.make_ir(target, options, backend.get_codegen_implementation(options),
-                    backend.get_module_map(), ctx)
+    ctx = ir.context()
+    ir.load_dialects(ctx)
+    mod = s.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
     md = {}
     mod = backend.make_ttir(mod, md, options)
     mod = backend.make_ttgir(mod, md, options)
@@ -50,13 +51,14 @@ def _build_lowerer(fn, sig, cex):
 
 
 @triton.jit
-def _gemm_bias_exp2(a_ptr, b_ptr, c1_ptr, c2_ptr, o_ptr, M, N, K,
-                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _gemm_bias_exp2(a_ptr, b_ptr, c1_ptr, c2_ptr, o_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """A fused GEMM+bias+exp2+GEMM+bias: TWO tt.dots with a LOADED C-operand + exp2,
     NO stability-max. This trips the biased-FA backward TRIGGER but is NOT a backward
     (no exp2-of-(scores-lse) subtraction) — the detector must fall through (return
     None), not mis-resolve (silent-wrong gradients) nor over-refuse."""
-    rm = tl.arange(0, BM); rn = tl.arange(0, BN); rk = tl.arange(0, BK)
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     a = tl.load(a_ptr + rm[:, None] * BK + rk[None, :])
     b = tl.load(b_ptr + rk[:, None] * BN + rn[None, :])
     c1 = tl.load(c1_ptr + rm[:, None] * BN + rn[None, :])
@@ -76,9 +78,9 @@ def test_bwd_detector_ignores_gemm_bias_exp2():
     P = "*fp32"
     low = _build_lowerer(
         _gemm_bias_exp2,
-        {"a_ptr": P, "b_ptr": P, "c1_ptr": P, "c2_ptr": P, "o_ptr": P,
-         "M": "i32", "N": "i32", "K": "i32"},
-        {"BM": 32, "BN": 32, "BK": 32})
+        {"a_ptr": P, "b_ptr": P, "c1_ptr": P, "c2_ptr": P, "o_ptr": P, "M": "i32", "N": "i32", "K": "i32"},
+        {"BM": 32, "BN": 32, "BK": 32},
+    )
     assert low._detect_biased_fa_backward() is None
     assert low._detect_biased_flash_attention() is None
 
@@ -220,21 +222,32 @@ def _reference(Hc, Hh, I, N, DIM, seed=0):
     o.retain_grad()
     o.backward(do)
 
-    lse = torch.logsumexp(raw, dim=-1).detach()          # [Hc,I,N] (row_max the bwd loads)
-    delta = (o.detach() * do).sum(-1).contiguous()       # [Hc,I,N]
+    lse = torch.logsumexp(raw, dim=-1).detach()  # [Hc,I,N] (row_max the bwd loads)
+    delta = (o.detach() * do).sum(-1).contiguous()  # [Hc,I,N]
     return dict(
-        q=q.detach(), k=k.detach(), v=v.detach(), bias=bias.detach(), mask=mask,
-        do=do, lse=lse, delta=delta, sm=sm,
-        dk_ref=k.grad.detach(), dv_ref=v.grad.detach(),
+        q=q.detach(),
+        k=k.detach(),
+        v=v.detach(),
+        bias=bias.detach(),
+        mask=mask,
+        do=do,
+        lse=lse,
+        delta=delta,
+        sm=sm,
+        dk_ref=k.grad.detach(),
+        dv_ref=v.grad.detach(),
     )
 
 
 @requires_mps
-@pytest.mark.parametrize("Hc,Hh,I,N,DIM", [
-    (4, 2, 3, 64, 32),   # cross-head mask (batch=2), 2 k-blocks
-    (2, 1, 2, 96, 32),   # single batch, N=96 -> 3 k-blocks + longer j-loop
-    (1, 1, 1, 48, 32),   # minimal, N not a block multiple (mask_k tail)
-])
+@pytest.mark.parametrize(
+    "Hc,Hh,I,N,DIM",
+    [
+        (4, 2, 3, 64, 32),  # cross-head mask (batch=2), 2 k-blocks
+        (2, 1, 2, 96, 32),  # single batch, N=96 -> 3 k-blocks + longer j-loop
+        (1, 1, 1, 48, 32),  # minimal, N not a block multiple (mask_k tail)
+    ],
+)
 def test_bwd_kv_routes_and_computes(Hc, Hh, I, N, DIM):
     # NOTE: BK*head_dim threads/threadgroup caps head_dim at 32 for BK=32 (DIM=64
     # would need 2048 threads > Metal's 1024 max and ~49KB > 32KB tg memory). Larger
@@ -247,11 +260,46 @@ def test_bwd_kv_routes_and_computes(Hc, Hh, I, N, DIM):
     dk = torch.zeros(Hc, I, N, DIM, device=dev)
     dv = torch.zeros(Hc, I, N, DIM, device=dev)
     q, k, v, bias, mask, do, lse, delta, sm = (
-        r["q"], r["k"], r["v"], r["bias"], r["mask"], r["do"], r["lse"], r["delta"], r["sm"])
+        r["q"],
+        r["k"],
+        r["v"],
+        r["bias"],
+        r["mask"],
+        r["do"],
+        r["lse"],
+        r["delta"],
+        r["sm"],
+    )
     _bwd_kv[(triton.cdiv(N, BK), I, Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), do, *st(do), dk, *st(dk), dv, *st(dv),
-        sm, NEG, N, Hh, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        dk,
+        *st(dk),
+        dv,
+        *st(dv),
+        sm,
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     dk_err = (dk - r["dk_ref"]).abs().max().item()
     dv_err = (dv - r["dv_ref"]).abs().max().item()
@@ -370,11 +418,14 @@ def _bwd_q(
 
 
 @requires_mps
-@pytest.mark.parametrize("Hc,Hh,I,N,DIM", [
-    (4, 2, 3, 64, 32),
-    (2, 1, 2, 96, 32),
-    (1, 1, 1, 48, 32),
-])
+@pytest.mark.parametrize(
+    "Hc,Hh,I,N,DIM",
+    [
+        (4, 2, 3, 64, 32),
+        (2, 1, 2, 96, 32),
+        (1, 1, 1, 48, 32),
+    ],
+)
 def test_bwd_q_routes_and_computes(Hc, Hh, I, N, DIM):
     """trifast's UNMODIFIED _bwd_q routes to the dQ+delta backward template and
     computes correct dQ (and the delta it stores) vs autograd."""
@@ -394,7 +445,8 @@ def test_bwd_q_routes_and_computes(Hc, Hh, I, N, DIM):
     raw = (qk + bias[:, None, :, :]).masked_fill(mh[:, :, None, :].bool(), float("-inf"))
     p = torch.softmax(raw, dim=-1)
     o = torch.einsum("hijk,hikd->hijd", p, v)
-    o.retain_grad(); o.backward(do)
+    o.retain_grad()
+    o.backward(do)
     dq_ref = q.grad.detach()
     lse = torch.logsumexp(raw, dim=-1).detach()
     o_det = o.detach().contiguous()
@@ -405,9 +457,35 @@ def test_bwd_q_routes_and_computes(Hc, Hh, I, N, DIM):
     dq = torch.zeros(Hc, I, N, DIM, device=dev)
     delta = torch.zeros(Hc, I, N, device=dev)
     _bwd_q[(triton.cdiv(N, BJ), I, Hc)](
-        delta, *st(delta), qd, *st(qd), kd, *st(kd), vd, *st(vd), bd, *st(bd),
-        lse, *st(lse), mask, *st(mask), o_det, *st(o_det), do, *st(do), dq, *st(dq),
-        sm, NEG, N, Hh, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        qd,
+        *st(qd),
+        kd,
+        *st(kd),
+        vd,
+        *st(vd),
+        bd,
+        *st(bd),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        o_det,
+        *st(o_det),
+        do,
+        *st(do),
+        dq,
+        *st(dq),
+        sm,
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     dq_err = (dq - dq_ref).abs().max().item()
     dlt_err = (delta - delta_ref).abs().max().item()
@@ -542,7 +620,8 @@ def test_bwd_b_routes_and_computes(Hc, Hh, N, DIM):
     raw = (qk + bias[:, None, :, :]).masked_fill(mh[:, :, None, :].bool(), float("-inf"))
     p = torch.softmax(raw, dim=-1)
     o = torch.einsum("hijk,hikd->hijd", p, v)
-    o.retain_grad(); o.backward(do)
+    o.retain_grad()
+    o.backward(do)
     db_ref = bias.grad.detach()
     lse = torch.logsumexp(raw, dim=-1).detach()
     delta = (o.detach() * do).sum(-1).contiguous()
@@ -551,9 +630,33 @@ def test_bwd_b_routes_and_computes(Hc, Hh, N, DIM):
     qd, kd, vd, bd = q.detach(), k.detach(), v.detach(), bias.detach()
     db = torch.zeros(Hc, N, N, device=dev)
     _bwd_b[(triton.cdiv(N, BJ), triton.cdiv(N, BK), Hc)](
-        delta, *st(delta), qd, *st(qd), kd, *st(kd), vd, *st(vd), bd, *st(bd),
-        lse, *st(lse), mask, *st(mask), do, *st(do), db, *st(db),
-        sm, NEG, Hh, N, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        qd,
+        *st(qd),
+        kd,
+        *st(kd),
+        vd,
+        *st(vd),
+        bd,
+        *st(bd),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        db,
+        *st(db),
+        sm,
+        NEG,
+        Hh,
+        N,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     db_err = (db - db_ref).abs().max().item()
     assert db_err < 5e-3, f"dbias wrong: {db_err:.3e} (ref scale {db_ref.abs().max():.2f})"

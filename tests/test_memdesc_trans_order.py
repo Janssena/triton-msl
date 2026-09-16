@@ -36,7 +36,9 @@ def _ttgir():
         {"A": "*fp32", "B": "*fp32", "C": "*fp32", "N": "constexpr"},
         {"N": 32},
     )
-    module = source.make_ir(backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+    module = source.make_ir(
+        backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     module = backend.make_ttir(module, {}, options)
     return str(backend.make_ttgir(module, {}, options))
 
@@ -116,10 +118,14 @@ def _descriptor_chain(canonical, orders, sibling_order=None):
         source, layout = result, next_layout
     if sibling_order is not None:
         sibling_layout = "#shared1" if list(sibling_order) == [1, 0] else "#shared"
-        sibling = first.replace("%1 =", "%sibling =").replace(
-            "{order = array<i32: 1, 0>}",
-            f"{{order = array<i32: {sibling_order[0]}, {sibling_order[1]}>}}",
-        ).replace("#shared1,", f"{sibling_layout},")
+        sibling = (
+            first.replace("%1 =", "%sibling =")
+            .replace(
+                "{order = array<i32: 1, 0>}",
+                f"{{order = array<i32: {sibling_order[0]}, {sibling_order[1]}>}}",
+            )
+            .replace("#shared1,", f"{sibling_layout},")
+        )
         lines.append(sibling)
     text = canonical.replace(first, "\n".join(lines))
     return text.replace(load, load.replace("%1", source).replace("#shared1", layout))

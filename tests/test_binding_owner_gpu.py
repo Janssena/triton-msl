@@ -1,4 +1,5 @@
 """Real temporary-input ownership on both existing Metal launch routes."""
+
 import gc
 import weakref
 
@@ -19,6 +20,7 @@ def test_temporary_input_storage_survives_real_execution(monkeypatch, tmp_path, 
     if not torch.backends.mps.is_available():
         pytest.skip("requires Metal")
     from triton_msl.backend import driver
+
     monkeypatch.setenv("TRITON_MSL_COMPILE_SHADER", "1" if route == "compile_shader" else "0")
     monkeypatch.setenv("TRITON_MSL_USE_CPP", "0")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
@@ -31,17 +33,21 @@ def test_temporary_input_storage_survives_real_execution(monkeypatch, tmp_path, 
     if route == "compile_shader":
         runtime = driver._get_compile_shader_runtime()
         original = runtime.dispatch
+
         def observed(*args, **kwargs):
             dispatches.append("compile_shader")
             return original(*args, **kwargs)
+
         monkeypatch.setattr(runtime, "dispatch", observed)
     else:
         utils = driver._get_utils()
         original = utils.launch
+
         def observed(*args, **kwargs):
             dispatches.append("host")
             assert kwargs.get("sync", True)
             return original(*args, **kwargs)
+
         monkeypatch.setattr(utils, "launch", observed)
 
     def temporary():

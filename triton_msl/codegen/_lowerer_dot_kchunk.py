@@ -132,11 +132,7 @@ class _DotKChunkMixin:
                         if len(consumer.operand_ids) < 2 or consumer.operand_ids[1] != current:
                             return False
                         terminals.add(consumer.id)
-                    elif (
-                        consumer.op in passthrough
-                        and consumer.operand_ids
-                        and consumer.operand_ids[0] == current
-                    ):
+                    elif consumer.op in passthrough and consumer.operand_ids and consumer.operand_ids[0] == current:
                         frontier.append(consumer.id)
                     else:
                         return False
@@ -437,9 +433,7 @@ class _DotKChunkMixin:
         base = ptr_info[0]
         M, _K, N = plan["shapes"][0]
         axis_hint = {"matrix": None, "row": 0, "col": 1}[plan["acc_kind"]]
-        offset = self._rebuild_staged_fill_offset(
-            ptr_id, by_id, base, M, N, axis_dim_hint=axis_hint
-        )
+        offset = self._rebuild_staged_fill_offset(ptr_id, by_id, base, M, N, axis_dim_hint=axis_hint)
         return f"{base}[{offset}]"
 
     def _lower_dot_kchunk(self, ssa):
@@ -495,16 +489,12 @@ class _DotKChunkMixin:
         self.kb.raw_line(f"        for (uint _sa = lid; _sa < {M * kc}u; _sa += {dispatch}u) {{")
         self.kb.raw_line(f"            uint _fill_row = _sa / {kc}u;")
         self.kb.raw_line(f"            uint _fill_col = _kc + (_sa % {kc}u);")
-        self.kb.raw_line(
-            f"            {a['name']}[_sa] = (_fill_col < {K}u) ? {a['base']}[{a['offset']}] : 0.0f;"
-        )
+        self.kb.raw_line(f"            {a['name']}[_sa] = (_fill_col < {K}u) ? {a['base']}[{a['offset']}] : 0.0f;")
         self.kb.raw_line("        }")
         self.kb.raw_line(f"        for (uint _sa = lid; _sa < {kc * N}u; _sa += {dispatch}u) {{")
         self.kb.raw_line(f"            uint _fill_row = _kc + (_sa / {N}u);")
         self.kb.raw_line(f"            uint _fill_col = _sa % {N}u;")
-        self.kb.raw_line(
-            f"            {b['name']}[_sa] = (_fill_row < {K}u) ? {b['base']}[{b['offset']}] : 0.0f;"
-        )
+        self.kb.raw_line(f"            {b['name']}[_sa] = (_fill_row < {K}u) ? {b['base']}[{b['offset']}] : 0.0f;")
         self.kb.raw_line("        }")
         self.kb.raw_line("        threadgroup_barrier(mem_flags::mem_threadgroup);")
         self.kb.raw_line(f"        for (uint _de = lid; _de < {M * N}u; _de += {dispatch}u) {{")
@@ -513,8 +503,7 @@ class _DotKChunkMixin:
         self.kb.raw_line(f"            float _dot_sum = {result}[_de];")
         self.kb.raw_line(f"            for (uint _dk = 0u; _dk < {kc}u; ++_dk) {{")
         self.kb.raw_line(
-            f"                _dot_sum += {a['name']}[_dot_row * {kc}u + _dk] * "
-            f"{b['name']}[_dk * {N}u + _dot_col];"
+            f"                _dot_sum += {a['name']}[_dot_row * {kc}u + _dk] * {b['name']}[_dk * {N}u + _dot_col];"
         )
         self.kb.raw_line("            }")
         self.kb.raw_line(f"            {result}[_de] = _dot_sum;")
@@ -567,9 +556,7 @@ class _DotKChunkMixin:
         self.kb.raw_line(f"            for (uint _sa = lid; _sa < {M * kc}u; _sa += {dispatch}u) {{")
         self.kb.raw_line(f"                uint _fill_row = _sa / {kc}u;")
         self.kb.raw_line(f"                uint _fill_col = _kc + (_sa % {kc}u);")
-        self.kb.raw_line(
-            f"                {a['name']}[_sa] = (_fill_col < {K}u) ? {a['base']}[{a['offset']}] : 0.0f;"
-        )
+        self.kb.raw_line(f"                {a['name']}[_sa] = (_fill_col < {K}u) ? {a['base']}[{a['offset']}] : 0.0f;")
         self.kb.raw_line("            }")
         self.kb.raw_line(f"            for (uint _sa = lid; _sa < {kc * kc}u; _sa += {dispatch}u) {{")
         self.kb.raw_line(f"                uint _fill_row = _kc + (_sa / {kc}u);")
@@ -600,9 +587,7 @@ class _DotKChunkMixin:
         self.kb.raw_line(f"        for (uint _sa = lid; _sa < {kc * N}u; _sa += {dispatch}u) {{")
         self.kb.raw_line(f"            uint _fill_row = _q0 + (_sa / {N}u);")
         self.kb.raw_line(f"            uint _fill_col = _sa % {N}u;")
-        self.kb.raw_line(
-            f"            {w['name']}[_sa] = (_fill_row < {Q}u) ? {w['base']}[{w['offset']}] : 0.0f;"
-        )
+        self.kb.raw_line(f"            {w['name']}[_sa] = (_fill_row < {Q}u) ? {w['base']}[{w['offset']}] : 0.0f;")
         self.kb.raw_line("        }")
         self.kb.raw_line("        threadgroup_barrier(mem_flags::mem_threadgroup);")
         self.kb.raw_line(f"        for (uint _de = lid; _de < {M * N}u; _de += {dispatch}u) {{")
@@ -611,8 +596,7 @@ class _DotKChunkMixin:
         self.kb.raw_line(f"            float _dot_sum = {result}[_de];")
         self.kb.raw_line(f"            for (uint _dk = 0u; _dk < {kc}u; ++_dk)")
         self.kb.raw_line(
-            f"                _dot_sum += {mid}[_dot_row * {kc}u + _dk] * "
-            f"{w['name']}[_dk * {N}u + _dot_col];"
+            f"                _dot_sum += {mid}[_dot_row * {kc}u + _dk] * {w['name']}[_dk * {N}u + _dot_col];"
         )
         self.kb.raw_line(f"            {result}[_de] = _dot_sum;")
         self.kb.raw_line("        }")
@@ -621,7 +605,9 @@ class _DotKChunkMixin:
 
         if ssa.elem_type in ("f16", "bf16"):
             quant_out = self._dot_kchunk_quantized(f"{result}[_de]", ssa.elem_type)
-            self.kb.raw_line(f"    for (uint _de = lid; _de < {M * N}u; _de += {dispatch}u) {result}[_de] = {quant_out};")
+            self.kb.raw_line(
+                f"    for (uint _de = lid; _de < {M * N}u; _de += {dispatch}u) {result}[_de] = {quant_out};"
+            )
             self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         result_var = self._next_var("dot")

@@ -62,8 +62,17 @@ def _emit(fn):
     options = backend.parse_options({"num_warps": 4})
     context = ir.context()
     ir.load_dialects(context)
-    sig = {"A": "*fp32", "B": "*fp32", "C": "*fp32", "M": "i32", "N": "i32", "K": "i32",
-           "BM": "constexpr", "BN": "constexpr", "BK": "constexpr"}
+    sig = {
+        "A": "*fp32",
+        "B": "*fp32",
+        "C": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr",
+        "BK": "constexpr",
+    }
     module = ASTSource(fn, sig, {"BM": 32, "BN": 32, "BK": 32}).make_ir(
         backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
     )

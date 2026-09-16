@@ -261,9 +261,7 @@ class _ModuleTextIndex:
         locations such as ``loc("%fake = arith.cmpi ugt, ...")`` from entering a
         walk-order semantic channel.
         """
-        prefix = re.compile(
-            rf"^\s*(?:%[\w.$-]+(?::\d+)?\s*=\s*)?{re.escape(opcode)}\b"
-        )
+        prefix = re.compile(rf"^\s*(?:%[\w.$-]+(?::\d+)?\s*=\s*)?{re.escape(opcode)}\b")
         return [line for line in self.text.splitlines() if prefix.match(line)]
 
     def _parse_func_name(self) -> str:
@@ -275,16 +273,14 @@ class _ModuleTextIndex:
         # so we can't use a simple [^)]* regex. Instead, find the
         # function keyword and then balanced-paren match the args.
         pattern = re.compile(
-            r'(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?'
+            r"(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?"
             r'@("(?:[^"\\]|\\.)*"|[^\s(]+)\s*\('
         )
         m = None
         for candidate in pattern.finditer(self.text):
             visibility = candidate.group(1) or "public"
             identity = _mlir_symbol_identity(candidate.group(2))
-            if (func_name is not None and identity == func_name) or (
-                func_name is None and visibility == "public"
-            ):
+            if (func_name is not None and identity == func_name) or (func_name is None and visibility == "public"):
                 m = candidate
                 break
         if not m:
@@ -399,7 +395,7 @@ class _ModuleTextIndex:
             r'(?:tt\.func|func\.func)\s+(?:(public|private)\s+)?@("(?:[^"\\]|\\.)*"|[^\s(]+)\s*\(',
             self.text,
         ):
-            visibility = m.group(1) or "public"   # MLIR default visibility is public
+            visibility = m.group(1) or "public"  # MLIR default visibility is public
             func_name = _mlir_symbol_identity(m.group(2))
 
             # Parse args (balanced paren matching)
@@ -787,13 +783,15 @@ class MLIRWalker:
             for i in range(block.get_num_arguments()):
                 value = block.get_argument(i)
                 self._result_meta[value.id()] = ResultMeta(
-                    value.id(), self._type_facts(value), kind, None, i, bid, function_name)
+                    value.id(), self._type_facts(value), kind, None, i, bid, function_name
+                )
         if op.get_num_results():
             producer = op.get_result(0).id()
             for i in range(op.get_num_results()):
                 value = op.get_result(i)
                 self._result_meta[value.id()] = ResultMeta(
-                    value.id(), self._type_facts(value), "result", producer, i, bid, function_name)
+                    value.id(), self._type_facts(value), "result", producer, i, bid, function_name
+                )
 
     def _record_reduce_return(self, op, block_id):
         """Packet 154: remember the operand ids of a ``tt.reduce.return`` for its block, so the
@@ -1041,8 +1039,12 @@ class MLIRWalker:
             block_id = block.id() if block is not None else None
             try:
                 self._record_native_metadata(
-                    op, block, block is not None and _is_function_body_block(block),
-                    _collecting_entry(), func_order[func_k[0]][0] if func_k[0] < len(func_order) else None)
+                    op,
+                    block,
+                    block is not None and _is_function_body_block(block),
+                    _collecting_entry(),
+                    func_order[func_k[0]][0] if func_k[0] < len(func_order) else None,
+                )
             except Exception as exc:
                 refusal[0] = f"walker: per-result metadata extraction failed: {type(exc).__name__}: {exc}"
                 return
@@ -1336,7 +1338,9 @@ class MLIRWalker:
         from triton_msl.errors import MetalNonRecoverableError
 
         if len(callee_funcs_raw) != len(private_funcs):
-            raise MetalNonRecoverableError("walker: callee body/name counts disagree; refusing to guess a function signature")
+            raise MetalNonRecoverableError(
+                "walker: callee body/name counts disagree; refusing to guess a function signature"
+            )
 
         def native_type(value_id, function_name, *, argument=False):
             meta = self._result_meta.get(value_id)
@@ -1367,7 +1371,7 @@ class MLIRWalker:
                 raise MetalNonRecoverableError(
                     f"walker: argument name/native-value counts disagree for callee {func_name!r}"
                 )
-            for bid in ([entry_bid] if entry_bid is not None else []):
+            for bid in [entry_bid] if entry_bid is not None else []:
                 if bid in block_args_map and block_args_map[bid]:
                     arg_ids = block_args_map[bid]
                     for j, arg_id in enumerate(arg_ids):
@@ -1414,8 +1418,7 @@ class MLIRWalker:
                     ops=ops,
                     return_types=return_types,
                     result_meta={
-                        vid: meta for vid, meta in self._result_meta.items()
-                        if meta.function_name == func_name
+                        vid: meta for vid, meta in self._result_meta.items() if meta.function_name == func_name
                     },
                 )
             )
@@ -1595,13 +1598,34 @@ class MLIRWalker:
             # spelling; locations/comments can never create a candidate record.
             idx = self._predicate_walk_index
             integer_names = {
-                0: "eq", 1: "ne", 2: "slt", 3: "sle", 4: "sgt",
-                5: "sge", 6: "ult", 7: "ule", 8: "ugt", 9: "uge",
+                0: "eq",
+                1: "ne",
+                2: "slt",
+                3: "sle",
+                4: "sgt",
+                5: "sge",
+                6: "ult",
+                7: "ule",
+                8: "ugt",
+                9: "uge",
             }
             float_names = {
-                0: "false", 1: "oeq", 2: "ogt", 3: "oge", 4: "olt",
-                5: "ole", 6: "one", 7: "ord", 8: "ueq", 9: "ugt",
-                10: "uge", 11: "ult", 12: "ule", 13: "une", 14: "uno", 15: "true",
+                0: "false",
+                1: "oeq",
+                2: "ogt",
+                3: "oge",
+                4: "olt",
+                5: "ole",
+                6: "one",
+                7: "ord",
+                8: "ueq",
+                9: "ugt",
+                10: "uge",
+                11: "ult",
+                12: "ule",
+                13: "une",
+                14: "uno",
+                15: "true",
             }
             native_name = (integer_names if name == "arith.cmpi" else float_names).get(pred)
             textual_name = self._predicates_in_order[idx] if idx < len(self._predicates_in_order) else None
@@ -1635,11 +1659,7 @@ class MLIRWalker:
             self._trans_walk_index += 1
             result = op.get_result(0) if op.get_num_results() == 1 else None
             facts = self._type_facts(result) if result is not None else None
-            text_facts = (
-                parse_type_facts(record["result_type"], self._type_aliases)
-                if record is not None
-                else None
-            )
+            text_facts = parse_type_facts(record["result_type"], self._type_aliases) if record is not None else None
             shape = facts.shape if facts is not None else None
             rank = len(shape) if shape is not None else None
             meta = self._result_meta.get(result.id()) if result is not None else None
@@ -1659,9 +1679,7 @@ class MLIRWalker:
                 )
             order = record["order"] if record is not None and same_owner and same_type else ()
             attrs["order"] = (
-                list(order)
-                if rank is not None and len(order) == rank and sorted(order) == list(range(rank))
-                else None
+                list(order) if rank is not None and len(order) == rank and sorted(order) == list(range(rank)) else None
             )
 
         elif name == "ttg.memdesc_trans":
@@ -1691,9 +1709,7 @@ class MLIRWalker:
             order = record["order"] if record is not None and same_owner and same_type else ()
             rank = len(native_signature[0]) if native_signature is not None else None
             attrs["order"] = (
-                list(order)
-                if rank is not None and len(order) == rank and sorted(order) == list(range(rank))
-                else None
+                list(order) if rank is not None and len(order) == rank and sorted(order) == list(range(rank)) else None
             )
 
         elif name == "tt.reduce":
@@ -1740,8 +1756,16 @@ class MLIRWalker:
             attrs["scope"] = {1: "gpu", 2: "cta", 3: "sys"}.get(op.get_int_attr("scope"))
             if name == "tt.atomic_rmw":
                 attrs["rmw_op"] = {
-                    1: "and", 2: "or", 3: "xor", 4: "add", 5: "fadd",
-                    6: "max", 7: "min", 8: "umax", 9: "umin", 10: "exch",
+                    1: "and",
+                    2: "or",
+                    3: "xor",
+                    4: "add",
+                    5: "fadd",
+                    6: "max",
+                    7: "min",
+                    8: "umax",
+                    9: "umin",
+                    10: "exch",
                 }.get(op.get_int_attr("atomic_rmw_op"))
 
         elif name == "tt.call":
@@ -1760,9 +1784,7 @@ class MLIRWalker:
             native_pure = op.get_bool_attr("pure")
             if idx < len(self._text_index.extern_elementwise_ops):
                 info = self._text_index.extern_elementwise_ops[idx]
-                for key, native in (
-                    ("symbol", native_symbol), ("libname", native_libname), ("pure", native_pure)
-                ):
+                for key, native in (("symbol", native_symbol), ("libname", native_libname), ("pure", native_pure)):
                     textual = info.get(key)
                     if native is not None and textual is not None and native != textual:
                         self._channel_binding_errors.append(

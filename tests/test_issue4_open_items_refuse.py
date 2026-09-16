@@ -13,6 +13,7 @@ Current behavior (2026-08-25, branch fix/trifast-issue4):
       real "collapses every row to the first" silent-wrong -- so #6b is entangled with that
       guard, NOT a trivial spelling change on our side).
 """
+
 import math
 import pytest
 import torch
@@ -28,51 +29,126 @@ requires_mps = pytest.mark.skipif(
 
 
 @triton.jit
-def _fa_scale_on_qk(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
-                    svz, svh, svn, svk, soz, soh, som, sok, Z, H, N,
-                    BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z*sqz + h*sqh + om[:, None]*sqm + od[None, :]*sqk, mask=om[:, None] < N, other=0.)
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32)
+def _fa_scale_on_qk(
+    Q,
+    K,
+    V,
+    O,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    hz = tl.program_id(1)
+    z = hz // H
+    h = hz % H
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z*skz + h*skh + kk[:, None]*skn + od[None, :]*skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        qk = qk * (1.0 / math.sqrt(D))          # scale on the dot RESULT (#6a)
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li*a + tl.sum(p, 1); acc = acc*a[:, None]
-        v = tl.load(V + z*svz + h*svh + kk[:, None]*svn + od[None, :]*svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); mi = m2
-    tl.store(O + z*soz + h*soh + om[:, None]*som + od[None, :]*sok, (acc/li[:, None]), mask=om[:, None] < N)
+        qk = qk * (1.0 / math.sqrt(D))  # scale on the dot RESULT (#6a)
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
+        mi = m2
+    tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, (acc / li[:, None]), mask=om[:, None] < N)
 
 
 @triton.jit
-def _fa_with_lse(Q, K, V, O, L, sqz, sqh, sqm, sqk, skz, skh, skn, skk,
-                 svz, svh, svn, svk, soz, soh, som, sok, slz, slh, slm, Z, H, N,
-                 BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z*sqz + h*sqh + om[:, None]*sqm + od[None, :]*sqk, mask=om[:, None] < N, other=0.)
+def _fa_with_lse(
+    Q,
+    K,
+    V,
+    O,
+    L,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    slz,
+    slh,
+    slm,
+    Z,
+    H,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    hz = tl.program_id(1)
+    z = hz // H
+    h = hz % H
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
     q = q * (1.0 / math.sqrt(D))
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z*skz + h*skh + kk[:, None]*skn + od[None, :]*skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li*a + tl.sum(p, 1); acc = acc*a[:, None]
-        v = tl.load(V + z*svz + h*svh + kk[:, None]*svn + od[None, :]*svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); mi = m2
-    tl.store(O + z*soz + h*soh + om[:, None]*som + od[None, :]*sok, (acc/li[:, None]), mask=om[:, None] < N)
-    tl.store(L + z*slz + h*slh + om*slm, mi + tl.log(li), mask=om < N)   # 1-D lse store (#6b)
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
+        mi = m2
+    tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, (acc / li[:, None]), mask=om[:, None] < N)
+    tl.store(L + z * slz + h * slh + om * slm, mi + tl.log(li), mask=om < N)  # 1-D lse store (#6b)
 
 
 @triton.jit
 def _mept_2d_acc(inp, out, M: tl.constexpr, N: tl.constexpr, STEPS: tl.constexpr):
-    rm = tl.arange(0, M); rn = tl.arange(0, N)
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
     acc = tl.zeros((M, N), dtype=tl.float32)
     for _ in range(0, STEPS):
         acc += tl.load(inp + rm[:, None] * N + rn[None, :])
@@ -95,12 +171,12 @@ def test_6a_scale_on_dot_result_routes_and_computes(monkeypatch):
     Z, H, N, D = 1, 2, 64, 64
     dev = "mps"
     torch.manual_seed(20260829)
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
-    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
-    _fa_scale_on_qk[(triton.cdiv(N, 32), Z*H)](
-        q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D
-    )
+    _fa_scale_on_qk[(triton.cdiv(N, 32), Z * H)](q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
     torch.mps.synchronize()
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     assert hits == [("flash_attention", True)]
@@ -132,13 +208,18 @@ def test_6b_fa_lse_store_computes():
     torch.manual_seed(0)
     Z, H, N, D = 1, 2, 64, 64
     dev = "mps"
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
-    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     lse = torch.zeros(Z, H, N, device=dev)
     st = lambda t: t.stride()
-    _fa_with_lse[(triton.cdiv(N, 32), Z*H)](q, k, v, o, lse, *st(q), *st(k), *st(v), *st(o), *st(lse), Z, H, N, 32, 32, D)
+    _fa_with_lse[(triton.cdiv(N, 32), Z * H)](
+        q, k, v, o, lse, *st(q), *st(k), *st(v), *st(o), *st(lse), Z, H, N, 32, 32, D
+    )
     torch.mps.synchronize()
     import math as _math
+
     scale = 1.0 / _math.sqrt(D)
     sc = (q.float() * scale) @ k.float().transpose(-2, -1)
     ref_o = torch.softmax(sc, -1) @ v.float()
@@ -151,7 +232,8 @@ def test_6b_fa_lse_store_computes():
 
 @triton.jit
 def _mept_two_accs(inp, out1, out2, M: tl.constexpr, N: tl.constexpr, STEPS: tl.constexpr):
-    rm = tl.arange(0, M); rn = tl.arange(0, N)
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
     a = tl.zeros((M, N), dtype=tl.float32)
     b = tl.full((M, N), 1.0, dtype=tl.float32)
     for _ in range(0, STEPS):
@@ -164,7 +246,8 @@ def _mept_two_accs(inp, out1, out2, M: tl.constexpr, N: tl.constexpr, STEPS: tl.
 
 @triton.jit
 def _mept_nested_acc(inp, out, M: tl.constexpr, N: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr):
-    rm = tl.arange(0, M); rn = tl.arange(0, N)
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
     acc = tl.zeros((M, N), dtype=tl.float32)
     for _i in range(0, S1):
         for _j in range(0, S2):
@@ -176,10 +259,12 @@ def _mept_nested_acc(inp, out, M: tl.constexpr, N: tl.constexpr, S1: tl.constexp
 def test_4_two_carried_accumulators():
     # Two independent 2-D carried accumulators in one loop, both diverted to per-element
     # scalars under the wrap regime.
-    dev = "mps"; M, N, S = 16, 16, 3
+    dev = "mps"
+    M, N, S = 16, 16, 3
     torch.manual_seed(0)
     x = torch.randn(M, N, device=dev)
-    o1 = torch.zeros(M, N, device=dev); o2 = torch.zeros(M, N, device=dev)
+    o1 = torch.zeros(M, N, device=dev)
+    o2 = torch.zeros(M, N, device=dev)
     _mept_two_accs[(1,)](x, o1, o2, M, N, S, num_warps=1)
     torch.mps.synchronize()
     rb = torch.full_like(x, 1.0)
@@ -193,9 +278,11 @@ def test_4_two_carried_accumulators():
 def test_4_nested_loop_carried_accumulator():
     # The accumulator carried through NESTED loops: the taint walk propagates through the
     # inner scf.for's init->block-arg/result instead of refusing.
-    dev = "mps"; M, N = 16, 16
+    dev = "mps"
+    M, N = 16, 16
     torch.manual_seed(0)
-    x = torch.randn(M, N, device=dev); o = torch.zeros(M, N, device=dev)
+    x = torch.randn(M, N, device=dev)
+    o = torch.zeros(M, N, device=dev)
     _mept_nested_acc[(1,)](x, o, M, N, 2, 3, num_warps=1)
     torch.mps.synchronize()
     assert (o - x * 6).abs().max().item() < 1e-4
@@ -211,7 +298,8 @@ def test_4_mept_2d_acc_fewer_threads_computes(nw):
     # num_warps, including the previously-broken 1/2/4.
     dev = "mps"
     torch.manual_seed(0)
-    inp = torch.randn(16, 16, device=dev); out = torch.zeros(16, 16, device=dev)
+    inp = torch.randn(16, 16, device=dev)
+    out = torch.zeros(16, 16, device=dev)
     _mept_2d_acc[(1,)](inp, out, 16, 16, 3, num_warps=nw)
     torch.mps.synchronize()
     err = (out - inp * 3).abs().max().item()

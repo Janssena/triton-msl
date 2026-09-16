@@ -63,10 +63,7 @@ class _ControlFlowMixin:
             )
 
         result = self._native_value_facts(ssa.id, op_name=op_name)
-        pointer, second, third = [
-            self._native_value_facts(value_id, op_name=op_name)
-            for value_id in ssa.operand_ids
-        ]
+        pointer, second, third = [self._native_value_facts(value_id, op_name=op_name) for value_id in ssa.operand_ids]
 
         shape = result.shape
         tensor_contract = (
@@ -84,11 +81,7 @@ class _ControlFlowMixin:
             )
 
         def same_lanes(facts):
-            return (
-                facts.is_tensor == result.is_tensor
-                and facts.shape == shape
-                and facts.layout == result.layout
-            )
+            return facts.is_tensor == result.is_tensor and facts.shape == shape and facts.layout == result.layout
 
         result_sig = (result.kind, result.elem, result.width, result.signed)
         pointee = pointer.pointee
@@ -110,23 +103,16 @@ class _ControlFlowMixin:
             data_operands = (second, third)
         elif ssa.op == "tt.atomic_rmw":
             data_operands = (second,)
-            if (
-                not same_lanes(third)
-                or (third.kind, third.elem, third.width) != ("integer", "i1", 1)
-            ):
+            if not same_lanes(third) or (third.kind, third.elem, third.width) != ("integer", "i1", 1):
                 raise MetalNonRecoverableError(
                     "atomic native mask representation is contradictory",
                     op_name=op_name,
                 )
         else:
-            raise MetalNonRecoverableError(
-                f"unsupported atomic native contract for {ssa.op!r}", op_name=op_name
-            )
+            raise MetalNonRecoverableError(f"unsupported atomic native contract for {ssa.op!r}", op_name=op_name)
 
         for facts in data_operands:
-            if not same_lanes(facts) or (
-                facts.kind, facts.elem, facts.width, facts.signed
-            ) != result_sig:
+            if not same_lanes(facts) or (facts.kind, facts.elem, facts.width, facts.signed) != result_sig:
                 raise MetalNonRecoverableError(
                     "atomic native value/result representation is contradictory",
                     op_name=op_name,
@@ -223,8 +209,7 @@ class _ControlFlowMixin:
                 _base, _off_arr, _n = _parr
                 _base_var = self._next_var("ptr_base")
                 self.kb.raw_line(f"    auto {_base_var} = {_base};")
-                _off_var = self._var_array(
-                    "off", [f"long({_off_arr}[{e}])" for e in range(_n)], "long")
+                _off_var = self._var_array("off", [f"long({_off_arr}[{e}])" for e in range(_n)], "long")
                 iter_vars.append(_off_var)
                 iter_dtypes.append(self._trace_ptr_dtype(init_id))
                 ptr_offset_arr_iter_indices.add(i)
@@ -292,12 +277,12 @@ class _ControlFlowMixin:
                                 return False
                             if _o.else_ops and not _elemwise_taint_walk(_o.else_ops):
                                 return False
-                            _yld = [y for y in list(_o.region_ops or []) + list(_o.else_ops or [])
-                                    if y.op == "scf.yield"]
-                            if any(y.id in _taint or any(x in _taint for x in (y.operand_ids or []))
-                                   for y in _yld):
+                            _yld = [
+                                y for y in list(_o.region_ops or []) + list(_o.else_ops or []) if y.op == "scf.yield"
+                            ]
+                            if any(y.id in _taint or any(x in _taint for x in (y.operand_ids or [])) for y in _yld):
                                 _taint.add(_o.id)
-                                for _rid in (_o.result_ids or []):
+                                for _rid in _o.result_ids or []:
                                     _taint.add(_rid)
                             continue
                         if any(x in _taint for x in (_o.operand_ids or [])):
@@ -569,9 +554,10 @@ class _ControlFlowMixin:
                                 info = self._loop_pointer_parts(yield_id)
                                 if info is None:
                                     from triton_msl.errors import MetalNonRecoverableError
+
                                     raise MetalNonRecoverableError(
-                                        "loop-carried pointer yield has no address representation",
-                                        op_name="scf.for")
+                                        "loop-carried pointer yield has no address representation", op_name="scf.for"
+                                    )
                                 base, off = info
                                 address = base if not off or off == "0" else f"({base} + {off})"
                                 next_ptr = self._next_var("next_ptr")
@@ -582,14 +568,17 @@ class _ControlFlowMixin:
                                 width = ptr_offset_arr_iter[i][1]
                                 if info is None or info[2] != width:
                                     from triton_msl.errors import MetalNonRecoverableError
+
                                     raise MetalNonRecoverableError(
                                         "loop-carried pointer-array yield representation/width mismatch",
-                                        op_name="scf.for")
+                                        op_name="scf.for",
+                                    )
                                 base, offsets, _ = info
                                 next_base = self._next_var("next_base")
                                 self.kb.raw_line(f"        auto {next_base} = {base};")
                                 next_offsets = self._var_array(
-                                    "next_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                                    "next_off", [f"long({offsets}[{e}])" for e in range(width)], "long"
+                                )
                                 pointer_next[i] = (next_base, next_offsets)
                         # Update iter_arg variables from yield operands
                         for i, yield_id in enumerate(body_op.operand_ids):
@@ -757,20 +746,29 @@ class _ControlFlowMixin:
             meta = self.graph.result_meta.get(rid)
             if meta is not None and meta.type.kind == "pointer":
                 pointee = meta.type.pointee
-                if (meta.schema_version != 1 or meta.value_id != rid
-                        or meta.kind != "result" or meta.producer_id != ssa.id
-                        or meta.result_index != i or meta.type.address_space != 1 or pointee is None
-                        or pointee.unknown_reason or pointee.elem is None):
+                if (
+                    meta.schema_version != 1
+                    or meta.value_id != rid
+                    or meta.kind != "result"
+                    or meta.producer_id != ssa.id
+                    or meta.result_index != i
+                    or meta.type.address_space != 1
+                    or pointee is None
+                    or pointee.unknown_reason
+                    or pointee.elem is None
+                ):
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
-                        "scf.if pointer result lacks complete native per-result metadata",
-                        op_name="scf.if")
+                        "scf.if pointer result lacks complete native per-result metadata", op_name="scf.if"
+                    )
                 pointer_results[i] = _mlir_to_triton_dtype(pointee.elem)
         if "!tt.ptr" in (ssa.type_str or "") and not pointer_results:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
-                "scf.if pointer result lacks native per-result identity; refusing address guessing",
-                op_name="scf.if")
+                "scf.if pointer result lacks native per-result identity; refusing address guessing", op_name="scf.if"
+            )
 
         # Check both then and else for yield with operands
         all_body_ops = list(ssa.region_ops or []) + list(ssa.else_ops or [])
@@ -852,11 +850,11 @@ class _ControlFlowMixin:
             info = self._loop_pointer_parts(yield_id)
             if info is None:
                 from triton_msl.errors import MetalNonRecoverableError
-                why = ("a per-thread pointer array" if yield_id in self.env_ptr_array
-                       else "no address representation")
+
+                why = "a per-thread pointer array" if yield_id in self.env_ptr_array else "no address representation"
                 raise MetalNonRecoverableError(
-                    f"scf.if pointer branch has {why}; refusing rather than load/cast it",
-                    op_name="scf.if")
+                    f"scf.if pointer branch has {why}; refusing rather than load/cast it", op_name="scf.if"
+                )
             base, offset = info
             expr = base if not offset or offset == "0" else f"({base} + {offset})"
             self.kb.raw_line(f"        {var_name} = {expr};")
@@ -933,8 +931,7 @@ class _ControlFlowMixin:
                 base, offsets, width = ptr_array
                 base_var = self._next_var("wh_base")
                 self.kb.raw_line(f"    auto {base_var} = {base};")
-                off_var = self._var_array(
-                    "wh_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                off_var = self._var_array("wh_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
                 iter_vars.append(off_var)
                 iter_dtypes.append(self._trace_ptr_dtype(init_id))
                 ptr_array_iter[i] = (base_var, width)
@@ -1017,9 +1014,10 @@ class _ControlFlowMixin:
                         info = self._loop_pointer_parts(yield_id)
                         if info is None:
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
-                                "scf.while pointer yield has no address representation",
-                                op_name="scf.while")
+                                "scf.while pointer yield has no address representation", op_name="scf.while"
+                            )
                         base, offset = info
                         address = base if not offset or offset == "0" else f"({base} + {offset})"
                         next_ptr = self._next_var("wh_next_ptr")
@@ -1030,14 +1028,16 @@ class _ControlFlowMixin:
                         width = ptr_array_iter[j][1]
                         if info is None or info[2] != width:
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
-                                "scf.while pointer-array yield representation/width mismatch",
-                                op_name="scf.while")
+                                "scf.while pointer-array yield representation/width mismatch", op_name="scf.while"
+                            )
                         base, offsets, _ = info
                         next_base = self._next_var("wh_next_base")
                         self.kb.raw_line(f"        auto {next_base} = {base};")
                         next_offsets = self._var_array(
-                            "wh_next_off", [f"long({offsets}[{e}])" for e in range(width)], "long")
+                            "wh_next_off", [f"long({offsets}[{e}])" for e in range(width)], "long"
+                        )
                         pointer_next[j] = (next_base, next_offsets)
                 # Update iter_arg variables from yield operands
                 for j, yield_id in enumerate(body_op.operand_ids):
@@ -1097,9 +1097,20 @@ class _ControlFlowMixin:
         if sem not in ("relaxed", "acquire", "release", "acq_rel"):
             raise MetalNonRecoverableError(f"atomic has missing/unknown semantics {sem!r}", op_name=ssa.op)
         if scope not in ("gpu", "cta"):
-            raise MetalNonRecoverableError(f"atomic scope {scope!r} is missing, unknown or unsupported on Metal", op_name=ssa.op)
+            raise MetalNonRecoverableError(
+                f"atomic scope {scope!r} is missing, unknown or unsupported on Metal", op_name=ssa.op
+            )
         if ssa.op == "tt.atomic_rmw" and ssa.attrs.get("rmw_op") not in (
-            "and", "or", "xor", "add", "fadd", "max", "min", "umax", "umin", "exch"
+            "and",
+            "or",
+            "xor",
+            "add",
+            "fadd",
+            "max",
+            "min",
+            "umax",
+            "umin",
+            "exch",
         ):
             raise MetalNonRecoverableError("atomic has missing/unknown RMW opcode", op_name=ssa.op)
         if sem == "relaxed":
@@ -1112,16 +1123,21 @@ class _ControlFlowMixin:
             version = device.metal_version
         match = re.fullmatch(r"([0-9]+)\.([0-9]+)", str(version))
         capability = re.fullmatch(r"([0-9]+)\.([0-9]+)", str(device.metal_version))
-        if (match is None or capability is None
-                or not (3, 2) <= tuple(map(int, match.groups())) <= tuple(map(int, capability.groups()))
-                or re.fullmatch(r"M[1-9][0-9]*", device.chip_family) is None):
+        if (
+            match is None
+            or capability is None
+            or not (3, 2) <= tuple(map(int, match.groups())) <= tuple(map(int, capability.groups()))
+            or re.fullmatch(r"M[1-9][0-9]*", device.chip_family) is None
+        ):
             raise MetalNonRecoverableError(
                 f"ordered atomic requires Metal >=3.2 on Apple silicon; got {version!r}/{device.chip_family!r}",
-                op_name=ssa.op)
-        fence = ("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, "
-                 "memory_order_seq_cst, thread_scope_" + ("device" if scope == "gpu" else "threadgroup") + ");")
-        return (fence if sem in ("release", "acq_rel") else None,
-                fence if sem in ("acquire", "acq_rel") else None)
+                op_name=ssa.op,
+            )
+        fence = (
+            "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, "
+            "memory_order_seq_cst, thread_scope_" + ("device" if scope == "gpu" else "threadgroup") + ");"
+        )
+        return (fence if sem in ("release", "acq_rel") else None, fence if sem in ("acquire", "acq_rel") else None)
 
     def _emit_atomic_rmw_16bit(self, base_ptr, offsets, val_var, rmw_op, half_type, result_var, indent, n):
         """Neighbor-preserving 16-bit float atomic RMW via a 32-bit word CAS.
@@ -1208,9 +1224,7 @@ class _ControlFlowMixin:
         # device atomic_int* and the value to (int), silently truncating a 64-bit
         # pointer + value to the low 32 bits (re-audit #10: int64 atomic_add wrote 0).
         # Refuse loudly rather than mis-compute.
-        if native_result.width != 32 and not (
-            native_result.kind == "float" and native_result.width == 16
-        ):
+        if native_result.width != 32 and not (native_result.kind == "float" and native_result.width == 16):
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
@@ -1241,9 +1255,7 @@ class _ControlFlowMixin:
                 op_name="tt.atomic_rmw",
             )
         elif not is_float and (
-            native_result.kind != "integer"
-            or native_result.elem != "i32"
-            or native_result.width != 32
+            native_result.kind != "integer" or native_result.elem != "i32" or native_result.width != 32
         ):
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -1665,7 +1677,9 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"{indent}uint cmp_bits_{n} = as_type<uint>((float){cmp_var});")
             self.kb.raw_line(f"{indent}uint expected_{n} = cmp_bits_{n};")
             self.kb.raw_line(f"{indent}uint desired_{n} = as_type<uint>((float){val_var});")
-            self.kb.raw_line(f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, desired_{n},")
+            self.kb.raw_line(
+                f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, desired_{n},"
+            )
             self.kb.raw_line(f"{indent}        memory_order_relaxed, memory_order_relaxed)) {{")
             self.kb.raw_line(f"{indent}    if (expected_{n} != cmp_bits_{n}) break;  // genuine mismatch: not spurious")
             self.kb.raw_line(f"{indent}}}")
@@ -1675,7 +1689,9 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"{indent}device atomic_int* aptr_{n} = (device atomic_int*)({base_ptr} + {offsets});")
             self.kb.raw_line(f"{indent}int cmp_val_{n} = (int){cmp_var};")
             self.kb.raw_line(f"{indent}int expected_{n} = cmp_val_{n};")
-            self.kb.raw_line(f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, (int){val_var},")
+            self.kb.raw_line(
+                f"{indent}while (!atomic_compare_exchange_weak_explicit(aptr_{n}, &expected_{n}, (int){val_var},"
+            )
             self.kb.raw_line(f"{indent}        memory_order_relaxed, memory_order_relaxed)) {{")
             self.kb.raw_line(f"{indent}    if (expected_{n} != cmp_val_{n}) break;  // genuine mismatch: not spurious")
             self.kb.raw_line(f"{indent}}}")

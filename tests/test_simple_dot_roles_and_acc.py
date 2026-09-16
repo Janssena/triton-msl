@@ -177,7 +177,9 @@ if HAS:
         tl.store(C + om[:, None] * S + on[None, :], tl.dot(x, tl.trans(yt)))
 
     @triton.jit
-    def _kloop_positive(C, A, B, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _kloop_positive(
+        C, A, B, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+    ):
         pm = tl.program_id(0)
         pn = tl.program_id(1)
         rm = pm * BM + tl.arange(0, BM)
@@ -186,7 +188,11 @@ if HAS:
         acc = tl.zeros((BM, BN), tl.float32)
         for k0 in range(0, K, BK):
             kk = k0 + rk
-            acc = tl.dot(tl.load(A + rm[:, None] * sam + kk[None, :] * sak), tl.load(B + kk[:, None] * sbk + rn[None, :] * sbn), acc)
+            acc = tl.dot(
+                tl.load(A + rm[:, None] * sam + kk[None, :] * sak),
+                tl.load(B + kk[:, None] * sbk + rn[None, :] * sbn),
+                acc,
+            )
         tl.store(C + rm[:, None] * scm + rn[None, :] * scn, acc)
 
     @triton.jit
@@ -250,7 +256,24 @@ if HAS:
         tl.store(C + om[:, None] * S + on[None, :], tl.dot(x, y))
 
     @triton.jit
-    def _kl_079(A, B, C, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr):
+    def _kl_079(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        sbk,
+        sbn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        MODE: tl.constexpr,
+    ):
         # MODE 0 bare | 1 per-iteration fp16 round of the accumulator | 3 non-canonical
         # A mask (rows >= M-8 zeroed) | 4 half pointer advance on A | 5 canonical masks.
         pid_m = tl.program_id(0)
@@ -287,7 +310,9 @@ if HAS:
             tl.store(C + rm[:, None] * scm + rn[None, :] * scn, acc)
 
     @triton.jit
-    def _kl_swapped_079(Bp, Ap, C, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _kl_swapped_079(
+        Bp, Ap, C, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+    ):
         # B's buffer is declared FIRST. Loop-carried A/B pointers did not trace, so the
         # resolver fell back to declaration order: A = Bp (GPU err 345, no exception).
         pid_m = tl.program_id(0)
@@ -305,7 +330,24 @@ if HAS:
         tl.store(C + rm[:, None] * scm + rn[None, :] * scn, acc)
 
     @triton.jit
-    def _kl_iv_079(A, B, C, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, SCALE: tl.constexpr):
+    def _kl_iv_079(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        sam,
+        sak,
+        sbk,
+        sbn,
+        scm,
+        scn,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
         # Induction-variable-addressed K index: SCALE=1 is the replayed ``k + range``;
         # SCALE=2 reads every other K tile, which the template silently ignores.
         pid_m = tl.program_id(0)
@@ -331,7 +373,9 @@ if HAS:
         tl.store(Z + om[:, None] * sz + on[None, :], tl.dot(x, y, out_dtype=tl.float16))
 
     @triton.jit
-    def _tut_1d_079(a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _tut_1d_079(
+        a_ptr, b_ptr, c_ptr, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+    ):
         # The Triton-tutorial matmul: 1-D grid split by ``pid % num_pid_m`` /
         # ``pid // num_pid_m``, wrap-around ``% M`` / ``% N`` load indices, an
         # iteration-counted K loop with ``K - k*BK`` masks and loop-carried pointers.
@@ -353,7 +397,11 @@ if HAS:
             b_ptrs += BK * sbk
         offs_cm = pid_m * BM + tl.arange(0, BM)
         offs_cn = pid_n * BN + tl.arange(0, BN)
-        tl.store(c_ptr + scm * offs_cm[:, None] + scn * offs_cn[None, :], acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+        tl.store(
+            c_ptr + scm * offs_cm[:, None] + scn * offs_cn[None, :],
+            acc,
+            mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N),
+        )
 
     @triton.jit
     def _i8_dot_079(X, Y, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
@@ -395,7 +443,9 @@ if HAS:
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
         context = ir.context()
         ir.load_dialects(context)
-        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+        mod = src.make_ir(
+            target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+        )
         metadata = {}
         mod = backend.make_ttir(mod, metadata, options)
         mod = backend.make_ttgir(mod, metadata, options)
@@ -406,7 +456,35 @@ if HAS:
 def cold_gpu_caches(tmp_path, monkeypatch):
     monkeypatch.setenv("TRITON_MSL_CACHE_DIR", str(tmp_path / "msl"))
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
-    for fn in (_leak_065, _four_ptr_bare, _out_first, _full5, _canon, _two_store_p_first, _two_store_c_first, _atomic_add_then_store, _atomic_cas_then_store, _a_const_residual, _b_runtime_residual, _c_residual, _trans_b_positive, _kloop_positive, _ab_cast_079, _b_only_cast_079, _c_roundtrip_079, _f16_out_079, _native_f16_079, _kl_079, _kl_swapped_079, _kl_iv_079, _out16_079, _tut_1d_079, _i8_dot_079, _i8_dot_narrow_079, _i8_dot_plus1_079):
+    for fn in (
+        _leak_065,
+        _four_ptr_bare,
+        _out_first,
+        _full5,
+        _canon,
+        _two_store_p_first,
+        _two_store_c_first,
+        _atomic_add_then_store,
+        _atomic_cas_then_store,
+        _a_const_residual,
+        _b_runtime_residual,
+        _c_residual,
+        _trans_b_positive,
+        _kloop_positive,
+        _ab_cast_079,
+        _b_only_cast_079,
+        _c_roundtrip_079,
+        _f16_out_079,
+        _native_f16_079,
+        _kl_079,
+        _kl_swapped_079,
+        _kl_iv_079,
+        _out16_079,
+        _tut_1d_079,
+        _i8_dot_079,
+        _i8_dot_narrow_079,
+        _i8_dot_plus1_079,
+    ):
         if hasattr(fn, "device_caches"):
             fn.device_caches.clear()
 
@@ -416,8 +494,14 @@ def route_spies(monkeypatch):
     inline, generic = [], []
     oi = lowerer_templates._TemplateMixin._lower_simple_dot_inline
     og = generic_lowerer.GenericLowerer._lower_dot
-    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_simple_dot_inline", lambda self, info: (inline.append(1), oi(self, info))[1])
-    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_dot", lambda self, ssa: (generic.append(1), og(self, ssa))[1])
+    monkeypatch.setattr(
+        generic_lowerer.GenericLowerer,
+        "_lower_simple_dot_inline",
+        lambda self, info: (inline.append(1), oi(self, info))[1],
+    )
+    monkeypatch.setattr(
+        generic_lowerer.GenericLowerer, "_lower_dot", lambda self, ssa: (generic.append(1), og(self, ssa))[1]
+    )
     return inline, generic
 
 
@@ -539,7 +623,11 @@ def test_lowering_boundary_two_stores_refuse(fn):
 
 
 @requires_gpu
-@pytest.mark.parametrize("fn,pdt", [(_atomic_add_then_store, torch.float32), (_atomic_cas_then_store, torch.int32)], ids=["atomic_rmw", "atomic_cas"])
+@pytest.mark.parametrize(
+    "fn,pdt",
+    [(_atomic_add_then_store, torch.float32), (_atomic_cas_then_store, torch.int32)],
+    ids=["atomic_rmw", "atomic_cas"],
+)
 def test_atomic_side_effect_refuses_on_bare_template(cold_gpu_caches, fn, pdt):
     """Packet 071: the bare template re-emits only its replayed vocabulary; an atomic
     (tt.atomic_rmw / tt.atomic_cas) is an externally observable effect it would
@@ -554,7 +642,9 @@ def test_atomic_side_effect_refuses_on_bare_template(cold_gpu_caches, fn, pdt):
 
 
 @requires
-@pytest.mark.parametrize("fn,pty", [(_atomic_add_then_store, "*fp32"), (_atomic_cas_then_store, "*i32")], ids=["atomic_rmw", "atomic_cas"])
+@pytest.mark.parametrize(
+    "fn,pty", [(_atomic_add_then_store, "*fp32"), (_atomic_cas_then_store, "*i32")], ids=["atomic_rmw", "atomic_cas"]
+)
 def test_lowering_boundary_atomic_refuses(fn, pty):
     """Rule 9: fresh TTGIR, both atomic families refuse at the template gate."""
     lw = _direct_lowerer_for(fn, {"X": "*fp32", "Y": "*fp32", "P": pty, "C": "*fp32"}, {"S": 32})
@@ -592,7 +682,9 @@ def test_lowering_boundary_residual_refuses(which):
     if which == "A-const":
         lw = _direct_lowerer_for(_a_const_residual, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32})
     elif which == "B-runtime":
-        lw = _direct_lowerer_for(_b_runtime_residual, {"X": "*fp32", "Y": "*fp32", "C": "*fp32", "off": "i32"}, {"S": 32})
+        lw = _direct_lowerer_for(
+            _b_runtime_residual, {"X": "*fp32", "Y": "*fp32", "C": "*fp32", "off": "i32"}, {"S": 32}
+        )
     else:
         lw = _direct_lowerer_for(_c_residual, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32})
     with pytest.raises(MetalNonRecoverableError, match="stride could not be inferred"):
@@ -619,7 +711,23 @@ def test_kloop_pid_tiles_positive(cold_gpu_caches):
     a = torch.randn(M, K, device="mps")
     b = torch.randn(K, N, device="mps")
     c = torch.full((M, N), float("nan"), device="mps")
-    _kloop_positive[(2, 2)](c, a, b, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM=32, BN=32, BK=16)
+    _kloop_positive[(2, 2)](
+        c,
+        a,
+        b,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=32,
+        BN=32,
+        BK=16,
+    )
     torch.mps.synchronize()
     assert not bool(c.isnan().any())
     torch.testing.assert_close(c, a @ b, rtol=1e-3, atol=1e-2)
@@ -629,7 +737,20 @@ def test_kloop_pid_tiles_positive(cold_gpu_caches):
 # Packet 079: per-role value-path proofs
 # ---------------------------------------------------------------------------
 
-_KL_SIG = {"A": "*fp32", "B": "*fp32", "C": "*fp32", "M": "i32", "N": "i32", "K": "i32", "sam": "i32", "sak": "i32", "sbk": "i32", "sbn": "i32", "scm": "i32", "scn": "i32"}
+_KL_SIG = {
+    "A": "*fp32",
+    "B": "*fp32",
+    "C": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "sam": "i32",
+    "sak": "i32",
+    "sbk": "i32",
+    "sbn": "i32",
+    "scm": "i32",
+    "scn": "i32",
+}
 
 
 def _witness(launch, c, raw, intended):
@@ -645,7 +766,9 @@ def _witness(launch, c, raw, intended):
         assert bool(c.isnan().all()), "a refused kernel must touch nothing"
         return "refused"
     err = (c.float() - intended).abs().max().item()
-    assert err == err and err <= sep / 10, f"computed the RAW-buffer result, not the intended one (err vs intended {err}, raw/intended separation {sep})"
+    assert err == err and err <= sep / 10, (
+        f"computed the RAW-buffer result, not the intended one (err vs intended {err}, raw/intended separation {sep})"
+    )
     return "computed"
 
 
@@ -689,7 +812,9 @@ def _kl_data(M=64, N=64, K=64, scale=3.0, seed=29):
 
 
 def _kl_launch(fn, grid, a, b, c, M, N, K, **kw):
-    return lambda: fn[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), **kw)
+    return lambda: fn[grid](
+        a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), **kw
+    )
 
 
 @requires_gpu
@@ -699,7 +824,7 @@ def test_kloop_body_cast_not_dropped(cold_gpu_caches):
     a, b, c = _kl_data()
     acc = torch.zeros(64, 64, device="mps")
     for k0 in range(0, 64, 32):
-        acc = (acc + a[:, k0:k0 + 32] @ b[k0:k0 + 32, :]).half().float()
+        acc = (acc + a[:, k0 : k0 + 32] @ b[k0 : k0 + 32, :]).half().float()
     _witness(_kl_launch(_kl_079, (2, 2), a, b, c, 64, 64, 64, BM=32, BN=32, BK=32, MODE=1), c, a @ b, acc)
 
 
@@ -709,7 +834,7 @@ def test_kloop_noncanonical_mask_not_dropped(cold_gpu_caches):
     zeroed) — the K-loop template applies only its own bounds (err 26)."""
     a, b, c = _kl_data()
     am = a.clone()
-    am[64 - 8:] = 0
+    am[64 - 8 :] = 0
     _witness(_kl_launch(_kl_079, (2, 2), a, b, c, 64, 64, 64, BM=32, BN=32, BK=32, MODE=3), c, a @ b, am @ b)
 
 
@@ -718,7 +843,7 @@ def test_kloop_pointer_advance_not_dropped(cold_gpu_caches):
     """Packet 079: A advanced by BLOCK_K/2 per iteration — the template advances by
     exactly BLOCK_K * stride and computed plain A @ B (err 43)."""
     a, b, c = _kl_data(M=32, N=32, K=128)
-    intended = sum(a[:, 16 * i:16 * i + 32] @ b[32 * i:32 * i + 32, :] for i in range(4))
+    intended = sum(a[:, 16 * i : 16 * i + 32] @ b[32 * i : 32 * i + 32, :] for i in range(4))
     _witness(_kl_launch(_kl_079, (1, 1), a, b, c, 32, 32, 128, BM=32, BN=32, BK=32, MODE=4), c, a @ b, intended)
 
 
@@ -728,7 +853,24 @@ def test_kloop_scaled_iv_index_not_dropped(cold_gpu_caches):
     ``k + range`` addressing computed the contiguous product instead."""
     a, b, c = _kl_data(M=32, N=32, K=128)
     intended = a[:, 0:32] @ b[0:32] + a[:, 64:96] @ b[64:96]
-    launch = lambda: _kl_iv_079[(1, 1)](a, b, c, 32, 32, 64, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM=32, BN=32, BK=32, SCALE=2)
+    launch = lambda: _kl_iv_079[(1, 1)](
+        a,
+        b,
+        c,
+        32,
+        32,
+        64,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=32,
+        BN=32,
+        BK=32,
+        SCALE=2,
+    )
     _witness(launch, c, a[:, :64] @ b[:64], intended)
 
 
@@ -738,7 +880,23 @@ def test_kloop_swapped_declaration_computes(cold_gpu_caches):
     first, the loop-carried A/B streams must trace THROUGH the iter-args to their
     args. Now computes exactly — the roles are dataflow, not position."""
     a, b, c = _kl_data()
-    _kl_swapped_079[(2, 2)](b, a, c, 64, 64, 64, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM=32, BN=32, BK=32)
+    _kl_swapped_079[(2, 2)](
+        b,
+        a,
+        c,
+        64,
+        64,
+        64,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=32,
+        BN=32,
+        BK=32,
+    )
     torch.mps.synchronize()
     assert not bool(c.isnan().any())
     torch.testing.assert_close(c, a @ b, rtol=1e-4, atol=1e-3)
@@ -783,20 +941,65 @@ def test_kloop_canonical_masks_positive(cold_gpu_caches, shape):
 def test_kloop_iv_addressed_positive(cold_gpu_caches):
     """Positive: K indexed as ``k + range`` (no loop-carried pointers) is replayed."""
     a, b, c = _kl_data()
-    _kl_iv_079[(2, 2)](a, b, c, 64, 64, 64, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM=32, BN=32, BK=32, SCALE=1)
+    _kl_iv_079[(2, 2)](
+        a,
+        b,
+        c,
+        64,
+        64,
+        64,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=32,
+        BN=32,
+        BK=32,
+        SCALE=1,
+    )
     torch.mps.synchronize()
     assert not bool(c.isnan().any())
     torch.testing.assert_close(c, a @ b, rtol=1e-4, atol=1e-3)
 
 
 _BOUNDARY_079 = [
-    ("A+B-cast", lambda: _direct_lowerer_for(_ab_cast_079, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32}), "dot operand A"),
-    ("B-only-cast", lambda: _direct_lowerer_for(_b_only_cast_079, {"X": "*fp16", "Y": "*fp32", "C": "*fp32"}, {"S": 32}), "dot operand B"),
-    ("C-roundtrip", lambda: _direct_lowerer_for(_c_roundtrip_079, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32}), "round-trip on the store path"),
-    ("kloop-body-cast", lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 1}), "accumulator"),
-    ("kloop-noncanonical-mask", lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 3}), "load mask"),
-    ("kloop-half-advance", lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 4}), "pointer advance"),
-    ("kloop-scaled-iv", lambda: _direct_lowerer_for(_kl_iv_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "SCALE": 2}), "scaled index"),
+    (
+        "A+B-cast",
+        lambda: _direct_lowerer_for(_ab_cast_079, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32}),
+        "dot operand A",
+    ),
+    (
+        "B-only-cast",
+        lambda: _direct_lowerer_for(_b_only_cast_079, {"X": "*fp16", "Y": "*fp32", "C": "*fp32"}, {"S": 32}),
+        "dot operand B",
+    ),
+    (
+        "C-roundtrip",
+        lambda: _direct_lowerer_for(_c_roundtrip_079, {"X": "*fp32", "Y": "*fp32", "C": "*fp32"}, {"S": 32}),
+        "round-trip on the store path",
+    ),
+    (
+        "kloop-body-cast",
+        lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 1}),
+        "accumulator",
+    ),
+    (
+        "kloop-noncanonical-mask",
+        lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 3}),
+        "load mask",
+    ),
+    (
+        "kloop-half-advance",
+        lambda: _direct_lowerer_for(_kl_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "MODE": 4}),
+        "pointer advance",
+    ),
+    (
+        "kloop-scaled-iv",
+        lambda: _direct_lowerer_for(_kl_iv_079, _KL_SIG, {"BM": 32, "BN": 32, "BK": 32, "SCALE": 2}),
+        "scaled index",
+    ),
 ]
 
 
@@ -814,7 +1017,20 @@ def test_lowering_boundary_value_paths_refuse(name, mk, expect):
 def test_lowering_boundary_kloop_roles_through_iter_args():
     """Rule 9 (bites on base): with B's buffer declared first, the emitted K-loop
     MSL must stage A from ``Ap`` — base staged it from ``Bp`` (declaration order)."""
-    sig = {"Bp": "*fp32", "Ap": "*fp32", "C": "*fp32", "M": "i32", "N": "i32", "K": "i32", "sam": "i32", "sak": "i32", "sbk": "i32", "sbn": "i32", "scm": "i32", "scn": "i32"}
+    sig = {
+        "Bp": "*fp32",
+        "Ap": "*fp32",
+        "C": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "sam": "i32",
+        "sak": "i32",
+        "sbk": "i32",
+        "sbn": "i32",
+        "scm": "i32",
+        "scn": "i32",
+    }
     lw = _direct_lowerer_for(_kl_swapped_079, sig, {"BM": 32, "BN": 32, "BK": 32})
     msl = lw.lower()
     # Unspecialized runtime strides route this harness to the strided SCALAR
@@ -889,7 +1105,9 @@ def test_lowering_boundary_f16_result_extended_refuses():
 
 
 @requires_gpu
-@pytest.mark.parametrize("shape", [(96, 80, 64), (64, 64, 64), (128, 128, 128)], ids=["9-tiles-unaligned", "single-tile", "4-tiles-aligned"])
+@pytest.mark.parametrize(
+    "shape", [(96, 80, 64), (64, 64, 64), (128, 128, 128)], ids=["9-tiles-unaligned", "single-tile", "4-tiles-aligned"]
+)
 def test_tutorial_1d_grid_mapping_replayed(cold_gpu_caches, shape):
     """Packet 080 W8 (bites on base for the 9-tile shape: 60% of C never written): the
     tutorial matmul's 1-D grid split ``pid % num_pid_m`` / ``pid // num_pid_m`` was
@@ -906,7 +1124,24 @@ def test_tutorial_1d_grid_mapping_replayed(cold_gpu_caches, shape):
     BM = BN = 32 if M % 64 else 64
     BK = 32
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
-    _tut_1d_079[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BM=BM, BN=BN, BK=BK, num_warps=4)
+    _tut_1d_079[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BM=BM,
+        BN=BN,
+        BK=BK,
+        num_warps=4,
+    )
     torch.mps.synchronize()
     assert not bool(c.isnan().any()), f"{c.isnan().float().mean().item():.0%} of C never written — tiles dropped"
     torch.testing.assert_close(c, a.float() @ b.float(), rtol=1e-3, atol=1e-2)
@@ -916,10 +1151,25 @@ def test_tutorial_1d_grid_mapping_replayed(cold_gpu_caches, shape):
 def test_lowering_boundary_1d_grid_mapping_emitted():
     """Rule 9 (bites on base): the emitted K-loop MSL for the tutorial form must split
     ``pid3.x`` by ``cdiv(_M, BLOCK_M)`` exactly as the IR does, never read ``pid3.y``."""
-    sig = {"a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32", "M": "i32", "N": "i32", "K": "i32", "sam": "i32", "sak": "i32", "sbk": "i32", "sbn": "i32", "scm": "i32", "scn": "i32"}
+    sig = {
+        "a_ptr": "*fp16",
+        "b_ptr": "*fp16",
+        "c_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "sam": "i32",
+        "sak": "i32",
+        "sbk": "i32",
+        "sbn": "i32",
+        "scm": "i32",
+        "scn": "i32",
+    }
     lw = _direct_lowerer_for(_tut_1d_079, sig, {"BM": 32, "BN": 32, "BK": 32})
     msl = lw.lower()
-    assert "pid3.x % _npm" in msl and "pid3.x / _npm" in msl and "((uint)_M + 32u - 1u) / 32u" in msl, "1-D grid split not replayed"
+    assert "pid3.x % _npm" in msl and "pid3.x / _npm" in msl and "((uint)_M + 32u - 1u) / 32u" in msl, (
+        "1-D grid split not replayed"
+    )
     assert "pid3.y" not in msl, "the 2-D mapping leaked into a 1-D-grid kernel"
 
 
@@ -961,10 +1211,14 @@ def test_lowering_boundary_int8_k1023_max_lowers():
 
 
 @requires
-@pytest.mark.parametrize("fn,sig,expect", [
-    (_i8_dot_narrow_079, {"X": "*i8", "Y": "*i8", "C": "*i8"}, "trailing compute epilogue|i32 output|trunci"),
-    (_i8_dot_plus1_079, _I8_SIG, "non-zero accumulator init|observed by|addi"),
-], ids=["narrowed-i8-C", "integer-consumer"])
+@pytest.mark.parametrize(
+    "fn,sig,expect",
+    [
+        (_i8_dot_narrow_079, {"X": "*i8", "Y": "*i8", "C": "*i8"}, "trailing compute epilogue|i32 output|trunci"),
+        (_i8_dot_plus1_079, _I8_SIG, "non-zero accumulator init|observed by|addi"),
+    ],
+    ids=["narrowed-i8-C", "integer-consumer"],
+)
 def test_lowering_boundary_int8_non_replayed_forms_refuse(fn, sig, expect):
     """Current-correctness pins (087 holdouts 3/4): an i32 result narrowed to an int8 buffer
     (modular in Triton, undefined for MSL float->char) and an integer consumer of the

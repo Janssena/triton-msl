@@ -60,10 +60,11 @@ def cold_gpu_caches(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ source variants (fresh modules)
 
+
 def _variant(kernel_name, replacements, name, tmp_dir):
     src = Path(__file__).with_name("test_fa_bwd_routing.py").read_text()
     start = src.index(f"@triton.jit\ndef {kernel_name}(")
-    end = start + 20 + re.search(r"\n(?=@|def )", src[start + 20:]).start()
+    end = start + 20 + re.search(r"\n(?=@|def )", src[start + 20 :]).start()
     ks = src[start:end]
     for old, new in replacements:
         assert ks.count(old) == 1, old
@@ -76,7 +77,9 @@ def _variant(kernel_name, replacements, name, tmp_dir):
     return getattr(mod, kernel_name)
 
 
-_Q_F32DELTA = [("delta = tl.sum(o_block * do_block, axis=1)", "delta = tl.sum((o_block * do_block).to(tl.float32), axis=1)")]
+_Q_F32DELTA = [
+    ("delta = tl.sum(o_block * do_block, axis=1)", "delta = tl.sum((o_block * do_block).to(tl.float32), axis=1)")
+]
 
 
 def _q_f32delta(tmp_path):
@@ -84,7 +87,10 @@ def _q_f32delta(tmp_path):
 
 
 def _sig(fn, dt):
-    cex = {n: (32 if n in ("DIM", "BLOCK_J", "BLOCK_K", "BLOCK_I") else 64) for n in [fn.arg_names[i] for i in fn.constexprs]}
+    cex = {
+        n: (32 if n in ("DIM", "BLOCK_J", "BLOCK_K", "BLOCK_I") else 64)
+        for n in [fn.arg_names[i] for i in fn.constexprs]
+    }
     sig = {}
     for n in fn.arg_names:
         if n in cex:
@@ -107,8 +113,10 @@ _ELEM = {"bf16": "bfloat", "fp16": "half"}
 # The uniform scale is rounded to bfloat by a software round-to-nearest-even (integer arithmetic):
 # the Metal compiler produced wrong values for `bfloat(scale)` on a kernel-uniform float in the kv
 # makers while the identical text in the q makers was fine (bisected on the M4 Max, packet 174 §4).
-_SCALE_R = {"bfloat": "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))",
-            "half": "float(half(scale))"}
+_SCALE_R = {
+    "bfloat": "(isnan(scale) ? scale : as_type<float>((as_type<uint>(scale) + 0x7FFFu + ((as_type<uint>(scale) >> 16u) & 1u)) & 0xFFFF0000u))",
+    "half": "float(half(scale))",
+}
 
 
 def _bf16_rne_software(bits):
@@ -121,6 +129,7 @@ def test_software_bf16_rounding_of_the_scale_matches_torch(value):
     """CPU: the integer round-to-nearest-even the makers emit for the bf16 scale equals torch's
     fp32→bf16 conversion on finite / infinite values (overflow rounds to inf as torch does)."""
     import struct
+
     bits = struct.unpack("<I", struct.pack("<f", value))[0]
     got = struct.unpack("<f", struct.pack("<I", _bf16_rne_software(bits)))[0]
     want = torch.tensor(value, dtype=torch.float32).to(torch.bfloat16).float().item()
@@ -131,7 +140,7 @@ def test_software_bf16_rounding_nan_is_guarded():
     """191: the bare integer formula maps a NaN payload (0x7fffffff) to 0x80000000 (−0.0); the
     emitted expression guards it with isnan(scale) so a NaN scale stays NaN. The integer formula's
     defect is pinned as such; the guard is pinned in the emitted text."""
-    assert _bf16_rne_software(0x7FFFFFFF) == 0x80000000       # the defect, as a fact about the formula
+    assert _bf16_rne_software(0x7FFFFFFF) == 0x80000000  # the defect, as a fact about the formula
     assert "(isnan(scale) ? scale : as_type<float>(" in _SCALE_R["bfloat"]
 
 
@@ -142,20 +151,57 @@ def test_nan_scale_propagates_on_the_bf16_kv_route(cold_gpu_caches):
     zero), and dK is NaN everywhere through its store-time `* scale`. Pre-fix the −0.0 mapping
     produced finite numbers for all of them. (My first cut of this pin expected dV NaN everywhere:
     wrong — the mask select bypasses the NaN score; corrected to the source's semantics.)"""
-    p = _problem(torch.bfloat16); p["sm"] = float("nan")
+    p = _problem(torch.bfloat16)
+    p["sm"] = float("nan")
     N, DIM, I, Hc, Hh = p["N"], p["DIM"], p["I"], p["Hc"], p["Hh"]
     st = lambda t: tuple(t.stride())
-    dk = torch.zeros(Hc, I, N, DIM, device=D, dtype=torch.bfloat16); dv = torch.zeros_like(dk)
-    q, k, v, bias, mask, do, lse, delta = p["q"], p["k"], p["v"], p["bias"], p["mask"], p["do"], p["lse"], p["delta"].to(torch.bfloat16)
+    dk = torch.zeros(Hc, I, N, DIM, device=D, dtype=torch.bfloat16)
+    dv = torch.zeros_like(dk)
+    q, k, v, bias, mask, do, lse, delta = (
+        p["q"],
+        p["k"],
+        p["v"],
+        p["bias"],
+        p["mask"],
+        p["do"],
+        p["lse"],
+        p["delta"].to(torch.bfloat16),
+    )
     if hasattr(_bwd_kv, "device_caches"):
         _bwd_kv.device_caches.clear()
     _bwd_kv[(triton.cdiv(N, 32), I, Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), do, *st(do), dk, *st(dk), dv, *st(dv),
-        p["sm"], NEG, N, Hh, DIM, N, 32, 32)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        dk,
+        *st(dk),
+        dv,
+        *st(dv),
+        p["sm"],
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        32,
+        32,
+    )
     torch.mps.synchronize()
     assert bool(torch.isnan(dk.float()).all()), "dK: the store-time * scale makes every element NaN"
-    unmasked = (~p["mh"])[..., None].expand(-1, -1, -1, DIM)          # key k of (h, i) present
+    unmasked = (~p["mh"])[..., None].expand(-1, -1, -1, DIM)  # key k of (h, i) present
     assert torch.equal(torch.isnan(dv.float()).cpu(), unmasked.cpu()), "dV: NaN exactly on unmasked keys"
 
 
@@ -164,6 +210,7 @@ def _staged(e, load):
 
 
 # ------------------------------------------------------------------ direct-lowering rows (CPU)
+
 
 @pytest.mark.parametrize("dt", ["bf16", "fp16"])
 def test_kv_replays_k_scale_p_and_ds_rounding(dt):
@@ -177,7 +224,11 @@ def test_kv_replays_k_scale_p_and_ds_rounding(dt):
     assert f"tg_dS[i] = float({e}(tg_P[i] * (tg_dS[i] - tg_delta[jj])));" in msl
     assert f"tg_P[i] = float({e}(tg_P[i]));" in msl
     # order: dS formed, then P rounded, then the dV dot reads tg_P
-    i_ds, i_pr, i_dv = msl.index("tg_dS[i] = float("), msl.index(f"tg_P[i] = float({e}(tg_P[i]))"), msl.index("simdgroup_load(pf, tg_P")
+    i_ds, i_pr, i_dv = (
+        msl.index("tg_dS[i] = float("),
+        msl.index(f"tg_P[i] = float({e}(tg_P[i]))"),
+        msl.index("simdgroup_load(pf, tg_P"),
+    )
     assert i_ds < i_pr < i_dv
     assert f"= {e}(tg_dS[i] * scale);" in msl and f"= {e}(tg_P[i]);" in msl
 
@@ -227,12 +278,46 @@ def test_fp32_sources_emit_no_rounding(fn, name):
     assert ("s*scale" in msl) or ("tg_P[i]*scale" in msl)
 
 
-@pytest.mark.parametrize("kernel,replacements,label", [
-    ("_bwd_kv", [("dscores = sm_value * (dsm_value - delta[:, None])", "dscores = sm_value.to(input_dtype) * (dsm_value - delta[:, None])")], "P rounded where it feeds dS"),
-    ("_bwd_kv", [('dsm_value = tl.dot(do, vt_block, dsm_value, input_precision="ieee")', 'dsm_value = tl.dot(do, vt_block, dsm_value, input_precision="ieee")\n        dsm_value = dsm_value.to(input_dtype).to(tl.float32)')], "dP rounded"),
-    ("_bwd_b", [("db_block += dscores", "db_block += dscores.to(input_dtype)")], "dS rounded before the dbias accumulation"),
-    ("_bwd_kv", [('dv_block += tl.dot(tl.trans(sm_value).to(input_dtype), do, input_precision="ieee")', 'dv_block += tl.dot(tl.trans(sm_value).to(input_dtype), (do.to(tl.float32) * 2.0).to(input_dtype), input_precision="ieee")')], "dO scaled and re-rounded"),
-])
+@pytest.mark.parametrize(
+    "kernel,replacements,label",
+    [
+        (
+            "_bwd_kv",
+            [
+                (
+                    "dscores = sm_value * (dsm_value - delta[:, None])",
+                    "dscores = sm_value.to(input_dtype) * (dsm_value - delta[:, None])",
+                )
+            ],
+            "P rounded where it feeds dS",
+        ),
+        (
+            "_bwd_kv",
+            [
+                (
+                    'dsm_value = tl.dot(do, vt_block, dsm_value, input_precision="ieee")',
+                    'dsm_value = tl.dot(do, vt_block, dsm_value, input_precision="ieee")\n        dsm_value = dsm_value.to(input_dtype).to(tl.float32)',
+                )
+            ],
+            "dP rounded",
+        ),
+        (
+            "_bwd_b",
+            [("db_block += dscores", "db_block += dscores.to(input_dtype)")],
+            "dS rounded before the dbias accumulation",
+        ),
+        (
+            "_bwd_kv",
+            [
+                (
+                    'dv_block += tl.dot(tl.trans(sm_value).to(input_dtype), do, input_precision="ieee")',
+                    'dv_block += tl.dot(tl.trans(sm_value).to(input_dtype), (do.to(tl.float32) * 2.0).to(input_dtype), input_precision="ieee")',
+                )
+            ],
+            "dO scaled and re-rounded",
+        ),
+    ],
+)
 def test_unreplayed_roundings_still_refuse(kernel, replacements, label, tmp_path):
     """Roundings the source does NOT make are not admitted: a narrowing where dS would consume a
     rounded P, a rounded dP, a rounded dS in the dbias accumulation, a dO scaled in fp32 and
@@ -245,6 +330,7 @@ def test_unreplayed_roundings_still_refuse(kernel, replacements, label, tmp_path
 
 
 # ------------------------------------------------------------------ GPU rows against the source's math
+
 
 def _rd(dtype):
     return (lambda t: t) if dtype == torch.float32 else (lambda t: t.to(dtype).float())
@@ -266,7 +352,24 @@ def _problem(dtype, Hc=2, Hh=1, I=2, N=64, DIM=32, seed=3):
     p = torch.exp(raw - lse[..., None])
     o = rd(torch.einsum("hijk,hikd->hijd", rd(p), v.float()))
     delta = (o * do.float()).sum(-1)
-    return dict(q=q, k=k, v=v, do=do, bias=bias, mask=mask, mh=mh, sm=sm, lse=lse, o=o.to(dtype), delta=rd(delta), N=N, DIM=DIM, Hc=Hc, Hh=Hh, I=I)
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        do=do,
+        bias=bias,
+        mask=mask,
+        mh=mh,
+        sm=sm,
+        lse=lse,
+        o=o.to(dtype),
+        delta=rd(delta),
+        N=N,
+        DIM=DIM,
+        Hc=Hc,
+        Hh=Hh,
+        I=I,
+    )
 
 
 def _oracle_kv(p, dtype):
@@ -286,16 +389,24 @@ def _oracle_kv(p, dtype):
 
 def _oracle_q(p, dtype):
     rd = _rd(dtype)
-    q, k, v, do, bias, mh, o = p["q"].float(), p["k"].float(), p["v"].float(), p["do"].float(), p["bias"].float(), p["mh"], p["o"].float()
+    q, k, v, do, bias, mh, o = (
+        p["q"].float(),
+        p["k"].float(),
+        p["v"].float(),
+        p["do"].float(),
+        p["bias"].float(),
+        p["mh"],
+        p["o"].float(),
+    )
     sm = torch.tensor(p["sm"], dtype=dtype).float().item() if dtype != torch.float32 else p["sm"]
-    delta = rd(o * do).sum(-1)                                   # products rounded, fp32 sum
+    delta = rd(o * do).sum(-1)  # products rounded, fp32 sum
     ks = rd(k * sm)
     s = torch.einsum("hijd,hikd->hijk", q, ks) + bias[:, None]
     s = s.masked_fill(mh[:, :, None, :], NEG)
     P = torch.exp2((s - p["lse"][..., None]) * INV_LN2)
     dP = torch.einsum("hijd,hikd->hijk", do, v)
     dS = rd(P * (dP - delta[..., None]))
-    dQ = torch.einsum("hijk,hikd->hijd", dS, ks)                 # the rounded, scaled K; no store scale
+    dQ = torch.einsum("hijk,hikd->hijd", dS, ks)  # the rounded, scaled K; no store scale
     return rd(dQ), rd(delta)
 
 
@@ -309,12 +420,12 @@ def _oracle_b(p, dtype):
     P = torch.exp2((s - p["lse"][..., None]) * INV_LN2)
     dP = torch.einsum("hijd,hikd->hijk", do, v)
     dS = P * (dP - p["delta"].float()[..., None])
-    return rd(dS.sum(1))                                          # sum over the triangle-i axis
+    return rd(dS.sum(1))  # sum over the triangle-i axis
 
 
 def _ulp(ref, dtype):
     bits = {torch.float32: 23, torch.float16: 10, torch.bfloat16: 7}[dtype]
-    return ref.abs().clamp(min=2.0 ** -20).log2().floor().exp2() * (2.0 ** -bits)
+    return ref.abs().clamp(min=2.0**-20).log2().floor().exp2() * (2.0**-bits)
 
 
 def _check(got, ref, dtype, label):
@@ -324,7 +435,9 @@ def _check(got, ref, dtype, label):
     err = (got.float() - ref).abs()
     frac = (err > 0).float().mean().item()
     tol = _ulp(ref, dtype) * (1.01 if dtype == torch.bfloat16 else 2.01)
-    assert bool((err <= tol).all()) and frac < 0.02, f"{label}: max err {err.max():.3e} (ref max {ref.abs().max():.2f}), {frac*100:.2f}% differ"
+    assert bool((err <= tol).all()) and frac < 0.02, (
+        f"{label}: max err {err.max():.3e} (ref max {ref.abs().max():.2f}), {frac * 100:.2f}% differ"
+    )
 
 
 @requires_gpu
@@ -333,17 +446,54 @@ def test_kv_computes_the_source_rounding_on_gpu(cold_gpu_caches, dtype):
     p = _problem(dtype)
     N, DIM, I, Hc, Hh = p["N"], p["DIM"], p["I"], p["Hc"], p["Hh"]
     st = lambda t: tuple(t.stride())
-    dk = torch.zeros(Hc, I, N, DIM, device=D, dtype=dtype); dv = torch.zeros_like(dk)
-    q, k, v, bias, mask, do, lse, delta = p["q"], p["k"], p["v"], p["bias"], p["mask"], p["do"], p["lse"], p["delta"].to(dtype)
+    dk = torch.zeros(Hc, I, N, DIM, device=D, dtype=dtype)
+    dv = torch.zeros_like(dk)
+    q, k, v, bias, mask, do, lse, delta = (
+        p["q"],
+        p["k"],
+        p["v"],
+        p["bias"],
+        p["mask"],
+        p["do"],
+        p["lse"],
+        p["delta"].to(dtype),
+    )
     if hasattr(_bwd_kv, "device_caches"):
         _bwd_kv.device_caches.clear()
     _bwd_kv[(triton.cdiv(N, 32), I, Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), do, *st(do), dk, *st(dk), dv, *st(dv),
-        p["sm"], NEG, N, Hh, DIM, N, 32, 32)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        dk,
+        *st(dk),
+        dv,
+        *st(dv),
+        p["sm"],
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        32,
+        32,
+    )
     torch.mps.synchronize()
     dk_ref, dv_ref = _oracle_kv(p, dtype)
-    _check(dv, dv_ref, dtype, "dV"); _check(dk, dk_ref, dtype, "dK")
+    _check(dv, dv_ref, dtype, "dV")
+    _check(dk, dk_ref, dtype, "dK")
 
 
 @requires_gpu
@@ -353,30 +503,91 @@ def test_q_fp32_delta_variant_computes_the_source_rounding_on_gpu(cold_gpu_cache
     p = _problem(dtype)
     N, DIM, I, Hc, Hh = p["N"], p["DIM"], p["I"], p["Hc"], p["Hh"]
     st = lambda t: tuple(t.stride())
-    dq = torch.zeros(Hc, I, N, DIM, device=D, dtype=dtype); delta = torch.zeros(Hc, I, N, device=D, dtype=dtype)
+    dq = torch.zeros(Hc, I, N, DIM, device=D, dtype=dtype)
+    delta = torch.zeros(Hc, I, N, device=D, dtype=dtype)
     q, k, v, bias, mask, do, lse, o = p["q"], p["k"], p["v"], p["bias"], p["mask"], p["do"], p["lse"], p["o"]
     fn[(triton.cdiv(N, 32), I, Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), o, *st(o), do, *st(do), dq, *st(dq),
-        p["sm"], NEG, N, Hh, DIM, N, 32, 32)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        o,
+        *st(o),
+        do,
+        *st(do),
+        dq,
+        *st(dq),
+        p["sm"],
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        32,
+        32,
+    )
     torch.mps.synchronize()
     dq_ref, delta_ref = _oracle_q(p, dtype)
-    _check(delta, delta_ref, dtype, "delta"); _check(dq, dq_ref, dtype, "dQ")
+    _check(delta, delta_ref, dtype, "delta")
+    _check(dq, dq_ref, dtype, "dQ")
 
 
 @requires_gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_b_computes_the_source_rounding_on_gpu(cold_gpu_caches, dtype):
-    p = _problem(dtype, I=64)          # _bwd_b loops i over N: I == N
+    p = _problem(dtype, I=64)  # _bwd_b loops i over N: I == N
     N, DIM, Hc, Hh = p["N"], p["DIM"], p["Hc"], p["Hh"]
     st = lambda t: tuple(t.stride())
     db = torch.zeros(Hc, N, N, device=D, dtype=dtype)
-    q, k, v, bias, mask, do, lse, delta = p["q"], p["k"], p["v"], p["bias"], p["mask"], p["do"], p["lse"], p["delta"].to(dtype)
+    q, k, v, bias, mask, do, lse, delta = (
+        p["q"],
+        p["k"],
+        p["v"],
+        p["bias"],
+        p["mask"],
+        p["do"],
+        p["lse"],
+        p["delta"].to(dtype),
+    )
     if hasattr(_bwd_b, "device_caches"):
         _bwd_b.device_caches.clear()
     _bwd_b[(triton.cdiv(N, 32), triton.cdiv(N, 32), Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), do, *st(do), db, *st(db),
-        p["sm"], NEG, Hh, N, DIM, N, 32, 32)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        db,
+        *st(db),
+        p["sm"],
+        NEG,
+        Hh,
+        N,
+        DIM,
+        N,
+        32,
+        32,
+    )
     torch.mps.synchronize()
     _check(db, _oracle_b(p, dtype), dtype, "dbias")

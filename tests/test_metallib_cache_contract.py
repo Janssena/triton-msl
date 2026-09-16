@@ -1,4 +1,5 @@
 """Controlled binary-cache witnesses, not GPU numerical/compiler emulation claims."""
+
 from pathlib import Path
 import importlib
 import json
@@ -40,12 +41,15 @@ def build(monkeypatch, tmp_path):
             assert "metallib" in cmd
             output.write_bytes(b"LIB:" + Path(cmd[cmd.index("metallib") + 1]).read_bytes())
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
     monkeypatch.setattr(compiler.subprocess, "run", run)
 
     def compile(route="msl", standard="3.1"):
         fn = compiler.MetalBackend.make_metallib if route == "msl" else compiler.MetalBackend.make_metallib_from_llir
-        return fn("same controlled source", {"name": "binary_contract"},
-                  compiler.MetalOptions(target_metal_version=standard))
+        return fn(
+            "same controlled source", {"name": "binary_contract"}, compiler.MetalOptions(target_metal_version=standard)
+        )
+
     return compile, state, calls, tmp_path
 
 
@@ -55,8 +59,8 @@ def test_msl_binary_key_includes_effective_standard(build):
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize('route', ['msl', 'llir'])
-@pytest.mark.parametrize('stage', ['metal', 'metallib'])
+@pytest.mark.parametrize("route", ["msl", "llir"])
+@pytest.mark.parametrize("stage", ["metal", "metallib"])
 def test_failed_toolchain_stage_is_not_retried_by_diagnostic_spelling(build, monkeypatch, route, stage):
     """Unknown compiler/linker failure is not a proved missing-artifact race.
 
@@ -67,24 +71,23 @@ def test_failed_toolchain_stage_is_not_retried_by_diagnostic_spelling(build, mon
 
     compile, _, _, _ = build
     run_ok = compiler.subprocess.run
-    for diagnostic in (b'internal compiler error: verifier failed',
-                       b'LLVM ERROR: Broken module found', b''):
+    for diagnostic in (b"internal compiler error: verifier failed", b"LLVM ERROR: Broken module found", b""):
         attempts = []
 
         def run(cmd, **kwargs):
             if stage in cmd:
                 attempts.append(tuple(cmd))
                 if len(attempts) == 1:
-                    raise subprocess.CalledProcessError(1, cmd, b'', diagnostic)
+                    raise subprocess.CalledProcessError(1, cmd, b"", diagnostic)
             return run_ok(cmd, **kwargs)
 
-        monkeypatch.setattr(compiler.subprocess, 'run', run)
+        monkeypatch.setattr(compiler.subprocess, "run", run)
         with pytest.raises(MetalCompilationError) as caught:
             compile(route)
-        assert len(attempts) == 1, 'a failed toolchain stage was silently retried'
-        assert not isinstance(caught.value, MetalResourceError), 'unknown failure became prunable'
+        assert len(attempts) == 1, "a failed toolchain stage was silently retried"
+        assert not isinstance(caught.value, MetalResourceError), "unknown failure became prunable"
         if diagnostic:
-            assert diagnostic.decode() in str(caught.value), 'compiler diagnostic was discarded'
+            assert diagnostic.decode() in str(caught.value), "compiler diagnostic was discarded"
 
 
 @pytest.mark.parametrize("route", ["msl", "llir"])
@@ -106,7 +109,7 @@ def test_msl_and_llvm_are_distinct_compiler_inputs(build):
 def test_corrupted_binary_is_not_returned(build, route):
     compile, _, calls, root = build
     first = compile(route)
-    path, = root.glob("*.metallib")
+    (path,) = root.glob("*.metallib")
     path.write_bytes(b"corrupted binary")
     assert compile(route) == first
     assert len(calls) == 2
@@ -136,7 +139,7 @@ def test_valid_binary_product_remains_a_cache_hit(build, route):
 def test_binary_record_must_describe_this_product(build, route, damage):
     compile, _, calls, root = build
     first = compile(route)
-    path, = root.glob("*.meta.json")
+    (path,) = root.glob("*.meta.json")
     record = json.loads(path.read_text())
     if damage == "schema":
         record["schema"] = -1
@@ -153,10 +156,12 @@ def test_binary_record_must_describe_this_product(build, route, damage):
 def test_public_cache_replacement_cannot_be_certified_as_private_output(build, route, monkeypatch):
     compile, _, calls, root = build
     real = compiler.os.replace
+
     def replacing(source, destination):
         real(source, destination)
         if str(destination).endswith(".metallib"):
             Path(destination).write_bytes(b"foreign concurrent replacement")
+
     monkeypatch.setattr(compiler.os, "replace", replacing)
     expected = b"LIB:toolchain-one:" + (b"-std=metal3.1" if route == "msl" else b"ir")
     assert compile(route) == expected

@@ -82,8 +82,7 @@ def test_2d_reduce_declares_layout(M, N, axis, strict_layout):
     o = torch.zeros(o_size, device="mps", dtype=torch.float32)
     _reduce_axis[(1,)](x, o, M=M, N=N, AXIS=axis)
     torch.mps.synchronize()
-    assert torch.allclose(o.cpu(), x.cpu().sum(dim=axis), atol=1e-3), (
-        f"2-D reduce axis={axis} wrong at {M}x{N}")
+    assert torch.allclose(o.cpu(), x.cpu().sum(dim=axis), atol=1e-3), f"2-D reduce axis={axis} wrong at {M}x{N}"
 
 
 @triton.jit
@@ -105,8 +104,7 @@ def test_2d_argmax_declares_layout(M, N, axis, strict_layout):
     oi = torch.zeros(o_size, device="mps", dtype=torch.int32)
     _argmax_axis[(1,)](x, oi, M=M, N=N, AXIS=axis)
     torch.mps.synchronize()
-    assert oi.cpu().tolist() == x.cpu().argmax(dim=axis).tolist(), (
-        f"argmax axis={axis} index wrong at {M}x{N}")
+    assert oi.cpu().tolist() == x.cpu().argmax(dim=axis).tolist(), f"argmax axis={axis} index wrong at {M}x{N}"
 
 
 @triton.jit
@@ -265,9 +263,7 @@ def test_blocked_convert_uses_reduce_inner_dim_not_effective_shape(strict_layout
     wide = torch.randn(M, W, device="mps")
     reduced = torch.zeros(M, device="mps")
     wide_out = torch.zeros_like(wide)
-    _blocked_reduce_with_larger_2d_shape[(1,)](
-        small, wide, reduced, wide_out, M=M, K=K, W=W
-    )
+    _blocked_reduce_with_larger_2d_shape[(1,)](small, wide, reduced, wide_out, M=M, K=K, W=W)
     torch.mps.synchronize()
     torch.testing.assert_close(reduced, small.sum(dim=1), rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(wide_out, wide + 0.25, rtol=0, atol=0)

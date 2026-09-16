@@ -19,14 +19,16 @@ def _module(tmp_path, name):
 
     backend = MetalBackend(GPUTarget("metal", "apple-m4", 32))
     path = tmp_path / "source.ttgir"
-    path.write_text('''module attributes {"ttg.num-ctas" = 1 : i32,
+    path.write_text(
+        """module attributes {"ttg.num-ctas" = 1 : i32,
       "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
       tt.func public @NAME(%out: !tt.ptr<f32>) {
         %c = arith.constant 1.0 : f32
         tt.store %out, %c : !tt.ptr<f32>
         tt.return
       }
-    }'''.replace("NAME", name))
+    }""".replace("NAME", name)
+    )
     ctx = ir.context()
     source = IRSource(str(path), ctx, backend)
     assert source.module.verify()
@@ -68,6 +70,7 @@ def test_unresolved_ssa_refuses_at_its_consumer(consumer):
 def test_unsupported_outcome_survives_diagnostic_comment_redaction(tmp_path, monkeypatch, location):
     """Synthetic unhandled op: no consumer, so only the explicit outcome can refuse."""
     from triton_msl.codegen.mlir_walker import CalledFunc, SSAValue
+
     monkeypatch.delenv("TRITON_MSL_LEGACY", raising=False)
     injections, redactions = [], []
 
@@ -81,6 +84,7 @@ def test_unsupported_outcome_survives_diagnostic_comment_redaction(tmp_path, mon
             else:
                 callee = CalledFunc("unhandled_callee", [], [op], [])
                 lowerer.kb._device_functions.append(lowerer._lower_one_called_func(callee))
+
         return register_with_unhandled_op
 
     def redact_kernel(_class, _original_comment):
@@ -88,6 +92,7 @@ def test_unsupported_outcome_survives_diagnostic_comment_redaction(tmp_path, mon
             if "test.unhandled" in text:
                 redactions.append("kernel")
             kb._emit("// diagnostic")
+
         return comment
 
     def redact_device(_class, original_emit):
@@ -95,6 +100,7 @@ def test_unsupported_outcome_survives_diagnostic_comment_redaction(tmp_path, mon
             if line.startswith("//") and "test.unhandled" in line:
                 redactions.append("callee")
             original_emit(lowerer, "// diagnostic" if line.startswith("//") else line)
+
         return emit
 
     # MEPT tests reload these modules after collection. Patch the current class

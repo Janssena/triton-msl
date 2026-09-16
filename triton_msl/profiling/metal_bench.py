@@ -9,8 +9,9 @@ import operator
 import time
 
 
-def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, synchronize=None,
-                   clock="wall", return_metadata=False, **kwargs):
+def metal_do_bench(
+    fn, *, quantiles=None, warmup=25, rep=100, synchronize=None, clock="wall", return_metadata=False, **kwargs
+):
     """Benchmark one completed workload per sample, with an explicit clock.
 
     Compatible with Triton's benchmarker interface (registered via
@@ -119,13 +120,15 @@ def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, synchronize=None,
         "clock": used_clock,
         "requested_clock": clock,
         "unit": "ms",
-        "boundary": ("entire-workload command buffer GPU start/end" if used_clock == "gpu"
-                     else "callback invocation through completion, including host overhead"),
+        "boundary": (
+            "entire-workload command buffer GPU start/end"
+            if used_clock == "gpu"
+            else "callback invocation through completion, including host overhead"
+        ),
         "warmup": warmup,
         "samples": rep,
         "valid_gpu_timestamp_samples": len(gpu_times) if clock != "wall" else None,
-        "fallback_reason": ("missing_or_invalid_gpu_timestamps"
-                            if clock == "auto" and not gpu_valid else None),
+        "fallback_reason": ("missing_or_invalid_gpu_timestamps" if clock == "auto" and not gpu_valid else None),
     }
 
 

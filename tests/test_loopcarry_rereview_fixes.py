@@ -8,6 +8,7 @@ F2 (was pre-existing silent-wrong): the multipass reduce phase loop strides _loo
    repeatedly (a 256-wide sum in a 512-element kernel counted every element twice). Now
    correct-or-refuse.
 """
+
 import pytest
 import torch
 import triton
@@ -24,7 +25,7 @@ requires_mps = pytest.mark.skipif(
 @triton.jit
 def _cnt_first(inp, out, cnt_out, BLOCK: tl.constexpr, STEPS: tl.constexpr):
     offs = tl.arange(0, BLOCK)
-    cnt = tl.zeros((), dtype=tl.int64)          # i64 counter FIRST
+    cnt = tl.zeros((), dtype=tl.int64)  # i64 counter FIRST
     acc = tl.zeros((BLOCK,), dtype=tl.float32)  # fp32 accumulator second
     for _ in range(0, STEPS):
         cnt += 2
@@ -37,7 +38,7 @@ def _cnt_first(inp, out, cnt_out, BLOCK: tl.constexpr, STEPS: tl.constexpr):
 def _acc_first(inp, out, cnt_out, BLOCK: tl.constexpr, STEPS: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     acc = tl.zeros((BLOCK,), dtype=tl.float32)  # fp32 accumulator FIRST
-    cnt = tl.zeros((), dtype=tl.int64)          # i64 counter second
+    cnt = tl.zeros((), dtype=tl.int64)  # i64 counter second
     for _ in range(0, STEPS):
         cnt += 2
         acc += tl.load(inp + offs)
@@ -48,8 +49,10 @@ def _acc_first(inp, out, cnt_out, BLOCK: tl.constexpr, STEPS: tl.constexpr):
 @requires_mps
 @pytest.mark.parametrize("kern", [_cnt_first, _acc_first], ids=["i64-first", "fp32-first"])
 def test_mixed_dtype_iter_args_order_independent(kern):
-    dev = "mps"; torch.manual_seed(0)
-    x = torch.randn(64, device=dev); out = torch.empty(64, device=dev)
+    dev = "mps"
+    torch.manual_seed(0)
+    x = torch.randn(64, device=dev)
+    out = torch.empty(64, device=dev)
     cnt = torch.zeros(1, device=dev, dtype=torch.int64)
     kern[(1,)](x, out, cnt, BLOCK=64, STEPS=3, num_warps=2)
     torch.mps.synchronize()
@@ -59,12 +62,12 @@ def test_mixed_dtype_iter_args_order_independent(kern):
 
 
 @triton.jit
-def _small_reduce_in_big_kernel(x_ptr, z_ptr, out_ptr, s_ptr,
-                                M: tl.constexpr, N: tl.constexpr, R: tl.constexpr):
-    rm = tl.arange(0, M); rn = tl.arange(0, N)
-    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])   # M*N elements (the kernel's total)
+def _small_reduce_in_big_kernel(x_ptr, z_ptr, out_ptr, s_ptr, M: tl.constexpr, N: tl.constexpr, R: tl.constexpr):
+    rm = tl.arange(0, M)
+    rn = tl.arange(0, N)
+    x = tl.load(x_ptr + rm[:, None] * N + rn[None, :])  # M*N elements (the kernel's total)
     rz = tl.arange(0, R)
-    z = tl.load(z_ptr + rz)                              # R < M*N elements
+    z = tl.load(z_ptr + rz)  # R < M*N elements
     s = tl.sum(z)
     tl.store(out_ptr + rm[:, None] * N + rn[None, :], x * 2.0)
     tl.store(s_ptr, s)
@@ -72,10 +75,13 @@ def _small_reduce_in_big_kernel(x_ptr, z_ptr, out_ptr, s_ptr,
 
 @requires_mps
 def test_small_reduce_in_multipass_correct_or_refuse():
-    dev = "mps"; torch.manual_seed(0)
-    M, N, R = 16, 32, 256                                # total 512, reduce input 256
-    x = torch.randn(M, N, device=dev); z = torch.randn(R, device=dev)
-    out = torch.zeros(M, N, device=dev); sv = torch.zeros(1, device=dev)
+    dev = "mps"
+    torch.manual_seed(0)
+    M, N, R = 16, 32, 256  # total 512, reduce input 256
+    x = torch.randn(M, N, device=dev)
+    z = torch.randn(R, device=dev)
+    out = torch.zeros(M, N, device=dev)
+    sv = torch.zeros(1, device=dev)
     try:
         _small_reduce_in_big_kernel[(1,)](x, z, out, sv, M, N, R, num_warps=2)
         torch.mps.synchronize()

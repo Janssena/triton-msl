@@ -12,6 +12,7 @@ dot's C operand, a loaded mask -> -inf, a per-row lse store, a runtime scale int
 Q, and a const result-scale (inv_ln2) with exp2 (== natural softmax over
 sm_scale*QK + bias). See generic_lowerer._detect_biased_flash_attention.
 """
+
 import math
 import pytest
 import torch
@@ -26,16 +27,49 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _biased_fa(
-    o_ptr, o_sz, o_sh, o_sm, o_sk,
-    lse_ptr, lse_sz, lse_sh, lse_sm,
-    q_ptr, q_sz, q_sh, q_sm, q_sk,
-    k_ptr, k_sz, k_sh, k_sn, k_sk,
-    v_ptr, v_sz, v_sh, v_sn, v_sk,
-    b_ptr, b_sz, b_sh, b_sm, b_sn,
-    mask_ptr, m_sz, m_sh, m_sn,
-    sm_scale, neg_inf, Z, H, N,
-    DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    BAD_TEMP: tl.constexpr = False, I3D: tl.constexpr = False,
+    o_ptr,
+    o_sz,
+    o_sh,
+    o_sm,
+    o_sk,
+    lse_ptr,
+    lse_sz,
+    lse_sh,
+    lse_sm,
+    q_ptr,
+    q_sz,
+    q_sh,
+    q_sm,
+    q_sk,
+    k_ptr,
+    k_sz,
+    k_sh,
+    k_sn,
+    k_sk,
+    v_ptr,
+    v_sz,
+    v_sh,
+    v_sn,
+    v_sk,
+    b_ptr,
+    b_sz,
+    b_sh,
+    b_sm,
+    b_sn,
+    mask_ptr,
+    m_sz,
+    m_sh,
+    m_sn,
+    sm_scale,
+    neg_inf,
+    Z,
+    H,
+    N,
+    DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BAD_TEMP: tl.constexpr = False,
+    I3D: tl.constexpr = False,
 ):
     inv_ln2: tl.constexpr = 1.4426950408889634
     ln2: tl.constexpr = 0.6931471824645996
@@ -111,8 +145,30 @@ def _run(Z, H, N, DIM, bad_temp=False):
     st = lambda t: tuple(t.stride())
     grid = (triton.cdiv(N, 32), Z * H)
     _biased_fa[grid](
-        o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v),
-        b, *st(b), mask, *st(mask), sm, -1e9, Z, H, N, DIM, 32, 32, bad_temp)
+        o,
+        *st(o),
+        lse,
+        *st(lse),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        b,
+        *st(b),
+        mask,
+        *st(mask),
+        sm,
+        -1e9,
+        Z,
+        H,
+        N,
+        DIM,
+        32,
+        32,
+        bad_temp,
+    )
     torch.mps.synchronize()
     raw = sm * (q @ k.transpose(-2, -1)) + b
     raw = raw.masked_fill(mask[:, :, None, :].bool(), float("-inf"))
@@ -147,23 +203,51 @@ def test_biased_fa_bad_temperature_refuses():
             _run(1, 2, 64, 32, bad_temp=True)
         except MetalNonRecoverableError as e:
             refused = "temperature" in str(e) or "Refusing" in str(e)
-    refused = refused or any(
-        "temperature" in str(w.message) or "Refusing" in str(w.message) for w in wl
-    )
+    refused = refused or any("temperature" in str(w.message) or "Refusing" in str(w.message) for w in wl)
     assert refused, "bad-temperature biased FA must be refused, not silently mis-routed"
 
 
 @triton.jit
 def _biased_tri_fa(
-    o_ptr, o_sh, o_si, o_sn, o_sd,
-    lse_ptr, lse_sh, lse_si, lse_sn,
-    q_ptr, q_sh, q_si, q_sn, q_sd,
-    k_ptr, k_sh, k_si, k_sn, k_sd,
-    v_ptr, v_sh, v_si, v_sn, v_sd,
-    b_ptr, b_sh, b_sn, b_sm,              # bias [h, n, m] — SHARED across the i-axis
-    mask_ptr, mask_sh, mask_si, mask_sn,  # mask [batch, i, k]; batch = pid_h // H
-    sm_scale, neg_inf, N, H,
-    DIM: tl.constexpr, BLOCK_J: tl.constexpr, BLOCK_K: tl.constexpr,
+    o_ptr,
+    o_sh,
+    o_si,
+    o_sn,
+    o_sd,
+    lse_ptr,
+    lse_sh,
+    lse_si,
+    lse_sn,
+    q_ptr,
+    q_sh,
+    q_si,
+    q_sn,
+    q_sd,
+    k_ptr,
+    k_sh,
+    k_si,
+    k_sn,
+    k_sd,
+    v_ptr,
+    v_sh,
+    v_si,
+    v_sn,
+    v_sd,
+    b_ptr,
+    b_sh,
+    b_sn,
+    b_sm,  # bias [h, n, m] — SHARED across the i-axis
+    mask_ptr,
+    mask_sh,
+    mask_si,
+    mask_sn,  # mask [batch, i, k]; batch = pid_h // H
+    sm_scale,
+    neg_inf,
+    N,
+    H,
+    DIM: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """trifast-style 3-D triangle attention: pid_j/pid_i/pid_h grid, bias shared
     across i, mask indexed pid_h//H (cross-head). Mirrors scratchpad trifast _fwd."""
@@ -223,11 +307,14 @@ def _biased_tri_fa(
 
 
 @requires_mps
-@pytest.mark.parametrize("DIM,dtype,o_tol", [
-    (32, torch.float32, 1e-3),   # small-head simd-MMA path
-    (64, torch.float32, 1e-3),   # simd-MMA path
-    (32, torch.bfloat16, 6e-2),  # bf16 in/out, fp32 compute -> tiled path
-])
+@pytest.mark.parametrize(
+    "DIM,dtype,o_tol",
+    [
+        (32, torch.float32, 1e-3),  # small-head simd-MMA path
+        (64, torch.float32, 1e-3),  # simd-MMA path
+        (32, torch.bfloat16, 6e-2),  # bf16 in/out, fp32 compute -> tiled path
+    ],
+)
 def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
     """trifast's 3-D triangle attention (bias shared across i, mask pid_h//H,
     >31 args -> packed ABI) computes correctly on Metal via the biased template.
@@ -235,7 +322,7 @@ def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
     (bf16 in/out, fp32 interior compute)."""
     torch.manual_seed(0)
     dev = "mps"
-    Hc, Hh, I, N = 4, 2, 3, 64   # H_combined=4, H_heads=2 => batch=2
+    Hc, Hh, I, N = 4, 2, 3, 64  # H_combined=4, H_heads=2 => batch=2
     batch = Hc // Hh
     sm = 1.0 / math.sqrt(DIM)
     q = torch.randn(Hc, I, N, DIM, device=dev, dtype=dtype)
@@ -248,8 +335,28 @@ def test_biased_tri_fa_3d_computes(DIM, dtype, o_tol):
     st = lambda t: tuple(t.stride())
     grid = (triton.cdiv(N, 32), I, Hc)
     _biased_tri_fa[grid](
-        o, *st(o), lse, *st(lse), q, *st(q), k, *st(k), v, *st(v),
-        bias, *st(bias), mask, *st(mask), sm, -1e9, N, Hh, DIM, 32, 32)
+        o,
+        *st(o),
+        lse,
+        *st(lse),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        mask,
+        *st(mask),
+        sm,
+        -1e9,
+        N,
+        Hh,
+        DIM,
+        32,
+        32,
+    )
     torch.mps.synchronize()
     qf, kf, vf, bf = q.float(), k.float(), v.float(), bias.float()
     if dtype == torch.float32:
@@ -285,24 +392,35 @@ def _build_biased_lowerer(*, signature_overrides=None, **constexpr_overrides):
     options = backend.parse_options({})
     ptr = "*fp32"
     sig = {}
+
     def add(names, ty):
         for n in names.split():
             sig[n] = ty
-    add("o_ptr", ptr); add("o_sz o_sh o_sm o_sk", "i32")
-    add("lse_ptr", ptr); add("lse_sz lse_sh lse_sm", "i32")
-    add("q_ptr", ptr); add("q_sz q_sh q_sm q_sk", "i32")
-    add("k_ptr", ptr); add("k_sz k_sh k_sn k_sk", "i32")
-    add("v_ptr", ptr); add("v_sz v_sh v_sn v_sk", "i32")
-    add("b_ptr", ptr); add("b_sz b_sh b_sm b_sn", "i32")
-    add("mask_ptr", "*i8"); add("m_sz m_sh m_sn", "i32")
-    add("sm_scale", "fp32"); add("neg_inf", "fp32"); add("Z H N", "i32")
+
+    add("o_ptr", ptr)
+    add("o_sz o_sh o_sm o_sk", "i32")
+    add("lse_ptr", ptr)
+    add("lse_sz lse_sh lse_sm", "i32")
+    add("q_ptr", ptr)
+    add("q_sz q_sh q_sm q_sk", "i32")
+    add("k_ptr", ptr)
+    add("k_sz k_sh k_sn k_sk", "i32")
+    add("v_ptr", ptr)
+    add("v_sz v_sh v_sn v_sk", "i32")
+    add("b_ptr", ptr)
+    add("b_sz b_sh b_sm b_sn", "i32")
+    add("mask_ptr", "*i8")
+    add("m_sz m_sh m_sn", "i32")
+    add("sm_scale", "fp32")
+    add("neg_inf", "fp32")
+    add("Z H N", "i32")
     sig.update(signature_overrides or {})
     constexprs = {"DIM": 32, "BLOCK_M": 32, "BLOCK_N": 32, "BAD_TEMP": False, "I3D": False}
     constexprs.update(constexpr_overrides)
     s = ASTSource(fn=_biased_fa, signature=sig, constexprs=constexprs)
-    ctx = ir.context(); ir.load_dialects(ctx)
-    mod = s.make_ir(target, options, backend.get_codegen_implementation(options),
-                    backend.get_module_map(), ctx)
+    ctx = ir.context()
+    ir.load_dialects(ctx)
+    mod = s.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
     md = {}
     mod = backend.make_ttir(mod, md, options)
     mod = backend.make_ttgir(mod, md, options)

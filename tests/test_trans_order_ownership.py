@@ -42,7 +42,9 @@ def _two_order_lowerer(tmp_path, monkeypatch):
     )
     context = ir.context()
     ir.load_dialects(context)
-    mod = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+    mod = source.make_ir(
+        target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+    )
     metadata = {}
     mod = backend.make_ttir(mod, metadata, options)
     mod = backend.make_ttgir(mod, metadata, options)
@@ -81,7 +83,7 @@ def test_canonical_batched_transpose_positive_is_preserved():
 
 
 def test_quoted_commented_nested_and_private_repeated_ssa_names_are_scoped():
-    source = r'''#b = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 2, 16], warpsPerCTA = [1, 1, 4], order = [2, 1, 0]}>
+    source = r"""#b = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 2, 16], warpsPerCTA = [1, 1, 4], order = [2, 1, 0]}>
 #loc = loc("%fake = tt.trans %x {order = array<i32: 2, 1, 0>}")
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @entry(%x: tensor<2x2x32xf32, #b>) {
@@ -97,7 +99,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return %t : tensor<2x32x2xf32, #b>
   }
 }
-'''
+"""
     records = _ModuleTextIndex(source).trans_orders
     assert [(r["function"], r["result"], r["order"]) for r in records] == [
         ("entry", "t", (1, 0, 2)),

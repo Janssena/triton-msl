@@ -212,16 +212,19 @@ def test_normalization_address_fill_and_effect_near_misses(routes, mode):
 @pytest.mark.parametrize("family", ["soft", "norm"])
 def test_normalization_type_proof_uses_native_value_metadata_not_legacy_strings(family):
     from triton_msl.codegen._normalization_proof import prove_normalization
+
     fn = _soft if family == "soft" else _norm
     lowerer = _build_lowerer(fn, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 0})
     info = lowerer._detect_softmax() if family == "soft" else lowerer._detect_layer_norm()
     assert info is not None
+
     def poison(ops):
         for op in ops:
             op.type_str = "unusable legacy type"
             op.elem_type = "unusable legacy element"
             poison(op.region_ops or [])
             poison(op.else_ops or [])
+
     poison(lowerer.graph.ops)
     for arg in lowerer.graph.args:
         arg.type_str = "unusable legacy type"
@@ -234,6 +237,7 @@ def test_normalization_type_proof_uses_native_value_metadata_not_legacy_strings(
 @pytest.mark.parametrize("damage", ["missing", "wrong_owner", "index_width", "projection"])
 def test_normalization_native_type_proof_rejects_unproved_facts(damage):
     from triton_msl.codegen._normalization_proof import prove_normalization
+
     lowerer = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 0})
     info = lowerer._detect_softmax()
     assert info is not None
@@ -259,7 +263,7 @@ def test_normalization_address_fill_and_effects_compute(routes, mode):
     torch.manual_seed(261)
     n, rows = 47, 8
     cpu = torch.randn(rows * n + int(mode == 7)) * 3 + 2
-    source = cpu[int(mode == 7):].reshape(rows, n)
+    source = cpu[int(mode == 7) :].reshape(rows, n)
     x = cpu.to("mps")
     storage = torch.full((rows * n + int(mode == 9),), -12345.0, device="mps")
     if mode == 9:
@@ -273,7 +277,7 @@ def test_normalization_address_fill_and_effects_compute(routes, mode):
         expected = torch.softmax(padded, dim=-1)[:, :n]
     else:
         expected = torch.softmax(source, dim=-1)
-    actual = storage[:rows * n].cpu().reshape(rows, n)
+    actual = storage[: rows * n].cpu().reshape(rows, n)
     if mode == 10:
         assert (actual[:, -1] == -12345).all()
         actual, expected = actual[:, :-1], expected[:, :-1]
@@ -283,11 +287,23 @@ def test_normalization_address_fill_and_effects_compute(routes, mode):
     assert not routes
 
 
-@pytest.mark.parametrize("kind", ["missing_return", "projection_return", "duplicate_operand", "wrong_axis",
-                                 "missing_type", "unknown_rank", "wrong_result_shape"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "missing_return",
+        "projection_return",
+        "duplicate_operand",
+        "wrong_axis",
+        "missing_type",
+        "unknown_rank",
+        "wrong_result_shape",
+    ],
+)
 def test_normalization_combiner_metadata_is_mandatory(routes, kind):
     type_case = kind in ("missing_type", "unknown_rank", "wrong_result_shape")
-    lowerer = _build_lowerer(_soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 1 if type_case else 0})
+    lowerer = _build_lowerer(
+        _soft, {"x_ptr": "*fp32", "o_ptr": "*fp32", "N": "i32"}, {"BLOCK": 64, "MODE": 1 if type_case else 0}
+    )
     reduce = next(o for o in lowerer.graph.ops if o.op == "tt.reduce")
     args = reduce.attrs["block_arg_ids"]
     if kind == "missing_return":

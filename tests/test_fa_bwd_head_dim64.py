@@ -10,6 +10,7 @@ silent-wrong). They now sub-tile the accumulation dimension so a large head_dim 
 head_dim<=32 stays a SINGLE pass (KS==BK / JS==BJ / Q staged) -> byte-identical to the
 validated trifast path. These reuse the exact _bwd_{kv,q,b} kernels from the routing test.
 """
+
 import math
 import pytest
 import torch
@@ -28,24 +29,63 @@ requires_mps = pytest.mark.skipif(
 @pytest.mark.parametrize("DIM", [64, 128])
 @pytest.mark.parametrize("Hc,Hh,I,N", [(4, 2, 3, 64), (1, 1, 1, 48)])
 def test_bwd_kv_head_dim_gt32(Hc, Hh, I, N, DIM):
-    dev = "mps"; BJ = BK = 32; NEG = -1e9
+    dev = "mps"
+    BJ = BK = 32
+    NEG = -1e9
     r = _reference(Hc, Hh, I, N, DIM)
     st = lambda t: tuple(t.stride())
     dk = torch.zeros(Hc, I, N, DIM, device=dev)
     dv = torch.zeros(Hc, I, N, DIM, device=dev)
     q, k, v, bias, mask, do, lse, delta, sm = (
-        r["q"], r["k"], r["v"], r["bias"], r["mask"], r["do"], r["lse"], r["delta"], r["sm"])
+        r["q"],
+        r["k"],
+        r["v"],
+        r["bias"],
+        r["mask"],
+        r["do"],
+        r["lse"],
+        r["delta"],
+        r["sm"],
+    )
     _bwd_kv[(triton.cdiv(N, BK), I, Hc)](
-        delta, *st(delta), q, *st(q), k, *st(k), v, *st(v), bias, *st(bias),
-        lse, *st(lse), mask, *st(mask), do, *st(do), dk, *st(dk), dv, *st(dv),
-        sm, NEG, N, Hh, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        q,
+        *st(q),
+        k,
+        *st(k),
+        v,
+        *st(v),
+        bias,
+        *st(bias),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        dk,
+        *st(dk),
+        dv,
+        *st(dv),
+        sm,
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     assert (dk - r["dk_ref"]).abs().max().item() < 3e-3
     assert (dv - r["dv_ref"]).abs().max().item() < 3e-3
 
 
 def _bwd_q_launch(Hc, Hh, I, N, DIM):
-    dev = "mps"; BJ = BK = 32; NEG = -1e9
+    dev = "mps"
+    BJ = BK = 32
+    NEG = -1e9
     torch.manual_seed(0)
     sm = 1.0 / math.sqrt(DIM)
     q = torch.randn(Hc, I, N, DIM, device=dev, requires_grad=True)
@@ -59,7 +99,8 @@ def _bwd_q_launch(Hc, Hh, I, N, DIM):
     raw = (qk + bias[:, None, :, :]).masked_fill(mh[:, :, None, :].bool(), float("-inf"))
     p = torch.softmax(raw, dim=-1)
     o = torch.einsum("hijk,hikd->hijd", p, v)
-    o.retain_grad(); o.backward(do)
+    o.retain_grad()
+    o.backward(do)
     dq_ref = q.grad.detach()
     lse = torch.logsumexp(raw, dim=-1).detach()
     o_det = o.detach().contiguous()
@@ -69,9 +110,35 @@ def _bwd_q_launch(Hc, Hh, I, N, DIM):
     dq = torch.zeros(Hc, I, N, DIM, device=dev)
     delta = torch.zeros(Hc, I, N, device=dev)
     _bwd_q[(triton.cdiv(N, BJ), I, Hc)](
-        delta, *st(delta), qd, *st(qd), kd, *st(kd), vd, *st(vd), bd, *st(bd),
-        lse, *st(lse), mask, *st(mask), o_det, *st(o_det), do, *st(do), dq, *st(dq),
-        sm, NEG, N, Hh, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        qd,
+        *st(qd),
+        kd,
+        *st(kd),
+        vd,
+        *st(vd),
+        bd,
+        *st(bd),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        o_det,
+        *st(o_det),
+        do,
+        *st(do),
+        dq,
+        *st(dq),
+        sm,
+        NEG,
+        N,
+        Hh,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     return dq, dq_ref, delta, delta_ref
 
@@ -92,7 +159,10 @@ def test_bwd_q_head_dim128_refuses():
 
 
 def _bwd_b_launch(Hc, Hh, N, DIM):
-    dev = "mps"; I = N; BJ = BK = 32; NEG = -1e9
+    dev = "mps"
+    I = N
+    BJ = BK = 32
+    NEG = -1e9
     torch.manual_seed(0)
     sm = 1.0 / math.sqrt(DIM)
     q = torch.randn(Hc, I, N, DIM, device=dev, requires_grad=True)
@@ -106,7 +176,8 @@ def _bwd_b_launch(Hc, Hh, N, DIM):
     raw = (qk + bias[:, None, :, :]).masked_fill(mh[:, :, None, :].bool(), float("-inf"))
     p = torch.softmax(raw, dim=-1)
     o = torch.einsum("hijk,hikd->hijd", p, v)
-    o.retain_grad(); o.backward(do)
+    o.retain_grad()
+    o.backward(do)
     db_ref = bias.grad.detach()
     lse = torch.logsumexp(raw, dim=-1).detach()
     delta = (o.detach() * do).sum(-1).contiguous()
@@ -114,9 +185,33 @@ def _bwd_b_launch(Hc, Hh, N, DIM):
     qd, kd, vd, bd = q.detach(), k.detach(), v.detach(), bias.detach()
     db = torch.zeros(Hc, N, N, device=dev)
     _bwd_b[(triton.cdiv(N, BJ), triton.cdiv(N, BK), Hc)](
-        delta, *st(delta), qd, *st(qd), kd, *st(kd), vd, *st(vd), bd, *st(bd),
-        lse, *st(lse), mask, *st(mask), do, *st(do), db, *st(db),
-        sm, NEG, Hh, N, DIM, N, BJ, BK)
+        delta,
+        *st(delta),
+        qd,
+        *st(qd),
+        kd,
+        *st(kd),
+        vd,
+        *st(vd),
+        bd,
+        *st(bd),
+        lse,
+        *st(lse),
+        mask,
+        *st(mask),
+        do,
+        *st(do),
+        db,
+        *st(db),
+        sm,
+        NEG,
+        Hh,
+        N,
+        DIM,
+        N,
+        BJ,
+        BK,
+    )
     torch.mps.synchronize()
     return db, db_ref
 

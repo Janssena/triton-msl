@@ -324,13 +324,7 @@ def test_replayable_masked_dot_uses_generic_route_and_computes(
     ref_b = _logical_tile(b, k, n, stride_b, limit_b, mask_mode, other)
     ref = (ref_a.float() @ ref_b.float()).to(tdt)
     assert bool(torch.isfinite(out).all())
-    atol, rtol = (
-        (5e-2, 5e-2)
-        if dtype == "bfloat16"
-        else (2e-2, 2e-2)
-        if dtype == "float16"
-        else (3e-4, 3e-4)
-    )
+    atol, rtol = (5e-2, 5e-2) if dtype == "bfloat16" else (2e-2, 2e-2) if dtype == "float16" else (3e-4, 3e-4)
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
     assert bool((extra == 23).all()), "trailing argument canary was mutated"
 

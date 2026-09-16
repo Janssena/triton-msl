@@ -328,10 +328,7 @@ def _wide_native_type(lowerer, value_id, shape, elem):
     if elem.startswith("ptr<"):
         pointee = facts.pointee
         return (
-            facts.kind == "pointer"
-            and pointee is not None
-            and pointee.kind == "float"
-            and pointee.elem == elem[4:-1]
+            facts.kind == "pointer" and pointee is not None and pointee.kind == "float" and pointee.elem == elem[4:-1]
         )
     kind = "float" if elem.startswith(("f", "bf")) else "integer"
     return facts.kind == kind and facts.elem == elem
@@ -398,9 +395,10 @@ def _wide_pointer_address(by_id, args_by_id, value_id):
             value_id, offset = op.operand_ids
             offsets.append(offset)
             continue
-        if op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout") and len(
-            op.operand_ids or []
-        ) == 1:
+        if (
+            op.op in ("tt.splat", "tt.broadcast", "tt.expand_dims", "ttg.convert_layout")
+            and len(op.operand_ids or []) == 1
+        ):
             value_id = op.operand_ids[0]
             continue
         return None
@@ -462,19 +460,10 @@ def _wide_coord(
     ):
         return False
     if kind == "row":
-        return (
-            shape["bounds"] == (0, rows)
-            and shape["pid"] == 0
-            and shape["coef"] == rows
-            and shape["iv"] == 0
-        )
+        return shape["bounds"] == (0, rows) and shape["pid"] == 0 and shape["coef"] == rows and shape["iv"] == 0
     if kind == "key":
         return shape["bounds"] == (0, cols) and shape["pid"] is None and shape["iv"] == 1
-    return (
-        shape["bounds"] == (0, depth)
-        and shape["pid"] is None
-        and shape["iv"] == 0
-    )
+    return shape["bounds"] == (0, depth) and shape["pid"] is None and shape["iv"] == 0
 
 
 def _wide_address_term(
@@ -634,21 +623,15 @@ def _wide_score_policy(lowerer, by_id, args_by_id, qk, reduction, loop_iv, rows,
             predicate in ("slt", "ult")
             and bound is not None
             and bound.index == nk_index
-            and _wide_coord(
-                lowerer, by_id, args_by_id, lhs, "key", 1, loop_iv, rows, cols, rows, cols, depth
-            )
+            and _wide_coord(lowerer, by_id, args_by_id, lhs, "key", 1, loop_iv, rows, cols, rows, cols, depth)
         ):
             if saw_tail:
                 return None
             saw_tail = True
         elif (
             predicate in ("sge", "uge")
-            and _wide_coord(
-                lowerer, by_id, args_by_id, lhs, "row", 0, loop_iv, rows, cols, rows, cols, depth
-            )
-            and _wide_coord(
-                lowerer, by_id, args_by_id, rhs, "key", 1, loop_iv, rows, cols, rows, cols, depth
-            )
+            and _wide_coord(lowerer, by_id, args_by_id, lhs, "row", 0, loop_iv, rows, cols, rows, cols, depth)
+            and _wide_coord(lowerer, by_id, args_by_id, rhs, "key", 1, loop_iv, rows, cols, rows, cols, depth)
         ):
             if saw_causal:
                 return None
@@ -722,9 +705,7 @@ def wide_row_plan(lowerer):
         return None
     # MSL fmax implements maxNum. NaN-propagating maximum has different
     # semantics and must remain outside this replay rather than being erased.
-    if sum(op.op == "arith.maxnumf" for op in ops) != 2 or any(
-        op.op == "arith.maximumf" for op in ops
-    ):
+    if sum(op.op == "arith.maxnumf" for op in ops) != 2 or any(op.op == "arith.maximumf" for op in ops):
         return None
 
     q_load_ids = _wide_cone_loads(by_id, qk.operand_ids[0])
@@ -797,10 +778,7 @@ def wide_row_plan(lowerer):
             (yields[0].operand_ids[2], (rows, depth), "f32"),
         )
     )
-    if not all(
-        _wide_native_type(lowerer, value_id, shape, elem)
-        for value_id, shape, elem in native_contract
-    ):
+    if not all(_wide_native_type(lowerer, value_id, shape, elem) for value_id, shape, elem in native_contract):
         return None
 
     address_specs = (
@@ -872,11 +850,7 @@ def wide_row_plan(lowerer):
     q_muls = [
         op
         for op in ops
-        if op.op == "arith.mulf"
-        and op.id in {
-            value_id
-            for value_id in _wide_value_cone_ids(by_id, qk.operand_ids[0])
-        }
+        if op.op == "arith.mulf" and op.id in {value_id for value_id in _wide_value_cone_ids(by_id, qk.operand_ids[0])}
     ]
     if len(q_muls) != 1 or not any(
         _wide_constant(by_id, value_id) == depth**-0.5 for value_id in q_muls[0].operand_ids
@@ -960,12 +934,8 @@ def lower_wide_rows(lowerer, plan):
         kb.raw_line(f"{indent}float {score} = {bias}[_p515_row * uint({nk}) + uint({key_name})];")
         kb.raw_line(f"{indent}for (uint {kd} = 0u; {kd} < {depth}u; ++{kd}) {{")
         kb.raw_line(f"{indent}    float {qv} = static_cast<float>({q}[_p515_row * {depth}u + {kd}]);")
-        kb.raw_line(
-            f"{indent}    {qv} = static_cast<float>(static_cast<half>({qv} * {depth**-0.5!r}f));"
-        )
-        kb.raw_line(
-            f"{indent}    {score} += {qv} * static_cast<float>({k}[uint({key_name}) * {depth}u + {kd}]);"
-        )
+        kb.raw_line(f"{indent}    {qv} = static_cast<float>(static_cast<half>({qv} * {depth**-0.5!r}f));")
+        kb.raw_line(f"{indent}    {score} += {qv} * static_cast<float>({k}[uint({key_name}) * {depth}u + {kd}]);")
         kb.raw_line(f"{indent}}}")
         if plan["causal"]:
             kb.raw_line(f"{indent}if (int(_p515_row) < {key_name}) {score} = -INFINITY;")
@@ -1032,9 +1002,7 @@ def lower_wide_rows(lowerer, plan):
     kb.raw_line("    threadgroup_barrier(mem_flags::mem_device);")
     kb.raw_line("    if (_p523_active) {")
     kb.raw_line(f"        for (uint _p523_od = 0u; _p523_od < {depth}u; ++_p523_od) {{")
-    kb.raw_line(
-        f"            {out}[_p515_row * {depth}u + _p523_od] = _p523_output[_p523_od];"
-    )
+    kb.raw_line(f"            {out}[_p515_row * {depth}u + _p523_od] = _p523_output[_p523_od];")
     kb.raw_line("        }")
     kb.raw_line("    }")
     if kb._threadgroup_arrays:

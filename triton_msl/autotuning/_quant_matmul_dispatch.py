@@ -72,7 +72,9 @@ def _gemv_grid_ok(grid, bn, N):
     return _launch_grid_ok(grid, (_cdiv(N, bn), 1, 1))
 
 
-def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def dispatch_quant_matmul(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Attempt to dispatch the fast quantized-matmul kernel.
 
     Parameters
@@ -97,22 +99,42 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=
     if isinstance(descriptor, (tuple, list)) and len(descriptor):
         if descriptor[0] == "gemv_int4":
             return _dispatch_int4_gemv(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                rt,
+                descriptor,
+                kargs,
+                grid=grid,
+                launch_exit_hook=launch_exit_hook,
+                launch_metadata=launch_metadata,
                 submission_state=_submission,
             )
         if descriptor[0] == "gemv":
             return _dispatch_gemv(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                rt,
+                descriptor,
+                kargs,
+                grid=grid,
+                launch_exit_hook=launch_exit_hook,
+                launch_metadata=launch_metadata,
                 submission_state=_submission,
             )
         if descriptor[0] in ("pergroup_int8", "pergroup_int4"):
             return _dispatch_pergroup_int8(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                rt,
+                descriptor,
+                kargs,
+                grid=grid,
+                launch_exit_hook=launch_exit_hook,
+                launch_metadata=launch_metadata,
                 submission_state=_submission,
             )
         if descriptor[0] == "sym_int8":
             return _dispatch_sym_int8(
-                rt, descriptor, kargs, grid=grid, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                rt,
+                descriptor,
+                kargs,
+                grid=grid,
+                launch_exit_hook=launch_exit_hook,
+                launch_metadata=launch_metadata,
                 submission_state=_submission,
             )
 
@@ -170,7 +192,9 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=
         return False
 
 
-def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_int4_gemv(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Dispatch make_int4_gemv (weight-only int4 per-group decode GEMV).
 
     descriptor = ("gemv_int4", int4_msl, in, w, out, scale, zero, n_idx, k_idx,
@@ -224,7 +248,9 @@ def _dispatch_int4_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=No
         return False
 
 
-def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_sym_int8(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Dispatch a SYMMETRIC int8 GEMM (no zero-point) via make_int8_matmul_pergroup.
 
     descriptor = ("sym_int8", pg_msl, m_idx, n_idx, k_idx,
@@ -272,8 +298,7 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=Non
 
         zeros = _torch.zeros(1, dtype=getattr(scale, "dtype", None), device=getattr(scale, "device", None))
         # input(0), weight(1), output(2), scale(3), zeros(synth,4), M,N,K, strides...
-        buffers = list(kargs[0:4]) + [zeros, M, N, K,
-                                      *strides[:6], 0, ssn_v, 0, 0]  # ssg=0, ssn, zsg=0, zsn=0
+        buffers = list(kargs[0:4]) + [zeros, M, N, K, *strides[:6], 0, ssn_v, 0, 0]  # ssg=0, ssn, zsg=0, zsn=0
         lib = rt.get_library(pg_msl)
         _grp = 256
         threads = _math.ceil((M * N) / _grp) * _grp
@@ -287,7 +312,9 @@ def _dispatch_sym_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=Non
         return False
 
 
-def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_pergroup_int8(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Dispatch the scalar per-group int8 GEMM (make_int8_matmul_pergroup).
 
     descriptor = ("pergroup_int8"|"pergroup_int4", pg_msl, m_idx, n_idx, k_idx,
@@ -356,11 +383,23 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hoo
             try:
                 rr, rc, bk, g_s = descriptor[7], descriptor[8], descriptor[9], descriptor[10]
                 tm, tn = 8 * rr, 8 * rc
-                if (M % tm == 0 and N % tn == 0 and K % bk == 0 and g_s % bk == 0
-                        and isc == 1 and wsn == 1 and osc == 1
-                        and isr == K and wsk == N and osr == N
-                        and zsg == ssg and zsn == ssn):
-                    _fkname = "int4_matmul_pergroup_fast" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup_fast"
+                if (
+                    M % tm == 0
+                    and N % tn == 0
+                    and K % bk == 0
+                    and g_s % bk == 0
+                    and isc == 1
+                    and wsn == 1
+                    and osc == 1
+                    and isr == K
+                    and wsk == N
+                    and osr == N
+                    and zsg == ssg
+                    and zsn == ssn
+                ):
+                    _fkname = (
+                        "int4_matmul_pergroup_fast" if descriptor[0] == "pergroup_int4" else "int8_matmul_pergroup_fast"
+                    )
                     flib = rt.get_library(_fast)
                     fbuf = list(kargs[0:5]) + [M, N, K, ssg, ssn]
                     fthreads = (M // tm) * (N // tn) * 32
@@ -394,7 +433,9 @@ def _dispatch_pergroup_int8(rt, descriptor, kargs, *, grid=None, launch_exit_hoo
         return False
 
 
-def _dispatch_gemv(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def _dispatch_gemv(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Dispatch the dedicated make_int8_gemv kernel (weight-only int8 decode GEMV).
 
     descriptor = ("gemv", gemv_msl, in_idx, w_idx, out_idx, scale_idx, zero_idx,

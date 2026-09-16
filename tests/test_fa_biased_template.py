@@ -49,30 +49,65 @@ def _run_biased(q, k, v, bias, mask, sm_scale, D, BM, BN, Dc, causal, out_dtype)
         "    constant float& arg_scale [[buffer(7)]]",
     ]
     qs, ks, vs, os_, bs, ms, ls = (
-        q.stride(), k.stride(), v.stride(), out.stride(), bias.stride(), mask.stride(), lse.stride(),
+        q.stride(),
+        k.stride(),
+        v.stride(),
+        out.stride(),
+        bias.stride(),
+        mask.stride(),
+        lse.stride(),
     )
     bindings = {
-        "q_sz": f"{qs[0]}u", "q_sh": f"{qs[1]}u", "q_sm": f"{qs[2]}u", "q_sk": f"{qs[3]}u",
-        "k_sz": f"{ks[0]}u", "k_sh": f"{ks[1]}u", "k_sn": f"{ks[2]}u", "k_sk": f"{ks[3]}u",
-        "v_sz": f"{vs[0]}u", "v_sh": f"{vs[1]}u", "v_sn": f"{vs[2]}u", "v_sk": f"{vs[3]}u",
-        "o_sz": f"{os_[0]}u", "o_sh": f"{os_[1]}u", "o_sm": f"{os_[2]}u", "o_sk": f"{os_[3]}u",
-        "Z": f"{Z}u", "H": f"{H}u", "N_CTX": f"{N}u",
-        "b_sz": f"{bs[0]}u", "b_sh": f"{bs[1]}u", "b_sm": f"{bs[2]}u", "b_sn": f"{bs[3]}u",
-        "mask_sz": f"{ms[0]}u", "mask_sh": f"{ms[1]}u", "mask_sn": f"{ms[2]}u",
-        "lse_sz": f"{ls[0]}u", "lse_sh": f"{ls[1]}u", "lse_sm": f"{ls[2]}u",
+        "q_sz": f"{qs[0]}u",
+        "q_sh": f"{qs[1]}u",
+        "q_sm": f"{qs[2]}u",
+        "q_sk": f"{qs[3]}u",
+        "k_sz": f"{ks[0]}u",
+        "k_sh": f"{ks[1]}u",
+        "k_sn": f"{ks[2]}u",
+        "k_sk": f"{ks[3]}u",
+        "v_sz": f"{vs[0]}u",
+        "v_sh": f"{vs[1]}u",
+        "v_sn": f"{vs[2]}u",
+        "v_sk": f"{vs[3]}u",
+        "o_sz": f"{os_[0]}u",
+        "o_sh": f"{os_[1]}u",
+        "o_sm": f"{os_[2]}u",
+        "o_sk": f"{os_[3]}u",
+        "Z": f"{Z}u",
+        "H": f"{H}u",
+        "N_CTX": f"{N}u",
+        "b_sz": f"{bs[0]}u",
+        "b_sh": f"{bs[1]}u",
+        "b_sm": f"{bs[2]}u",
+        "b_sn": f"{bs[3]}u",
+        "mask_sz": f"{ms[0]}u",
+        "mask_sh": f"{ms[1]}u",
+        "mask_sn": f"{ms[2]}u",
+        "lse_sz": f"{ls[0]}u",
+        "lse_sh": f"{ls[1]}u",
+        "lse_sm": f"{ls[2]}u",
         "scale": "arg_scale",
     }
     src = make_flash_attention_kernel_tiled(
-        D, BM, BN, Dc=Dc, causal=causal, out_dtype=out_dtype,
-        bias=True, mask=True, lse=True, runtime_scale=True,
-        arg_decls=arg_decls, bindings=bindings,
+        D,
+        BM,
+        BN,
+        Dc=Dc,
+        causal=causal,
+        out_dtype=out_dtype,
+        bias=True,
+        mask=True,
+        lse=True,
+        runtime_scale=True,
+        arg_decls=arg_decls,
+        bindings=bindings,
     )
     lib = torch.mps.compile_shader(src)
     tpg = BM * BN
     threads = ((N // BM) * tpg, Z * H)
     group_size = (tpg, 1)
-    lib.flash_attention(q, k, v, out, bias, mask, lse, float(sm_scale),
-                        threads=threads, group_size=group_size)
+    lib.flash_attention(q, k, v, out, bias, mask, lse, float(sm_scale), threads=threads, group_size=group_size)
     torch.mps.synchronize()
     return out, lse
 
@@ -162,12 +197,24 @@ def test_flags_off_emits_no_bias_mask_lse():
 
 def test_biased_flags_emit_expected_tokens():
     src = make_flash_attention_kernel_tiled(
-        32, 32, 32, Dc=32, causal=False, out_dtype="fp32",
-        bias=True, mask=True, lse=True, runtime_scale=True,
+        32,
+        32,
+        32,
+        Dc=32,
+        causal=False,
+        out_dtype="fp32",
+        bias=True,
+        mask=True,
+        lse=True,
+        runtime_scale=True,
     )
     for tok in (
-        "device const float* Bias", "device const uchar* Mask", "device float* Lse",
-        "const float scale = arg_scale;", "s += float(Bias[bias_base",
-        "if (Mask[mask_base", "Lse[lse_base + q_row * lse_sm] = (l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY;",
+        "device const float* Bias",
+        "device const uchar* Mask",
+        "device float* Lse",
+        "const float scale = arg_scale;",
+        "s += float(Bias[bias_base",
+        "if (Mask[mask_base",
+        "Lse[lse_base + q_row * lse_sm] = (l_val > 0.0f) ? (tg_m[r] + log(l_val)) : -INFINITY;",
     ):
         assert tok in src, f"biased FA missing token: {tok!r}"

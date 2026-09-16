@@ -1,4 +1,5 @@
 """CPU pins for the producer-owned KDA state diagnostic and replay ordering."""
+
 import pytest
 
 from triton_msl.codegen._msl_templates import make_kda_kernel

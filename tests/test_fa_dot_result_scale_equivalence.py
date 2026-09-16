@@ -63,13 +63,7 @@ def _fa_dot_result_scale(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    q_ptrs = (
-        Q
-        + off_z * sqz
-        + off_h * sqh
-        + offs_m[:, None] * sqm
-        + offs_d[None, :] * sqk
-    )
+    q_ptrs = Q + off_z * sqz + off_h * sqh + offs_m[:, None] * sqm + offs_d[None, :] * sqk
     q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
     base_scale = 1.0 / tl.sqrt(float(HEAD_DIM))
     if VARIANT == 0 or VARIANT == 4 or VARIANT == 6 or VARIANT == 7:
@@ -82,13 +76,7 @@ def _fa_dot_result_scale(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for start_n in range(0, N_CTX, BLOCK_N):
         kn = start_n + offs_n
-        k_ptrs = (
-            K
-            + off_z * skz
-            + off_h * skh
-            + kn[:, None] * skn
-            + offs_d[None, :] * skk
-        )
+        k_ptrs = K + off_z * skz + off_h * skh + kn[:, None] * skn + offs_d[None, :] * skk
         k = tl.load(k_ptrs, mask=kn[:, None] < N_CTX, other=0.0)
         qk = tl.dot(q, tl.trans(k).to(q.dtype))
         if VARIANT == 1:
@@ -132,24 +120,12 @@ def _fa_dot_result_scale(
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
 
-        v_ptrs = (
-            V
-            + off_z * svz
-            + off_h * svh
-            + kn[:, None] * svn
-            + offs_d[None, :] * svk
-        )
+        v_ptrs = V + off_z * svz + off_h * svh + kn[:, None] * svn + offs_d[None, :] * svk
         v = tl.load(v_ptrs, mask=kn[:, None] < N_CTX, other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
-    o_ptrs = (
-        Out
-        + off_z * soz
-        + off_h * soh
-        + offs_m[:, None] * som
-        + offs_d[None, :] * sok
-    )
+    o_ptrs = Out + off_z * soz + off_h * soh + offs_m[:, None] * som + offs_d[None, :] * sok
     tl.store(o_ptrs, acc / l_i[:, None], mask=offs_m[:, None] < N_CTX)
 
 
@@ -192,9 +168,7 @@ def _run(variant, monkeypatch):
         variant,
     )
     torch.mps.synchronize()
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q.float(), k.float(), v.float(), scale=scale
-    )
+    ref = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float(), scale=scale)
     return out, ref, hits
 
 
@@ -265,9 +239,7 @@ def test_biased_result_scale_is_not_double_folded(monkeypatch):
         spy,
     )
     out, lse, out_ref, lse_ref = biased._run(1, 2, 64, 32)
-    assert hits == [("flash_attention", True)], (
-        "trifast-form biased FA did not take its specialized native-grid route"
-    )
+    assert hits == [("flash_attention", True)], "trifast-form biased FA did not take its specialized native-grid route"
     assert (out - out_ref).abs().max().item() < 1e-3
     finite = torch.isfinite(lse_ref)
     assert (lse[finite] - lse_ref[finite]).abs().max().item() < 1e-3

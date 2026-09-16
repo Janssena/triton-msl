@@ -1,4 +1,5 @@
 """Loader generations may skip a name scan only after a complete stable proof."""
+
 from pathlib import Path
 import pytest
 
@@ -6,6 +7,7 @@ import pytest
 @pytest.fixture
 def state(tmp_path):
     from triton_msl.backend._framework_contract import _LoadedNativeGuard
+
     first, second = tmp_path / "first.so", tmp_path / "second.so"
     first.touch()
     second.touch()
@@ -18,9 +20,11 @@ def state(tmp_path):
     guard._generation_checked = None
     guard._generation_reader = lambda: state["generation"]
     guard.count = lambda: len(state["names"])
+
     def name(index):
         state["reads"] += 1
         return state["names"][index]
+
     guard.name = name
     return guard, state, first, second
 
@@ -66,8 +70,10 @@ def test_generation_change_during_scan_is_not_published(state):
 def test_unreadable_generation_is_not_a_cached_approval(state):
     guard, state, _, _ = state
     guard.verify()
+
     def unreadable():
         raise RuntimeError("unreadable native generation")
+
     guard._generation_reader = unreadable
     with pytest.raises(RuntimeError, match="unreadable"):
         guard.verify()

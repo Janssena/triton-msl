@@ -11,6 +11,7 @@ templates can't express it and the generic path runs it at ~0.04 TF. These tests
     silently mis-mask);
   * a DENSE FA kernel is NOT stolen by the varlen detector (still correct).
 """
+
 import math
 import pytest
 import torch
@@ -27,13 +28,30 @@ requires_mps = pytest.mark.skipif(
 
 @triton.jit
 def _varlen_fwd(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_bh = tl.program_id(1)
@@ -77,13 +95,30 @@ def _varlen_fwd(
 
 @triton.jit
 def _varlen_causal_fwd(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_bh = tl.program_id(1)
@@ -160,9 +195,8 @@ def _run_varlen(kernel, lens_q, lens_k, H, D, dtype, scale, seed=0):
     max_seqlen = max(max(lens_q), max(lens_k))
     grid = (triton.cdiv(max_seqlen, BM), len(lens_q) * H)
     kernel[grid](
-        q, k, v, o, cu_q, cu_k,
-        *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        H, max_seqlen, scale, BM, BN, D)
+        q, k, v, o, cu_q, cu_k, *q.stride(), *k.stride(), *v.stride(), *o.stride(), H, max_seqlen, scale, BM, BN, D
+    )
     torch.mps.synchronize()
     return q, k, v, o, cu_q, cu_k
 
@@ -240,16 +274,19 @@ def test_varlen_max_seqlen_clamp(dt, tol):
     # silently attended MORE keys whenever max_seqlen was smaller (err ~0.6-0.9). The
     # templates now clamp to the kernel's own bound. Grid covers cdiv(max_seqlen, BM)
     # query blocks, so rows past it stay unwritten (zero) — exactly the kernel's semantics.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     H, D = 2, 64
     cu = torch.tensor([0, 48], device=dev, dtype=torch.int32)
     T, MAXS = 48, 32
     scale = 1.0 / math.sqrt(D)
-    q = torch.randn(T, H, D, device=dev, dtype=dt); k = torch.randn(T, H, D, device=dev, dtype=dt)
-    v = torch.randn(T, H, D, device=dev, dtype=dt); o = torch.zeros(T, H, D, device=dev, dtype=dt)
+    q = torch.randn(T, H, D, device=dev, dtype=dt)
+    k = torch.randn(T, H, D, device=dev, dtype=dt)
+    v = torch.randn(T, H, D, device=dev, dtype=dt)
+    o = torch.zeros(T, H, D, device=dev, dtype=dt)
     _varlen_fwd[(triton.cdiv(MAXS, 32), H)](
-        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        H, MAXS, scale, 32, 32, D)
+        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(), H, MAXS, scale, 32, 32, D
+    )
     torch.mps.synchronize()
     ref = torch.zeros_like(o)
     for h in range(H):
@@ -315,13 +352,30 @@ def test_varlen_causal_routes_and_correct(D):
 
 @triton.jit
 def _varlen_strict_causal_fwd(
-    Q, K, V, Out, cu_q, cu_k,
-    stride_qt, stride_qh, stride_qd,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_ot, stride_oh, stride_od,
-    H, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    H,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_bh = tl.program_id(1)
@@ -344,14 +398,18 @@ def _varlen_strict_causal_fwd(
         k_ptrs = K + (k_start + kn)[:, None] * stride_kt + off_h * stride_kh + offs_d[None, :] * stride_kd
         k = tl.load(k_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
         qk = tl.dot(q, tl.trans(k).to(q.dtype))
-        strict = offs_m[:, None] > kn[None, :]                # STRICT > (not the template's >=)
+        strict = offs_m[:, None] > kn[None, :]  # STRICT > (not the template's >=)
         qk = tl.where((kn[None, :] < seqlen_k) & strict, qk, float("-inf"))
-        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
         v_ptrs = V + (k_start + kn)[:, None] * stride_vt + off_h * stride_vh + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=kn[:, None] < seqlen_k, other=0.0)
-        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
+        m_i = m_new
     acc = acc / l_i[:, None]
     o_ptrs = Out + (q_start + offs_m)[:, None] * stride_ot + off_h * stride_oh + offs_d[None, :] * stride_od
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
@@ -380,46 +438,138 @@ def test_varlen_strict_causal_not_misrouted():
 
 
 @triton.jit
-def _dense_fa(Q, K, V, O, sqz, sqh, sqm, sqk, skz, skh, skn, skk, svz, svh, svn, svk,
-              soz, soh, som, sok, Z, H, N, BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr):
-    sm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
-    om = sm * BM + tl.arange(0, BM); on = tl.arange(0, BN); od = tl.arange(0, D)
-    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.)
+def _dense_fa(
+    Q,
+    K,
+    V,
+    O,
+    sqz,
+    sqh,
+    sqm,
+    sqk,
+    skz,
+    skh,
+    skn,
+    skk,
+    svz,
+    svh,
+    svn,
+    svk,
+    soz,
+    soh,
+    som,
+    sok,
+    Z,
+    H,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    D: tl.constexpr,
+):
+    sm = tl.program_id(0)
+    hz = tl.program_id(1)
+    z = hz // H
+    h = hz % H
+    om = sm * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    od = tl.arange(0, D)
+    q = tl.load(Q + z * sqz + h * sqh + om[:, None] * sqm + od[None, :] * sqk, mask=om[:, None] < N, other=0.0)
     q = q * (1.0 / math.sqrt(D))
-    mi = tl.full([BM], -float("inf"), tl.float32); li = tl.zeros([BM], tl.float32); acc = tl.zeros([BM, D], tl.float32)
+    mi = tl.full([BM], -float("inf"), tl.float32)
+    li = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
     for kn in range(0, N, BN):
         kk = kn + on
-        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.)
+        k = tl.load(K + z * skz + h * skh + kk[:, None] * skn + od[None, :] * skk, mask=kk[:, None] < N, other=0.0)
         qk = tl.dot(q, tl.trans(k))
-        m2 = tl.maximum(mi, tl.max(qk, 1)); a = tl.exp(mi - m2); p = tl.exp(qk - m2[:, None])
-        li = li * a + tl.sum(p, 1); acc = acc * a[:, None]
-        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.)
-        acc += tl.dot(p, v); mi = m2
+        m2 = tl.maximum(mi, tl.max(qk, 1))
+        a = tl.exp(mi - m2)
+        p = tl.exp(qk - m2[:, None])
+        li = li * a + tl.sum(p, 1)
+        acc = acc * a[:, None]
+        v = tl.load(V + z * svz + h * svh + kk[:, None] * svn + od[None, :] * svk, mask=kk[:, None] < N, other=0.0)
+        acc += tl.dot(p, v)
+        mi = m2
     tl.store(O + z * soz + h * soh + om[:, None] * som + od[None, :] * sok, acc / li[:, None], mask=om[:, None] < N)
 
 
 @triton.jit
-def _gqa_varlen_fwd(Q, K, V, Out, cu_q, cu_k,
-    sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
-    H, GROUP, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
-    start_m = tl.program_id(0); off_bh = tl.program_id(1)
-    off_b = off_bh // H; off_h = off_bh % H
-    off_h_kv = off_h // GROUP                       # GQA: fewer kv heads (Llama/Mistral)
-    q_start = tl.load(cu_q + off_b); seqlen_q = tl.load(cu_q + off_b + 1) - q_start
-    k_start = tl.load(cu_k + off_b); seqlen_k = tl.load(cu_k + off_b + 1) - k_start
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_n = tl.arange(0, BLOCK_N); offs_d = tl.arange(0, HEAD_DIM)
-    q = tl.load(Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd, mask=offs_m[:, None] < seqlen_q, other=0.) * SCALE
-    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32); l_i = tl.zeros([BLOCK_M], tl.float32); acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+def _gqa_varlen_fwd(
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    sqt,
+    sqh,
+    sqd,
+    skt,
+    skh,
+    skd,
+    svt,
+    svh,
+    svd,
+    sot,
+    soh,
+    sod,
+    H,
+    GROUP,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_bh = tl.program_id(1)
+    off_b = off_bh // H
+    off_h = off_bh % H
+    off_h_kv = off_h // GROUP  # GQA: fewer kv heads (Llama/Mistral)
+    q_start = tl.load(cu_q + off_b)
+    seqlen_q = tl.load(cu_q + off_b + 1) - q_start
+    k_start = tl.load(cu_k + off_b)
+    seqlen_k = tl.load(cu_k + off_b + 1) - k_start
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = (
+        tl.load(
+            Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd,
+            mask=offs_m[:, None] < seqlen_q,
+            other=0.0,
+        )
+        * SCALE
+    )
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     for start_n in range(0, max_seqlen, BLOCK_N):
         kn = start_n + offs_n
-        k = tl.load(K + (k_start + kn)[:, None] * skt + off_h_kv * skh + offs_d[None, :] * skd, mask=kn[:, None] < seqlen_k, other=0.)
+        k = tl.load(
+            K + (k_start + kn)[:, None] * skt + off_h_kv * skh + offs_d[None, :] * skd,
+            mask=kn[:, None] < seqlen_k,
+            other=0.0,
+        )
         qk = tl.where(kn[None, :] < seqlen_k, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
-        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij); alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
-        v = tl.load(V + (k_start + kn)[:, None] * svt + off_h_kv * svh + offs_d[None, :] * svd, mask=kn[:, None] < seqlen_k, other=0.)
-        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
-    tl.store(Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod, (acc / l_i[:, None]).to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            V + (k_start + kn)[:, None] * svt + off_h_kv * svh + offs_d[None, :] * svd,
+            mask=kn[:, None] < seqlen_k,
+            other=0.0,
+        )
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
+        m_i = m_new
+    tl.store(
+        Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod,
+        (acc / l_i[:, None]).to(Out.dtype.element_ty),
+        mask=offs_m[:, None] < seqlen_q,
+    )
 
 
 @requires_mps
@@ -428,18 +578,21 @@ def test_gqa_varlen_not_misrouted():
     # DIFFERENT head index than Q. The varlen template applies Q's head index to K/V, so
     # routing GQA would SILENT-WRONG. The detector must refuse (Q/K/V head-index mismatch)
     # -> the kernel computes on the fallback path. Output must match the GQA reference.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     H, Hkv, D = 4, 2, 64
     G = H // Hkv
     scale = 1.0 / math.sqrt(D)
     cu = torch.tensor([0, 48, 80], device=dev, dtype=torch.int32)
-    q = torch.randn(80, H, D, device=dev); k = torch.randn(80, Hkv, D, device=dev)
-    v = torch.randn(80, Hkv, D, device=dev); o = torch.zeros(80, H, D, device=dev)
+    q = torch.randn(80, H, D, device=dev)
+    k = torch.randn(80, Hkv, D, device=dev)
+    v = torch.randn(80, Hkv, D, device=dev)
+    o = torch.zeros(80, H, D, device=dev)
     BM = BN = 32
     try:
         _gqa_varlen_fwd[(triton.cdiv(48, BM), 2 * H)](
-            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-            H, G, 48, scale, BM, BN, D)
+            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(), H, G, 48, scale, BM, BN, D
+        )
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return  # refused loudly — safe
@@ -455,26 +608,80 @@ def test_gqa_varlen_not_misrouted():
 
 
 @triton.jit
-def _batch_inner_varlen(Q, K, V, Out, cu_q, cu_k,
-    sqt, sqh, sqd, skt, skh, skd, svt, svh, svd, sot, soh, sod,
-    NB, max_seqlen, SCALE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
-    start_m = tl.program_id(0); off_bh = tl.program_id(1)
-    off_h = off_bh // NB; off_b = off_bh % NB          # BATCH-INNER (template assumes head-inner)
-    q_start = tl.load(cu_q + off_b); seqlen_q = tl.load(cu_q + off_b + 1) - q_start
-    k_start = tl.load(cu_k + off_b); seqlen_k = tl.load(cu_k + off_b + 1) - k_start
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_n = tl.arange(0, BLOCK_N); offs_d = tl.arange(0, HEAD_DIM)
-    q = tl.load(Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd, mask=offs_m[:, None] < seqlen_q, other=0.) * SCALE
-    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32); l_i = tl.zeros([BLOCK_M], tl.float32); acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+def _batch_inner_varlen(
+    Q,
+    K,
+    V,
+    Out,
+    cu_q,
+    cu_k,
+    sqt,
+    sqh,
+    sqd,
+    skt,
+    skh,
+    skd,
+    svt,
+    svh,
+    svd,
+    sot,
+    soh,
+    sod,
+    NB,
+    max_seqlen,
+    SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_bh = tl.program_id(1)
+    off_h = off_bh // NB
+    off_b = off_bh % NB  # BATCH-INNER (template assumes head-inner)
+    q_start = tl.load(cu_q + off_b)
+    seqlen_q = tl.load(cu_q + off_b + 1) - q_start
+    k_start = tl.load(cu_k + off_b)
+    seqlen_k = tl.load(cu_k + off_b + 1) - k_start
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = (
+        tl.load(
+            Q + (q_start + offs_m)[:, None] * sqt + off_h * sqh + offs_d[None, :] * sqd,
+            mask=offs_m[:, None] < seqlen_q,
+            other=0.0,
+        )
+        * SCALE
+    )
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     for start_n in range(0, max_seqlen, BLOCK_N):
         kn = start_n + offs_n
-        k = tl.load(K + (k_start + kn)[:, None] * skt + off_h * skh + offs_d[None, :] * skd, mask=kn[:, None] < seqlen_k, other=0.)
+        k = tl.load(
+            K + (k_start + kn)[:, None] * skt + off_h * skh + offs_d[None, :] * skd,
+            mask=kn[:, None] < seqlen_k,
+            other=0.0,
+        )
         qk = tl.where(kn[None, :] < seqlen_k, tl.dot(q, tl.trans(k).to(q.dtype)), float("-inf"))
-        m_ij = tl.max(qk, 1); m_new = tl.maximum(m_i, m_ij); alpha = tl.exp(m_i - m_new); p = tl.exp(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1); acc = acc * alpha[:, None]
-        v = tl.load(V + (k_start + kn)[:, None] * svt + off_h * svh + offs_d[None, :] * svd, mask=kn[:, None] < seqlen_k, other=0.)
-        acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); m_i = m_new
-    tl.store(Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod, (acc / l_i[:, None]).to(Out.dtype.element_ty), mask=offs_m[:, None] < seqlen_q)
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        v = tl.load(
+            V + (k_start + kn)[:, None] * svt + off_h * svh + offs_d[None, :] * svd,
+            mask=kn[:, None] < seqlen_k,
+            other=0.0,
+        )
+        acc += tl.dot(p.to(tl.float32), v.to(tl.float32))
+        m_i = m_new
+    tl.store(
+        Out + (q_start + offs_m)[:, None] * sot + off_h * soh + offs_d[None, :] * sod,
+        (acc / l_i[:, None]).to(Out.dtype.element_ty),
+        mask=offs_m[:, None] < seqlen_q,
+    )
 
 
 @requires_mps
@@ -485,16 +692,19 @@ def test_batch_inner_varlen_not_misrouted():
     # divsi, not remsi(pid, H)) -> fallback computes correctly. cu is padded to H+1 entries
     # so that even a hypothetical misroute stays in-bounds (a detectable wrong result, never
     # an out-of-bounds runaway loop) — the test can only pass or fail, never hang.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     H, D, NB = 3, 64, 2
     scale = 1.0 / math.sqrt(D)
     cu = torch.tensor([0, 48, 80, 80], device=dev, dtype=torch.int32)  # NB=2 real + 1 phantom
-    q = torch.randn(80, H, D, device=dev); k = torch.randn(80, H, D, device=dev)
-    v = torch.randn(80, H, D, device=dev); o = torch.zeros(80, H, D, device=dev)
+    q = torch.randn(80, H, D, device=dev)
+    k = torch.randn(80, H, D, device=dev)
+    v = torch.randn(80, H, D, device=dev)
+    o = torch.zeros(80, H, D, device=dev)
     BM = BN = 32
     _batch_inner_varlen[(triton.cdiv(48, BM), H * NB)](
-        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-        NB, 48, scale, BM, BN, D)
+        q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(), NB, 48, scale, BM, BN, D
+    )
     torch.mps.synchronize()
     ref = torch.zeros_like(q)
     for b in range(NB):
@@ -515,15 +725,18 @@ def test_varlen_block64_not_misrouted():
     D = 64
     scale = 1.0 / math.sqrt(D)
     # _varlen_fwd is generic over BLOCK_M/BLOCK_N constexprs; launch it at 64.
-    dev = "mps"; torch.manual_seed(0)
+    dev = "mps"
+    torch.manual_seed(0)
     cu = torch.tensor([0, 96, 160], device=dev, dtype=torch.int32)
-    q = torch.randn(160, 2, D, device=dev); k = torch.randn(160, 2, D, device=dev)
-    v = torch.randn(160, 2, D, device=dev); o = torch.zeros(160, 2, D, device=dev)
+    q = torch.randn(160, 2, D, device=dev)
+    k = torch.randn(160, 2, D, device=dev)
+    v = torch.randn(160, 2, D, device=dev)
+    o = torch.zeros(160, 2, D, device=dev)
     max_seqlen = 96
     try:
         _varlen_fwd[(triton.cdiv(max_seqlen, 64), 2 * 2)](
-            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(),
-            2, max_seqlen, scale, 64, 64, D)
+            q, k, v, o, cu, cu, *q.stride(), *k.stride(), *v.stride(), *o.stride(), 2, max_seqlen, scale, 64, 64, D
+        )
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return  # refused loudly — safe
@@ -536,10 +749,13 @@ def test_varlen_block64_not_misrouted():
 def test_dense_fa_not_misrouted():
     # A DENSE [Z,H,N,D] FA kernel (0 int-pointer args) must NOT be captured by the varlen
     # detector — it stays on the dense FA path and stays correct.
-    dev = "mps"; Z, H, N, D = 1, 2, 64, 64
+    dev = "mps"
+    Z, H, N, D = 1, 2, 64, 64
     torch.manual_seed(0)
-    q = torch.randn(Z, H, N, D, device=dev); k = torch.randn(Z, H, N, D, device=dev)
-    v = torch.randn(Z, H, N, D, device=dev); o = torch.zeros(Z, H, N, D, device=dev)
+    q = torch.randn(Z, H, N, D, device=dev)
+    k = torch.randn(Z, H, N, D, device=dev)
+    v = torch.randn(Z, H, N, D, device=dev)
+    o = torch.zeros(Z, H, N, D, device=dev)
     st = lambda t: t.stride()
     _dense_fa[(triton.cdiv(N, 32), Z * H)](q, k, v, o, *st(q), *st(k), *st(v), *st(o), Z, H, N, 32, 32, D)
     torch.mps.synchronize()
@@ -547,6 +763,6 @@ def test_dense_fa_not_misrouted():
     for z in range(Z):
         for h in range(H):
             sc = (q[z, h].float() @ k[z, h].float().T) / math.sqrt(D)
-            ref[z, h] = (torch.softmax(sc, -1) @ v[z, h].float())
+            ref[z, h] = torch.softmax(sc, -1) @ v[z, h].float()
     err = (o - ref).abs().max().item()
     assert err < 1e-3, f"dense FA misrouted/wrong: err {err:.2e}"

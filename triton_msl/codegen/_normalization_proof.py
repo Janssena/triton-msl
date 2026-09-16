@@ -39,22 +39,33 @@ def normalization_template_matches(graph, info, family):
             results = op.result_ids or [op.id]
             axis = op.attrs.get("axis")
             if len(operands) != 1 or len(results) != 1:
-                raise MetalNonRecoverableError("Normalization fallback requires a single-value row reduction.", op_name="tt.reduce") from None
+                raise MetalNonRecoverableError(
+                    "Normalization fallback requires a single-value row reduction.", op_name="tt.reduce"
+                ) from None
             source = metadata.get(operands[0])
             result = metadata.get(results[0])
             if source is None or result is None:
-                raise MetalNonRecoverableError("Normalization fallback requires native per-result reduction types.", op_name="tt.reduce") from None
+                raise MetalNonRecoverableError(
+                    "Normalization fallback requires native per-result reduction types.", op_name="tt.reduce"
+                ) from None
             src, dst = source.type, result.type
             if not (
                 source.schema_version == result.schema_version == 1
-                and source.value_id == operands[0] and result.value_id == results[0]
-                and result.producer_id == op.id and result.result_index == 0
-                and not src.unknown_reason and not dst.unknown_reason
-                and src.kind == dst.kind == "float" and src.elem == dst.elem == "f32"
+                and source.value_id == operands[0]
+                and result.value_id == results[0]
+                and result.producer_id == op.id
+                and result.result_index == 0
+                and not src.unknown_reason
+                and not dst.unknown_reason
+                and src.kind == dst.kind == "float"
+                and src.elem == dst.elem == "f32"
                 and src.width == dst.width == 32
-                and src.is_tensor and src.shape == (info["block_size"],)
-                and type(axis) is int and 0 <= axis < len(src.shape)
-                and not dst.is_tensor and dst.shape == src.shape[:axis] + src.shape[axis + 1:]
+                and src.is_tensor
+                and src.shape == (info["block_size"],)
+                and type(axis) is int
+                and 0 <= axis < len(src.shape)
+                and not dst.is_tensor
+                and dst.shape == src.shape[:axis] + src.shape[axis + 1 :]
             ):
                 raise MetalNonRecoverableError(
                     "Normalization fallback cannot prove the original reduction axis, shape or precision.",
@@ -89,6 +100,7 @@ def prove_normalization(graph, info, family):
     # Facts belong to a specific SSA result, including region-local combiners;
     # the first-result fields on the legacy op are not a type authority here.
     owners = {arg.id: ("entry_arg", None, i) for i, arg in enumerate(graph.args)}
+
     def record_owners(region):
         for op in region:
             # SSAValue keeps result_ids only for multi-result ops; a native
@@ -100,6 +112,7 @@ def prove_normalization(graph, info, family):
                 owners[vid] = ("block_arg", None, i)
             record_owners(op.region_ops or [])
             record_owners(op.else_ops or [])
+
     record_owners(graph.ops)
     native_cache = {}
 
@@ -108,27 +121,35 @@ def prove_normalization(graph, info, family):
             return native_cache[vid]
         meta = graph.result_meta.get(vid)
         require(
-            meta is not None and meta.schema_version == 1 and meta.value_id == vid
+            meta is not None
+            and meta.schema_version == 1
+            and meta.value_id == vid
             and owners.get(vid) == (meta.kind, meta.producer_id, meta.result_index),
             "missing or mismatched native value metadata ownership",
         )
         facts = meta.type
         require(
-            not facts.unknown_reason and facts.shape in ((), (block,))
-            and facts.is_tensor == (facts.shape == (block,)),
+            not facts.unknown_reason and facts.shape in ((), (block,)) and facts.is_tensor == (facts.shape == (block,)),
             "unproved native normalization projection",
         )
         element = facts
         if facts.kind == "pointer":
             require(
-                facts.address_space == 1 and facts.pointee is not None
-                and not facts.pointee.unknown_reason and not facts.pointee.is_tensor
+                facts.address_space == 1
+                and facts.pointee is not None
+                and not facts.pointee.unknown_reason
+                and not facts.pointee.is_tensor
                 and facts.pointee.shape == (),
                 "unproved native pointer representation",
             )
             element = facts.pointee
-        expected = {"f32": ("float", 32), "f16": ("float", 16),
-                    "bf16": ("float", 16), "i32": ("integer", 32), "i1": ("integer", 1)}
+        expected = {
+            "f32": ("float", 32),
+            "f16": ("float", 16),
+            "bf16": ("float", 16),
+            "i32": ("integer", 32),
+            "i1": ("integer", 1),
+        }
         require(
             element.elem in expected and (element.kind, element.width) == expected[element.elem],
             "unproved native element kind or width",
@@ -236,7 +257,8 @@ def prove_normalization(graph, info, family):
             combine = body[0]
             require(
                 combine.op in ("arith.addf", "arith.maxnumf")
-                and elem(combine.id) == "f32" and shape(combine.id) == ()
+                and elem(combine.id) == "f32"
+                and shape(combine.id) == ()
                 and all(elem(x) == "f32" and shape(x) == () for x in bargs)
                 and sorted(combine.operand_ids or []) == sorted(bargs)
                 and op.attrs.get("return_ids") == [combine.id],

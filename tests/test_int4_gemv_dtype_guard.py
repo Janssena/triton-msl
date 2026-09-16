@@ -102,10 +102,7 @@ def test_int4_gemv_fp16_scale_zero_correct_or_refuse(monkeypatch, half_scale, ha
     group_index = torch.arange(K, device=device) // G
     ref = ((w4.float() - zero.float()[:, group_index]) * scale.float()[:, group_index]) @ x
     err = (out - ref).abs().max().item()
-    print(
-        "INT4_GEMV_PROBE "
-        f"half_scale={half_scale} half_zero={half_zero} route_calls={route['calls']} err={err}"
-    )
+    print(f"INT4_GEMV_PROBE half_scale={half_scale} half_zero={half_zero} route_calls={route['calls']} err={err}")
     assert err < 1e-2, (
         "INT4 GEMV violated correct-or-refuse for a non-f32 scale/zero buffer: "
         f"route_calls={route['calls']}, max_err={err}"

@@ -22,14 +22,22 @@ def backend(monkeypatch):
     return MetalBackend(GPUTarget("metal", "apple-m4", 32))
 
 
-@pytest.mark.parametrize("name,a,b", [
-    ("MEPT", "1", "0"), ("QUANT_MATMUL", "1", "0"),
-    ("FAST_MATMUL", "1", "0"), ("COMPILE_SHADER", "1", "0"),
-    ("FA_FAST", "1", "0"), ("INFER_LAYOUT", "0", "1"),
-    ("LEGACY", "0", "1"), ("USE_CPP", "0", "1"),
-    ("FORCE_PYTHON", "0", "1"), ("FA_HALF_ACCUM", "0", "1"),
-    ("CPP_SKIP", "", "reduce"),
-])
+@pytest.mark.parametrize(
+    "name,a,b",
+    [
+        ("MEPT", "1", "0"),
+        ("QUANT_MATMUL", "1", "0"),
+        ("FAST_MATMUL", "1", "0"),
+        ("COMPILE_SHADER", "1", "0"),
+        ("FA_FAST", "1", "0"),
+        ("INFER_LAYOUT", "0", "1"),
+        ("LEGACY", "0", "1"),
+        ("USE_CPP", "0", "1"),
+        ("FORCE_PYTHON", "0", "1"),
+        ("FA_HALF_ACCUM", "0", "1"),
+        ("CPP_SKIP", "", "reduce"),
+    ],
+)
 def test_same_backend_instance_rekeys_current_policy(backend, monkeypatch, name, a, b):
     monkeypatch.setenv("TRITON_MSL_" + name, a)
     first = backend.hash()

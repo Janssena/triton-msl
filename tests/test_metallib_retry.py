@@ -211,9 +211,7 @@ def test_make_metallib_nonzero_compile_exit_is_loud(tmp_path, monkeypatch):
 
     with pytest.raises(MetalCompilationError, match="Segmentation fault"):
         MetalBackend.make_metallib(_MINIMAL_MSL, dict(metadata), options)
-    assert call_count["metal_c"] == 1, (
-        f"Compiler crash must raise on attempt 1, got {call_count['metal_c']} calls"
-    )
+    assert call_count["metal_c"] == 1, f"Compiler crash must raise on attempt 1, got {call_count['metal_c']} calls"
 
 
 @requires_metal_compiler

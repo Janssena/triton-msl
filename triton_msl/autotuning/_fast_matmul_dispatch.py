@@ -27,7 +27,9 @@ _SPLITK_MSL = None
 from triton_msl.autotuning._submission import SubmissionState
 
 
-def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, rr=4, rc=2, bk=32, submission_state=None):
+def _maybe_splitk_dispatch(
+    rt, M, N, K, kargs, launch_exit_hook, launch_metadata, rr=4, rc=2, bk=32, submission_state=None
+):
     """Deterministic two-pass split-K for a SKINNY/DEEP fp32 matmul, or False.
 
     Fires only when the output-tile count is small (occupancy-starved) AND K is deep
@@ -126,7 +128,9 @@ def _fast_grid_ok(grid, spec, M, N):
     return False
 
 
-def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None):
+def dispatch_fast_matmul(
+    rt, descriptor, kargs, *, grid=None, launch_exit_hook=None, launch_metadata=None, submission_state=None
+):
     """Attempt to dispatch via the simdgroup fast-matmul template.
 
     Parameters
@@ -218,7 +222,9 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, grid=None, launch_exit_hook=N
         # row-major above. Any non-fit returns from _maybe_splitk_dispatch → falls
         # through to the regular fast dispatch below (unchanged).
         if msl_dtype in ("fp32", "f32", "float") and msl_out in ("fp32", "f32", "float"):
-            if _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, submission_state=_submission):
+            if _maybe_splitk_dispatch(
+                rt, M, N, K, kargs, launch_exit_hook, launch_metadata, submission_state=_submission
+            ):
                 return True
 
         # --- Per-shape deterministic tile selection (safe: every CANDIDATES config

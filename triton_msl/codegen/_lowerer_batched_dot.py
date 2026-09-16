@@ -24,8 +24,11 @@ class _BatchedDotMixin:
         facts = self._native_value_facts(value_id, op_name="tt.dot")
         if pointer:
             if (
-                facts.kind != "pointer" or facts.is_tensor or facts.shape != ()
-                or facts.address_space != 1 or facts.pointee is None
+                facts.kind != "pointer"
+                or facts.is_tensor
+                or facts.shape != ()
+                or facts.address_space != 1
+                or facts.pointee is None
             ):
                 raise MetalNonRecoverableError(
                     "batched-dot native dtype requires a scalar device pointer",
@@ -34,18 +37,24 @@ class _BatchedDotMixin:
             facts = facts.pointee
             if facts.is_tensor or facts.shape != () or facts.unknown_reason is not None:
                 raise MetalNonRecoverableError(
-                    "batched-dot native dtype has an invalid pointee", op_name="tt.dot",
+                    "batched-dot native dtype has an invalid pointee",
+                    op_name="tt.dot",
                 )
         signatures = {
-            "f16": ("float", 16, None), "bf16": ("float", 16, None),
-            "f32": ("float", 32, None), "f64": ("float", 64, None),
-            "i1": ("integer", 1, None), "i8": ("integer", 8, None),
-            "i16": ("integer", 16, None), "i32": ("integer", 32, None),
+            "f16": ("float", 16, None),
+            "bf16": ("float", 16, None),
+            "f32": ("float", 32, None),
+            "f64": ("float", 64, None),
+            "i1": ("integer", 1, None),
+            "i8": ("integer", 8, None),
+            "i16": ("integer", 16, None),
+            "i32": ("integer", 32, None),
             "i64": ("integer", 64, None),
         }
         if signatures.get(facts.elem) != (facts.kind, facts.width, facts.signed):
             raise MetalNonRecoverableError(
-                "batched-dot native dtype is unsupported or contradictory", op_name="tt.dot",
+                "batched-dot native dtype is unsupported or contradictory",
+                op_name="tt.dot",
             )
         return facts.elem
 
@@ -110,11 +119,7 @@ class _BatchedDotMixin:
         if current is None:
             if current_id != arg.id:
                 return None
-        elif not (
-            current.op == "tt.splat"
-            and current.operand_ids
-            and current.operand_ids[0] == arg.id
-        ):
+        elif not (current.op == "tt.splat" and current.operand_ids and current.operand_ids[0] == arg.id):
             # This rejects residual base arithmetic hidden below a splat, such
             # as ``A + 1`` or ``A + runtime_offset``.
             return None
@@ -272,11 +277,7 @@ class _BatchedDotMixin:
 
         def _operand_path(value_id):
             local_load = op_by_id.get(value_id)
-            if (
-                local_load is None
-                or local_load.op != "ttg.local_load"
-                or len(local_load.operand_ids or []) != 1
-            ):
+            if local_load is None or local_load.op != "ttg.local_load" or len(local_load.operand_ids or []) != 1:
                 return None
             alloc = op_by_id.get(local_load.operand_ids[0])
             if alloc is None or alloc.op != "ttg.local_alloc" or len(alloc.operand_ids or []) != 1:
@@ -330,9 +331,7 @@ class _BatchedDotMixin:
                     return None
                 matches = []
                 for arg in ptr_args:
-                    address_claimed = self._flat_contiguous_address(
-                        current.operand_ids[0], arg, op_by_id, total
-                    )
+                    address_claimed = self._flat_contiguous_address(current.operand_ids[0], arg, op_by_id, total)
                     if address_claimed is not None:
                         matches.append((arg, address_claimed))
                 if len(matches) != 1:
@@ -530,9 +529,7 @@ class _BatchedDotMixin:
         c_dtype = self._batched_dot_dtype(c_arg.id, pointer=True)
         if self._batched_dot_dtype(dot.id) != c_dtype:
             return None
-        if a_dtype == "i8" and (
-            c_dtype != "i32" or k * 128 * 128 >= 2**24
-        ):
+        if a_dtype == "i8" and (c_dtype != "i32" or k * 128 * 128 >= 2**24):
             # Apple has no signed-int8 simdgroup fragment here.  Float MMA is
             # nevertheless bit-exact for the admitted K=32/64 envelope: int8
             # values and products are exactly representable, and even the

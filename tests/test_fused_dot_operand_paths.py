@@ -40,8 +40,20 @@ requires_gpu = pytest.mark.skipif(not HAS_GPU, reason="Metal GPU needed")
 if HAS:
 
     @triton.jit
-    def _fused_softmax(X, Y, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                       CAST_A: tl.constexpr, CAST_B: tl.constexpr, CAST_AB16: tl.constexpr, TRANS_A: tl.constexpr, TRANS_B: tl.constexpr, Y_NK: tl.constexpr):
+    def _fused_softmax(
+        X,
+        Y,
+        C,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        CAST_A: tl.constexpr,
+        CAST_B: tl.constexpr,
+        CAST_AB16: tl.constexpr,
+        TRANS_A: tl.constexpr,
+        TRANS_B: tl.constexpr,
+        Y_NK: tl.constexpr,
+    ):
         om = tl.arange(0, M)
         on = tl.arange(0, N)
         ok = tl.arange(0, K)
@@ -67,8 +79,21 @@ if HAS:
         tl.store(C + om[:, None] * N + on[None, :], num / tl.sum(num, 1)[:, None])
 
     @triton.jit
-    def _fused_epilogue(X, Y, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                        CAST_A: tl.constexpr, CAST_B: tl.constexpr, CAST_AB16: tl.constexpr, TRANS_A: tl.constexpr, TRANS_B: tl.constexpr, Y_NK: tl.constexpr):
+    def _fused_epilogue(
+        X,
+        Y,
+        B,
+        C,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        CAST_A: tl.constexpr,
+        CAST_B: tl.constexpr,
+        CAST_AB16: tl.constexpr,
+        TRANS_A: tl.constexpr,
+        TRANS_B: tl.constexpr,
+        Y_NK: tl.constexpr,
+    ):
         om = tl.arange(0, M)
         on = tl.arange(0, N)
         ok = tl.arange(0, K)
@@ -101,7 +126,9 @@ if HAS:
         src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
         context = ir.context()
         ir.load_dialects(context)
-        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context)
+        mod = src.make_ir(
+            target, options, backend.get_codegen_implementation(options), backend.get_module_map(), context
+        )
         metadata = {}
         mod = backend.make_ttir(mod, metadata, options)
         mod = backend.make_ttgir(mod, metadata, options)
@@ -145,8 +172,14 @@ def route_spies(monkeypatch):
     fused, generic = [], []
     of = generic_lowerer.GenericLowerer._lower_matmul_softmax_template
     og = generic_lowerer.GenericLowerer._lower_dot
-    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_matmul_softmax_template", lambda self, info: (fused.append(1), of(self, info))[1])
-    monkeypatch.setattr(generic_lowerer.GenericLowerer, "_lower_dot", lambda self, ssa: (generic.append(1), og(self, ssa))[1])
+    monkeypatch.setattr(
+        generic_lowerer.GenericLowerer,
+        "_lower_matmul_softmax_template",
+        lambda self, info: (fused.append(1), of(self, info))[1],
+    )
+    monkeypatch.setattr(
+        generic_lowerer.GenericLowerer, "_lower_dot", lambda self, ssa: (generic.append(1), og(self, ssa))[1]
+    )
     return fused, generic
 
 
@@ -183,7 +216,9 @@ def _witness(launch, c, raw, intended):
         assert bool(c.isnan().all()), "a refused kernel must touch nothing"
         return "refused"
     err = (c - intended).abs().max().item()
-    assert err == err and err <= sep / 10, f"computed the raw result, not the intended one (err {err}, separation {sep})"
+    assert err == err and err <= sep / 10, (
+        f"computed the raw result, not the intended one (err {err}, separation {sep})"
+    )
     return "computed"
 
 
@@ -229,9 +264,14 @@ def test_fused_fp32_positive_keeps_template(cold_gpu_caches, route_spies, form):
     torch.testing.assert_close(c, ref, rtol=1e-4, atol=1e-4)
 
 
-_ROLE_MATCH = {"castA": "dot operand A", "castB": "dot operand B", "castAB": "dot operand A",
-               "transA": "dot operand A .*transposed", "transB": "dot operand B .*transposed",
-               "transB-canonical": "dot operand B .*transposed"}
+_ROLE_MATCH = {
+    "castA": "dot operand A",
+    "castB": "dot operand B",
+    "castAB": "dot operand A",
+    "transA": "dot operand A .*transposed",
+    "transB": "dot operand B .*transposed",
+    "transB-canonical": "dot operand B .*transposed",
+}
 
 
 @requires

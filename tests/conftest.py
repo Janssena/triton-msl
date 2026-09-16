@@ -41,7 +41,9 @@ requires_metal = pytest.mark.skipif(
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--project-lane", choices=("correctness", "performance", "all"), default="correctness",
+        "--project-lane",
+        choices=("correctness", "performance", "all"),
+        default="correctness",
         help="Separate hardware throughput floors from correctness (default). 'all' is diagnostic only.",
     )
 
@@ -57,9 +59,9 @@ def pytest_configure(config):
     Inductor's cache key omits our CODEGEN_VERSION; fresh disk state prevents an
     old generated wrapper from hiding a lowering regression in a new session.
     """
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(private_directory(
-        os.environ.get("TORCHINDUCTOR_CACHE_DIR"), prefix="triton_msl_pytest_inductor_"
-    ))
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(
+        private_directory(os.environ.get("TORCHINDUCTOR_CACHE_DIR"), prefix="triton_msl_pytest_inductor_")
+    )
 
 
 def pytest_collection_modifyitems(config, items):

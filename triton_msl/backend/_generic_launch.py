@@ -1,4 +1,5 @@
 """Shared host grid mapping and conservative generic 2D zero-copy eligibility."""
+
 import json
 from functools import lru_cache
 
@@ -19,7 +20,7 @@ def _msl_only_policy(execution_contract):
     # Caller has already unconditionally validated this exact live stamp.
     # Reuse only parsing of an immutable value, not execution validation.
     try:
-        return json.loads(execution_contract)['source']['policy']['USE_CPP'] is False
+        return json.loads(execution_contract)["source"]["policy"]["USE_CPP"] is False
     except (ValueError, TypeError, KeyError):
         return False
 
@@ -35,46 +36,60 @@ def generic_2d_geometry(launcher, arguments, signatures, metadata, grid):
     """
     import torch
 
-    if (type(launcher._msl) is not str or not launcher._msl
-            or not _msl_only_policy(launcher._execution_contract)
-            or len(metadata) != 12 or metadata[5] is not True
-            or any(v is not None for v in metadata[6:11])
-            or type(launcher._msl_block_size) is not int
-            or not 1 <= launcher._msl_block_size <= 1024
-            or launcher._msl_block_size != metadata[3]
-            or len(grid) != 3 or any(type(v) is not int or not 0 < v <= 0x7fffffff for v in grid)
-            or grid[2] != 1
-            or len(arguments) != len(signatures) or not arguments
-            or len(arguments) + (metadata[11] is not None) > 31):
+    if (
+        type(launcher._msl) is not str
+        or not launcher._msl
+        or not _msl_only_policy(launcher._execution_contract)
+        or len(metadata) != 12
+        or metadata[5] is not True
+        or any(v is not None for v in metadata[6:11])
+        or type(launcher._msl_block_size) is not int
+        or not 1 <= launcher._msl_block_size <= 1024
+        or launcher._msl_block_size != metadata[3]
+        or len(grid) != 3
+        or any(type(v) is not int or not 0 < v <= 0x7FFFFFFF for v in grid)
+        or grid[2] != 1
+        or len(arguments) != len(signatures)
+        or not arguments
+        or len(arguments) + (metadata[11] is not None) > 31
+    ):
         return None
-    dtypes = {'*fp16': torch.float16, '*fp32': torch.float32,
-              '*i32': torch.int32, '*i64': torch.int64}
+    dtypes = {"*fp16": torch.float16, "*fp32": torch.float32, "*i32": torch.int32, "*i64": torch.int64}
     pointers = 0
     for value, declared in zip(arguments, signatures):
         if type(declared) is not str:
             return None
-        if declared.startswith('*'):
-            if (type(value) is not torch.Tensor or value.device.type != 'mps'
-                    or value.dtype != dtypes.get(declared)
-                    or value.layout != torch.strided or not value.is_contiguous()
-                    or value.is_conj() or value.is_neg() or value.numel() <= 0):
+        if declared.startswith("*"):
+            if (
+                type(value) is not torch.Tensor
+                or value.device.type != "mps"
+                or value.dtype != dtypes.get(declared)
+                or value.layout != torch.strided
+                or not value.is_contiguous()
+                or value.is_conj()
+                or value.is_neg()
+                or value.numel() <= 0
+            ):
                 return None
             storage = value.untyped_storage()
             offset = value.storage_offset() * value.element_size()
             size = storage.nbytes()
-            if (storage.data_ptr() <= 0 or offset < 0
-                    or offset + value.numel() * value.element_size() > size
-                    or value.data_ptr() != storage.data_ptr() + offset):
+            if (
+                storage.data_ptr() <= 0
+                or offset < 0
+                or offset + value.numel() * value.element_size() > size
+                or value.data_ptr() != storage.data_ptr() + offset
+            ):
                 return None
             pointers += 1
         else:
             # Existing scalar representability/declared-width checks have run.
             # PyTorch's raw scalar bridge accepts float32 or signed int64;
             # lower-width integer declarations read the checked low bytes.
-            if declared == 'fp32':
+            if declared == "fp32":
                 if type(value) is not float:
                     return None
-            elif declared in {'i1', 'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64'}:
+            elif declared in {"i1", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64"}:
                 if type(value) not in (int, bool) or not -(1 << 63) <= value < (1 << 63):
                     return None
             else:
@@ -83,6 +98,6 @@ def generic_2d_geometry(launcher, arguments, signatures, metadata, grid):
         return None
     groups, group_size = host_launch_geometry(grid, metadata[3], metadata[5])
     threads = tuple(count * width for count, width in zip(groups, group_size))
-    if any(v > 0x7fffffff for v in threads):
+    if any(v > 0x7FFFFFFF for v in threads):
         return None
     return threads, group_size

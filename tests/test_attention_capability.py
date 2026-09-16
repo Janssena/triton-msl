@@ -173,7 +173,19 @@ def test_wide_score_reuse_is_outside_output_column_loop(case):
     accumulate = msl.index("_p515_acc += _p553_block_values[_p515_j_a1]", valid_key)
     normalize = msl.index("_p523_output[_p515_od] = _p515_acc / _p515_denom;")
     barrier = msl.index("threadgroup_barrier(mem_flags::mem_device);")
-    assert block < score < maximum < probability < denom < output_loop < rescale < valid_key < accumulate < normalize < barrier
+    assert (
+        block
+        < score
+        < maximum
+        < probability
+        < denom
+        < output_loop
+        < rescale
+        < valid_key
+        < accumulate
+        < normalize
+        < barrier
+    )
     assert "Bias[" not in msl[output_loop:]
     assert "Q[" not in msl[output_loop:]
     assert "K[" not in msl[output_loop:]
@@ -284,7 +296,10 @@ def test_attention_runtime(case, poison, monkeypatch):
     assert torch.equal(torch.isposinf(actual[:nq]), torch.isposinf(expected))
     assert torch.equal(torch.isneginf(actual[:nq]), torch.isneginf(expected))
     torch.testing.assert_close(
-        actual[:nq], expected, atol=3e-5, rtol=3e-5,
+        actual[:nq],
+        expected,
+        atol=3e-5,
+        rtol=3e-5,
         equal_nan=poison in ("masked_row", "nan_bias", "inf_bias"),
     )
     assert torch.equal(actual[nq:], torch.full_like(actual[nq:], -8192.0))

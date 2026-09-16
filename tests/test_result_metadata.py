@@ -1,4 +1,5 @@
 """182/191 stage 1a: facts belong to EACH result, not the first result's op."""
+
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -11,38 +12,46 @@ from test_scan_multivalue_dtypes import _mixed_scan_kernel
 from test_walker_entry_block import _HEADER, _parse
 
 
-@pytest.mark.parametrize("raw,kind,elem,width,signed,shape", [
-    ("f32", "float", "f32", 32, None, ()),
-    ("bf16", "float", "bf16", 16, None, ()),
-    ("f16", "float", "f16", 16, None, ()),
-    ("f64", "float", "f64", 64, None, ()),
-    ("f8E4M3FN", "float", "f8E4M3FN", 8, None, ()),
-    ("i1", "integer", "i1", 1, None, ()),
-    ("i64", "integer", "i64", 64, None, ()),
-    ("si32", "integer", "si32", 32, True, ()),
-    ("ui8", "integer", "ui8", 8, False, ()),
-    ("index", "index", "index", None, None, ()),
-    ("tensor<32x1xbf16, #ttg.slice<{dim = 1, parent = #blocked}>>", "float", "bf16", 16, None, (32, 1)),
-    ("tensor<32xi64>", "integer", "i64", 64, None, (32,)),
-    ("tensor<?x32xf32>", "float", "f32", 32, None, (None, 32)),
-    ("tensor<f32>", "float", "f32", 32, None, ()),
-])
+@pytest.mark.parametrize(
+    "raw,kind,elem,width,signed,shape",
+    [
+        ("f32", "float", "f32", 32, None, ()),
+        ("bf16", "float", "bf16", 16, None, ()),
+        ("f16", "float", "f16", 16, None, ()),
+        ("f64", "float", "f64", 64, None, ()),
+        ("f8E4M3FN", "float", "f8E4M3FN", 8, None, ()),
+        ("i1", "integer", "i1", 1, None, ()),
+        ("i64", "integer", "i64", 64, None, ()),
+        ("si32", "integer", "si32", 32, True, ()),
+        ("ui8", "integer", "ui8", 8, False, ()),
+        ("index", "index", "index", None, None, ()),
+        ("tensor<32x1xbf16, #ttg.slice<{dim = 1, parent = #blocked}>>", "float", "bf16", 16, None, (32, 1)),
+        ("tensor<32xi64>", "integer", "i64", 64, None, (32,)),
+        ("tensor<?x32xf32>", "float", "f32", 32, None, (None, 32)),
+        ("tensor<f32>", "float", "f32", 32, None, ()),
+    ],
+)
 def test_type_facts_have_no_implicit_f32_or_signed_default(raw, kind, elem, width, signed, shape):
     from triton_msl.codegen.result_metadata import parse_type_facts
+
     facts = parse_type_facts(raw, {"#blocked": "#ttg.blocked<{sizePerThread = [1], order = [0]}>"})
     assert (facts.kind, facts.elem, facts.width, facts.signed, facts.shape) == (kind, elem, width, signed, shape)
     assert facts.raw == raw and facts.unknown_reason is None
     assert facts.is_tensor == raw.startswith("tensor<")
 
 
-@pytest.mark.parametrize("raw,shape,address_space", [
-    ("!tt.ptr<f32>", (), 1),
-    ("!tt.ptr<bf16, 3>", (), 3),
-    ("tensor<32x!tt.ptr<i64>, #blocked>", (32,), 1),
-    ("tensor<4x8x!tt.ptr<f16, 3>, #blocked>", (4, 8), 3),
-])
+@pytest.mark.parametrize(
+    "raw,shape,address_space",
+    [
+        ("!tt.ptr<f32>", (), 1),
+        ("!tt.ptr<bf16, 3>", (), 3),
+        ("tensor<32x!tt.ptr<i64>, #blocked>", (32,), 1),
+        ("tensor<4x8x!tt.ptr<f16, 3>, #blocked>", (4, 8), 3),
+    ],
+)
 def test_pointer_bits_are_not_pointee_bits(raw, shape, address_space):
     from triton_msl.codegen.result_metadata import parse_type_facts
+
     facts = parse_type_facts(raw, {"#blocked": "#ttg.blocked<{sizePerThread = [1], order = [0]}>"})
     assert facts.kind == "pointer" and facts.width is None and facts.signed is None
     assert facts.shape == shape and facts.address_space == address_space
@@ -51,9 +60,22 @@ def test_pointer_bits_are_not_pointee_bits(raw, shape, address_space):
     assert facts.unknown_reason is None
 
 
-@pytest.mark.parametrize("raw", ["", "garbage", "f31", "tensor<watxf32>", "tensor<32xf32", "!tt.ptr<garbage>", "vector<4xf32>", "!ttg.memdesc<32xf32, #blocked, #smem>"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "garbage",
+        "f31",
+        "tensor<watxf32>",
+        "tensor<32xf32",
+        "!tt.ptr<garbage>",
+        "vector<4xf32>",
+        "!ttg.memdesc<32xf32, #blocked, #smem>",
+    ],
+)
 def test_unknown_types_are_unknown_not_scalar_f32(raw):
     from triton_msl.codegen.result_metadata import parse_type_facts
+
     facts = parse_type_facts(raw)
     assert facts.unknown_reason and facts.raw == raw
     assert facts.kind == "unknown" and facts.shape is None
@@ -62,11 +84,17 @@ def test_unknown_types_are_unknown_not_scalar_f32(raw):
 
 def test_layout_aliases_are_resolved_without_erasing_raw_type():
     from triton_msl.codegen.result_metadata import parse_type_facts
+
     raw = "tensor<32xf32, #slice>"
-    aliases = {"#slice": "#ttg.slice<{dim = 0, parent = #blocked}>",
-               "#blocked": "#ttg.blocked<{sizePerThread = [1], order = [0]}>"}
+    aliases = {
+        "#slice": "#ttg.slice<{dim = 0, parent = #blocked}>",
+        "#blocked": "#ttg.blocked<{sizePerThread = [1], order = [0]}>",
+    }
     facts = parse_type_facts(raw, aliases)
-    assert facts.raw == raw and facts.layout == "#ttg.slice<{dim = 0, parent = #ttg.blocked<{sizePerThread = [1], order = [0]}>}>"
+    assert (
+        facts.raw == raw
+        and facts.layout == "#ttg.slice<{dim = 0, parent = #ttg.blocked<{sizePerThread = [1], order = [0]}>}>"
+    )
     assert facts.unknown_reason is None
     with pytest.raises(FrozenInstanceError):
         facts.width = 16
@@ -75,6 +103,7 @@ def test_layout_aliases_are_resolved_without_erasing_raw_type():
 @pytest.mark.parametrize("aliases", [{}, {"#slice": "#slice"}, {"#slice": "#other", "#other": "#slice"}])
 def test_unresolved_or_cyclic_layout_is_not_a_proved_layout(aliases):
     from triton_msl.codegen.result_metadata import parse_type_facts
+
     facts = parse_type_facts("tensor<32xf32, #slice>", aliases)
     assert facts.layout is None and facts.unknown_reason
     assert facts.width == 32 and facts.shape == (32,)  # known independent facts survive
@@ -134,9 +163,7 @@ def _unguarded_welford(X, O_MEAN, O_M2, O_WEIGHT, N: tl.constexpr):
     value = tl.load(X + offset).to(tl.float32)
     m2 = tl.full((N,), 0.0, tl.float32)
     weight = tl.full((N,), 1.0, tl.float32)
-    mean, m2, weight = tl.reduce(
-        (value, m2, weight), 0, _unguarded_welford_combine
-    )
+    mean, m2, weight = tl.reduce((value, m2, weight), 0, _unguarded_welford_combine)
     tl.store(O_MEAN, mean)
     tl.store(O_M2, m2)
     tl.store(O_WEIGHT, weight)
@@ -225,7 +252,7 @@ def _all_ops(ops):
 
 
 def _assert_results(graph, op_name, expected):
-    op, = [o for o in _all_ops(graph.ops) if o.op == op_name]
+    (op,) = [o for o in _all_ops(graph.ops) if o.op == op_name]
     metas = [graph.result_meta[rid] for rid in op.result_ids]
     assert [m.type.elem for m in metas] == expected
     assert [m.result_index for m in metas] == list(range(len(expected)))
@@ -338,9 +365,7 @@ def test_atomic_native_contract_refuses_cross_operand_shape_or_width_damage():
         atomic = next(op for op in _all_ops(lowerer.graph.ops) if op.op.startswith("tt.atomic_"))
         atomic.attrs["sem"] = "relaxed"
         meta = lowerer.graph.result_meta[atomic.id]
-        lowerer.graph.result_meta[atomic.id] = replace(
-            meta, type=replace(meta.type, **type_changes)
-        )
+        lowerer.graph.result_meta[atomic.id] = replace(meta, type=replace(meta.type, **type_changes))
         with pytest.raises(MetalNonRecoverableError, match="atomic.*native|native.*atomic"):
             lowerer.lower()
 
@@ -390,9 +415,7 @@ def test_single_result_reduce_refuses_cross_boundary_native_damage():
             "return": reduce.attrs["return_ids"][0],
         }[damaged_value]
         meta = lowerer.graph.result_meta[value_id]
-        lowerer.graph.result_meta[value_id] = replace(
-            meta, type=replace(meta.type, **changes)
-        )
+        lowerer.graph.result_meta[value_id] = replace(meta, type=replace(meta.type, **changes))
         with pytest.raises(MetalNonRecoverableError, match="reduce.*native|native.*reduce"):
             lowerer.lower()
 
@@ -415,7 +438,8 @@ def test_kernel_extent_prescan_uses_native_result_shapes_not_legacy_text():
         target = next(
             op
             for op in _all_ops(lowerer.graph.ops)
-            if op.op == target_op and lowerer.graph.result_meta.get(op.id, None) is not None
+            if op.op == target_op
+            and lowerer.graph.result_meta.get(op.id, None) is not None
             and lowerer.graph.result_meta[op.id].type.is_tensor
         )
         target.type_str = "tensor<1x999xf32>"
@@ -435,9 +459,7 @@ def test_kernel_extent_prescan_uses_native_pointer_shape_not_legacy_text():
 
     lowerer = _single_reduce_lowerer("rows")
     store = next(op for op in _all_ops(lowerer.graph.ops) if op.op == "tt.store")
-    pointer = next(
-        op for op in _all_ops(lowerer.graph.ops) if op.id == store.operand_ids[0]
-    )
+    pointer = next(op for op in _all_ops(lowerer.graph.ops) if op.id == store.operand_ids[0])
     assert lowerer.graph.result_meta[pointer.id].type.shape == (4,)
     pointer.type_str = "tensor<1x999x!tt.ptr<f32>>"
     assert lowerer.lower() == canonical_msl
@@ -460,13 +482,9 @@ def test_kernel_extent_prescan_refuses_damaged_native_shape_contract():
         if damage == "missing":
             lowerer.graph.result_meta.pop(load.id)
         elif damage == "dynamic":
-            lowerer.graph.result_meta[load.id] = replace(
-                meta, type=replace(meta.type, shape=(None,))
-            )
+            lowerer.graph.result_meta[load.id] = replace(meta, type=replace(meta.type, shape=(None,)))
         else:
-            lowerer.graph.result_meta[load.id] = replace(
-                meta, type=replace(meta.type, is_tensor=False, shape=())
-            )
+            lowerer.graph.result_meta[load.id] = replace(meta, type=replace(meta.type, is_tensor=False, shape=()))
         with pytest.raises(MetalNonRecoverableError, match="native.*(missing|shape|tensor-kind)"):
             lowerer.lower()
 
@@ -502,22 +520,12 @@ def test_store_refuses_native_operand_contract_disagreement():
     # does not relate them. Equal element counts do not make ranks equivalent;
     # a mask must additionally remain an i1 value.
     for damage in ("value_shape", "mask_shape", "mask_type"):
-        lowerer = _build_lowerer(
-            _metadata_masked_copy, {"X": "*fp32", "O": "*fp32"}, {}
-        )
-        store = next(
-            op for op in _all_ops(lowerer.graph.ops) if op.op == "tt.store"
-        )
+        lowerer = _build_lowerer(_metadata_masked_copy, {"X": "*fp32", "O": "*fp32"}, {})
+        store = next(op for op in _all_ops(lowerer.graph.ops) if op.op == "tt.store")
         target_id = store.operand_ids[1 if damage == "value_shape" else 2]
         meta = lowerer.graph.result_meta[target_id]
-        changes = (
-            {"shape": (2, 4)}
-            if damage != "mask_type"
-            else {"kind": "integer", "elem": "i32", "width": 32}
-        )
-        lowerer.graph.result_meta[target_id] = replace(
-            meta, type=replace(meta.type, **changes)
-        )
+        changes = {"shape": (2, 4)} if damage != "mask_type" else {"kind": "integer", "elem": "i32", "width": 32}
+        lowerer.graph.result_meta[target_id] = replace(meta, type=replace(meta.type, **changes))
 
         original = lowerer._lower_store
 
@@ -541,9 +549,7 @@ def test_broadcast_layout_propagation_uses_native_operand_shape():
     from test_audit_2026_06_21_silent_wrongs import _sort_rows
 
     def make_lowerer():
-        result = _build_lowerer(
-            _sort_rows, {"a": "*fp32", "o": "*fp32"}, {"M": 2, "N": 16}
-        )
+        result = _build_lowerer(_sort_rows, {"a": "*fp32", "o": "*fp32"}, {"M": 2, "N": 16})
         # Exercise the generic broadcast consumer directly; the production
         # row-sort template otherwise short-circuits this lowering path.
         result._detect_row_wise_sort = lambda: None
@@ -573,9 +579,7 @@ def test_broadcast_layout_propagation_uses_native_operand_shape():
                     self.env_shapes[other_id] = replay_shape
         return original(binary)
 
-    lowerer._propagate_bcast_layout_binary = MethodType(
-        poison_then_propagate, lowerer
-    )
+    lowerer._propagate_bcast_layout_binary = MethodType(poison_then_propagate, lowerer)
     assert lowerer.lower() == canonical
     assert hits
 
@@ -588,37 +592,24 @@ def test_make_range_reshape_rewrite_uses_native_result_layout():
     from test_audit_2026_06_21_silent_wrongs import _sort_rows
     from triton_msl.codegen.msl_emitter import KernelBuilder
 
-    lowerer = _build_lowerer(
-        _sort_rows, {"a": "*fp32", "o": "*fp32"}, {"M": 2, "N": 16}
-    )
+    lowerer = _build_lowerer(_sort_rows, {"a": "*fp32", "o": "*fp32"}, {"M": 2, "N": 16})
     ops = list(_all_ops(lowerer.graph.ops))
     op_by_id = {op.id: op for op in ops}
     reshape = next(
         op
         for op in ops
         if op.op == "tt.reshape"
-        and sum(
-            dim != 1 for dim in lowerer.graph.result_meta[op.id].type.shape
-        )
-        == 1
-        and lowerer._trace_to_make_range(
-            op.operand_ids[0], ops, op_by_id
-        )
-        is not None
+        and sum(dim != 1 for dim in lowerer.graph.result_meta[op.id].type.shape) == 1
+        and lowerer._trace_to_make_range(op.operand_ids[0], ops, op_by_id) is not None
     )
     shape = lowerer.graph.result_meta[reshape.id].type.shape
-    assert not lowerer.graph.result_meta[reshape.id].type.layout.startswith(
-        "#ttg.slice<"
-    )
+    assert not lowerer.graph.result_meta[reshape.id].type.layout.startswith("#ttg.slice<")
     forged_layout = next(
         lowerer.graph.result_meta[op.id].type.layout
         for op in ops
-        if op.op == "tt.reduce"
-        and lowerer.graph.result_meta[op.id].type.layout
+        if op.op == "tt.reduce" and lowerer.graph.result_meta[op.id].type.layout
     )
-    reshape.type_str = (
-        f"tensor<{'x'.join(map(str, shape))}xi32, {forged_layout}>"
-    )
+    reshape.type_str = f"tensor<{'x'.join(map(str, shape))}xi32, {forged_layout}>"
     lowerer._bcast_layouts_by_layout = {forged_layout: (shape, "lid")}
     lowerer.kb = KernelBuilder("metadata_layout_probe", block_size=32)
 
@@ -630,9 +621,7 @@ def test_make_range_reshape_rewrite_uses_native_result_layout():
     meta = lowerer.graph.result_meta[reshape.id]
     wrong_layout = re.sub(r"dim = \d+", "dim = 99", forged_layout, count=1)
     assert wrong_layout != forged_layout
-    lowerer.graph.result_meta[reshape.id] = replace(
-        meta, type=replace(meta.type, layout=wrong_layout)
-    )
+    lowerer.graph.result_meta[reshape.id] = replace(meta, type=replace(meta.type, layout=wrong_layout))
     lowerer._bcast_layouts_by_layout = {}
     lowerer._bcast_layouts_by_shape = {shape: "lid"}
     lowerer.kb = KernelBuilder("metadata_shape_fallback_probe", block_size=32)
@@ -646,21 +635,15 @@ def test_reduce_broadcast_layout_registration_refuses_conflicting_native_key():
 
     from triton_msl.errors import MetalNonRecoverableError
 
-    lowerer = _build_lowerer(
-        _mixed_reduce, {"X": "*fp32", "O": "*fp32", "I": "*i32"}, {}
-    )
+    lowerer = _build_lowerer(_mixed_reduce, {"X": "*fp32", "O": "*fp32", "I": "*i32"}, {})
     facts = SimpleNamespace(layout="#ttg.slice<{dim = 1, parent = #blocked}>")
 
     lowerer._register_bcast_layout_by_native(facts, (2, 16), "lid % 16u")
     # Replaying the same stage is idempotent.
     lowerer._register_bcast_layout_by_native(facts, (2, 16), "lid % 16u")
 
-    other_stage = SimpleNamespace(
-        layout="#ttg.slice<{dim = 0, parent = #blocked}>"
-    )
-    lowerer._register_bcast_layout_by_native(
-        other_stage, (2, 16), "(lid / 2u) % 16u"
-    )
+    other_stage = SimpleNamespace(layout="#ttg.slice<{dim = 0, parent = #blocked}>")
+    lowerer._register_bcast_layout_by_native(other_stage, (2, 16), "(lid / 2u) % 16u")
     assert lowerer._bcast_shapes_by_expr == {
         "lid % 16u": {(2, 16)},
         "(lid / 2u) % 16u": {(2, 16)},
@@ -677,9 +660,7 @@ def test_reduce_broadcast_layout_registration_refuses_conflicting_native_key():
     # sharing a logical shape does not overwrite an earlier stage.
     no_layout = SimpleNamespace(layout=None)
     lowerer._register_bcast_layout_by_native(no_layout, (8, 4), "lid % 4u")
-    lowerer._register_bcast_layout_by_native(
-        no_layout, (8, 4), "(lid / 2u) % 4u"
-    )
+    lowerer._register_bcast_layout_by_native(no_layout, (8, 4), "(lid / 2u) % 4u")
     assert lowerer._bcast_shapes_by_expr["lid % 4u"] == {(8, 4)}
     assert lowerer._bcast_shapes_by_expr["(lid / 2u) % 4u"] == {(8, 4)}
 
@@ -698,9 +679,7 @@ def test_multi_result_reduce_refuses_damaged_native_slot_contracts():
         "mismatched_operand_layout",
         "welford_narrow_slot",
     ):
-        lowerer = _multi_reduce_lowerer(
-            "welford" if damage == "welford_narrow_slot" else "argmax"
-        )
+        lowerer = _multi_reduce_lowerer("welford" if damage == "welford_narrow_slot" else "argmax")
         reduce = _multi_reduce_op(lowerer)
         if damage == "missing_operand":
             lowerer.graph.result_meta.pop(reduce.operand_ids[0])
@@ -715,21 +694,15 @@ def test_multi_result_reduce_refuses_damaged_native_slot_contracts():
         elif damage == "wrong_return_width":
             value_id = reduce.attrs["return_ids"][1]
             meta = lowerer.graph.result_meta[value_id]
-            lowerer.graph.result_meta[value_id] = replace(
-                meta, type=replace(meta.type, elem="i64", width=64)
-            )
+            lowerer.graph.result_meta[value_id] = replace(meta, type=replace(meta.type, elem="i64", width=64))
         elif damage == "mismatched_operand_layout":
             value_id = reduce.operand_ids[1]
             meta = lowerer.graph.result_meta[value_id]
-            lowerer.graph.result_meta[value_id] = replace(
-                meta, type=replace(meta.type, layout="#different")
-            )
+            lowerer.graph.result_meta[value_id] = replace(meta, type=replace(meta.type, layout="#different"))
         elif damage == "welford_narrow_slot":
             value_id = reduce.operand_ids[2]
             meta = lowerer.graph.result_meta[value_id]
-            lowerer.graph.result_meta[value_id] = replace(
-                meta, type=replace(meta.type, elem="f16", width=16)
-            )
+            lowerer.graph.result_meta[value_id] = replace(meta, type=replace(meta.type, elem="f16", width=16))
 
         with pytest.raises(MetalNonRecoverableError, match="native|Welford"):
             lowerer.lower()
@@ -780,12 +753,16 @@ def test_welford_multi_result_reducer_computes_all_three_slots(tmp_path, monkeyp
 
 
 def test_mixed_scan_results_keep_their_own_types():
-    graph = _build_lowerer(_mixed_scan_kernel, {"x_ptr": "*fp32", "c_ptr": "*i32", "o_val": "*fp32", "o_cnt": "*i32"}, {"N": 32}).graph
+    graph = _build_lowerer(
+        _mixed_scan_kernel, {"x_ptr": "*fp32", "c_ptr": "*i32", "o_val": "*fp32", "o_cnt": "*i32"}, {"N": 32}
+    ).graph
     _assert_results(graph, "tt.scan", ["f32", "i32"])
     assert all(graph.result_meta[a.id].kind == "entry_arg" for a in graph.args)
 
 
-MIXED_CONTROL = _HEADER + '''
+MIXED_CONTROL = (
+    _HEADER
+    + """
   tt.func public @entry(%c: i1, %x: f32, %n: i64, %o: !tt.ptr<f32>, %oi: !tt.ptr<i64>) {
     %r:2 = tt.call @helper(%c, %x, %n) : (i1, f32, i64) -> (f32, i64)
     tt.store %o, %r#0 : !tt.ptr<f32>
@@ -801,46 +778,61 @@ MIXED_CONTROL = _HEADER + '''
     tt.return %r#0, %r#1 : f32, i64
   }
 }
-'''
+"""
+)
 
 
 def test_mixed_callee_call_and_control_flow_results(tmp_path):
     graph = _parse(MIXED_CONTROL, tmp_path)
     _assert_results(graph, "tt.call", ["f32", "i64"])
-    callee, = graph.called_funcs
-    branch, = [o for o in callee.ops if o.op == "scf.if"]
+    (callee,) = graph.called_funcs
+    (branch,) = [o for o in callee.ops if o.op == "scf.if"]
     assert [graph.result_meta[rid].type.elem for rid in branch.result_ids] == ["f32", "i64"]
     assert [graph.result_meta[rid].result_index for rid in branch.result_ids] == [0, 1]
     assert all(graph.result_meta[a.id].kind == "callee_arg" for a in callee.args)
     assert [graph.result_meta[a.id].type.elem for a in callee.args] == ["i1", "f32", "i64"]
 
 
-@pytest.mark.parametrize("kind,body", [
-    ("scf.for", '''
+@pytest.mark.parametrize(
+    "kind,body",
+    [
+        (
+            "scf.for",
+            """
       %r:2 = scf.for %i = %lb to %ub step %st iter_args(%a = %x, %b = %n) -> (f32, i64) {
         scf.yield %a, %b : f32, i64
       }
-    '''),
-    ("scf.while", '''
+    """,
+        ),
+        (
+            "scf.while",
+            """
       %r:2 = scf.while (%a = %x, %b = %n) : (f32, i64) -> (f32, i64) {
         scf.condition(%c) %a, %b : f32, i64
       } do {
       ^bb0(%a: f32, %b: i64):
         scf.yield %a, %b : f32, i64
       }
-    '''),
-])
+    """,
+        ),
+    ],
+)
 def test_mixed_loop_results_and_every_native_block_arg(tmp_path, kind, body):
     # Type/IR-only: the while body is not a GPU liveness test.
-    text = _HEADER + '''
+    text = (
+        _HEADER
+        + """
       tt.func public @entry(%lb: index, %ub: index, %st: index, %c: i1, %x: f32, %n: i64, %o: !tt.ptr<f32>, %oi: !tt.ptr<i64>) {
-    ''' + body + '''
+    """
+        + body
+        + """
         tt.store %o, %r#0 : !tt.ptr<f32>
         tt.store %oi, %r#1 : !tt.ptr<i64>
         tt.return
       }
     }
-    '''
+    """
+    )
     graph = _parse(text, tmp_path)
     _assert_results(graph, kind, ["f32", "i64"])
     args = [m for m in graph.result_meta.values() if m.kind == "block_arg"]
@@ -850,7 +842,9 @@ def test_mixed_loop_results_and_every_native_block_arg(tmp_path, kind, body):
 
 
 def test_signless_bits_remain_signless_for_signed_and_unsigned_consumers(tmp_path):
-    text = _HEADER + '''
+    text = (
+        _HEADER
+        + """
       tt.func public @entry(%x: i32, %y: i32, %os: !tt.ptr<i32>, %ou: !tt.ptr<i32>) {
         %s = arith.divsi %x, %y : i32
         %u = arith.divui %x, %y : i32
@@ -859,7 +853,8 @@ def test_signless_bits_remain_signless_for_signed_and_unsigned_consumers(tmp_pat
         tt.return
       }
     }
-    '''
+    """
+    )
     graph = _parse(text, tmp_path)
     assert all(m.type.signed is None for m in graph.result_meta.values())
     assert {o.op for o in graph.ops} >= {"arith.divsi", "arith.divui"}

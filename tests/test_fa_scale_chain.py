@@ -1,4 +1,5 @@
 """Scalar conversion is independent of Q-product and probability rounding."""
+
 import struct
 
 import pytest
@@ -30,8 +31,15 @@ def _variant(chain):
 
 def _lower(fn):
     cex = {"DIM": 32, "BLOCK_J": 32, "BLOCK_K": 32}
-    sig = {n: ("*u8" if n == "mask_ptr" else "*fp32") if n.endswith("_ptr") else
-           "fp32" if n in ("sm_scale", "neg_inf") else "i32" for n in fn.arg_names if n not in cex}
+    sig = {
+        n: ("*u8" if n == "mask_ptr" else "*fp32")
+        if n.endswith("_ptr")
+        else "fp32"
+        if n in ("sm_scale", "neg_inf")
+        else "i32"
+        for n in fn.arg_names
+        if n not in cex
+    }
     return _build_lowerer(fn, sig, cex)
 
 
@@ -52,6 +60,7 @@ def test_scale_chain_is_preserved_at_lowering_boundary(chain):
 def test_unproved_scalar_chain_refuses_before_maker(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("unproved conversion reached a forward maker")
+
     monkeypatch.setattr(makers, "make_flash_attention_kernel_simdgroup", forbidden)
     monkeypatch.setattr(makers, "make_flash_attention_kernel_tiled", forbidden)
     with pytest.raises(MetalNonRecoverableError, match="scalar.*(chain|conversion)"):
@@ -85,9 +94,11 @@ def test_gpu_scalar_chain_matches_source(chain, route, cold, monkeypatch):
     calls = []
     name = "make_flash_attention_kernel_" + route
     real = getattr(makers, name)
+
     def spy(*args, **kw):
         calls.append(kw)
         return real(*args, **kw)
+
     monkeypatch.setattr(makers, name, spy)
     actual, _ = source._launch(p, torch.float32)
     error = (actual - ref).abs().max().item()
