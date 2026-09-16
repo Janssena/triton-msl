@@ -5,11 +5,27 @@ not identify the final artifacts; the runtime-payload binding is described below
 
 ## Evidence and remaining limitations
 
-Exact frozen871 is bound by packet 872: 6,079 project passes / 16 skips and the exact 9,342-node upstream map (5,780 passes / 3,562 skips). Packet 875 builds and relocates the native and pure rc4 validation artifacts; packet 876 installed acceptance passes 1,468 native / 252 pure with no failures or skips. Packet 878 re-executes the original and additive-IEEE portability contracts on exact871 in both local native and pure Metal modes and rebinds those outputs to retained remote outputs. Packet 879 records four passing M4 Max floors and the current performance tables below. Runtime payload equality binds these receipts. The final-version 0.3.0 artifacts have been freshly built, reproduced from the sdist, installed and relocated for CPU checks, rather than relabeling rc4. Only documentation/version metadata changed; no new numerical or performance run is claimed for that artifact-only step.
+The formatted 0.3.0 candidate at `73ba428` is bound to fresh packet 906 gates: 6,079 project passes / 16 skips and the exact 9,342-node upstream map (5,780 passes / 3,562 skips). Packet 907 builds, reproduces and relocates its native and pure validation artifacts. Packet 909 installed acceptance passes 1,468 native / 252 pure with no failures or skips; all four unchanged M4 Max performance floors pass, and the three-workload cold subset below computes correctly in every arm. Final documentation-only artifacts are rebuilt, reproduced from the sdist and rebound to these tested runtime payloads, with fresh and relocated CPU checks. Formatting changed Python bytes and cache identities, so the earlier runtime-byte-equality claim is not used to inherit the old gates.
+
+The pre-format lineage remains separately attributed: packet 872 tested frozen871, packets 875/876 covered its rc4 artifacts and installed acceptance, and packet 878 re-executed the original and additive-IEEE portability contracts on that source in both local Metal modes against retained remote outputs. Packet 879 supplies the full main-relative warm tables below; packets 890/895 supply the later attention comparisons on pre-format final-version artifacts. These full warm comparisons and vendor receipts were not rerun on formatted bytes. Their historical scopes, failures and limitations remain unchanged; no warm alert is cleared.
+
+### Formatted-candidate revalidation and cold subset (2026-09-16)
+
+The 228-file formatting commit preserved 226 syntax trees excluding source locations; the other two changed only docstring whitespace. The reviewed corpus produced 38 identical emissions covering 35 distinct shaders and 29 unchanged refusal messages. This is finite corpus evidence, not universal emission equivalence. Two source-mutation test fixtures were updated for the formatter's spelling while preserving negative-kernel ASTs, assertions and parameter IDs. The installed flip witness's old literal producer hash was separately rebound to the AST-identical formatted file; all installed tests then reran. No numerical threshold, skip, refusal or capability was removed to obtain the passes.
+
+Packet 909 retained the existing workload workers, inputs, source oracles and acceptance thresholds. Its single cold observations, in seconds, are:
+
+| Workload | Public main | Formatted native wheel | Formatted pure wheel |
+|---|---:|---:|---:|
+| Add | 0.629 | 9.480 | 9.586 |
+| Compiled MLP | 0.861 | 10.024 | 10.053 |
+| GPT-2 small | 2.810 | 5.130 | 5.174 |
+
+The timer covers the first synchronized specialization invocation, including compilation and the retained live observer, but excludes imports, input/model construction and oracle evaluation. Add starts in a fresh portable worker. MLP and then GPT-2 share a fresh model worker, so GPT-2 is not a fresh-interpreter start. The original 20 setup warmups and final checks remain, but the full warm-matrix timed loops between rows were omitted. These observations do not reproduce that matrix's entire process history and do not establish a formatting-driven improvement over packet 879. Cold costs remain substantial. The four passing floors are fixed thresholds, not clearance of any main-relative regression.
 
 The 814→871 audit added faithful or fail-closed handling for width/layout guards, partial-K source extents and fast-path fallback, ordered quiet/propagating comparator reductions (including bounded multipass), native callee types, operation-owned transpose order/orientation chains, matmul/flip detector false positives and retained side effects, KDA state validation/copyback, and precise ambiguous diagnostics. This is finite tested coverage, not proof that every source is safe. Remaining unproved nested/MEPT/multipass/layout forms refuse as recorded in the capability register.
 
-All 11 scoped exact-byte predicates pass across current local native/pure Metal outputs and retained A40/MI300X outputs. Local Metal passes 16/16 original required numerical rows; each remote backend remains 14/16 because the two original default-precision attention rows fail. Separate additive explicit-IEEE contexts pass 2/2 on every arm. No default or tolerance changed. M1 is still user-run after merge. Optional C++ sources are packaged but the route remains deferred, unaudited and off by default. Performance regressions remain open and are quantified below.
+In packet 878's pre-format receipt, all 11 scoped exact-byte predicates pass across local native/pure Metal outputs and retained A40/MI300X outputs. Local Metal passes 16/16 original required numerical rows; each remote backend remains 14/16 because the two original default-precision attention rows fail. Separate additive explicit-IEEE contexts pass 2/2 on every arm. No default or tolerance changed. M1 is still user-run after merge. Optional C++ sources are packaged but the route remains deferred, unaudited and off by default. Performance regressions remain open and are quantified below.
 
 ### Cross-vendor precision and parity scope (2026-09-15)
 
@@ -167,9 +183,9 @@ source patterns as suspect until using a validated corrected artifact; no adviso
 
 Packet 883 measured the existing execution-contract capture at 17.53 s, including 10.03 s for the tree stage and 6.52 s for the first resolver. In three fresh-process optimistic screens with a preloaded manifest, identity work alone took 2.11–2.23 s (median 2.16173 s). Those screens excluded stat traversal, cache I/O, compiler and GPU work, so the tree-only proposal could not meet the declared approximately 1.5 s target under its own optimistic conditions.
 
-No persistent memo was implemented or adopted, and exact871 is unchanged. This is not a finding of no possible benefit, an absolute performance ceiling, or proof that another mechanism cannot improve cold start. The default continues to content-hash the relevant trees once per interpreter. The measured p879 first-specialization disclosures above remain current.
+No persistent memo was implemented or adopted, and exact871 is unchanged. This is not a finding of no possible benefit, an absolute performance ceiling, or proof that another mechanism cannot improve cold start. The default continues to content-hash the relevant trees once per interpreter. The p879 first-specialization figures are retained pre-format observations; the formatted cold subset is reported separately above.
 
-## Latest composed main-relative evidence: exact 871
+## Latest composed main-relative evidence: exact 871 (pre-format)
 
 The September 16, 2026 installed-wheel comparisons use public main `182c1820fd24a836d565e1da842f28414de64084` and exact frozen 871 on one M4 Max. Each mode retains 11,520 samples under the unchanged p527 protocol. Main is correct on 18 comparable rows, wrong on six and refuses six; the candidate computes all 30 required rows. Wrong/refusing main is untimed and receives no ratio. The optional TF32 diagnostic errors without execution credit.
 
