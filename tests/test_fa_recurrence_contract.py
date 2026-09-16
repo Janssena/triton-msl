@@ -68,9 +68,9 @@ def test_recurrence_reducer_must_return_its_combiner(combiner):
 @pytest.mark.parametrize(
     "old,new",
     [
-        ("l = l*a + tl.sum(p, 1)", "l = l*a + 2. * tl.sum(p, 1)"),
-        ("l = l*a + tl.sum(p, 1)", "l = l*a + tl.max(p, 1)"),
-        ("acc/l[:, None]", "acc/(l[:, None] + 1.)"),
+        ("l = l * a + tl.sum(p, 1)", "l = l * a + 2. * tl.sum(p, 1)"),
+        ("l = l * a + tl.sum(p, 1)", "l = l * a + tl.max(p, 1)"),
+        ("acc / l[:, None]", "acc / (l[:, None] + 1.)"),
     ],
     ids=["singleton-denominator-scale", "singleton-denominator-reducer", "singleton-output-denominator"],
 )

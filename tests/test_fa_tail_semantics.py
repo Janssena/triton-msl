@@ -306,6 +306,8 @@ def test_dense_addresses_must_match_the_proved_coordinates(term, monkeypatch):
     from triton_msl.codegen.generic_lowerer import GenericLowerer
 
     fn = triton.JITFunction(_tail_attention.fn)
+    # Match Ruff's source spelling while retaining the existing parameter IDs.
+    term = term.replace("*", " * ")
     assert fn.src.count(term) == 1
     fn._unsafe_update_src(fn.src.replace(term, "(" + term[:2] + "+32)" + term[2:]))
     monkeypatch.setattr(sys.modules[__name__], "_tail_attention", fn)
